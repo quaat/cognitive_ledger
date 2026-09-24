@@ -1,7 +1,8 @@
 //! Restricted deterministic RDF patch protocol for the walking skeleton.
 
 use ledger_core::{ContentId, PatchId};
-use serde::{Deserialize, Serialize};
+use oxttl::NQuadsParser;
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use std::{collections::BTreeSet, fmt, str::FromStr};
 use thiserror::Error;
 
@@ -17,8 +18,7 @@ pub enum RdfError {
     #[error("invalid patch encoding: {0}")]
     InvalidPatch(String),
 }
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(transparent)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Quad(String);
 impl fmt::Display for Quad {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -28,93 +28,34 @@ impl fmt::Display for Quad {
 impl FromStr for Quad {
     type Err = RdfError;
     fn from_str(v: &str) -> Result<Self, Self::Err> {
-        validate_quad(v)?;
-        Ok(Self(v.into()))
-    }
-}
-
-fn valid_iri(v: &str) -> bool {
-    v.starts_with('<')
-        && v.ends_with('>')
-        && v[1..v.len() - 1].contains(':')
-        && !v.contains([' ', '\n', '\r', '\t'])
-}
-fn valid_literal(value: &str) -> bool {
-    let Some(body) = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) else {
-        return false;
-    };
-    let mut escaped = false;
-    for ch in body.chars() {
-        if escaped {
-            if !matches!(ch, '"' | '\\' | 'n' | 'r' | 't') {
-                return false;
-            }
-            escaped = false;
-        } else if ch == '\\' {
-            escaped = true;
-        } else if ch == '"' || ch.is_control() {
-            return false;
+        let mut parser = NQuadsParser::new().for_slice(v.as_bytes());
+        let quad = parser
+            .next()
+            .ok_or_else(|| RdfError::InvalidQuad(v.into()))?
+            .map_err(|error| RdfError::InvalidQuad(error.to_string()))?;
+        if parser.next().is_some() {
+            return Err(RdfError::InvalidQuad("expected exactly one quad".into()));
         }
-    }
-    !escaped
-}
-fn terms(input: &str) -> Result<Vec<String>, RdfError> {
-    let mut result = Vec::new();
-    let mut current = String::new();
-    let mut quoted = false;
-    let mut escaped = false;
-    for ch in input.chars() {
-        if quoted {
-            current.push(ch);
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                quoted = false;
-            }
-        } else if ch == '"' {
-            quoted = true;
-            current.push(ch);
-        } else if ch.is_whitespace() {
-            if !current.is_empty() {
-                result.push(std::mem::take(&mut current));
-            }
-        } else {
-            current.push(ch);
+        if quad.subject.is_blank_node()
+            || quad.object.is_blank_node()
+            || quad.graph_name.is_blank_node()
+        {
+            return Err(RdfError::BlankNode);
         }
+        Ok(Self(format!("{quad} .")))
     }
-    if quoted || escaped {
-        return Err(RdfError::InvalidQuad(input.into()));
-    }
-    if !current.is_empty() {
-        result.push(current);
-    }
-    Ok(result)
 }
-fn validate_quad(value: &str) -> Result<(), RdfError> {
-    if value.chars().any(|c| c == '\n' || c == '\r' || c == '\0') {
-        return Err(RdfError::InvalidQuad(value.into()));
+impl Serialize for Quad {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
     }
-    let body = value
-        .strip_suffix(" .")
-        .ok_or_else(|| RdfError::InvalidQuad(value.into()))?;
-    let ts = terms(body)?;
-    if ts.iter().any(|term| term.starts_with("_:")) {
-        return Err(RdfError::BlankNode);
+}
+impl<'de> Deserialize<'de> for Quad {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(D::Error::custom)
     }
-    if !(ts.len() == 3 || ts.len() == 4)
-        || !valid_iri(&ts[0])
-        || !valid_iri(&ts[1])
-        || (ts.len() == 4 && !valid_iri(&ts[3]))
-    {
-        return Err(RdfError::InvalidQuad(value.into()));
-    }
-    let object = &ts[2];
-    if !(valid_iri(object) || valid_literal(object)) {
-        return Err(RdfError::InvalidQuad(value.into()));
-    }
-    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -127,9 +68,18 @@ pub struct Operation {
     pub kind: OperationKind,
     pub quad: Quad,
 }
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Patch {
     operations: Vec<Operation>,
+}
+impl<'de> Deserialize<'de> for Patch {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct WirePatch {
+            operations: Vec<Operation>,
+        }
+        Self::new(WirePatch::deserialize(deserializer)?.operations).map_err(D::Error::custom)
+    }
 }
 impl Patch {
     pub fn new(operations: impl IntoIterator<Item = Operation>) -> Result<Self, RdfError> {
@@ -242,5 +192,40 @@ mod tests {
         assert!("<urn:s> <urn:p> \"a\"\"b\" .".parse::<Quad>().is_err());
         assert!(r#"<urn:s> <urn:p> "a\q" ."#.parse::<Quad>().is_err());
         assert!("<urn:s> <urn:p> \"line\nbreak\" .".parse::<Quad>().is_err());
+        assert!("<relative> <urn:p> <urn:o> .".parse::<Quad>().is_err());
+        assert!("<urn:s bad> <urn:p> <urn:o> .".parse::<Quad>().is_err());
+    }
+    #[test]
+    fn serde_cannot_bypass_quad_validation() {
+        assert!(serde_json::from_str::<Quad>(r#""_:hidden <urn:p> <urn:o> .""#).is_err());
+        assert!(serde_json::from_str::<Quad>(r#""<relative> <urn:p> <urn:o> .""#).is_err());
+    }
+    #[test]
+    fn serde_cannot_bypass_patch_normalization() {
+        let duplicate = r#"{"operations":[{"kind":"Add","quad":"<urn:s> <urn:p> <urn:o> ."},{"kind":"Add","quad":"<urn:s> <urn:p> <urn:o> ."}]}"#;
+        let patch: Patch = serde_json::from_str(duplicate).unwrap();
+        assert_eq!(patch.operations().len(), 1);
+
+        let conflict = r#"{"operations":[{"kind":"Add","quad":"<urn:s> <urn:p> <urn:o> ."},{"kind":"Delete","quad":"<urn:s> <urn:p> <urn:o> ."}]}"#;
+        assert!(serde_json::from_str::<Patch>(conflict).is_err());
+    }
+    #[test]
+    fn standards_parser_canonicalizes_supported_nquads_terms() {
+        let language: Quad = "<urn:s> <urn:p> \"bonjour\"@fr <urn:g> .".parse().unwrap();
+        assert_eq!(
+            language.to_string(),
+            "<urn:s> <urn:p> \"bonjour\"@fr <urn:g> ."
+        );
+
+        let typed: Quad = "<urn:s> <urn:p> \"7\"^^<http://www.w3.org/2001/XMLSchema#integer> ."
+            .parse()
+            .unwrap();
+        assert_eq!(
+            typed.to_string(),
+            "<urn:s> <urn:p> \"7\"^^<http://www.w3.org/2001/XMLSchema#integer> ."
+        );
+
+        let escaped: Quad = "<urn:s> <urn:p> \"\\u0061\" .".parse().unwrap();
+        assert_eq!(escaped.to_string(), "<urn:s> <urn:p> \"a\" .");
     }
 }

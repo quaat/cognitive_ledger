@@ -1,7 +1,7 @@
 # Technical debt and deferred work
 
 - Replace host-local ref locking with PostgreSQL transactional CAS and a real two-writer integration test.
-- Complete RDF 1.1 parsing, term normalization, and a stable skolemization protocol with hostile-input limits.
+- Design a stable skolemization/import protocol and hostile-input limits around the standards N-Quads parser.
 - Pin the official Fluree reference image by digest and implement/run the semantic-state adapter.
 - Add Fuseki/Jena candidate validation and projection retry integration without coupling it to history.
 - Add OpenAPI, authentication/authorization boundary, request/body and ancestry depth limits.

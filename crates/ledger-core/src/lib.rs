@@ -1,6 +1,6 @@
 //! Infrastructure-free protocol types and storage boundaries.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use sha2::{Digest, Sha256};
 use std::{fmt, str::FromStr};
 use thiserror::Error;
@@ -98,9 +98,11 @@ macro_rules! typed_id {
 typed_id!(PatchId);
 typed_id!(CommitId);
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Commit {
-    pub parent: Option<CommitId>,
+    /// Ordered parents. Parent zero is the reconstruction/mainline parent.
+    /// Protocol v1 permits zero (genesis), one (linear), or two (merge).
+    pub parents: Vec<CommitId>,
     pub patch: PatchId,
     pub author: String,
     pub message: String,
@@ -110,12 +112,22 @@ pub struct Commit {
 
 const COMMIT_HEADER: &[u8] = b"sculpin-commit-v1\0";
 impl Commit {
+    fn validate_shape(&self) -> Result<(), LedgerError> {
+        if self.parents.len() > 2 {
+            return Err(LedgerError::InvalidCommit(
+                "protocol v1 permits at most two parents".into(),
+            ));
+        }
+        if self.parents.len() == 2 && self.parents[0] == self.parents[1] {
+            return Err(LedgerError::InvalidCommit(
+                "merge parents must be distinct".into(),
+            ));
+        }
+        Ok(())
+    }
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, LedgerError> {
+        self.validate_shape()?;
         let fields = [
-            self.parent
-                .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_default(),
             self.patch.to_string(),
             self.author.clone(),
             self.message.clone(),
@@ -123,11 +135,16 @@ impl Commit {
             self.recorded_time.clone(),
         ];
         let mut out = COMMIT_HEADER.to_vec();
+        out.extend_from_slice(
+            &u32::try_from(self.parents.len())
+                .expect("parent count is bounded by two")
+                .to_be_bytes(),
+        );
+        for parent in &self.parents {
+            encode_field(&mut out, &parent.to_string())?;
+        }
         for field in fields {
-            let len = u32::try_from(field.len())
-                .map_err(|_| LedgerError::InvalidCommit("field exceeds u32".into()))?;
-            out.extend_from_slice(&len.to_be_bytes());
-            out.extend_from_slice(field.as_bytes());
+            encode_field(&mut out, &field)?;
         }
         Ok(out)
     }
@@ -138,40 +155,90 @@ impl Commit {
         let mut rest = bytes
             .strip_prefix(COMMIT_HEADER)
             .ok_or_else(|| LedgerError::InvalidCommit("unknown header".into()))?;
-        let mut values = Vec::with_capacity(6);
-        for _ in 0..6 {
-            if rest.len() < 4 {
-                return Err(LedgerError::InvalidCommit("truncated length".into()));
-            }
-            let len = u32::from_be_bytes(rest[..4].try_into().expect("four bytes")) as usize;
-            rest = &rest[4..];
-            if rest.len() < len {
-                return Err(LedgerError::InvalidCommit("truncated field".into()));
-            }
-            values.push(
-                std::str::from_utf8(&rest[..len])
-                    .map_err(|_| LedgerError::InvalidCommit("non-UTF-8 field".into()))?
-                    .to_owned(),
-            );
-            rest = &rest[len..];
+        if rest.len() < 4 {
+            return Err(LedgerError::InvalidCommit("truncated parent count".into()));
+        }
+        let parent_count = u32::from_be_bytes(rest[..4].try_into().expect("four bytes")) as usize;
+        rest = &rest[4..];
+        if parent_count > 2 {
+            return Err(LedgerError::InvalidCommit(
+                "protocol v1 permits at most two parents".into(),
+            ));
+        }
+        let mut parents = Vec::with_capacity(parent_count);
+        for _ in 0..parent_count {
+            parents.push(read_field(&mut rest)?.parse()?);
+        }
+        if parents.len() == 2 && parents[0] == parents[1] {
+            return Err(LedgerError::InvalidCommit(
+                "merge parents must be distinct".into(),
+            ));
+        }
+        let mut values = Vec::with_capacity(5);
+        for _ in 0..5 {
+            values.push(read_field(&mut rest)?);
         }
         if !rest.is_empty() {
             return Err(LedgerError::InvalidCommit("trailing bytes".into()));
         }
-        let parent = if values[0].is_empty() {
-            None
-        } else {
-            Some(values[0].parse()?)
-        };
         Ok(Self {
-            parent,
-            patch: values[1].parse()?,
-            author: values[2].clone(),
-            message: values[3].clone(),
-            event_time: values[4].clone(),
-            recorded_time: values[5].clone(),
+            parents,
+            patch: values[0].parse()?,
+            author: values[1].clone(),
+            message: values[2].clone(),
+            event_time: values[3].clone(),
+            recorded_time: values[4].clone(),
         })
     }
+}
+
+impl<'de> Deserialize<'de> for Commit {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct WireCommit {
+            parents: Vec<CommitId>,
+            patch: PatchId,
+            author: String,
+            message: String,
+            event_time: String,
+            recorded_time: String,
+        }
+        let wire = WireCommit::deserialize(deserializer)?;
+        let commit = Self {
+            parents: wire.parents,
+            patch: wire.patch,
+            author: wire.author,
+            message: wire.message,
+            event_time: wire.event_time,
+            recorded_time: wire.recorded_time,
+        };
+        commit.validate_shape().map_err(D::Error::custom)?;
+        Ok(commit)
+    }
+}
+
+fn encode_field(out: &mut Vec<u8>, field: &str) -> Result<(), LedgerError> {
+    let len = u32::try_from(field.len())
+        .map_err(|_| LedgerError::InvalidCommit("field exceeds u32".into()))?;
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(field.as_bytes());
+    Ok(())
+}
+
+fn read_field(rest: &mut &[u8]) -> Result<String, LedgerError> {
+    if rest.len() < 4 {
+        return Err(LedgerError::InvalidCommit("truncated length".into()));
+    }
+    let len = u32::from_be_bytes(rest[..4].try_into().expect("four bytes")) as usize;
+    *rest = &rest[4..];
+    if rest.len() < len {
+        return Err(LedgerError::InvalidCommit("truncated field".into()));
+    }
+    let value = std::str::from_utf8(&rest[..len])
+        .map_err(|_| LedgerError::InvalidCommit("non-UTF-8 field".into()))?
+        .to_owned();
+    *rest = &rest[len..];
+    Ok(value)
 }
 
 pub trait ObjectStore: Send + Sync {
@@ -203,7 +270,7 @@ mod tests {
     #[test]
     fn commit_round_trip() {
         let c = Commit {
-            parent: None,
+            parents: vec![],
             patch: PatchId(ContentId::for_bytes(b"p")),
             author: "a".into(),
             message: "m".into(),
@@ -214,5 +281,52 @@ mod tests {
             Commit::from_canonical_bytes(&c.canonical_bytes().unwrap()).unwrap(),
             c
         );
+    }
+    #[test]
+    fn ordered_merge_parents_round_trip_and_affect_identity() {
+        let a = CommitId(ContentId::for_bytes(b"a"));
+        let b = CommitId(ContentId::for_bytes(b"b"));
+        let commit = Commit {
+            parents: vec![a.clone(), b.clone()],
+            patch: PatchId(ContentId::for_bytes(b"p")),
+            author: "a".into(),
+            message: "merge".into(),
+            event_time: "e".into(),
+            recorded_time: "r".into(),
+        };
+        let decoded = Commit::from_canonical_bytes(&commit.canonical_bytes().unwrap()).unwrap();
+        assert_eq!(decoded, commit);
+        let mut reversed = commit.clone();
+        reversed.parents = vec![b, a];
+        assert_ne!(commit.id().unwrap(), reversed.id().unwrap());
+    }
+    #[test]
+    fn v1_rejects_duplicate_or_excess_parents() {
+        let parent = CommitId(ContentId::for_bytes(b"p"));
+        let base = Commit {
+            parents: vec![parent.clone(), parent.clone()],
+            patch: PatchId(ContentId::for_bytes(b"patch")),
+            author: "a".into(),
+            message: "m".into(),
+            event_time: "e".into(),
+            recorded_time: "r".into(),
+        };
+        assert!(base.canonical_bytes().is_err());
+        let mut excessive = base;
+        excessive.parents = vec![
+            parent,
+            CommitId(ContentId::for_bytes(b"q")),
+            CommitId(ContentId::for_bytes(b"r")),
+        ];
+        assert!(excessive.canonical_bytes().is_err());
+    }
+    #[test]
+    fn serde_cannot_bypass_parent_validation() {
+        let id = ContentId::for_bytes(b"parent");
+        let patch = ContentId::for_bytes(b"patch");
+        let duplicate = format!(
+            r#"{{"parents":["{id}","{id}"],"patch":"{patch}","author":"a","message":"m","event_time":"e","recorded_time":"r"}}"#
+        );
+        assert!(serde_json::from_str::<Commit>(&duplicate).is_err());
     }
 }

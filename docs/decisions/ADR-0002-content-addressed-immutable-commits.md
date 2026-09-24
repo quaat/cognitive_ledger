@@ -7,7 +7,7 @@ Accepted
 Audit history needs stable identity, reproducibility, and safe concurrency.
 
 ## Decision
-Hash versioned canonical patch and commit bytes with SHA-256. Store immutable objects before CAS-moving `main`. The initial model permits zero/one parent only and rejects a missing parent.
+Hash versioned canonical patch and commit bytes with SHA-256. Store immutable objects before CAS-moving `main`. Protocol v1 permits zero, one, or two ordered parents and rejects any missing parent; ADR-0006 finalizes parent ordering before release.
 
 ## Alternatives considered
 Database-generated IDs lose content identity. Mutable commit rows weaken auditability. Snapshot-per-commit is unnecessary initially.

@@ -36,13 +36,13 @@ async fn head(State(l): State<Arc<Ledger>>) -> Result<Json<Head>, ApiError> {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommitBody {
     pub expected_head: Option<CommitId>,
     pub operations: Vec<OperationBody>,
     pub author: String,
     pub message: String,
     pub event_time: String,
-    pub recorded_time: String,
 }
 #[derive(Deserialize)]
 pub struct OperationBody {
@@ -77,7 +77,6 @@ async fn commit(
         author: body.author,
         message: body.message,
         event_time: body.event_time,
-        recorded_time: body.recorded_time,
     })?;
     Ok((StatusCode::CREATED, Json(CommitResponse { id })))
 }
@@ -194,12 +193,11 @@ mod tests {
             author: "a".into(),
             message: "m".into(),
             event_time: "e".into(),
-            recorded_time: "r".into(),
         };
         let c1 = ledger.commit(request(None)).unwrap();
         let _c2 = ledger.commit(request(Some(c1.clone()))).unwrap();
         let json = format!(
-            r#"{{"expected_head":"{c1}","operations":[{{"op":"add","quad":"<urn:x> <urn:p> <urn:o> ."}}],"author":"a","message":"m","event_time":"e","recorded_time":"r"}}"#
+            r#"{{"expected_head":"{c1}","operations":[{{"op":"add","quad":"<urn:x> <urn:p> <urn:o> ."}}],"author":"a","message":"m","event_time":"e"}}"#
         );
         let app = router(ledger);
         let r = app
@@ -220,5 +218,24 @@ mod tests {
                 .unwrap()
                 .contains("HEAD_CHANGED")
         );
+    }
+    #[tokio::test]
+    async fn clients_cannot_supply_recorded_time() {
+        let d = tempfile::tempdir().unwrap();
+        let ledger = Arc::new(Ledger::open(d.path()).unwrap());
+        let body = r#"{"expected_head":null,"operations":[],"author":"a","message":"m","event_time":"e","recorded_time":"forged"}"#;
+        let response = router(Arc::clone(&ledger))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/commits")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_client_error());
+        assert_eq!(ledger.head().unwrap(), None);
     }
 }

@@ -13,7 +13,6 @@ fn request(
         author: "urn:agent:test".into(),
         message: message.into(),
         event_time: "2026-09-24T10:00:00Z".into(),
-        recorded_time: "2026-09-24T10:01:00Z".into(),
     }
 }
 #[test]

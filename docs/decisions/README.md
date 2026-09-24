@@ -7,3 +7,5 @@ ADRs record accepted, expensive-to-reverse choices. Use `ADR-NNNN-title.md` with
 - [ADR-0003: RDF patch canonicalization](ADR-0003-rdf-patch-canonicalization.md)
 - [ADR-0004: Immutable objects and mutable ref metadata](ADR-0004-storage-separation.md)
 - [ADR-0005: Fluree differential-reference policy](ADR-0005-fluree-reference-policy.md)
+
+- [ADR-0006: Finalize unreleased v1 parent and recording-time semantics](ADR-0006-finalize-unreleased-v1-parent-and-time-semantics.md)

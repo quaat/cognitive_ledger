@@ -13,6 +13,7 @@ use std::{
     str::FromStr,
     sync::atomic::{AtomicU64, Ordering},
 };
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 #[derive(Debug)]
 pub struct FileStore {
@@ -23,6 +24,13 @@ impl FileStore {
         let root = root.as_ref().to_owned();
         fs::create_dir_all(root.join("objects/sha256")).map_err(storage)?;
         fs::create_dir_all(root.join("refs")).map_err(storage)?;
+        if let Some(parent) = root.parent() {
+            sync_directory(parent)?;
+        }
+        sync_directory(&root)?;
+        sync_directory(&root.join("objects"))?;
+        sync_directory(&root.join("objects/sha256"))?;
+        sync_directory(&root.join("refs"))?;
         Ok(Self { root })
     }
     fn object_path(&self, id: &ContentId) -> PathBuf {
@@ -54,6 +62,11 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 fn storage(e: impl std::fmt::Display) -> LedgerError {
     LedgerError::Storage(e.to_string())
 }
+fn sync_directory(path: &Path) -> Result<(), LedgerError> {
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(storage)
+}
 impl ObjectStore for FileStore {
     fn put(&self, id: &ContentId, bytes: &[u8]) -> Result<(), LedgerError> {
         if &ContentId::for_bytes(bytes) != id {
@@ -69,6 +82,7 @@ impl ObjectStore for FileStore {
         }
         let parent = path.parent().expect("object path has parent");
         fs::create_dir_all(parent).map_err(storage)?;
+        sync_directory(parent.parent().expect("object shard has parent"))?;
         let tmp = loop {
             let candidate = parent.join(format!(
                 ".{}.tmp-{}-{}",
@@ -91,7 +105,10 @@ impl ObjectStore for FileStore {
             .and_then(|()| file.sync_all())
             .map_err(storage)?;
         match fs::rename(&tmp, &path) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                sync_directory(parent)?;
+                Ok(())
+            }
             Err(_e) if path.exists() => {
                 let _ = fs::remove_file(tmp);
                 let existing = fs::read(path).map_err(storage)?;
@@ -126,10 +143,10 @@ impl ObjectStore for FileStore {
 }
 impl CommitStore for FileStore {
     fn put_commit(&self, commit: &Commit) -> Result<CommitId, LedgerError> {
-        if let Some(parent) = &commit.parent
-            && self.get_commit(parent)?.is_none()
-        {
-            return Err(LedgerError::MissingParent(parent.clone()));
+        for parent in &commit.parents {
+            if self.get_commit(parent)?.is_none() {
+                return Err(LedgerError::MissingParent(parent.clone()));
+            }
         }
         if self.get(&commit.patch.0)?.is_none() {
             return Err(LedgerError::MissingPatch(commit.patch.clone()));
@@ -191,6 +208,7 @@ impl RefStore for FileStore {
             .and_then(|()| f.sync_all())
             .map_err(storage)?;
         fs::rename(&tmp, &path).map_err(storage)?;
+        sync_directory(path.parent().expect("ref path has parent"))?;
         Ok(())
     }
 }
@@ -202,7 +220,6 @@ pub struct CommitRequest {
     pub author: String,
     pub message: String,
     pub event_time: String,
-    pub recorded_time: String,
 }
 #[derive(Debug)]
 pub struct Ledger {
@@ -222,12 +239,14 @@ impl Ledger {
         let patch_id = request.patch.id();
         self.store.put(&patch_id.0, &patch_bytes)?;
         let commit = Commit {
-            parent: request.expected_head.clone(),
+            parents: request.expected_head.clone().into_iter().collect(),
             patch: patch_id,
             author: request.author,
             message: request.message,
             event_time: request.event_time,
-            recorded_time: request.recorded_time,
+            recorded_time: OffsetDateTime::now_utc()
+                .format(&Rfc3339)
+                .map_err(storage)?,
         };
         let id = self.store.put_commit(&commit)?;
         self.store
@@ -249,7 +268,9 @@ impl Ledger {
                 .store
                 .get_commit(&current)?
                 .ok_or_else(|| LedgerError::NotFound(current.0.clone()))?;
-            cursor = c.parent.clone();
+            // Protocol v1 defines parent zero as the state reconstruction parent.
+            // Additional merge parents carry ancestry and provenance.
+            cursor = c.parents.first().cloned();
             chain.push(c);
         }
         let mut state = BTreeSet::new();
@@ -335,7 +356,7 @@ mod tests {
         let store = FileStore::open(t.path()).unwrap();
         let patch = PatchId(ContentId::for_bytes(b"absent"));
         let commit = Commit {
-            parent: None,
+            parents: vec![],
             patch,
             author: "a".into(),
             message: "m".into(),
@@ -362,9 +383,11 @@ mod tests {
             author: "a".into(),
             message: "m".into(),
             event_time: "2026-01-01T00:00:00Z".into(),
-            recorded_time: "2026-01-01T00:00:00Z".into(),
         };
         let c1 = ledger.commit(req(None)).unwrap();
+        let stored = ledger.store.get_commit(&c1).unwrap().unwrap();
+        assert!(OffsetDateTime::parse(&stored.recorded_time, &Rfc3339).is_ok());
+        assert_ne!(stored.recorded_time, "2026-01-01T00:00:00Z");
         let c2 = ledger.commit(req(Some(c1.clone()))).unwrap();
         assert!(matches!(
             ledger.commit(req(Some(c1))),
@@ -390,7 +413,6 @@ mod tests {
                 author: "a".into(),
                 message: "base".into(),
                 event_time: "e".into(),
-                recorded_time: "r".into(),
             })
             .unwrap();
         let barrier = Arc::new(Barrier::new(3));
@@ -409,7 +431,6 @@ mod tests {
                         author: value.into(),
                         message: value.into(),
                         event_time: "e".into(),
-                        recorded_time: "r".into(),
                     })
                 })
             })
