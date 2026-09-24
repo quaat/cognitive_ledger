@@ -1,0 +1,21 @@
+name: ci-security
+on:
+  pull_request:
+  schedule:
+    - cron: "41 4 * * 4"
+permissions: {contents: read}
+jobs:
+  dependency-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/dependency-review-action@v4
+  audit:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: taiki-e/install-action@cargo-audit
+      - run: cargo audit

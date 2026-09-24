@@ -1,0 +1,21 @@
+[package]
+name = "ledger-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+axum.workspace = true
+ledger-core = { path = "../ledger-core" }
+ledger-rdf = { path = "../ledger-rdf" }
+ledger-store = { path = "../ledger-store" }
+serde.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
+tower.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,18 @@
+{
+  "name": "sculpin-cognitive-ledger",
+  "version": "0.1.0",
+  "description": "Workflows for safely developing the Sculpin Cognitive Ledger",
+  "author": {"name": "Sculpin Cognitive Ledger maintainers"},
+  "license": "Apache-2.0",
+  "skills": "./skills/",
+  "keywords": ["rdf", "ledger", "architecture", "quality"],
+  "interface": {
+    "displayName": "Sculpin Cognitive Ledger",
+    "shortDescription": "Safe RDF ledger development workflows",
+    "longDescription": "Invariant, protocol, planning, review, and quality workflows for the Sculpin Cognitive Ledger.",
+    "developerName": "Sculpin Cognitive Ledger maintainers",
+    "category": "Developer Tools",
+    "capabilities": ["Write", "Review"],
+    "defaultPrompt": ["Review ledger invariants", "Run the project quality gate"]
+  }
+}

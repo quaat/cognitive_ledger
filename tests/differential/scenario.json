@@ -1,0 +1,9 @@
+{
+  "name": "addition-deletion-history-v1",
+  "initial": ["<urn:item> <urn:status> \"unknown\" ."],
+  "changes": [
+    {"delete": "<urn:item> <urn:status> \"unknown\" ."},
+    {"add": "<urn:item> <urn:status> \"operational\" ."}
+  ],
+  "expected_current": ["<urn:item> <urn:status> \"operational\" ."]
+}

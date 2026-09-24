@@ -1,0 +1,17 @@
+[package]
+name = "ledger-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fs2 = "0.4.3"
+ledger-core = { path = "../ledger-core" }
+ledger-rdf = { path = "../ledger-rdf" }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

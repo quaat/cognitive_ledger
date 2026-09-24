@@ -1,0 +1,43 @@
+services:
+  ledger:
+    build: .
+    environment:
+      LEDGER_DATA_DIR: /data
+      LEDGER_ADDR: 0.0.0.0:8080
+    volumes: [ledger-data:/data]
+    ports: ["8080:8080"]
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+  postgres:
+    image: postgres:17.2-bookworm
+    environment:
+      POSTGRES_USER: ledger
+      POSTGRES_PASSWORD: ledger-development-only
+      POSTGRES_DB: ledger
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ledger"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+  fuseki:
+    image: stain/jena-fuseki:5.2.0
+    environment:
+      ADMIN_PASSWORD: development-only
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://127.0.0.1:3030/$/ping || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+  fluree-reference:
+    image: ${FLUREE_IMAGE:-fluree/server:unresolved-pin}
+    profiles: [differential]
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://127.0.0.1:8090 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+volumes:
+  ledger-data: {}

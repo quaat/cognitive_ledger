@@ -1,0 +1,7 @@
+{
+  "image": null,
+  "version": null,
+  "digest": null,
+  "purpose": "Official fluree/server image used only for semantic differential testing",
+  "status": "BLOCKED: verify a stable public version and digest in a networked environment; never invent or use latest"
+}
