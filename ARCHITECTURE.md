@@ -11,7 +11,7 @@ ledger-server -> ledger-api -> ledger-store -> ledger-core
 ledger-testkit -------------------------------> all test-facing crates
 ```
 
-`ledger-core` owns IDs, commit protocol objects, errors, and storage traits. `ledger-rdf` owns the restricted canonical RDF change model. `ledger-store` implements filesystem persistence, the single `main` CAS ref, and reconstruction. `ledger-api` adapts HTTP to the application service; `ledger-server` composes infrastructure. Infrastructure types never enter core.
+`ledger-core` owns IDs, commit protocol objects, errors, and storage traits. `ledger-rdf` owns the restricted canonical RDF change model. `ledger-store` provides filesystem immutable object/commit storage and reconstruction plus a pluggable ref store (filesystem or PostgreSQL `PgRefStore`), with `Ledger` holding an `Arc<FileStore>` alongside an `Arc<dyn RefStore>` per ADR-0007. `ledger-api` adapts HTTP to the application service; `ledger-server` composes infrastructure. Infrastructure types never enter core.
 
 ## Runtime boundary
 Accepted changes are durable before refs move. Projection is downstream and cannot roll history back. Jena validates/reasons; Fuseki queries projections. The virtual A-box stays transient. Fluree is an optional external differential-test oracle only.

@@ -1,9 +1,10 @@
 # Sculpin Cognitive Ledger agent map
 
 ## Start here
-Sculpin Cognitive Ledger is a narrow, Git-like RDF history service—not a graph database. Before implementation, read the one plan in `docs/exec-plans/active/`, then the authoritative `docs/product-specs/cognitive-ledger.md` and `ARCHITECTURE.md`.
+Sculpin Cognitive Ledger is a narrow, Git-like RDF history service—not a graph database. Before implementation, read the active plan in `docs/exec-plans/active/`, then the authoritative `docs/product-specs/cognitive-ledger.md`, `ARCHITECTURE.md`, and the phased roadmap `product_development_plan.md` (P0–P8). Follow the phase sequence: P0 consolidation/decisions, P1 production persistence + auth + idempotency + limits, P2 proposal/validation, P3 projection, P4 branches, P5 diff/merge, P6 reconstruction scale, P7 security/resilience, P8 Sculpin agent integration.
 
 - Documentation index: `docs/README.md`
+- Phased development plan: `product_development_plan.md`
 - Architectural decisions: `docs/decisions/README.md`
 - Current work/evidence: `docs/exec-plans/active/`
 - Deferred work: `docs/exec-plans/tech-debt.md`

@@ -42,7 +42,7 @@ IDs are lowercase `sha256:<64 hex>` values over exact canonical bytes. Patch and
 The initial server exposes health, current `main`, commit creation with an expected head, and state retrieval by commit. A stale expected head maps to HTTP 409 with stable code `HEAD_CHANGED`. It has no RDF query language.
 
 ## Later capabilities
-General branches, multi-parent merges, semantic validation coordination, checkpoints, richer provenance, PostgreSQL refs, and projection delivery require later execution plans. See [architecture](../../ARCHITECTURE.md), [data model](../design/data-model.md), and [ADRs](../decisions/README.md).
+General branches, multi-parent merges, semantic validation coordination, checkpoints, richer provenance, and projection delivery require later execution plans. See [architecture](../../ARCHITECTURE.md), [data model](../design/data-model.md), and [ADRs](../decisions/README.md).
 
 ## Normative evolution model
 
@@ -119,7 +119,7 @@ Before production use, configurable limits MUST cover HTTP body size, patch oper
 
 ### Storage and durability
 
-Immutable object durability and mutable-ref durability have distinct implementations but the same acknowledgement rule: data and containing directory entries MUST be synchronized before success is returned. A branch must never expose a commit whose patch or parents are absent. The bootstrap filesystem adapter is single-host; PostgreSQL transactional CAS is required before horizontal service deployment. PostgreSQL stores mutable ref/outbox metadata, while immutable object storage remains behind a separate interface.
+Immutable object durability and mutable-ref durability have distinct implementations but the same acknowledgement rule: data and containing directory entries MUST be synchronized before success is returned. A branch must never expose a commit whose patch or parents are absent. PostgreSQL transactional CAS for the mutable ref is now implemented (per ADR-0007), but immutable commit/patch objects remain node-local on the filesystem, so a shared immutable object store is still required before multi-replica horizontal deployment. PostgreSQL stores mutable ref/outbox metadata, while immutable object storage remains behind a separate interface.
 
 ### Compatibility and migrations
 
@@ -127,10 +127,9 @@ Canonical patch bytes, commit envelopes, ID algorithms, first-parent rules, and 
 
 ## Quality roadmap
 
-In addition to the bootstrap gates, production milestones MUST add:
+Real PostgreSQL two-connection CAS tests and HTTP commit/state/restart tests against the deployed container are delivered baseline gates. In addition to those and the other bootstrap gates, production milestones MUST add:
 
-- real PostgreSQL two-connection CAS and migration upgrade tests;
-- HTTP commit/state/restart tests against the deployed container;
+- migration upgrade tests;
 - property tests for normalization, determinism, and DAG invariants with replayable seeds;
 - differential semantic-state scenarios against a digest-pinned external reference;
 - projection retry, duplicate delivery, lag, and rebuild tests;
