@@ -6,8 +6,11 @@ members = [
   "crates/ledger-api",
   "crates/ledger-testkit",
   "apps/ledger-server",
+  "apps/ledger-stress",
 ]
 resolver = "2"
+# cargo-fuzz targets (nightly, sanitizers) live in their own workspace: scripts/fuzz.sh.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"

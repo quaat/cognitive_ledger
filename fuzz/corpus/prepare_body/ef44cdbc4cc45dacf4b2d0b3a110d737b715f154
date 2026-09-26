@@ -1,0 +1,1 @@
+{"ref": "main", "operations": [{"op": "add", "quad": "<urn: ."}], "activity": "a", "event_time": "2T13:0:+00002:00", "evidence_refs": ["u0", "evrn:e:1"], "source_system": "fuzz", "message": "m"}

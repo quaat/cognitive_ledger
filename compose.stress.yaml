@@ -1,0 +1,22 @@
+# Development / qualification harness only — NOT a deployment artefact. It inherits the
+# development authenticator, the unvalidated-acceptance switch and the loopback-only ports
+# of compose.yaml (see its header) for a second replica used by scripts/stress.sh and
+# scripts/fault.sh. Both replicas share the ledger-data volume: harmless with the PostgreSQL
+# immutable backend (the only qualified topology), wrong for LEDGER_IMMUTABLE_BACKEND=filesystem.
+# Qualification override (Plan 0005 §2/§4): a second server replica with the same runtime
+# identity and configuration, published on a second loopback port so the stress harness can
+# address both replicas explicitly (identical retries deliberately land on different
+# replicas). Use together with compose.yaml:
+#   docker compose -f compose.yaml -f compose.stress.yaml up --build -d --wait ledger ledger-b postgres
+services:
+  ledger-b:
+    extends:
+      file: compose.yaml
+      service: ledger
+    # `extends` merges lists; override so this replica publishes only its own port.
+    ports: !override ["127.0.0.1:8081:8080"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully

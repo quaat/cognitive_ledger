@@ -1,0 +1,71 @@
+[package]
+name = "ledger-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+description = "cargo-fuzz targets for the ledger's untrusted-input parsers and canonical encoders (Plan 0005 §5)"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = "0.4"
+serde_json = "1"
+ledger-core = { path = "../crates/ledger-core" }
+ledger-rdf = { path = "../crates/ledger-rdf" }
+ledger-api = { path = "../crates/ledger-api" }
+
+# Fuzz targets are their own workspace so nightly-only sanitizer builds never touch the
+# release workspace (the root Cargo.toml excludes this directory).
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "quad_parse"
+path = "fuzz_targets/quad_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "patch_canonical"
+path = "fuzz_targets/patch_canonical.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "commit_decode"
+path = "fuzz_targets/commit_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "prepare_body"
+path = "fuzz_targets/prepare_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "accept_body"
+path = "fuzz_targets/accept_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "request_identity"
+path = "fuzz_targets/request_identity.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "timestamp"
+path = "fuzz_targets/timestamp.rs"
+test = false
+doc = false
+bench = false

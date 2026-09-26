@@ -251,8 +251,7 @@ echo "identity boundary confirmed: server sessions run as ledger_runtime, owner 
 # busybox container because the runtime image has no shell.
 DATA_VOLUME=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}' "${LEDGER_CONTAINER}")
 [ -n "${DATA_VOLUME}" ] || { echo "FAIL: could not resolve the ledger /data volume" >&2; exit 1; }
-LOCAL_OBJECTS=$(docker run --rm -v "${DATA_VOLUME}:/data:ro" busybox:1.37@sha256:1b0e2c1a6be1d7d9e7f5f6a5bd9d3e1b7b1b0e1a6a5b4c3d2e1f0a9b8c7d6e5f sh -c 'find /data -type f | wc -l' 2>/dev/null | tr -d '[:space:]' || true)
-[ -n "${LOCAL_OBJECTS}" ] || LOCAL_OBJECTS=$(docker run --rm -v "${DATA_VOLUME}:/data:ro" busybox:1.37 sh -c 'find /data -type f | wc -l' | tr -d '[:space:]')
+LOCAL_OBJECTS=$(docker run --rm -v "${DATA_VOLUME}:/data:ro" busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e sh -c 'find /data -type f | wc -l' | tr -d '[:space:]')
 [ "${LOCAL_OBJECTS}" = "0" ] || { echo "FAIL: ledger container holds ${LOCAL_OBJECTS} node-local object file(s)" >&2; exit 1; }
 echo "invariants confirmed: 2 v2 commits indexed under ${GRAPH}, no non-v2 commit anywhere, exactly 4 new objects, refs.version=2 with 2 ref events, 2 accepted decisions, 2 outbox rows, 4 idempotency rows, correlation ids recorded, 0 node-local object files"
 # The reusable invariant suite (Plan 0005 §20) over the whole database, as the owner.

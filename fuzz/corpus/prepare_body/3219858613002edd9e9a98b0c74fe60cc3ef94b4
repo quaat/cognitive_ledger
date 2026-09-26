@@ -1,0 +1,1 @@
+{"ref": "main", "expected_head": null, "operations": [{"op": "add", "quad": "<urn:s> Êrn:p> \"1\" ."}], "activity": "a", "source_system": "fuzz", "message": "m"}

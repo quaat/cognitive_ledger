@@ -110,10 +110,13 @@ integrity rules against real PostgreSQL, including a non-superuser owner.
 ## Assumptions and status
 - The identity provider is trusted for the claims it signs; the ledger does not verify
   that an `on_behalf_of` human consented.
-- Kill-based fault injection, 1,000-writer stress, multi-replica auth, fuzzing,
-  dependency/container scanning, upgrade/backup qualification and live-issuer tests are
-  the remaining P1.5 slices. **The service is not production-qualified until Plan 0005
-  passes in full.**
+- Executed P1.5 evidence so far: least privilege (slice 1), supply chain (slice 2), the
+  1,000-writer and kill-injection runs (`docs/quality/evidence/`), two-replica JWKS
+  rotation and adversarial limits (`pg_api`), bounded fuzzing of every untrusted-input
+  parser (`fuzz/`, `ci-fuzz`). Upgrade/backup qualification,
+  performance baselines and the **live Entra ID issuer smoke test (pending: no tenant
+  credentials available to the runs; never mark it passed)** remain. **The service is not
+  production-qualified until Plan 0005 passes in full.**
 
 ## Supply chain (Plan 0005 slice 2)
 `scripts/check-supply-chain.sh` (blocking in `ci-security`) runs, in order:

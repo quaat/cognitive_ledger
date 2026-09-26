@@ -12,3 +12,6 @@ __pycache__/
 *.cdx.json
 # Local repository snapshot, never committed
 cognitive_ledger.zip
+# cargo-fuzz build output and crash artefacts (crash inputs are committed as corpus seeds, not here)
+/fuzz/target/
+/fuzz/artifacts/

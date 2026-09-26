@@ -987,6 +987,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ledger-stress"
+version = "0.1.0"
+dependencies = [
+ "jsonwebtoken",
+ "ledger-core",
+ "ledger-store",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "ledger-testkit"
 version = "0.1.0"
 dependencies = [

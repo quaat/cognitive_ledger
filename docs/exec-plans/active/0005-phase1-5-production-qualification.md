@@ -254,6 +254,161 @@ supply-chain, upgrade, backup harnesses), `docs/` (operations runbook, security)
   detected inside a rolled-back owner transaction while counts stay identical; the Docker
   harness runs `verify` after the end-to-end scenario and requires `VERIFY OK`.
 
+### Slice 3 — 1,000-writer gate (§2, 2026-09-26): executed, PASS
+- `apps/ledger-stress` (workspace binary, never shipped; refuses non-loopback targets) +
+  `compose.stress.yaml` (second replica `ledger-b`, same runtime identity, port 8081, own
+  compose project) + `scripts/stress.sh`. 1,000 concurrent writers (one HS256 subject each)
+  against two containerised replicas chosen per request; every tenth writer duplicates each
+  prepare/accept to a second replica under the same `Idempotency-Key`. A pair counts as
+  *compared* only when both replicas answered (then exactly one original execution and
+  identical durable fields are required); one side refused by admission control is
+  reported separately; any other asymmetry is a disagreement. Phase A: 60 s time-boxed on
+  one graph (worst case, all writers on one ref); phase B: 3 commits per writer over 100
+  graphs. Pass conditions per phase: per-graph SQL equalities (`refs.version` =
+  `count(ref_events)` = distinct versions = max version = accepted decisions = outbox rows
+  = client-observed landings, each landing present in `ref_events` with the same version and
+  head), no pair disagreement, no unexpected error class (anything but transport,
+  `503 RESOURCE_LIMIT`, `503 DEPENDENCY_UNAVAILABLE`; a `DEPENDENCY_TIMEOUT` — how a 40P01
+  deadlock surfaces — fails), no malformed response, `pg_stat_database.deadlocks` unchanged
+  (read after the 10 s statistics flush interval), a minimum number of commits, every writer
+  at its target (phase B), and the p99 of *successful* operations under a 5 s budget;
+  then `ledger_store::verify` and `ledger-admin verify`.
+- Evidence (`docs/quality/evidence/stress-1000-writers-2026-09-26.md`, rerun after the
+  review fixes): contended 320,066 requests / 60.6 s (5,278 req/s), 282 commits, 13,686
+  CAS conflicts, successful p99 ref-read 99 ms / prepare 327 ms / accept 112 ms (refused
+  prepares p99 45 ms); independent 47,116 requests / 8.7 s, 3,000 commits (346/s),
+  successful p99 ≤ 157 ms. Duplicated pairs: 188 + 371 compared with both answers (one
+  original each, identical fields), 1,833 both-conflict, 1,981 one side refused, 16,802
+  neither side answered; 0 disagreements. 0 deadlocks, 0 unexpected error classes, max 32
+  runtime sessions (= 2 × pool 16), all landings found as ref events, verifier clean,
+  `STRESS GATE OK`. `503 RESOURCE_LIMIT` (168,601) is the 12-slot expensive-operation
+  admission control refusing immediately under overload (intended backpressure; a bounded
+  queue is noted in tech-debt). Store-level concurrency is therefore capped at 2 × 12
+  expensive slots and 32 sessions; "1,000 concurrent writers" is the client-side load.
+
+### Slice 4 — kill fault injection (§3, 2026-09-26): executed, PASS
+- `ledger-stress fault` + `scripts/fault.sh`: 200 sustained writers over 20 graphs; eight
+  `docker kill -s KILL` of alternating replicas and three of PostgreSQL, each triggered after
+  ≥30 observed new commits, `docker wait` before restart, recovery detected by `/ready`
+  polling; replicas' `StartedAt` asserted unchanged across the PostgreSQL kills (pools
+  reconnected within ≈2 s of crash recovery, no restart); `ledger-admin verify` after every
+  recovery (11 × `VERIFY OK`). In every quiet window the writers pause, in-flight requests
+  drain, and every in-doubt response (connection died while served, `503 DEPENDENCY_*` while
+  PostgreSQL was down, or connection refused while a replica was down — reported apart as
+  `never-sent`) is replayed verbatim (same key, body, actor) with retry/backoff and classified
+  against the database: durable-before-crash (replayed, exactly one ref event), executed on
+  retry (one event), refused `HEAD_CHANGED` (zero events); `LINEAGE_MISMATCH`, any other
+  answer or an unresolved replay is inconsistent. Pass conditions: per-graph equalities
+  incl. landings matched to `ref_events`, 0 inconsistent, no unexpected error class, no
+  malformed response, verifier clean, and at least `--min-durable-accepts` observations
+  (default 0: the count is reported, see below).
+- Evidence (`docs/quality/evidence/fault-injection-2026-09-26.md`, rerun after the review
+  fixes): 93,835 requests, 4,514 commits during the run, 1,967 in-doubt responses (33–83
+  in-flight and 139–271 never-sent per server kill, 24–28 in-flight per PostgreSQL kill);
+  replays: 3 accepts and 1 prepare durable before the crash (replayed identically, one ref
+  event each), 549 accepts refused `HEAD_CHANGED` with zero ref events, 1,413 prepares
+  `HEAD_CHANGED` on retry, 1 prepare executed on retry, 0 unresolved, **0 inconsistent**;
+  Σ refs.version = 4,517 = Σ ref_events = accepted decisions = outbox rows = client-observed
+  landings, all found as ref events; verifier clean; `FAULT GATE OK`. Honesty note: the
+  durable-before-crash case is observed by chance (sub-millisecond window; an earlier
+  30-kill run observed 0 accepts), so the deterministic proof of "lost response after COMMIT
+  replays" remains the `FailPoint` unit test; a feature-gated crash switch in a separate
+  qualification build would make it deterministic at the HTTP level (tech-debt).
+
+### Slice 5 — multi-replica authentication and idempotency (§4, 2026-09-26): executed except the live issuer
+- `pg_api::two_replicas_share_one_key_source_and_replay_identically_across_rotation`: two
+  in-process replicas (own runtime pools and `OidcAuthenticator`s) over one real local JWKS
+  endpoint on real PostgreSQL: concurrent identical prepare and accept on different replicas
+  (one original, identical durable fields, one ref event), rotation to a new `kid` picked up
+  by each replica on first sight, withdrawal of the old key taking effect after a refresh,
+  `exp`/`nbf` boundaries inside and beyond the 30 s leeway (±25/±35 s pin the value), the
+  accept replayed after rotation with the new key on the other replica (idempotency is bound
+  to the complete actor, not the token), and — with the production refresh policy and an
+  injected clock — a `kid` published after the last fetch refused until the 60 s refresh
+  interval elapses, then accepted (documented rotation latency; tech-debt). Scope caveats:
+  the replicas are in-process routers addressed explicitly (no shared address / load
+  balancer) and rotation happens between steps, not under load; cross-replica replay at
+  scale is the 559 both-answered duplicated pairs of slice 3 (containerised replicas,
+  HS256), not the whole 21,000 pairs.
+- **Live Entra ID issuer smoke test: PENDING** (no tenant or credentials available to
+  these runs; it is not marked passed). Blocker for production qualification.
+
+### Slice 6 — fuzzing (§5, 2026-09-27): executed, bounded run clean; ASan deferred
+- `fuzz/` (own cargo-fuzz workspace, excluded from the root; nightly only for this job) with
+  seven libFuzzer targets over every untrusted-input parser and canonical encoder:
+  `quad_parse` (N-Quads single quad; canonical text is a fixed point), `patch_canonical`
+  and `commit_decode` (v1 + v2; accepted bytes must re-encode identically, so one identity
+  per object), `prepare_body` / `accept_body` (strict JSON → handler normalization →
+  request identity, deterministic), `request_identity` (structured `arbitrary` bodies:
+  operation order and duplicated evidence never change the identity), `timestamp` (canonical
+  form satisfies the strict parser). Corpora seeded from the golden vectors (valid and
+  invalid commits, requests, patches) and hand-written cases, then grown and minimized by
+  libFuzzer (`cargo fuzz cmin`); committed under `fuzz/corpus/`. `scripts/fuzz.sh
+  [seconds]` runs all targets and fails on any crash; `ci-fuzz` runs 45 s per target on
+  every pull request and weekly and uploads logs and artefacts.
+- Executed (2026-09-27, `scripts/fuzz.sh 60`, sanitizer `none`): 0 crashes across
+  ≈87 M executions — quad_parse 8.4 M (cov 1621), patch_canonical 4.6 M (1720),
+  commit_decode 13.7 M (636), prepare_body 9.1 M (2620), accept_body 17.0 M (859),
+  request_identity 2.4 M (1661), timestamp 32.0 M (203). **Deferred:** the AddressSanitizer
+  build crashes at start-up on the qualification host (SIGSEGV before the first input, all
+  targets alike; the same binaries run when built without the sanitizer), so ASan runs are
+  not claimed; the workspace forbids `unsafe`, so ASan would only observe dependencies.
+  Validate `FUZZ_SANITIZER=address` on a compatible host and record a longer (hours) run
+  before the final qualification decision.
+
+### Slice 9 — adversarial resource limits (§9, 2026-09-26): executed
+- `pg_api::expensive_operations_are_admission_controlled_under_a_slow_database`: owner
+  holds `ACCESS EXCLUSIVE` on `immutable_objects`; two expensive reads occupy both slots
+  (barrier: two runtime sessions observed waiting on the lock); the third read and a
+  prepare get `503 RESOURCE_LIMIT` immediately, cheap ref reads and `/ready` still succeed;
+  the blocked reads end in `503 DEPENDENCY_TIMEOUT` (PostgreSQL `lock_timeout`), slots are
+  released, a new read blocks (not refused) and succeeds after the lock is released;
+  runtime sessions never exceed the 16-connection pool (sampled at the peak of the episode
+  and after it), 20 follow-up reads succeed; whole-process RSS is printed as a measurement
+  only (other tests share the process), the memory evidence is the stress run.
+- `pg_api::edge_timeout_slow_loris_and_body_boundary_are_bounded`: edge timeout fires as
+  `RESOURCE_LIMIT` under a blocked database when the store's own timeout is longer; a
+  slow-loris body is cut by the same timeout (through the router's middleware; the test
+  uses `oneshot`, so socket-level connection closing is not exercised); exactly
+  `body_bytes` is accepted and one more byte is refused before parsing. Depth beyond `max_depth` and states beyond `max_quads`
+  were already covered by `resource_limits_are_enforced_with_a_stable_code` and the
+  reconstruction tests. Both new tests run on throwaway databases (a table lock disturbs
+  every session); the first version of the suite exposed exactly that interference.
+
+### Review record — slices 3, 4, 5, 9 (storage/concurrency, test, security; Opus, read-only, on the first complete draft)
+- No P0. P1s, all fixed before commit and the runs regenerated: (1) the duplicated-pair
+  evidence counted pairs where one side never reached the store (`503 RESOURCE_LIMIT`) and
+  accepted any one-sided failure → pairs are classified (`compared` / both-conflict /
+  one-side-refused / both-failed / disagreement), only both-answered pairs are claimed, and
+  a one-sided `409 IDEMPOTENCY_CONFLICT`, 500, 401 or `DEPENDENCY_TIMEOUT` is a
+  disagreement (unit-tested); (2) server answers were only counted, never checked → every
+  client landing `(version, head)` is joined to `ref_events`, head ≠ candidate is a
+  malformed response, and any unexpected error class fails the run; (3) p99 mixed immediate
+  refusals with successes and no bound was enforced → per-outcome histograms, successful
+  p99 held to a budget; (4) the fault gate could pass without ever observing a lost response
+  after COMMIT → the count is reported explicitly, replays run in every quiet window with
+  retry/backoff, `--min-durable-accepts` can demand observations; the deterministic proof
+  remains the `FailPoint` unit test (the COMMIT-to-response window is sub-millisecond, 30
+  random kills produced 0–1 observations), stated as such rather than claimed.
+- P2s fixed: loopback-only guard for replicas and the owner database (`--allow-non-loopback`
+  override); the HTTP-level "two replicas" and slow-loris claims narrowed (in-process
+  routers, `oneshot`); prepare pair checks the durable proposal row; pool bound sampled at
+  the peak against the configured pool size; RSS demoted to a measurement; harness setup
+  migrates the shared database before granting (test-order independence); production
+  refresh-throttle rotation test with an injected clock; `never-sent` (connection refused)
+  separated from in-flight in-doubt responses; deadlock counter read after PostgreSQL's
+  flush interval and unreadable → fail; `saturating_mul`; `docker wait` after each kill;
+  replicas' `StartedAt` asserted unchanged across PostgreSQL kills (restart count was
+  meaningless without a restart policy); isolated compose projects (`-p`), preflight for
+  required tools, `--locked` builds, owner DSN via environment, container logs captured in
+  the exit trap; `compose.stress.yaml` labelled as a non-deployment artefact; the busybox
+  digest in `scripts/test-integration.sh` replaced by the registry's real digest and the
+  unpinned fallback removed; quality-gates wording made consistent.
+- Accepted / recorded in tech-debt: `accept` takes no expensive slot and an edge timeout
+  releases the slot while the PostgreSQL statement runs on (bounded by session limits);
+  rotation latency under the 60 s refresh throttle; a bounded admission queue as a possible
+  refinement; the live Entra ID issuer test remains pending.
+
 ## Sub-agent decomposition (§42)
 storage/concurrency (role split, kill injection), API/security (multi-replica auth,
 adversarial limits, live issuer), testing/fault-injection (1,000-writer harness, upgrade,

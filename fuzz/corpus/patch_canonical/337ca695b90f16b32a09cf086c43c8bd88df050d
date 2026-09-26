@@ -1,0 +1,3 @@
+sculpin-rdf-patch-v1
+A <n:alice> <urn:re> "Egine".
+D <urn:alice> <urn:role> "cer" .

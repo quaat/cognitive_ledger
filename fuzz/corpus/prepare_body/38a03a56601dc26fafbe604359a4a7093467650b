@@ -1,0 +1,1 @@
+{"ref": "ma", "expected_head": null, "operations": [{"op": "add", "quad": "<urn:s> @sEpBn: \"1\" ."}], "activity": "a", "event_time": "202z", "message": "m"}
