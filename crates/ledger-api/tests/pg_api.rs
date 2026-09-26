@@ -76,23 +76,59 @@ fn token(tenant: &str, subject: &str, roles: &[&str]) -> String {
 }
 
 struct Harness {
+    /// Runtime-identity store behind the router.
     store: PostgresLedgerStore,
+    /// Owner-identity store for provisioning and raw assertions.
+    owner: PostgresLedgerStore,
     app: Router,
 }
 
+/// Owner migrates and grants once; the served store connects as a least-privilege runtime
+/// role (created here if absent), so every HTTP test runs under production privileges.
 async fn harness_with(
     acceptance: AcceptancePolicy,
     limits: ApiLimits,
     policy: ClaimsPolicy,
 ) -> Harness {
-    let store = PostgresLedgerStore::connect(&database_url(), V1Binding::Reject)
+    let owner = PostgresLedgerStore::connect_and_migrate(&database_url(), V1Binding::Reject)
         .await
         .unwrap();
+    // Role creation and the REVOKE/GRANT sequence touch shared catalog rows; tests in this
+    // binary run in parallel, so the setup happens exactly once per process.
+    static SETUP: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    SETUP
+        .get_or_init(|| async {
+            use sqlx::Connection;
+            let mut conn = sqlx::postgres::PgConnection::connect(&database_url())
+                .await
+                .unwrap();
+            sqlx::query(
+                "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ledger_rt_api') THEN \
+                 CREATE ROLE ledger_rt_api LOGIN PASSWORD 'rt-api-test-secret'; END IF; END $$",
+            )
+            .execute(&mut conn)
+            .await
+            .unwrap();
+            ledger_store::schema::grant_runtime_role(&mut conn, "ledger_rt_api")
+                .await
+                .unwrap();
+            conn.close().await.unwrap();
+        })
+        .await;
+    let runtime_url = {
+        let url = database_url();
+        let (scheme, rest) = url.split_once("://").unwrap();
+        let (_, host_part) = rest.rsplit_once('@').unwrap();
+        format!("{scheme}://ledger_rt_api:rt-api-test-secret@{host_part}")
+    };
+    let store = PostgresLedgerStore::connect(&runtime_url, V1Binding::Reject)
+        .await
+        .expect("runtime role connects with verify-only startup");
     let auth = Arc::new(
         DevHs256Authenticator::new(ISSUER.into(), AUDIENCE.into(), SECRET, policy).unwrap(),
     );
     let app = ledger_api::router(AppState::new(store.clone(), auth, limits, acceptance));
-    Harness { store, app }
+    Harness { store, owner, app }
 }
 
 async fn harness(acceptance: AcceptancePolicy, limits: ApiLimits) -> Harness {
@@ -104,7 +140,7 @@ type Reply = (StatusCode, Value, Option<String>);
 impl Harness {
     async fn graph(&self, tenant: &str) -> GraphId {
         let id = GraphId::new(unique("api")).unwrap();
-        self.store
+        self.owner
             .graphs()
             .create(&NewGraph {
                 graph_id: id.clone(),
@@ -177,7 +213,7 @@ impl Harness {
             "SELECT count(*) AS n FROM {table} WHERE graph_id = $1"
         ))
         .bind(graph.as_str())
-        .fetch_one(self.store.pool())
+        .fetch_one(self.owner.pool())
         .await
         .unwrap()
         .get::<i64, _>("n")
@@ -553,7 +589,7 @@ async fn persisted_actor_and_correlation_come_from_the_verified_token() {
         "SELECT tenant_id, principal_id, principal_type, on_behalf_of, correlation_id FROM proposals WHERE proposal_id = $1",
     )
     .bind(prepared["proposal_id"].as_i64().unwrap())
-    .fetch_one(h.store.pool())
+    .fetch_one(h.owner.pool())
     .await
     .unwrap();
     assert_eq!(row.get::<String, _>("tenant_id"), "tenant-a");
@@ -592,7 +628,7 @@ async fn persisted_actor_and_correlation_come_from_the_verified_token() {
          JOIN idempotency i ON i.result_decision_id = d.decision_id WHERE d.decision_id = $1",
     )
     .bind(accepted["decision_id"].as_i64().unwrap())
-    .fetch_one(h.store.pool())
+    .fetch_one(h.owner.pool())
     .await
     .unwrap();
     assert_eq!(row.get::<String, _>("dp"), "urn:sculpin:human:reviewer-1");
@@ -875,7 +911,7 @@ async fn lost_responses_replay_identically_and_conflicts_are_detected() {
     let outbox: i64 =
         sqlx::query("SELECT count(*) AS n FROM projection_outbox WHERE graph_id = $1")
             .bind(g.as_str())
-            .fetch_one(h.store.pool())
+            .fetch_one(h.owner.pool())
             .await
             .unwrap()
             .get("n");
@@ -1432,6 +1468,15 @@ async fn resource_limits_are_enforced_with_a_stable_code() {
 #[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
 async fn readiness_reports_the_database_and_openapi_is_served() {
     let h = harness(dev(), ApiLimits::default()).await;
+    // The served store runs as the least-privilege runtime role, not the owner.
+    let (who, is_super): (String, bool) = sqlx::query_as(
+        "SELECT current_user::text, (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)",
+    )
+    .fetch_one(h.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(who, "ledger_rt_api");
+    assert!(!is_super);
     let (status, body, _) = h.call("GET", "/ready", None, None, None).await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
     let (status, doc, _) = h.call("GET", "/openapi.json", None, None, None).await;

@@ -159,16 +159,90 @@ pub struct PostgresLedgerStore {
     workflows: WorkflowRepository,
 }
 
-impl PostgresLedgerStore {
-    /// Connect, run all migrations, and compose the components over one pool.
-    pub async fn connect(database_url: &str, v1_binding: V1Binding) -> Result<Self, LedgerError> {
-        let pool = PgPoolOptions::new()
-            .max_connections(16)
+/// Session limits the runtime identity sets on every connection (ADR-0016): a statement,
+/// a lock wait or an idle transaction that exceeds them is cancelled by PostgreSQL and
+/// surfaces as a retryable `DependencyTimeout`/`DependencyUnavailable`, so a stuck
+/// request can never pin a connection or a lock indefinitely.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DbSessionLimits {
+    pub statement_timeout: std::time::Duration,
+    pub lock_timeout: std::time::Duration,
+    pub idle_in_transaction_timeout: std::time::Duration,
+    pub max_connections: u32,
+}
+
+impl Default for DbSessionLimits {
+    fn default() -> Self {
+        Self {
+            statement_timeout: std::time::Duration::from_secs(30),
+            lock_timeout: std::time::Duration::from_secs(10),
+            idle_in_transaction_timeout: std::time::Duration::from_secs(60),
+            max_connections: 16,
+        }
+    }
+}
+
+impl DbSessionLimits {
+    pub(crate) fn pool_options(self) -> PgPoolOptions {
+        // Zero would disable a limit; the smallest effective value is one millisecond.
+        let statement = self.statement_timeout.as_millis().max(1);
+        let lock = self.lock_timeout.as_millis().max(1);
+        let idle = self.idle_in_transaction_timeout.as_millis().max(1);
+        PgPoolOptions::new()
+            .max_connections(self.max_connections)
             .acquire_timeout(std::time::Duration::from_secs(10))
+            .after_connect(move |conn, _meta| {
+                Box::pin(async move {
+                    // Simple-protocol multi-statement (SET cannot be parameterised).
+                    use sqlx::Executor;
+                    let sql = format!(
+                        "SET statement_timeout = '{statement}ms'; SET lock_timeout = '{lock}ms'; \
+                         SET idle_in_transaction_session_timeout = '{idle}ms'"
+                    );
+                    conn.execute(sql.as_str()).await?;
+                    Ok(())
+                })
+            })
+    }
+}
+
+impl PostgresLedgerStore {
+    /// Connect as the runtime identity: apply the session limits, **verify** the schema is
+    /// exactly the level this build requires, and compose the components over one pool.
+    /// Never runs migrations (ADR-0016).
+    pub async fn connect(database_url: &str, v1_binding: V1Binding) -> Result<Self, LedgerError> {
+        Self::connect_with(database_url, v1_binding, DbSessionLimits::default()).await
+    }
+
+    /// `connect` with explicit session limits.
+    pub async fn connect_with(
+        database_url: &str,
+        v1_binding: V1Binding,
+        limits: DbSessionLimits,
+    ) -> Result<Self, LedgerError> {
+        let pool = limits
+            .pool_options()
+            .connect(database_url)
+            .await
+            .map_err(db_error)?;
+        crate::schema::verify(&pool).await?;
+        crate::schema::verify_runtime_identity(&pool).await?;
+        Ok(Self::from_pool_migrated(pool, v1_binding))
+    }
+
+    /// Connect **and migrate**: tests and tooling only. The server never calls this; a
+    /// production runtime identity cannot run DDL.
+    pub async fn connect_and_migrate(
+        database_url: &str,
+        v1_binding: V1Binding,
+    ) -> Result<Self, LedgerError> {
+        let pool = DbSessionLimits::default()
+            .pool_options()
             .connect(database_url)
             .await
             .map_err(db_error)?;
         crate::schema::migrate_all(&pool).await?;
+        crate::schema::verify(&pool).await?;
         Ok(Self::from_pool_migrated(pool, v1_binding))
     }
 
@@ -236,22 +310,10 @@ impl PostgresLedgerStore {
         .transpose()
     }
 
-    /// Readiness probe: the database answers and the schema is at least at the level
-    /// this binary requires (matters once migrations run under a separate role).
+    /// Readiness probe: the database answers and the schema is exactly the level this
+    /// build requires (ADR-0016). A drifted schema is `SchemaIncompatible`, not ready.
     pub async fn ready(&self) -> Result<(), LedgerError> {
-        let row = sqlx::query("SELECT max(version) AS v FROM _sqlx_migrations WHERE success")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(db_error)?;
-        let version: Option<i64> = row.try_get("v").map_err(db_error)?;
-        if version.unwrap_or(0) < crate::schema::REQUIRED_SCHEMA_VERSION {
-            return Err(LedgerError::DependencyUnavailable(format!(
-                "schema version {} is below the required {}",
-                version.unwrap_or(0),
-                crate::schema::REQUIRED_SCHEMA_VERSION
-            )));
-        }
-        Ok(())
+        crate::schema::verify(&self.pool).await.map(|_| ())
     }
 }
 
@@ -445,8 +507,8 @@ impl WorkflowRepository {
             operation.as_str(),
             scope.idempotency_key
         );
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-            .bind(lock_key)
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(crate::lock_key(&format!("idempotency:{lock_key}")))
             .execute(&mut *tx)
             .await
             .map_err(db_error)?;
@@ -545,6 +607,36 @@ impl WorkflowRepository {
         Ok(())
     }
 
+    /// Shared advisory lock on a graph's status; migration 0009's trigger takes the
+    /// exclusive counterpart for every status change, so no transition can interleave with
+    /// a workflow transaction that checked the status.
+    async fn lock_graph_status_shared(
+        conn: &mut PgConnection,
+        graph: &GraphId,
+    ) -> Result<(), LedgerError> {
+        sqlx::query("SELECT pg_advisory_xact_lock_shared($1)")
+            .bind(crate::lock_key(&format!("graph-status:{}", graph.as_str())))
+            .execute(&mut *conn)
+            .await
+            .map_err(db_error)?;
+        Ok(())
+    }
+
+    /// Per-proposal advisory lock taken by every path that records a terminal decision
+    /// (accept, reject, supersede), so two deciders serialize and the second sees the
+    /// first's decision instead of racing the unique indexes.
+    async fn lock_proposal_decision(
+        conn: &mut PgConnection,
+        proposal_id: i64,
+    ) -> Result<(), LedgerError> {
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(crate::lock_key(&format!("proposal-decision:{proposal_id}")))
+            .execute(&mut *conn)
+            .await
+            .map_err(db_error)?;
+        Ok(())
+    }
+
     /// The graph must exist, belong to the caller's tenant (a foreign or missing graph is
     /// reported identically as `UnknownGraph`, so nothing about other tenants leaks), and
     /// be `active` for normal workflow operations.
@@ -552,9 +644,12 @@ impl WorkflowRepository {
         conn: &mut PgConnection,
         scope: &RequestScope,
     ) -> Result<(), LedgerError> {
-        // FOR SHARE: a lifecycle transition committed concurrently cannot slip between
-        // this check and the workflow's writes.
-        let row = sqlx::query("SELECT tenant_id, status FROM graphs WHERE graph_id = $1 FOR SHARE")
+        // Shared advisory lock on the graph's status (ADR-0016): the runtime identity has
+        // no UPDATE on `graphs`, so it cannot take `FOR SHARE`; a lifecycle transition
+        // MUST take the exclusive counterpart, so it cannot slip between this check and the
+        // workflow's writes.
+        Self::lock_graph_status_shared(conn, &scope.graph).await?;
+        let row = sqlx::query("SELECT tenant_id, status FROM graphs WHERE graph_id = $1")
             .bind(scope.graph.as_str())
             .fetch_optional(&mut *conn)
             .await
@@ -637,6 +732,8 @@ impl WorkflowRepository {
                 "candidate {candidate} has no proposal; only prepared candidates are decided"
             )));
         };
+        // Every decider (accept, reject, supersede) serializes per proposal (ADR-0016).
+        Self::lock_proposal_decision(conn, proposal.proposal_id).await?;
         // A decided candidate is refused for that reason first: it is the more specific
         // fact, and it holds regardless of which ref the caller names.
         let decided =
@@ -1330,6 +1427,7 @@ impl WorkflowRepository {
             .execute(&mut *tx)
             .await
             .map_err(db_error)?;
+        Self::lock_graph_status_shared(&mut tx, graph).await?;
         let owner = sqlx::query("SELECT tenant_id, status FROM graphs WHERE graph_id = $1")
             .bind(graph.as_str())
             .fetch_optional(&mut *tx)
@@ -1349,10 +1447,26 @@ impl WorkflowRepository {
                 status,
             });
         }
+        // The proposal must belong to this graph before any lock keyed by its id is taken
+        // (a caller cannot probe or delay other graphs' proposals).
+        let owned = sqlx::query("SELECT 1 FROM proposals WHERE proposal_id = $1 AND graph_id = $2")
+            .bind(proposal_id)
+            .bind(graph.as_str())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_error)?;
+        if owned.is_none() {
+            return Err(LedgerError::LineageMismatch(
+                "unknown proposal for this graph".into(),
+            ));
+        }
+        // Serialize against a concurrent reject/accept of the same proposal without a row
+        // lock (the runtime identity has no UPDATE on `proposals`, ADR-0016).
+        Self::lock_proposal_decision(&mut tx, proposal_id).await?;
         let row = sqlx::query(
             "SELECT p.graph_id, p.branch, p.candidate_commit, p.expected_head, r.head \
              FROM proposals p LEFT JOIN refs r ON r.graph_id = p.graph_id AND r.branch = p.branch \
-             WHERE p.proposal_id = $1 AND p.graph_id = $2 FOR NO KEY UPDATE OF p",
+             WHERE p.proposal_id = $1 AND p.graph_id = $2",
         )
         .bind(proposal_id)
         .bind(graph.as_str())

@@ -70,8 +70,26 @@ fn corrupt(id: &ContentId, reason: &str) -> LedgerError {
 }
 
 impl PostgresImmutableStore {
-    /// Connect a fresh pool, run migrations, and apply `v1_binding` on writes.
+    /// Connect a fresh pool, **verify** the schema level (never migrate) and apply
+    /// `v1_binding` on writes.
     pub async fn connect(database_url: &str, v1_binding: V1Binding) -> Result<Self, LedgerError> {
+        let pool = crate::DbSessionLimits {
+            max_connections: 8,
+            ..crate::DbSessionLimits::default()
+        }
+        .pool_options()
+        .connect(database_url)
+        .await
+        .map_err(db_error)?;
+        crate::schema::verify(&pool).await?;
+        Ok(Self::from_pool_migrated(pool, v1_binding))
+    }
+
+    /// Connect **and migrate** (tests and tooling only; ADR-0016). The server never uses it.
+    pub async fn connect_and_migrate(
+        database_url: &str,
+        v1_binding: V1Binding,
+    ) -> Result<Self, LedgerError> {
         let pool = PgPoolOptions::new()
             .max_connections(8)
             .acquire_timeout(std::time::Duration::from_secs(10))
@@ -81,7 +99,7 @@ impl PostgresImmutableStore {
         Self::from_pool(pool, v1_binding).await
     }
 
-    /// Compose over an existing pool. Runs all migrations first.
+    /// Compose over an existing pool **and migrate** (tests and tooling only; ADR-0016).
     pub async fn from_pool(pool: PgPool, v1_binding: V1Binding) -> Result<Self, LedgerError> {
         crate::schema::migrate_all(&pool).await?;
         Ok(Self::from_pool_migrated(pool, v1_binding))

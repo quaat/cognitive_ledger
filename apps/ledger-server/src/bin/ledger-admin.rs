@@ -1,13 +1,15 @@
 //! Administrative entry points that must never run inside request handling.
 //!
 //! ```text
-//! LEDGER_DATABASE_URL=postgres://… ledger-admin migrate-fs-to-pg --source <dir> \
+//! LEDGER_MIGRATION_DATABASE_URL=postgres://… ledger-admin migrate [--runtime-role <name>]
+//! LEDGER_MIGRATION_DATABASE_URL=postgres://… ledger-admin migrate-fs-to-pg --source <dir> \
 //!     [--graph default] [--branch main] [--json]
-//! LEDGER_DATABASE_URL=postgres://… ledger-admin graph create --graph <id> --tenant <id> \
+//! LEDGER_MIGRATION_DATABASE_URL=postgres://… ledger-admin graph create --graph <id> --tenant <id> \
 //!     [--status active|importing] [--kb <id>] [--purpose <text>]
 //! ```
-//! Graph provisioning is deliberately an operator command (ADR-0010): the public HTTP
-//! surface has no graph administration API.
+//! Every command runs under the **schema owner / migration identity** (ADR-0016): the
+//! runtime identity cannot run DDL or provision graphs. Graph provisioning is deliberately
+//! an operator command (ADR-0010): the public HTTP surface has no graph administration API.
 //! The database URL carries credentials: prefer the environment variable. `--database-url`
 //! is accepted for scripted use but exposes the URL in process listings. No argument value
 //! is ever echoed back, so a misplaced URL cannot leak through an error message.
@@ -20,8 +22,14 @@ use ledger_store::{
 use std::{env, process::ExitCode};
 
 enum Command {
-    Migrate(Args),
+    MigrateFs(Args),
     CreateGraph(GraphArgs),
+    Migrate(MigrateArgs),
+}
+
+struct MigrateArgs {
+    database_url: String,
+    runtime_role: Option<String>,
 }
 
 struct GraphArgs {
@@ -39,22 +47,106 @@ struct Args {
     graph: String,
     branch: String,
     json: bool,
+    runtime_role: Option<String>,
 }
 
 fn usage() -> &'static str {
-    "usage: ledger-admin migrate-fs-to-pg --source <dir> [--database-url <url>] \
-     [--graph <graph_id>] [--branch <name>] [--json]\n\
+    "usage: ledger-admin migrate [--runtime-role <role>] [--database-url <url>]\n\
+     \x20      ledger-admin migrate-fs-to-pg --source <dir> [--database-url <url>] \
+     [--graph <graph_id>] [--branch <name>] [--runtime-role <role>] [--json]\n\
      \x20      ledger-admin graph create --graph <graph_id> --tenant <tenant_id> \
      [--status active|importing] [--kb <knowledge_base_id>] [--purpose <text>] \
      [--database-url <url>]\n\
-     (database url defaults to $LEDGER_DATABASE_URL, which is preferred; argument values \
-     are never echoed)"
+     (the database url is the schema OWNER / migration identity and defaults to \
+     $LEDGER_MIGRATION_DATABASE_URL, which is preferred; the runtime LEDGER_DATABASE_URL is \
+     deliberately not used; argument values are never echoed)"
 }
 
 fn database_url_from_env() -> Option<String> {
-    env::var("LEDGER_DATABASE_URL")
+    env::var("LEDGER_MIGRATION_DATABASE_URL")
         .ok()
         .filter(|u| !u.is_empty())
+}
+
+/// A runtime role must be a plain SQL identifier; anything else (for example a database
+/// URL pasted by mistake) is refused before it can be echoed or sent to the server.
+fn role_name(value: String) -> Result<String, String> {
+    let ok = value.len() <= 63
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+    if ok {
+        Ok(value)
+    } else {
+        Err("--runtime-role must be a lower-case SQL identifier ([a-z_][a-z0-9_]{0,62}); value not shown".into())
+    }
+}
+
+fn parse_migrate(mut argv: impl Iterator<Item = String>) -> Result<MigrateArgs, String> {
+    let mut database_url = database_url_from_env();
+    let mut runtime_role = None;
+    while let Some(flag) = argv.next() {
+        match flag.as_str() {
+            "--database-url" => database_url = Some(value(&mut argv, "--database-url")?),
+            "--runtime-role" => {
+                runtime_role = Some(role_name(value(&mut argv, "--runtime-role")?)?)
+            }
+            other if other.starts_with("--") => {
+                return Err(format!("unknown flag {other}\n{}", usage()));
+            }
+            _ => {
+                return Err(format!(
+                    "unexpected positional argument (value not shown)\n{}",
+                    usage()
+                ));
+            }
+        }
+    }
+    Ok(MigrateArgs {
+        database_url: database_url.ok_or_else(|| {
+            format!(
+                "--database-url or LEDGER_MIGRATION_DATABASE_URL is required\n{}",
+                usage()
+            )
+        })?,
+        runtime_role,
+    })
+}
+
+/// Apply every migration on one dedicated owner connection, then (optionally) grant the
+/// runtime role its privileges through the versioned function from migration 0008.
+async fn migrate_schema(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use sqlx::{Connection, Executor};
+    let mut conn = sqlx::postgres::PgConnection::connect(&args.database_url).await?;
+    // Never hang silently behind a replica that is still running or a held migration lock.
+    conn.execute("SET lock_timeout = '60s'").await?;
+    ledger_store::schema::migrate_all_on(&mut conn).await?;
+    if let Some(role) = &args.runtime_role {
+        ledger_store::schema::grant_runtime_role(&mut conn, role).await?;
+        println!("granted runtime privileges to role {role} (ledger_grant_runtime)");
+    } else {
+        println!(
+            "no --runtime-role given: migrations applied, runtime grants not touched (a runtime \
+             identity without grants cannot serve; see ADR-0016)"
+        );
+    }
+    conn.close().await?;
+    // Verify with a fresh pool exactly as the runtime would (owner identity here).
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&args.database_url)
+        .await?;
+    let report = ledger_store::schema::verify(&pool).await?;
+    println!(
+        "schema at {:04} (required {:04})",
+        report.version,
+        ledger_store::schema::REQUIRED_SCHEMA_VERSION
+    );
+    Ok(())
 }
 
 fn parse_graph_create(mut argv: impl Iterator<Item = String>) -> Result<GraphArgs, String> {
@@ -94,7 +186,7 @@ fn parse_graph_create(mut argv: impl Iterator<Item = String>) -> Result<GraphArg
     Ok(GraphArgs {
         database_url: database_url.ok_or_else(|| {
             format!(
-                "--database-url or LEDGER_DATABASE_URL is required\n{}",
+                "--database-url or LEDGER_MIGRATION_DATABASE_URL is required\n{}",
                 usage()
             )
         })?,
@@ -108,7 +200,8 @@ fn parse_graph_create(mut argv: impl Iterator<Item = String>) -> Result<GraphArg
 
 fn parse_command(mut argv: impl Iterator<Item = String>) -> Result<Command, String> {
     match argv.next().as_deref() {
-        Some("migrate-fs-to-pg") => parse(argv).map(Command::Migrate),
+        Some("migrate") => parse_migrate(argv).map(Command::Migrate),
+        Some("migrate-fs-to-pg") => parse(argv).map(Command::MigrateFs),
         Some("graph") => match argv.next().as_deref() {
             Some("create") => parse_graph_create(argv).map(Command::CreateGraph),
             _ => Err(usage().into()),
@@ -124,7 +217,8 @@ async fn create_graph(args: &GraphArgs) -> Result<(), Box<dyn std::error::Error>
         .max_connections(2)
         .connect(&args.database_url)
         .await?;
-    ledger_store::schema::migrate_all(&pool).await?;
+    // Provisioning never migrates; the schema must already be at the required level.
+    ledger_store::schema::verify(&pool).await?;
     PgGraphs::new(pool)
         .create(&NewGraph {
             graph_id: graph_id.clone(),
@@ -157,6 +251,7 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut graph = "default".to_owned();
     let mut branch = "main".to_owned();
     let mut json = false;
+    let mut runtime_role = None;
     let mut position = 0usize;
     while let Some(flag) = argv.next() {
         position += 1;
@@ -165,6 +260,9 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
             "--database-url" => database_url = Some(value(&mut argv, "--database-url")?),
             "--graph" => graph = value(&mut argv, "--graph")?,
             "--branch" => branch = value(&mut argv, "--branch")?,
+            "--runtime-role" => {
+                runtime_role = Some(role_name(value(&mut argv, "--runtime-role")?)?)
+            }
             "--json" => json = true,
             other if other.starts_with("--") => {
                 return Err(format!("unknown flag {other}\n{}", usage()));
@@ -182,13 +280,14 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
         source: source.ok_or_else(|| format!("--source is required\n{}", usage()))?,
         database_url: database_url.ok_or_else(|| {
             format!(
-                "--database-url or LEDGER_DATABASE_URL is required\n{}",
+                "--database-url or LEDGER_MIGRATION_DATABASE_URL is required\n{}",
                 usage()
             )
         })?,
         graph,
         branch,
         json,
+        runtime_role,
     })
 }
 
@@ -202,6 +301,19 @@ async fn main() -> ExitCode {
         }
     };
     let args = match command {
+        Command::Migrate(args) => {
+            return match migrate_schema(&args).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("migrate failed: {e}");
+                    eprintln!(
+                        "the schema was left at its previous level or at the last successfully \
+                         applied migration; re-run after fixing the cause"
+                    );
+                    ExitCode::FAILURE
+                }
+            };
+        }
         Command::CreateGraph(args) => {
             return match create_graph(&args).await {
                 Ok(()) => ExitCode::SUCCESS,
@@ -211,7 +323,7 @@ async fn main() -> ExitCode {
                 }
             };
         }
-        Command::Migrate(args) => args,
+        Command::MigrateFs(args) => args,
     };
     match migrate(&args).await {
         Ok(()) => ExitCode::SUCCESS,
@@ -247,6 +359,17 @@ async fn migrate(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         .run()
         .await?;
     ledger_store::schema::migrate_all(&pool).await?;
+    if let Some(role) = &args.runtime_role {
+        use sqlx::Connection;
+        let mut conn = sqlx::postgres::PgConnection::connect(&args.database_url).await?;
+        ledger_store::schema::grant_runtime_role(&mut conn, role).await?;
+        conn.close().await?;
+    } else {
+        eprintln!(
+            "note: no --runtime-role given; run `ledger-admin migrate --runtime-role <role>` before \
+             starting the server (ADR-0016)"
+        );
+    }
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -282,4 +405,30 @@ async fn migrate(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::role_name;
+
+    #[test]
+    fn runtime_role_must_be_a_plain_identifier() {
+        assert_eq!(
+            role_name("ledger_runtime".into()).unwrap(),
+            "ledger_runtime"
+        );
+        assert_eq!(role_name("_rt9".into()).unwrap(), "_rt9");
+        for bad in [
+            "Ledger",
+            "9start",
+            "with-dash",
+            "postgres://user:secret@host/db",
+            "",
+            &"a".repeat(64),
+            "role;drop",
+        ] {
+            let err = role_name(bad.into()).unwrap_err();
+            assert!(!err.contains("secret"), "must never echo the value");
+        }
+    }
 }

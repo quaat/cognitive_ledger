@@ -4,7 +4,7 @@ use ledger_api::{
         Capability, ClaimsPolicy, DevHs256Authenticator, OidcAuthenticator, SharedAuthenticator,
     },
 };
-use ledger_store::{Ledger, PostgresLedgerStore, ReconstructionLimits, V1Binding};
+use ledger_store::{DbSessionLimits, Ledger, PostgresLedgerStore, ReconstructionLimits, V1Binding};
 use std::{
     collections::BTreeSet,
     env,
@@ -304,6 +304,32 @@ fn authenticator_from(
     }
 }
 
+/// Session limits for the runtime database identity (ADR-0016); milliseconds.
+fn db_session_limits() -> Result<DbSessionLimits, String> {
+    let d = DbSessionLimits::default();
+    let ms = |name: &str, default: Duration| -> Result<Duration, String> {
+        let value = env_usize(name, default.as_millis() as usize)?;
+        // PostgreSQL stores these settings as 32-bit milliseconds.
+        if value > i32::MAX as usize {
+            return Err(format!("{name} must be at most {} ms", i32::MAX));
+        }
+        Ok(Duration::from_millis(value as u64))
+    };
+    Ok(DbSessionLimits {
+        statement_timeout: ms("LEDGER_DB_STATEMENT_TIMEOUT_MS", d.statement_timeout)?,
+        lock_timeout: ms("LEDGER_DB_LOCK_TIMEOUT_MS", d.lock_timeout)?,
+        idle_in_transaction_timeout: ms(
+            "LEDGER_DB_IDLE_IN_TRANSACTION_TIMEOUT_MS",
+            d.idle_in_transaction_timeout,
+        )?,
+        max_connections: u32::try_from(env_usize(
+            "LEDGER_DB_MAX_CONNECTIONS",
+            d.max_connections as usize,
+        )?)
+        .map_err(|_| "LEDGER_DB_MAX_CONNECTIONS is too large".to_owned())?,
+    })
+}
+
 fn limits() -> Result<ApiLimits, String> {
     let d = ApiLimits::default();
     Ok(ApiLimits {
@@ -377,10 +403,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let acceptance =
                 acceptance_policy(env_optional("LEDGER_UNVALIDATED_ACCEPTANCE")?.as_deref())?;
             check_acceptance(acceptance, authenticator.is_production_grade())?;
+            if env_optional("LEDGER_MIGRATION_DATABASE_URL")?.is_some() {
+                warn!(
+                    "LEDGER_MIGRATION_DATABASE_URL is set in the server environment; the server \
+                     never uses the owner identity and a runtime container should not hold its \
+                     credentials (ADR-0016)"
+                );
+            }
             // Public writes are CommitV2 through the workflow only: no v1 envelope may be
             // published by this process (ADR-0010 policy `Reject`), and no route reaches the
-            // raw ref primitive or `Ledger::commit`.
-            let store = PostgresLedgerStore::connect(url, V1Binding::Reject).await?;
+            // raw ref primitive or `Ledger::commit`. The connection is verify-only: the
+            // runtime identity never migrates and refuses a schema at any other level.
+            let store =
+                PostgresLedgerStore::connect_with(url, V1Binding::Reject, db_session_limits()?)
+                    .await
+                    .map_err(|e| format!("startup refused: {e}"))?;
             info!(
                 auth = %authenticator.describe(),
                 "shared PostgreSQL topology: refs, objects and workflow in one database; v1 \

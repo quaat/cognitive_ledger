@@ -88,12 +88,32 @@ Preserve object digest verification and atomic ref updates. Never commit secrets
   concurrency limit) means the outcome is unknown to the client: **retry with the same
   `Idempotency-Key`**; a completed request replays, an aborted one runs once.
 
+## Database privilege boundary (ADR-0016)
+The runtime identity (`LEDGER_DATABASE_URL`) holds exactly the DML the request path
+executes (migration 0008: `SELECT`, column-level `INSERT`, `UPDATE (head, version,
+updated_at)` on `refs`) and cannot `ALTER`, `DROP`, `TRUNCATE`, `DISABLE TRIGGER`, modify
+or delete existing immutable or audit rows, back-date or pre-mark new rows, provision
+graphs or run migrations. Migration 0009 makes ref movement itself a database fact: a head
+move needs a matching ref event in the same transaction and must be a fast-forward, status
+changes serialize against in-flight workflows, and objects must be content-addressed.
+Migrations run only through `ledger-admin migrate` with the owner identity; the server
+verifies the exact schema level, contiguity, checksums and enabled guards, and verifies
+that its own role is a least-privilege identity, refusing otherwise. Every runtime session
+is bounded by `statement_timeout`, `lock_timeout` and `idle_in_transaction_session_timeout`
+(set per connection; requires a direct or session-mode connection). **Accepted residual
+risk:** the runtime is the trusted writer of new audit rows, so a compromised runtime can
+still fabricate a consistent forward move within its tenants; `SECURITY DEFINER` write
+functions would close this (tech-debt). `pg_least_privilege` proves the denied statement
+set, the privilege matrix, the schema-level refusals, the identity refusal and the 0009
+integrity rules against real PostgreSQL, including a non-superuser owner.
+
 ## Assumptions and status
 - The identity provider is trusted for the claims it signs; the ledger does not verify
   that an `on_behalf_of` human consented.
-- The PostgreSQL runtime role still owns the schema and migrations run on connect; the
-  role split, kill-based fault injection, dependency/container scanning and live-issuer
-  tests are P1.5. **The service is not production-qualified until P1.5 passes.**
+- Kill-based fault injection, 1,000-writer stress, multi-replica auth, fuzzing,
+  dependency/container scanning, upgrade/backup qualification and live-issuer tests are
+  the remaining P1.5 slices. **The service is not production-qualified until Plan 0005
+  passes in full.**
 
 ## Supply chain
 `scripts/check-supply-chain.sh` (blocking in `ci-security`) runs `cargo audit` with the

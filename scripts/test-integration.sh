@@ -27,9 +27,18 @@ AUTH_AUDIENCE=api://sculpin-ledger-dev
 AUTH_SECRET=development-only-hs256-secret-not-for-production-use
 
 docker compose config --quiet
+# Production-shaped start (ADR-0016): PostgreSQL → owner migration (one-shot `migrate`
+# service, runtime role granted) → server with the least-privilege runtime identity.
 docker compose up --build -d --wait ledger postgres
 trap 'docker compose down --remove-orphans --volumes' EXIT
+REQUIRED_SCHEMA=$(grep -oE 'REQUIRED_SCHEMA_VERSION: i64 = [0-9]+' crates/ledger-store/src/schema.rs | grep -oE '[0-9]+$')
+REQUIRED_SCHEMA=$(printf '%04d' "${REQUIRED_SCHEMA}")
+docker compose logs migrate | grep -q "schema at ${REQUIRED_SCHEMA}" || { echo "FAIL: owner migration step did not report schema ${REQUIRED_SCHEMA}" >&2; docker compose logs migrate >&2; exit 1; }
+docker compose logs migrate | grep -q "granted runtime privileges to role ledger_runtime" || { echo "FAIL: owner migration step did not grant the runtime role" >&2; exit 1; }
+echo "owner migration completed; server runs as the runtime identity"
 
+# Owner identity for the host-run store suites (they create throwaway databases and run
+# migrations); the runtime identity for the least-privilege suite.
 export LEDGER_TEST_DATABASE_URL="postgres://ledger:ledger-development-only@localhost:${PG_HOST_PORT}/ledger?sslmode=disable"
 
 # --- 1. Real-PostgreSQL two-connection CAS race -----------------------------------
@@ -51,6 +60,10 @@ cargo test -p ledger-store --features postgres --test pg_workflow -- --ignored -
 # --- 1f. Authenticated HTTP API over real PostgreSQL (P1.4) -------------------------------
 cargo test -p ledger-api --test pg_api -- --ignored --nocapture
 
+# --- 1g. Least privilege (ADR-0016, P1.5): owner migrates, runtime serves, runtime cannot
+#         alter/drop/disable/rewrite, schema level fail-closed ----------------------------
+cargo test -p ledger-store --features postgres --test pg_least_privilege -- --ignored --nocapture
+
 # --- 2. Containerised server: provision, authenticate, prepare/accept v2, restart, read ---
 curl --fail --silent --retry 10 --retry-delay 2 --retry-all-errors --retry-connrefused "${BASE}/health" >/dev/null
 curl --fail --silent "${BASE}/ready" >/dev/null
@@ -62,8 +75,10 @@ psql_q() { docker compose exec -T postgres psql -U ledger -d ledger -tAc "$1"; }
 # commit of any other version anywhere in the database.
 OBJECTS_BEFORE=$(psql_q "select count(*) from immutable_objects")
 NON_V2_BEFORE=$(psql_q "select count(*) from commit_index where version <> 2")
-docker compose exec -T ledger ledger-admin graph create --graph "${GRAPH}" --tenant "${TENANT}" --status active --purpose 'integration test'
-echo "graph provisioned by operator command: ${GRAPH}"
+# Provisioning is an owner operation: run it through the migrate service (owner URL), not
+# inside the runtime container, which holds only the runtime identity.
+docker compose run --rm migrate graph create --graph "${GRAPH}" --tenant "${TENANT}" --status active --purpose 'integration test'
+echo "graph provisioned by operator command under the owner identity: ${GRAPH}"
 
 # Mint an HS256 token exactly as the identity provider would (stdlib only).
 mint() {
@@ -188,6 +203,40 @@ IDEMPOTENCY=$(psql_q "select count(*) from idempotency where graph_id = '${GRAPH
 [ "${IDEMPOTENCY}" = "4" ] || { echo "FAIL: expected 4 idempotency rows (2 prepares + 2 accepts; retries add none), got ${IDEMPOTENCY}" >&2; exit 1; }
 CORR=$(psql_q "select count(*) from decisions d join ref_events e on e.event_id = d.ref_event_id where d.graph_id = '${GRAPH}' and d.correlation_id is not null and e.correlation_id is not null")
 [ "${CORR}" = "2" ] || { echo "FAIL: correlation ids missing on accepted decisions/events (count=${CORR})" >&2; exit 1; }
+# The serving process holds only the runtime identity: no owner credentials anywhere in its
+# environment, its database sessions belong to ledger_runtime and none to the owner, and
+# the runtime role cannot alter the schema.
+docker compose exec -T ledger sh -c 'env | grep -q "^LEDGER_MIGRATION_DATABASE_URL=" && exit 1 || exit 0' || { echo "FAIL: runtime container holds the owner URL" >&2; exit 1; }
+[ "$(docker compose exec -T ledger sh -c 'env | grep -c "ledger-development-only@" || true')" = "0" ] || { echo "FAIL: runtime container holds the owner credentials" >&2; exit 1; }
+RT_SESSIONS=$(psql_q "select count(*) from pg_stat_activity where datname = 'ledger' and usename = 'ledger_runtime' and client_addr is not null")
+OWNER_SESSIONS=$(psql_q "select count(*) from pg_stat_activity where datname = 'ledger' and usename = 'ledger' and client_addr is not null and application_name <> 'psql'")
+[ "${RT_SESSIONS}" -ge 1 ] || { echo "FAIL: the server has no sessions as ledger_runtime (${RT_SESSIONS})" >&2; exit 1; }
+[ "${OWNER_SESSIONS}" = "0" ] || { echo "FAIL: ${OWNER_SESSIONS} network session(s) run as the owner while only the server should be connected" >&2; exit 1; }
+RT_ALTER=$(docker compose exec -T postgres psql -U ledger_runtime -d ledger -tAc "ALTER TABLE immutable_objects DISABLE TRIGGER immutable_objects_write_once" 2>&1 || true)
+echo "${RT_ALTER}" | grep -q "must be owner of table immutable_objects" || { echo "FAIL: runtime role could alter a ledger table: ${RT_ALTER}" >&2; exit 1; }
+# Readiness follows the schema level live: a migration recorded by a newer build makes
+# /ready refuse until it is gone.
+psql_q "insert into _sqlx_migrations (version, description, success, checksum, execution_time) values (9999, 'from the future', true, '\\x00', 0)" >/dev/null
+READY_DRIFT=$(curl --silent -o /dev/null -w '%{http_code}' "${BASE}/ready")
+psql_q "delete from _sqlx_migrations where version = 9999" >/dev/null
+[ "${READY_DRIFT}" = "503" ] || { echo "FAIL: /ready returned ${READY_DRIFT} on a drifted schema" >&2; exit 1; }
+curl --fail --silent --retry 5 --retry-delay 1 --retry-all-errors "${BASE}/ready" >/dev/null
+# A server pointed at a never-migrated database refuses to start (process level).
+psql_q "create database stale_schema" >/dev/null
+set +e
+STALE_OUT=$(docker compose run --rm --no-deps -e LEDGER_DATABASE_URL="postgres://ledger_runtime:ledger-runtime-development-only@postgres:5432/stale_schema?sslmode=disable" ledger 2>&1)
+STALE_EXIT=$?
+set -e
+[ "${STALE_EXIT}" -ne 0 ] || { echo "FAIL: server started against a never-migrated database" >&2; exit 1; }
+echo "${STALE_OUT}" | grep -q "never been migrated\|permission denied\|cannot read the migration metadata" || { echo "FAIL: stale-schema refusal lacks an actionable message: ${STALE_OUT}" >&2; exit 1; }
+# The owner identity is refused as a runtime identity even on a correct schema.
+set +e
+OWNER_OUT=$(docker compose run --rm --no-deps -e LEDGER_DATABASE_URL="postgres://ledger:ledger-development-only@postgres:5432/ledger?sslmode=disable" ledger 2>&1)
+OWNER_EXIT=$?
+set -e
+[ "${OWNER_EXIT}" -ne 0 ] || { echo "FAIL: server started as the schema owner" >&2; exit 1; }
+echo "${OWNER_OUT}" | grep -q "RUNTIME_IDENTITY" || { echo "FAIL: owner-identity refusal lacks the RUNTIME_IDENTITY reason: ${OWNER_OUT}" >&2; exit 1; }
+echo "identity boundary confirmed: server sessions run as ledger_runtime, owner refused as runtime, stale schema refused, /ready follows schema drift"
 LOCAL_OBJECTS=$(docker compose exec -T ledger sh -c 'find /data -type f 2>/dev/null | wc -l')
 [ "${LOCAL_OBJECTS}" = "0" ] || { echo "FAIL: ledger container holds ${LOCAL_OBJECTS} node-local object file(s)" >&2; exit 1; }
 echo "invariants confirmed: 2 v2 commits indexed under ${GRAPH}, no non-v2 commit anywhere, exactly 4 new objects, refs.version=2 with 2 ref events, 2 accepted decisions, 2 outbox rows, 4 idempotency rows, correlation ids recorded, 0 node-local object files"

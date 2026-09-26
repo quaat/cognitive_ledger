@@ -103,6 +103,7 @@
               "VALIDATION_REQUIRED",
               "RESOURCE_LIMIT",
               "DEPENDENCY_UNAVAILABLE",
+              "DEPENDENCY_TIMEOUT",
               "INTERNAL"
             ]
           },
@@ -393,7 +394,7 @@
     },
     "responses": {
       "Error": {
-        "description": "Error envelope. 503 is DEPENDENCY_UNAVAILABLE (database or key source unreachable) or RESOURCE_LIMIT (time or concurrency limit); retry with the same Idempotency-Key. 500 is INTERNAL with a generic message; the detail is logged under correlation_id.",
+        "description": "Error envelope. 503 is DEPENDENCY_UNAVAILABLE (database, key source or schema not usable), DEPENDENCY_TIMEOUT (a database statement or lock wait exceeded its limit; the transaction was rolled back) or RESOURCE_LIMIT (HTTP time or concurrency limit); all three mean the outcome is unknown: retry with the same Idempotency-Key. 500 is INTERNAL with a generic message; the detail is logged under correlation_id.",
         "content": {
           "application/json": {
             "schema": {

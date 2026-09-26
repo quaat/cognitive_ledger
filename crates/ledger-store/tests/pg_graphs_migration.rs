@@ -209,7 +209,7 @@ fn v2(graph: &str, patch: &PatchId, message: &str) -> AnyCommit {
 #[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
 async fn graph_id_is_globally_unique_and_tenant_binding_is_immutable() {
     let _ = IGNORE;
-    let store = PostgresImmutableStore::connect(&database_url(), V1Binding::Reject)
+    let store = PostgresImmutableStore::connect_and_migrate(&database_url(), V1Binding::Reject)
         .await
         .unwrap();
     let graphs = PgGraphs::new(store.pool().clone());
@@ -303,7 +303,7 @@ async fn graph_id_is_globally_unique_and_tenant_binding_is_immutable() {
 #[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
 async fn refs_and_commits_cannot_reference_unknown_graphs_and_graphs_with_history_cannot_be_deleted()
  {
-    let store = PostgresImmutableStore::connect(&database_url(), V1Binding::Reject)
+    let store = PostgresImmutableStore::connect_and_migrate(&database_url(), V1Binding::Reject)
         .await
         .unwrap();
     let pool = store.pool();
@@ -358,6 +358,12 @@ async fn refs_and_commits_cannot_reference_unknown_graphs_and_graphs_with_histor
         .unwrap();
     let anchor = store
         .put_commit(&v2(&with_ref, &p.id(), "anchor"))
+        .await
+        .unwrap();
+    // Raw ref writes are legal only on bootstrap/importing graphs since migration 0009.
+    sqlx::query("UPDATE graphs SET status = 'importing' WHERE graph_id = $1")
+        .bind(&with_ref)
+        .execute(pool)
         .await
         .unwrap();
     sqlx::query("INSERT INTO refs (graph_id, branch, head) VALUES ($1, 'main', $2)")
@@ -428,7 +434,7 @@ async fn refs_and_commits_cannot_reference_unknown_graphs_and_graphs_with_histor
 #[tokio::test]
 #[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
 async fn immutable_tables_are_write_once_and_ref_identity_is_immutable() {
-    let store = PostgresImmutableStore::connect(&database_url(), V1Binding::Reject)
+    let store = PostgresImmutableStore::connect_and_migrate(&database_url(), V1Binding::Reject)
         .await
         .unwrap();
     let pool = store.pool();
@@ -469,6 +475,12 @@ async fn immutable_tables_are_write_once_and_ref_identity_is_immutable() {
     }
     // refs: head moves, identity does not.
     let branch = unique("wo-ref");
+    // Raw ref writes are legal only on bootstrap/importing graphs since migration 0009.
+    sqlx::query("UPDATE graphs SET status = 'importing' WHERE graph_id = $1")
+        .bind(&graph)
+        .execute(pool)
+        .await
+        .unwrap();
     sqlx::query("INSERT INTO refs (graph_id, branch, head) VALUES ($1, $2, $3)")
         .bind(&graph)
         .bind(&branch)
@@ -608,7 +620,12 @@ async fn verify_commit_index_detects_every_tampered_column() {
     ));
     apply("UPDATE commit_index SET graph_id = (SELECT graph_id FROM commit_index WHERE id = $1) WHERE id = $2").await;
     assert_eq!(store.verify_commit_index().await.unwrap(), 2);
-    // Damaged bytes behind a healthy-looking index row are caught too.
+    // Damaged bytes behind a healthy-looking index row are caught too (the 0009 CHECK has
+    // to be dropped first: since then the database refuses such bytes on its own).
+    sqlx::query("ALTER TABLE immutable_objects DROP CONSTRAINT IF EXISTS immutable_objects_content_addressed")
+        .execute(&pool)
+        .await
+        .unwrap();
     apply("UPDATE immutable_objects SET bytes = 'damaged' WHERE id = $1").await;
     assert!(matches!(
         store.verify_commit_index().await,

@@ -51,7 +51,9 @@ target an indexed commit of its graph.
 | `LEDGER_UNVALIDATED_ACCEPTANCE` | Only `allow-unvalidated-acceptance-development-only` enables `accept` without semantic validation (Phase 2); any other value refuses to start; unset → `accept` returns `VALIDATION_REQUIRED`. |
 | `LEDGER_LIMIT_BODY_BYTES`, `_PATCH_OPERATIONS`, `_TERM_BYTES`, `_METADATA_BYTES`, `_RECONSTRUCTION_DEPTH`, `_RECONSTRUCTION_QUADS`, `_RECONSTRUCTION_BYTES`, `_EXPORT_BYTES`, `_REQUEST_SECONDS`, `_CONCURRENT_EXPENSIVE` | Resource limits below the untrusted boundary (defaults in `ledger_api::ApiLimits`); exceeding one is `RESOURCE_LIMIT`. |
 | `LEDGER_DATA_DIR` | Filesystem root for the filesystem backend (default `./data`). |
-| `LEDGER_DATABASE_URL` | When set: PostgreSQL holds the ref head **and, by default, the immutable objects**. Unset: filesystem-only development mode. Set but empty, or not valid Unicode: startup error (no silent filesystem fallback). Carries credentials; never logged. |
+| `LEDGER_DATABASE_URL` | The **runtime identity** (ADR-0016). When set: PostgreSQL holds the ref head **and, by default, the immutable objects**; startup verifies the schema is exactly `REQUIRED_SCHEMA_VERSION` and never migrates. Unset: filesystem-only development mode. Set but empty, or not valid Unicode: startup error (no silent filesystem fallback). Carries credentials; never logged. |
+| `LEDGER_MIGRATION_DATABASE_URL` | The **schema owner / migration identity**, read only by `ledger-admin` (`migrate`, `graph create`, `migrate-fs-to-pg`). The server never uses it and warns if it is present in its environment. |
+| `LEDGER_DB_STATEMENT_TIMEOUT_MS`, `LEDGER_DB_LOCK_TIMEOUT_MS`, `LEDGER_DB_IDLE_IN_TRANSACTION_TIMEOUT_MS`, `LEDGER_DB_MAX_CONNECTIONS` | Session limits applied to every runtime connection (defaults 30000 / 10000 / 60000 / 16). Cancelled statements and lock waits are retryable 503s. |
 | `LEDGER_IMMUTABLE_BACKEND` | `postgres` (default when a database URL is set). `filesystem` is accepted only without a database URL (development mode); combined with a database URL it is refused since migration 0006 (PostgreSQL refs must target indexed commits). `postgres` without a database URL is a configuration error. Any other value refuses to start. |
 | (shutdown) | Graceful shutdown on SIGINT and, on Unix, SIGTERM: stop accepting, drain open connections, exit after at most 30 s regardless (PostgreSQL rolls back any unfinished publication). |
 | (startup) | Filesystem mode verifies that HEAD resolves and serves a read-only inspection router (`/v1/refs/main`, `/v1/states/{id}`). Shared mode connects with `V1Binding::Reject`, so this process can never publish a v1 envelope. |
@@ -69,14 +71,20 @@ encoder `scripts/golden/request_v1_reference.py`). Errors are `{code, message,
 correlation_id}`; `X-Correlation-Id` is accepted (bounded, printable ASCII) or generated
 and echoed on every response. `/health` is liveness; `/ready` checks the database.
 
+## Schema migration (administrative, ADR-0016)
+`LEDGER_MIGRATION_DATABASE_URL=… ledger-admin migrate --runtime-role <role>` applies the
+embedded migrations on one dedicated owner connection and grants the pre-created runtime
+role through `ledger_grant_runtime` (migration 0008). See `docs/operations/deployment.md`.
+
 ## Graph provisioning (administrative)
-`LEDGER_DATABASE_URL=… ledger-admin graph create --graph <id> --tenant <id> [--status
-active|importing] [--kb <id>] [--purpose <text>]`. Graphs are created by operators, never
+`LEDGER_MIGRATION_DATABASE_URL=… ledger-admin graph create --graph <id> --tenant <id>
+[--status active|importing] [--kb <id>] [--purpose <text>]` (owner identity; the runtime
+role cannot insert into `graphs`). Graphs are created by operators, never
 through HTTP (ADR-0010); `bootstrap` is reserved and `archived` is a lifecycle transition,
 not a creation state.
 
 ## Filesystem → PostgreSQL content migration (administrative)
-`LEDGER_DATABASE_URL=… ledger-admin migrate-fs-to-pg --source <dir> [--graph default] [--branch main] [--json]`
+`LEDGER_MIGRATION_DATABASE_URL=… ledger-admin migrate-fs-to-pg --source <dir> [--graph default] [--branch main] [--json]`
 runs `FsToPgMigration` (`crates/ledger-store/src/migrate_fs_to_pg.rs`). Prefer the
 environment variable for the URL (`--database-url` is accepted but visible in process
 listings; argument values are never echoed). The source is opened read-only and must

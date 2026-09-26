@@ -1,8 +1,14 @@
 # Plan 0005: P1.5 — production qualification of the Phase 1 ledger
 
-Status: **planned, not started** (created 2026-09-26 at P1.4 closure). Implementation begins
-only after Plan 0004's P1.4 evidence is accepted. Nothing in this plan is implemented yet;
-no gate below may be reported as passed until it is executable and has run.
+Status: **in progress** (started 2026-09-26 after PR #1 merged). Branch
+`claude/p1.5-production-qualification` from `main` at `f027fbf9f06c6c642dca16a0caf9746571fd76a7`
+(the PR #1 merge). Execution slices, in order: (1) least privilege and migration separation
+(ADR-0016, migration 0008, `ledger-admin migrate`, verify-only startup, `pg_least_privilege`);
+(2) supply chain (cargo-deny, pinned Actions, SBOM, image scan); (3) 1,000-writer stress;
+(4) crash/fault injection; (5) multi-replica auth/idempotency and live issuer; (6) fuzzing;
+(7) adversarial resource limits; (8) upgrade qualification; (9) backup/restore; (10)
+performance baselines; then the qualification decision. No gate below is reported as passed
+until it is executable and has run; status per slice is recorded under "Evidence".
 
 ## Goal
 Turn the functionally complete Phase 1 service (shared PostgreSQL persistence, atomic
@@ -98,6 +104,92 @@ supply-chain, upgrade, backup harnesses), `docs/` (operations runbook, security)
 - Adversarial limit run with memory/pool metrics.
 - Benchmark report committed under `docs/quality/performance-baselines.md`.
 - Independent security, storage/concurrency, and test reviews with no open P0/P1.
+
+## Evidence
+
+### Slice 1 — least privilege and migration separation (2026-09-26): complete; all gates green on the reviewed content
+- ADR-0016; migration 0008 (`ledger_grant_runtime(role)`: owner-only, pinned `search_path`,
+  revoke-then-grant, column-level INSERT, refuses superusers and CREATE-holders, EXECUTE
+  revoked from PUBLIC, no role creation); migration 0009 (audited fast-forward-only ref
+  movement, serialized status changes, content-addressed objects, `ledger_lock_key`);
+  `schema::verify` (exact `REQUIRED_SCHEMA_VERSION = 9`, contiguity, checksums against the
+  embedded migrations, failed/unknown/absent metadata and disabled guard triggers refused)
+  and `schema::verify_runtime_identity` (not superuser/owner/CREATE-holder, exact privilege
+  matrix; `RUNTIME_IDENTITY` refusal); SHA-256 advisory-lock keys; `PostgresLedgerStore::connect`
+  and `PostgresImmutableStore::connect` are verify-only with `DbSessionLimits`
+  (`statement_timeout` 30 s, `lock_timeout` 10 s, `idle_in_transaction_session_timeout` 60 s,
+  configurable `LEDGER_DB_*`); `connect_and_migrate`/`from_pool` documented tests-and-tooling
+  only; `ledger-admin migrate [--runtime-role]` on a dedicated owner connection
+  (`LEDGER_MIGRATION_DATABASE_URL`), `graph create` and the cutover moved to the owner URL and
+  verify instead of migrate; runtime row locks that need `UPDATE` privilege replaced by
+  advisory locks (`graph-status:` shared; `proposal-decision:` exclusive in
+  bound_undecided_proposal and mark_superseded); `DependencyTimeout` (57014/55P03) and
+  `SchemaIncompatible` errors mapped to retryable 503s; compose runs PostgreSQL → one-shot
+  `migrate` (owner) → server (runtime role from `deploy/postgres-init`), and the integration
+  script provisions graphs through the owner service and asserts the runtime container holds
+  no owner URL and cannot `DISABLE TRIGGER`.
+- Executed on the final, review-fixed content (real PostgreSQL 17.2, fresh volumes):
+  `./scripts/check-fast.sh` exit 0; `./scripts/check-supply-chain.sh` exit 0; `pg_cas_race`
+  1, `pg_immutable_store` 9, `pg_graphs_migration` 7, `pg_fs_migration` 8, `pg_workflow` 14,
+  `pg_api` 10 (served store proven to run as `ledger_rt_api`, a granted non-superuser role),
+  `pg_least_privilege` 5 — whole workflow incl. replay/accept/reject/supersede and reads
+  under a per-test runtime role proven by `current_user`/`rolsuper`; 39 denied statements
+  (DDL, trigger disable, TRUNCATE, every UPDATE/DELETE on immutable and audit tables, graph
+  provisioning, `session_replication_role`, `setval`, `protected=false` refs, pre-delivered
+  outbox rows, back-dated decisions) each refused with 42501 while a full-table snapshot
+  stays identical; a pending migration refused for the runtime role with 42501 and not
+  recorded; lock_timeout through `prepare` → `DependencyTimeout` with no idempotency row and
+  a fresh retry; idle-in-transaction termination and pool recovery; statement_timeout →
+  57014; privilege matrix via `has_table/any_column/sequence/schema_privilege` exactly as
+  documented, column-level INSERT excluding ids/timestamps/`protected`/`delivered_at`;
+  grant function owner-only, idempotent, refuses unknown roles, superusers and CREATE
+  holders; startup/readiness refuse absent, behind (0007 → "requires 0009"), ahead (9999),
+  tampered checksum, failed record, non-contiguous history, a disabled guard trigger, and
+  the owner identity (`RUNTIME_IDENTITY`); a NOSUPERUSER/NOCREATEROLE database owner can
+  migrate, grant and provision while being refused as runtime; migration 0009 rules hold
+  even for the owner (rewind without event refused, forged event with a non-descendant head
+  refused, mislabelled object refused, status change waits on the graph-status lock with
+  55P03, archived graph refused by the workflow, SQL/Rust lock-key derivation identical) —
+  54 passed, 0 failed. `./scripts/test-integration.sh` exit 0 `INTEGRATION OK`: owner
+  `migrate` service reports `schema at 0009` and the grant; server sessions are
+  `ledger_runtime` with no owner session; the runtime container holds no owner credentials;
+  `ALTER TABLE … DISABLE TRIGGER` as the runtime role fails with "must be owner"; `/ready`
+  answers 503 while a future migration row exists; a server started against a
+  never-migrated database and one started with the owner URL both exit non-zero with the
+  actionable reason; the v2 prepare/accept/replay/restart/read scenario and its SQL
+  invariants pass as before. Development note: editing the unreleased 0008 while a dev
+  database had already applied it produced the intended "previously applied but modified"
+  refusal; the throwaway compose volume was reset.
+- Reviews (storage/concurrency, security, invariant, test; Opus, read-only, on the first
+  complete draft): no P0. Agreed P1 decisions, all implemented before commit: (1) a runtime
+  holding `UPDATE (head, version)` on `refs` could move a ref to any indexed commit without
+  an event → migration 0009 deferred constraint trigger (matching `ref_events` row in the
+  same transaction, fast-forward only; bootstrap/importing exempt for the owner raw path);
+  (2) `ledger_grant_runtime` ran unqualified with the owner's `search_path` and never
+  checked `CREATE` on the schema (CVE-2018-1058 pattern) → pinned `search_path`,
+  schema-qualified names, refuses superusers / CREATE-holders / non-owner callers;
+  (3) the server never checked its own privileges, so a Phase-1 owner URL would keep
+  serving with owner rights → `verify_runtime_identity` at startup (`RUNTIME_IDENTITY`
+  refusal; process-level check in the Docker harness). P2s implemented: `BEFORE UPDATE OF
+  status` trigger taking the exclusive graph-status lock (raw operator SQL can no longer
+  interleave), advisory-lock keys from SHA-256 instead of `hashtextextended` (chosen
+  `Idempotency-Key` collision search), column-level INSERT grants matching the store's
+  INSERT statements (no back-dated rows, no `protected=false` refs, no pre-delivered
+  outbox rows), revoke-then-grant so the set is exact, `mark_superseded` takes the shared
+  graph-status lock and checks graph ownership before locking, contiguity and enabled-
+  trigger checks in `verify`, 42501 mapped to an actionable "not granted" error,
+  `DEPENDENCY_TIMEOUT` as a distinct API code (40001/40P01 retryable too), session limits
+  on the immutable store, bounded `LEDGER_DB_*` values, `--runtime-role` validated as a
+  plain identifier and never echoed, `ledger-admin migrate` lock timeout, cutover
+  `--runtime-role`, compose readiness probe on `/ready` and TCP `pg_isready`, content-
+  addressed CHECK on `immutable_objects`. Tests added for every item (privilege matrix via
+  `has_*_privilege`, snapshot invariance across 39 denied statements, pending-migration
+  refusal with 42501, lock/idle timeouts through the repository, failed/gap/disabled-
+  trigger/owner-identity refusals, non-superuser owner path, 0009 integrity, HTTP suite
+  under a granted runtime role). Documented accepted residual risk: the runtime remains the
+  trusted writer of new audit rows (fabricated consistent forward moves within its tenants;
+  `SECURITY DEFINER` write path is tech-debt); session limits require a direct or
+  session-mode connection.
 
 ## Sub-agent decomposition (§42)
 storage/concurrency (role split, kill injection), API/security (multi-replica auth,

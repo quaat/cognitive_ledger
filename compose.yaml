@@ -3,6 +3,19 @@
 # use and MUST NOT be reused as a production deployment: a real deployment injects
 # LEDGER_DATABASE_URL with managed secrets and TLS. This file is not a deploy artifact.
 services:
+  # One-shot schema owner step (ADR-0016): applies migrations 0001..N on a dedicated owner
+  # connection and grants the pre-created runtime role. The server below starts only after
+  # this completed successfully and connects with the RUNTIME identity, which cannot run DDL.
+  migrate:
+    build: .
+    entrypoint: ["ledger-admin"]
+    command: ["migrate", "--runtime-role", "ledger_runtime"]
+    restart: "no"
+    environment:
+      LEDGER_MIGRATION_DATABASE_URL: postgres://ledger:ledger-development-only@postgres:5432/ledger?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
   ledger:
     build: .
     environment:
@@ -12,7 +25,9 @@ services:
       # head (ADR-0004/0007) and the immutable objects (ADR-0012 shared store): the only
       # topology in which a shared ref never references node-local content. /data is
       # used only when LEDGER_IMMUTABLE_BACKEND=filesystem is set explicitly (single host).
-      LEDGER_DATABASE_URL: postgres://ledger:ledger-development-only@postgres:5432/ledger?sslmode=disable
+      # RUNTIME identity (least privilege, ADR-0016): created by deploy/postgres-init,
+      # granted by the migrate service. The owner URL is deliberately absent here.
+      LEDGER_DATABASE_URL: postgres://ledger_runtime:ledger-runtime-development-only@postgres:5432/ledger?sslmode=disable
       # DEVELOPMENT AUTHENTICATION ONLY. The server has no unauthenticated mode; this
       # harness uses the HS256 development authenticator with a baked secret so the
       # integration test can mint tokens. Production uses LEDGER_AUTH_MODE=oidc with the
@@ -34,8 +49,10 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/health"]
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/ready"]
       interval: 5s
       timeout: 3s
       retries: 12
@@ -45,10 +62,12 @@ services:
       POSTGRES_USER: ledger
       POSTGRES_PASSWORD: ledger-development-only
       POSTGRES_DB: ledger
+    # Creates the development runtime role (ADR-0016); see deploy/postgres-init/.
+    volumes: ["./deploy/postgres-init:/docker-entrypoint-initdb.d:ro"]
     # Published on loopback only for the host-run PostgreSQL tests (scripts/test-integration.sh).
     ports: ["127.0.0.1:55432:5432"]
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ledger"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ledger -d ledger"]
       interval: 5s
       timeout: 3s
       retries: 12

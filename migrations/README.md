@@ -13,6 +13,8 @@ for clean install and for the supported upgrade path against a real PostgreSQL
 | 0004 | `graphs` + FKs | Graph authority (ADR-0010): globally unique `graph_id`, immutable `tenant_id` (trigger), many graphs per KB; `refs.graph_id` and `commit_index.graph_id` reference `graphs` with `ON DELETE RESTRICT`. |
 | 0005 | write-once triggers | `immutable_objects`, `commit_index`, `commit_parents` refuse UPDATE/DELETE; `refs` identity columns are immutable (only `head` moves). Accident guard, not a defence against a table-owning role. |
 | 0007 | actor scope, correlation, tenant integrity | `idempotency` gains `principal_type`/`on_behalf_of` (backfilled from each row's proposal; fails closed on unbindable or mismatched rows), a surrogate primary key and `UNIQUE NULLS NOT DISTINCT (tenant_id, principal_id, principal_type, on_behalf_of, graph_id, operation, idempotency_key)`; bounded `correlation_id` (1–128 bytes, nullable, audit only) on `proposals`, `ref_events`, `decisions`; `graphs UNIQUE (graph_id, tenant_id)` and composite `(graph_id, tenant_id) → graphs` FKs from `proposals`, `ref_events`, `decisions`, `idempotency`. |
+| 0008 | runtime least privilege (ADR-0016) | Installs `ledger_grant_runtime(role text)` (owner-only, pinned `search_path`, refuses superusers and roles with `CREATE` on the schema): revokes everything the role holds on the schema, then grants `USAGE` on the schema, `SELECT` on every ledger table and `_sqlx_migrations`, column-level `INSERT` matching the store's INSERT statements, `UPDATE (head, version, updated_at)` on `refs`, `USAGE` on the audit sequences. Creates no role. Applied by `ledger-admin migrate --runtime-role <name>`. |
+| 0009 | ref movement integrity (ADR-0016) | Deferred constraint trigger: a head move on an `active`/`archived` graph needs a matching `ref_events` row in the same transaction and must be a fast-forward; `graphs` status changes take the exclusive `graph-status:` advisory lock; `immutable_objects.id` must be the SHA-256 of `bytes`; `ledger_lock_key(text)` mirrors `ledger_store::lock_key`. |
 | 0006 | workflow persistence | `refs.version` (monotonic, trigger-enforced) and `refs.protected`; composite FK `refs(graph_id, head) → commit_index(graph_id, id)`; append-only `proposals`, `ref_events`, `decisions`; `projection_outbox` (identity immutable, delivery columns mutable); `idempotency` results. Guard: fails with the offending `(graph, branch → head)` list if any existing ref head is not an indexed commit of its graph. |
 
 ## Upgrade semantics of 0004
@@ -41,6 +43,28 @@ for clean install and for the supported upgrade path against a real PostgreSQL
   content against the existing shared ref, then apply the remaining migrations.
 - Existing refs receive `version = 1`; every later head movement must bump it by exactly one
   (trigger), including the raw `PgRefStore` primitive.
+
+## Who runs migrations (ADR-0016)
+Only the schema owner, through `ledger-admin migrate` on a dedicated connection
+(`LEDGER_MIGRATION_DATABASE_URL`). The server connects with the runtime identity and
+**verifies** the schema instead: it refuses to start (and `/ready` refuses) when the
+recorded level is behind or ahead of `REQUIRED_SCHEMA_VERSION`, when the migration table is
+absent, when a recorded migration failed, or when a recorded checksum differs from the
+embedded migration (released migrations are immutable). The runtime role cannot run DDL,
+so a misconfigured deployment cannot migrate by accident.
+
+## Upgrade semantics of 0008 and 0009
+- 0008 is additive: one function and a `REVOKE`. Requires the operator-created runtime role
+  to exist before `ledger-admin migrate --runtime-role` is run; re-running is idempotent
+  (the function revokes and re-grants). The caller must own the ledger tables.
+- 0009 adds a deferred constraint trigger on `refs`, a `BEFORE UPDATE OF status` trigger on
+  `graphs`, a CHECK on `immutable_objects` (validated against existing rows; every stored
+  object is already content-addressed) and the `ledger_lock_key` function. Existing history
+  is unaffected; from 0009 on, raw ref moves on `active`/`archived` graphs are refused
+  without a matching event, and any status change waits for in-flight workflow
+  transactions. The runtime's graph-status check and proposal decisions use advisory locks
+  (`ledger_lock_key('graph-status:' || graph_id)`, `'proposal-decision:' || proposal_id`)
+  instead of `FOR SHARE`/`FOR NO KEY UPDATE`, which require `UPDATE` privilege.
 
 ## Upgrade semantics of 0007
 - Requires PostgreSQL 15 or later (`UNIQUE NULLS NOT DISTINCT`); compose pins 17.2.
