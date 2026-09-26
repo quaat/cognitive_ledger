@@ -39,9 +39,12 @@ gate passes the service is **not production-qualified** (Plan 0004 P1.4 report).
 5. **Fuzzing.** `cargo fuzz` targets for the N-Quads/quad parser, patch canonicalization,
    commit v1/v2 decoding, request-body deserialization and the request identity encoder;
    corpora checked in; a bounded run in CI, longer runs recorded as evidence.
-6. **Supply chain.** `cargo audit`, `cargo deny` (licenses, bans, advisories, sources),
-   SBOM (CycloneDX) for the workspace and the container image, container image scan;
-   findings classified (fix / accept with reason / false positive), never ignored.
+6. **Supply chain.** `cargo deny` (licenses, bans, advisories, sources) alongside the
+   already-blocking `cargo audit` gate (`scripts/check-supply-chain.sh`; re-evaluate the
+   RUSTSEC-2023-0071 lockfile-only exception on every sqlx move), SBOM (CycloneDX) for the
+   workspace and the container image, container image scan, and pinning every third-party
+   GitHub Action by immutable commit SHA; findings classified (fix / accept with reason /
+   false positive), never ignored.
 7. **Upgrade from the previous release.** Build the last tagged image, load data through
    its API, upgrade to the new image + migrations, verify history, refs, idempotency
    replay and reads; clean install vs upgrade schema convergence for every migration.

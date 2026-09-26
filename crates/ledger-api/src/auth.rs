@@ -247,12 +247,19 @@ fn validation(
 /// Bearer tokens validated against an OIDC issuer's JWKS.
 ///
 /// Key handling: keys are cached by `kid`; a refresh happens for an unknown `kid` or when
-/// the cache is older than `max_key_age` (so a withdrawn key stops validating without a
-/// restart), at most once per `min_refresh_interval` (also after a failed fetch, so an
-/// unavailable issuer is not hammered), and under a single-flight lock so concurrent
-/// requests share one fetch. Only keys with `use = sig` (or no `use`) and a `kid` are
-/// loaded; the token's `alg` must match the key family. An unknown key fails closed; an
-/// unreachable key source is `KeySourceUnavailable` (503), never a bypass.
+/// the cache is older than `max_key_age`, at most once per `min_refresh_interval` (also
+/// after a failed fetch, so an unavailable issuer is not hammered), and under a
+/// single-flight lock so concurrent requests share one fetch. **A cached key is never
+/// trusted beyond `max_key_age`**: once the cache has aged out, a request authenticates
+/// only after a successful refresh; if the refresh fails or is throttled the request fails
+/// closed with `KeySourceUnavailable`, never with the stale material. Key selection honours
+/// the JWK's own metadata: a key is loaded only if it has a `kid`, is not `use = enc`, does
+/// not carry a `key_ops` list without `verify`, and its `alg` (when stated) is exactly the
+/// algorithm this ledger supports for its family (RSA → RS256, P-256 → ES256); a key
+/// stating any other algorithm is skipped rather than reinterpreted. The token's `alg` must
+/// match the selected key's algorithm. An unknown key fails closed; an unreachable key
+/// source is `KeySourceUnavailable` (503), never a bypass. Timestamps come from an
+/// injectable clock so tests drive key age and throttling deterministically.
 pub struct OidcAuthenticator {
     issuer: String,
     audience: String,
@@ -262,8 +269,13 @@ pub struct OidcAuthenticator {
     refresh: tokio::sync::Mutex<()>,
     min_refresh_interval: Duration,
     max_key_age: Duration,
+    clock: Clock,
     policy: ClaimsPolicy,
 }
+
+/// Monotonic time source for key-cache age and refresh throttling (`Instant::now` in
+/// production; tests substitute a manual clock).
+pub type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
 /// Largest JWKS document accepted (a real issuer's set is a few kilobytes).
 const MAX_JWKS_BYTES: usize = 256 * 1024;
@@ -297,8 +309,19 @@ impl OidcAuthenticator {
             refresh: tokio::sync::Mutex::new(()),
             min_refresh_interval: Duration::from_secs(60),
             max_key_age: Duration::from_secs(60 * 60),
+            clock: Arc::new(Instant::now),
             policy,
         }
+    }
+
+    /// Substitute the time source (tests only; production uses `Instant::now`).
+    pub fn with_clock(mut self, clock: Clock) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    fn now(&self) -> Instant {
+        (self.clock)()
     }
 
     /// Tune the refresh policy (tests use a zero interval; deployments rarely need this).
@@ -345,51 +368,46 @@ impl OidcAuthenticator {
     }
 
     /// Refresh under the single-flight lock, honouring the minimum interval between
-    /// attempts. Returns whether a fetch was performed.
-    async fn refresh_keys(&self) -> Result<bool, AuthError> {
+    /// attempts.
+    async fn refresh_keys(&self) -> Result<RefreshOutcome, AuthError> {
         let _flight = self.refresh.lock().await;
+        let now = self.now();
         let throttled = self
             .keys
             .read()
             .await
             .attempted_at
-            .is_some_and(|t| t.elapsed() < self.min_refresh_interval);
+            .is_some_and(|t| now.duration_since(t) < self.min_refresh_interval);
         if throttled {
-            return Ok(false);
+            return Ok(RefreshOutcome::Throttled);
         }
-        self.keys.write().await.attempted_at = Some(Instant::now());
+        self.keys.write().await.attempted_at = Some(now);
         let set = self.fetch_jwks().await?;
         let mut by_kid = HashMap::new();
         for jwk in set.keys {
             let Some(kid) = jwk.common.key_id.clone() else {
                 continue;
             };
-            if jwk
-                .common
-                .public_key_use
-                .as_ref()
-                .is_some_and(|u| *u != jsonwebtoken::jwk::PublicKeyUse::Signature)
-            {
-                continue;
-            }
-            let Ok(key) = jsonwebtoken::DecodingKey::from_jwk(&jwk) else {
+            let Some(algorithm) = verification_algorithm(&jwk) else {
                 continue;
             };
-            let algorithm = match &jwk.algorithm {
-                jsonwebtoken::jwk::AlgorithmParameters::RSA(_) => jsonwebtoken::Algorithm::RS256,
-                jsonwebtoken::jwk::AlgorithmParameters::EllipticCurve(ec)
-                    if ec.curve == jsonwebtoken::jwk::EllipticCurve::P256 =>
-                {
-                    jsonwebtoken::Algorithm::ES256
-                }
-                _ => continue,
+            let Ok(key) = jsonwebtoken::DecodingKey::from_jwk(&jwk) else {
+                continue;
             };
             by_kid.insert(kid, (key, algorithm));
         }
         let mut cache = self.keys.write().await;
         cache.by_kid = by_kid;
-        cache.loaded_at = Some(Instant::now());
-        Ok(true)
+        cache.loaded_at = Some(self.now());
+        Ok(RefreshOutcome::Refreshed)
+    }
+
+    /// Whether the cache as a whole is still within `max_key_age`.
+    fn cache_is_fresh(&self, cache: &KeyCache) -> bool {
+        let now = self.now();
+        cache
+            .loaded_at
+            .is_some_and(|t| now.duration_since(t) < self.max_key_age)
     }
 
     async fn key_for(
@@ -398,23 +416,76 @@ impl OidcAuthenticator {
     ) -> Result<(jsonwebtoken::DecodingKey, jsonwebtoken::Algorithm), AuthError> {
         {
             let cache = self.keys.read().await;
-            if let Some(found) = cache.by_kid.get(kid)
-                && cache
-                    .loaded_at
-                    .is_some_and(|t| t.elapsed() < self.max_key_age)
+            if self.cache_is_fresh(&cache)
+                && let Some(found) = cache.by_kid.get(kid)
             {
                 return Ok(found.clone());
             }
         }
-        // Unknown or aged key: one shared, rate-limited refresh, then fail closed. An aged
-        // key whose source cannot be reached is not trusted on the strength of its age.
-        self.refresh_keys().await?;
-        if let Some(found) = self.keys.read().await.by_kid.get(kid) {
+        // Unknown kid or aged cache: one shared, rate-limited refresh. Whatever happened,
+        // a key is returned only from a cache that is within max_key_age *now*.
+        // A key is returned only from a cache that was just refreshed or is still within
+        // max_key_age; a throttled refresh after the cache aged out (an earlier failed
+        // attempt) fails closed rather than trusting stale material.
+        let outcome = self.refresh_keys().await?;
+        let cache = self.keys.read().await;
+        if outcome == RefreshOutcome::Throttled && !self.cache_is_fresh(&cache) {
+            return Err(AuthError::KeySourceUnavailable(
+                "signing keys are older than the maximum key age and could not be refreshed".into(),
+            ));
+        }
+        if let Some(found) = cache.by_kid.get(kid) {
             return Ok(found.clone());
         }
         Err(AuthError::Unauthenticated(format!(
             "unknown signing key id {kid:?}"
         )))
+    }
+}
+
+/// Result of a refresh attempt that did not fail outright.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RefreshOutcome {
+    /// A fresh JWKS document was fetched and installed.
+    Refreshed,
+    /// The minimum interval since the last attempt has not elapsed; nothing was fetched.
+    Throttled,
+}
+
+/// The verification algorithm a JWK may be used for under this ledger's policy, or `None`
+/// when the key must be skipped: wrong `use`, `key_ops` without `verify`, contradictory
+/// `use`/`key_ops`, an unsupported key family or curve, or an explicit `alg` other than
+/// the one supported algorithm for that family.
+fn verification_algorithm(jwk: &jsonwebtoken::jwk::Jwk) -> Option<jsonwebtoken::Algorithm> {
+    use jsonwebtoken::jwk::{
+        AlgorithmParameters, EllipticCurve, KeyAlgorithm, KeyOperations, PublicKeyUse,
+    };
+    let common = &jwk.common;
+    if common
+        .public_key_use
+        .as_ref()
+        .is_some_and(|u| *u != PublicKeyUse::Signature)
+    {
+        return None;
+    }
+    if common
+        .key_operations
+        .as_ref()
+        .is_some_and(|ops| !ops.contains(&KeyOperations::Verify))
+    {
+        return None;
+    }
+    let family = match &jwk.algorithm {
+        AlgorithmParameters::RSA(_) => (jsonwebtoken::Algorithm::RS256, KeyAlgorithm::RS256),
+        AlgorithmParameters::EllipticCurve(ec) if ec.curve == EllipticCurve::P256 => {
+            (jsonwebtoken::Algorithm::ES256, KeyAlgorithm::ES256)
+        }
+        _ => return None,
+    };
+    match &common.key_algorithm {
+        None => Some(family.0),
+        Some(stated) if *stated == family.1 => Some(family.0),
+        Some(_) => None,
     }
 }
 
@@ -562,25 +633,37 @@ mod tests {
         jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap()
     }
 
-    /// A local JWKS endpoint whose document can be swapped, plus a request counter.
+    /// A local JWKS endpoint whose document can be swapped, a request counter, and a
+    /// switch that makes the issuer answer 503 (an outage).
     struct Jwks {
         url: String,
         document: Arc<std::sync::Mutex<String>>,
         hits: Arc<std::sync::atomic::AtomicUsize>,
+        fail: Arc<std::sync::atomic::AtomicBool>,
     }
 
     async fn jwks_server(initial: &str) -> Jwks {
         let document = Arc::new(std::sync::Mutex::new(initial.to_owned()));
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let (d, h) = (document.clone(), hits.clone());
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (d, h, f) = (document.clone(), hits.clone(), fail.clone());
         let app = axum::Router::new().route(
             "/keys",
             axum::routing::get(move || {
                 let d = d.clone();
                 let h = h.clone();
+                let f = f.clone();
                 async move {
                     h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if f.load(std::sync::atomic::Ordering::SeqCst) {
+                        return (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            String::new(),
+                        );
+                    }
                     (
+                        axum::http::StatusCode::OK,
                         [(axum::http::header::CONTENT_TYPE, "application/json")],
                         d.lock().unwrap().clone(),
                     )
@@ -594,6 +677,7 @@ mod tests {
             url,
             document,
             hits,
+            fail,
         }
     }
 
@@ -662,7 +746,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oidc_refresh_is_rate_limited_and_aged_keys_are_refetched() {
+    async fn oidc_refresh_is_rate_limited_and_withdrawn_keys_stop_validating() {
         let server = jwks_server(JWKS_INITIAL).await;
         // One-hour minimum interval: repeated unknown kids cause exactly one fetch.
         let auth = OidcAuthenticator::new(
@@ -703,6 +787,208 @@ mod tests {
             auth.authenticate(&a).await,
             Err(AuthError::Unauthenticated(_))
         ));
+    }
+
+    /// Deterministic clock: a manual time source advances only when the test says so, so
+    /// key age and throttling are exact and independent of network timing.
+    #[tokio::test]
+    async fn oidc_never_trusts_a_cached_key_beyond_max_key_age() {
+        let server = jwks_server(JWKS_INITIAL).await;
+        let min_interval = Duration::from_secs(60);
+        let max_age = Duration::from_secs(3600);
+        let offset = Arc::new(std::sync::Mutex::new(Duration::ZERO));
+        let base = Instant::now();
+        let clock_offset = offset.clone();
+        let advance = |d: Duration| *offset.lock().unwrap() += d;
+        let auth = OidcAuthenticator::new(
+            ISS.into(),
+            AUD.into(),
+            server.url.clone(),
+            ClaimsPolicy::default(),
+        )
+        .with_refresh_policy(min_interval, max_age)
+        .with_clock(Arc::new(move || base + *clock_offset.lock().unwrap()));
+        let token = || {
+            sign(
+                jsonwebtoken::Algorithm::RS256,
+                "kid-a",
+                &rsa(RSA_A),
+                &claims(),
+            )
+        };
+        // 1. Load keys, then take the issuer down: a fresh cached key keeps working.
+        auth.authenticate(&token()).await.unwrap();
+        server.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        advance(max_age - Duration::from_secs(1));
+        auth.authenticate(&token()).await.unwrap();
+        let hits_before = server.hits.load(std::sync::atomic::Ordering::SeqCst);
+        // 2. Past max_key_age, the same outage is a dependency failure, not a bypass.
+        advance(Duration::from_secs(2));
+        assert!(matches!(
+            auth.authenticate(&token()).await,
+            Err(AuthError::KeySourceUnavailable(_))
+        ));
+        assert_eq!(
+            server.hits.load(std::sync::atomic::Ordering::SeqCst),
+            hits_before + 1,
+            "exactly one refresh attempt"
+        );
+        // 3. Inside the throttle window the stale key is still refused and no fetch runs.
+        advance(Duration::from_secs(10));
+        assert!(matches!(
+            auth.authenticate(&token()).await,
+            Err(AuthError::KeySourceUnavailable(_))
+        ));
+        assert_eq!(
+            server.hits.load(std::sync::atomic::Ordering::SeqCst),
+            hits_before + 1
+        );
+        // Unknown kids stay fail closed throughout.
+        let unknown = sign(
+            jsonwebtoken::Algorithm::RS256,
+            "kid-c",
+            &rsa(RSA_C),
+            &claims(),
+        );
+        assert!(auth.authenticate(&unknown).await.is_err());
+        // 4. The issuer returns: after the throttle window a refresh succeeds, the lifetime
+        //    resets, the key works again and keeps working while fresh.
+        server
+            .fail
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        advance(min_interval);
+        auth.authenticate(&token()).await.unwrap();
+        server.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        advance(max_age / 2);
+        auth.authenticate(&token()).await.unwrap();
+        // 5. An unknown kid after expiry with the issuer down is unavailable, not a guess.
+        advance(max_age);
+        assert!(matches!(
+            auth.authenticate(&unknown).await,
+            Err(AuthError::KeySourceUnavailable(_))
+        ));
+    }
+
+    /// JWK metadata is honoured: `alg`, `key_ops` and `use` restrict which keys become
+    /// verification keys, and a key is never reinterpreted as another algorithm.
+    #[tokio::test]
+    async fn oidc_honours_jwk_algorithm_and_key_operation_restrictions() {
+        let base: Value = serde_json::from_str(JWKS_INITIAL).unwrap();
+        let rsa_jwk = base["keys"][0].clone();
+        let ec_jwk = base["keys"][1].clone();
+        assert_eq!(rsa_jwk["kid"], "kid-a");
+        assert_eq!(ec_jwk["kid"], "kid-b");
+        let variant = |mut jwk: Value, edits: &[(&str, Option<Value>)]| {
+            for (field, value) in edits {
+                match value {
+                    Some(v) => jwk[*field] = v.clone(),
+                    None => {
+                        jwk.as_object_mut().unwrap().remove(*field);
+                    }
+                }
+            }
+            json!({"keys": [jwk]}).to_string()
+        };
+        let rs = sign(
+            jsonwebtoken::Algorithm::RS256,
+            "kid-a",
+            &rsa(RSA_A),
+            &claims(),
+        );
+        let es = sign(
+            jsonwebtoken::Algorithm::ES256,
+            "kid-b",
+            &jsonwebtoken::EncodingKey::from_ec_pem(EC_B.as_bytes()).unwrap(),
+            &claims(),
+        );
+        let cases: Vec<(&str, String, &str, bool)> = vec![
+            ("rsa alg=RS256", variant(rsa_jwk.clone(), &[]), &rs, true),
+            (
+                "rsa alg absent",
+                variant(rsa_jwk.clone(), &[("alg", None)]),
+                &rs,
+                true,
+            ),
+            (
+                "rsa alg=PS256",
+                variant(rsa_jwk.clone(), &[("alg", Some(json!("PS256")))]),
+                &rs,
+                false,
+            ),
+            (
+                "rsa alg=RS512",
+                variant(rsa_jwk.clone(), &[("alg", Some(json!("RS512")))]),
+                &rs,
+                false,
+            ),
+            ("ec alg=ES256", variant(ec_jwk.clone(), &[]), &es, true),
+            (
+                "ec alg=ES384",
+                variant(ec_jwk.clone(), &[("alg", Some(json!("ES384")))]),
+                &es,
+                false,
+            ),
+            (
+                "key_ops verify",
+                variant(
+                    rsa_jwk.clone(),
+                    &[("use", None), ("key_ops", Some(json!(["verify"])))],
+                ),
+                &rs,
+                true,
+            ),
+            (
+                "key_ops sign only",
+                variant(
+                    rsa_jwk.clone(),
+                    &[("use", None), ("key_ops", Some(json!(["sign"])))],
+                ),
+                &rs,
+                false,
+            ),
+            (
+                "key_ops encrypt only",
+                variant(rsa_jwk.clone(), &[("key_ops", Some(json!(["encrypt"])))]),
+                &rs,
+                false,
+            ),
+            (
+                "use=enc",
+                variant(rsa_jwk.clone(), &[("use", Some(json!("enc")))]),
+                &rs,
+                false,
+            ),
+            (
+                "use=enc with verify ops (contradictory)",
+                variant(
+                    rsa_jwk.clone(),
+                    &[
+                        ("use", Some(json!("enc"))),
+                        ("key_ops", Some(json!(["verify"]))),
+                    ],
+                ),
+                &rs,
+                false,
+            ),
+            (
+                "use=sig with sign-only ops (contradictory)",
+                variant(rsa_jwk.clone(), &[("key_ops", Some(json!(["sign"])))]),
+                &rs,
+                false,
+            ),
+        ];
+        for (name, document, token, accepted) in cases {
+            let server = jwks_server(&document).await;
+            let auth = oidc(&server.url);
+            let result = auth.authenticate(token).await;
+            assert_eq!(result.is_ok(), accepted, "{name}: {result:?}");
+            if !accepted {
+                assert!(
+                    matches!(result, Err(AuthError::Unauthenticated(ref m)) if m.contains("unknown signing key")),
+                    "{name}: a skipped key must be unknown, never reinterpreted: {result:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

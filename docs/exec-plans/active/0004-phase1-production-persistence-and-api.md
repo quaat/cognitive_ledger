@@ -623,6 +623,51 @@ Evidence (2026-09-26, final code after the review fixes; real PostgreSQL 17.2 vi
 Security assumptions and dev-only switches: see `docs/quality/security.md`. Production
 qualification: **NO** until Plan 0005 (P1.5) passes.
 
+### Phase 1 closure pass (2026-09-26, PR #1 merge readiness)
+
+Scope: make PR #1 merge-ready without redesign. Changes:
+- **OIDC stale-key expiry defect fixed.** `key_for` previously returned a cached key after
+  `max_key_age` when the refresh attempt failed and a later request fell inside the
+  `min_refresh_interval` throttle. `refresh_keys` now returns an explicit
+  `RefreshOutcome::{Refreshed, Throttled}`; a key is served only from a cache that was just
+  refreshed or is still within `max_key_age`, otherwise `KeySourceUnavailable` (503). Time
+  comes from an injectable `Clock` (`with_clock`) so the test drives age and throttling
+  deterministically without wall-clock sleeps: fresh key works during an outage; past
+  max age the same outage is `KeySourceUnavailable`; a request inside the throttle window
+  also fails and performs no fetch; a successful refresh resets the lifetime; unknown kids
+  stay fail closed (`oidc_never_trusts_a_cached_key_beyond_max_key_age`).
+- **JWK metadata honoured.** `verification_algorithm` loads a key only if `use` is absent
+  or `sig`, `key_ops` (when present) contains `verify`, the family is RSA or P-256, and
+  `alg` (when stated) is exactly RS256 / ES256; PS256, RS512, ES384, sign-only or
+  encrypt-only keys and `use`/`key_ops` contradictions are skipped, never reinterpreted
+  (`oidc_honours_jwk_algorithm_and_key_operation_restrictions`, 12 cases). Existing
+  alg-confusion tests unchanged. `docs/quality/security.md` restated to match.
+- **Supply chain.** `cargo tree --target all -e normal,build -i rsa` is empty: `rsa 0.9.10`
+  is a lockfile-only optional dependency (`sqlx → sqlx-mysql → rsa`) that no workspace
+  feature enables; removing the `macros` feature would not remove it (the `sqlx` facade
+  crate itself lists `sqlx-mysql` optionally), and dropping the facade is not a reasonable
+  trade for a lockfile-only entry. Exception recorded in `.cargo/audit.toml` with the path,
+  proof, advisory and review trigger; `scripts/check-supply-chain.sh` re-proves the premise
+  (unreachable in the build graph, only dependent `sqlx-mysql`, version on the 0.9 line,
+  exactly one exception) before `cargo audit`, so a fixed `rsa`, an sqlx change or a new
+  advisory fails the gate. `ci-security`'s audit job is now blocking (no
+  `continue-on-error`). Local: `./scripts/check-supply-chain.sh` exit 0 (cargo-audit 0.22.2,
+  1271 advisories, 282 dependencies).
+- **Dependency graph** enabled on the repository (Dependabot alerts turned on via the API;
+  SBOM endpoint now answers), so `dependency-review-action` can run.
+- **CI hygiene**: `actions/checkout@v6` in all four workflows; pinning actions by commit
+  SHA recorded for Plan 0005.
+- **Old Codex threads** (walking-skeleton commit) verified against the current code and
+  resolved with notes: directory fsync after rename (`sync_directory` in
+  `put_object_sync`), `Quad`/`Patch` Serde deserialization through `FromStr`/`Patch::new`
+  (`serde_cannot_bypass_*` tests), standards N-Quads ingress via `oxttl`.
+- **Governance**: `main` has no protection or rulesets; a ruleset requiring `ci-fast`,
+  `ci-integration`, `ci-security` and resolved conversations is recommended in the PR (not
+  imposed).
+
+Evidence for this pass is recorded in the PR description and the final report; CI on the
+final head must show `ci-fast`, `ci-integration` and `ci-security` green.
+
 ## Test evidence
 - 2026-09-26 `python3 scripts/golden/commit_v2_reference.py check`: exit 0, "all 18
   commit v2 vectors (positive and negative) match the reference encoder";

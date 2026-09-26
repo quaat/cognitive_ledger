@@ -8,7 +8,7 @@ jobs:
   reference:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Require verified reference pin
         id: pin
         run: |

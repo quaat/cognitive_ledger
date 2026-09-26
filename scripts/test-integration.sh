@@ -52,7 +52,7 @@ cargo test -p ledger-store --features postgres --test pg_workflow -- --ignored -
 cargo test -p ledger-api --test pg_api -- --ignored --nocapture
 
 # --- 2. Containerised server: provision, authenticate, prepare/accept v2, restart, read ---
-curl --fail --silent --retry 10 --retry-delay 2 "${BASE}/health" >/dev/null
+curl --fail --silent --retry 10 --retry-delay 2 --retry-all-errors --retry-connrefused "${BASE}/health" >/dev/null
 curl --fail --silent "${BASE}/ready" >/dev/null
 
 GRAPH="it-graph-$(date +%s)"
@@ -147,8 +147,8 @@ echo "second accepted: ${C2}"
 
 # Restart only the ledger process; PostgreSQL carries refs, objects, workflow state.
 docker compose restart ledger
-curl --fail --silent --retry 20 --retry-delay 2 "${BASE}/health" >/dev/null
-curl --fail --silent --retry 20 --retry-delay 2 "${BASE}/ready" >/dev/null
+curl --fail --silent --retry 20 --retry-delay 2 --retry-all-errors --retry-connrefused "${BASE}/health" >/dev/null
+curl --fail --silent --retry 20 --retry-delay 2 --retry-all-errors --retry-connrefused "${BASE}/ready" >/dev/null
 
 R=$(api GET "/v1/graphs/${GRAPH}/refs?name=main" "${TOKEN}" "" "")
 HEAD_AFTER=$(echo "${R}" | body_of | json_field head)

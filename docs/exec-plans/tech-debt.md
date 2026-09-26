@@ -20,5 +20,6 @@
 - The request timeout is enforced by dropping the handler future; a PostgreSQL transaction in flight is rolled back by the pool on connection return, but a slow query keeps its connection until it finishes — add `statement_timeout` on the runtime role (P1.5 role split).
 - Identical prepares whose content, actor and microsecond `recorded_at` coincide under two different keys collide on `proposals_candidate_unique`; reported as `LINEAGE_MISMATCH` (not a 500) — acceptable, extremely unlikely.
 - Failed sqlx migration runs keep their advisory lock on the pooled connection; library constructors that migrate on a caller's pool inherit this. Run migrations on a dedicated connection or through the explicit `schema` entry points from a fresh process.
-- Evaluate `cargo-deny`, `cargo-audit`, SBOM, and container scanning with classified findings.
+- Evaluate `cargo-deny`, SBOM, and container scanning with classified findings (`cargo audit` is now a blocking gate via `scripts/check-supply-chain.sh`; its single exception, RUSTSEC-2023-0071 for the lockfile-only `rsa` under `sqlx-mysql`, is re-proven on every run and must be deleted when sqlx/rsa move).
+- Pin third-party GitHub Actions (`actions/checkout`, `dtolnay/rust-toolchain`, `Swatinem/rust-cache`, `taiki-e/install-action`, `actions/dependency-review-action`) by immutable commit SHA (Plan 0005 supply-chain slice); P1.4 closure only moved `actions/checkout` to the supported `v6` major.
 - Establish benchmark baselines and checkpoint policy before performance gates.
