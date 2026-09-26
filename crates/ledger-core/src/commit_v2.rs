@@ -287,6 +287,23 @@ impl AnyCommit {
         Err(LedgerError::UnknownCommitVersion(shown))
     }
 
+    /// Protocol version tag as stored in a commit index (`1` or `2`).
+    pub const fn version(&self) -> u8 {
+        match self {
+            Self::V1(_) => 1,
+            Self::V2(_) => 2,
+        }
+    }
+
+    /// The graph a commit is bound to by its own bytes. v1 envelopes carry none; their
+    /// graph binding is a deployment policy decision (ADR-0010), not commit content.
+    pub fn graph_id(&self) -> Option<&GraphId> {
+        match self {
+            Self::V1(_) => None,
+            Self::V2(c) => Some(&c.graph_id),
+        }
+    }
+
     pub fn parents(&self) -> &[CommitId] {
         match self {
             Self::V1(c) => &c.parents,

@@ -2,8 +2,7 @@
 
 use fs2::FileExt;
 use ledger_core::{
-    Commit, CommitId, CommitStore, ContentId, ImmutableStore, LedgerError, ObjectStore, PatchId,
-    RefStore,
+    AnyCommit, Commit, CommitId, ContentId, ImmutableStore, LedgerError, PatchId, RefStore,
 };
 use ledger_rdf::{OperationKind, Patch, Quad};
 use std::{
@@ -149,32 +148,37 @@ impl FileStore {
     fn exists_sync(&self, id: &ContentId) -> Result<bool, LedgerError> {
         self.object_path(id).try_exists().map_err(storage)
     }
-    fn put_commit_sync(&self, commit: &Commit) -> Result<CommitId, LedgerError> {
-        for parent in &commit.parents {
+    fn put_commit_sync(&self, commit: &AnyCommit) -> Result<CommitId, LedgerError> {
+        for parent in commit.parents() {
             if self.get_commit_sync(parent)?.is_none() {
                 return Err(LedgerError::MissingParent(parent.clone()));
             }
         }
-        if self.get_object_sync(&commit.patch.0)?.is_none() {
-            return Err(LedgerError::MissingPatch(commit.patch.clone()));
+        if self.get_object_sync(&commit.patch().0)?.is_none() {
+            return Err(LedgerError::MissingPatch(commit.patch().clone()));
         }
         let bytes = commit.canonical_bytes()?;
         let id = commit.id()?;
         self.put_object_sync(&id.0, &bytes)?;
         Ok(id)
     }
-    fn get_commit_sync(&self, id: &CommitId) -> Result<Option<Commit>, LedgerError> {
+    /// Typed read: an object that exists but is not a decodable commit envelope (a patch,
+    /// say) yields `None`, never a reinterpretation. Bytes that decode but do not hash to
+    /// their own id are corruption.
+    fn get_commit_sync(&self, id: &CommitId) -> Result<Option<AnyCommit>, LedgerError> {
         let Some(bytes) = self.get_object_sync(&id.0)? else {
             return Ok(None);
         };
-        let c = Commit::from_canonical_bytes(&bytes)?;
-        if c.id()? != *id {
+        let Ok(commit) = AnyCommit::from_canonical_bytes(&bytes) else {
+            return Ok(None);
+        };
+        if commit.id()? != *id {
             return Err(LedgerError::CorruptObject {
                 id: id.0.clone(),
                 reason: "commit ID mismatch".into(),
             });
         }
-        Ok(Some(c))
+        Ok(Some(commit))
     }
     fn head_sync(&self) -> Result<Option<CommitId>, LedgerError> {
         match fs::read_to_string(self.head_path()) {
@@ -226,33 +230,6 @@ where
 }
 
 #[async_trait::async_trait]
-impl ObjectStore for FileStore {
-    async fn put(&self, id: &ContentId, bytes: &[u8]) -> Result<(), LedgerError> {
-        let this = self.clone();
-        let id = id.clone();
-        let bytes = bytes.to_vec();
-        run_blocking(move || this.put_object_sync(&id, &bytes)).await
-    }
-    async fn get(&self, id: &ContentId) -> Result<Option<Vec<u8>>, LedgerError> {
-        let this = self.clone();
-        let id = id.clone();
-        run_blocking(move || this.get_object_sync(&id)).await
-    }
-}
-#[async_trait::async_trait]
-impl CommitStore for FileStore {
-    async fn put_commit(&self, commit: &Commit) -> Result<CommitId, LedgerError> {
-        let this = self.clone();
-        let commit = commit.clone();
-        run_blocking(move || this.put_commit_sync(&commit)).await
-    }
-    async fn get_commit(&self, id: &CommitId) -> Result<Option<Commit>, LedgerError> {
-        let this = self.clone();
-        let id = id.clone();
-        run_blocking(move || this.get_commit_sync(&id)).await
-    }
-}
-#[async_trait::async_trait]
 impl ImmutableStore for FileStore {
     async fn put_content(&self, id: &ContentId, bytes: &[u8]) -> Result<(), LedgerError> {
         let this = self.clone();
@@ -265,12 +242,12 @@ impl ImmutableStore for FileStore {
         let id = id.clone();
         run_blocking(move || this.get_object_sync(&id)).await
     }
-    async fn put_commit(&self, commit: &Commit) -> Result<CommitId, LedgerError> {
+    async fn put_commit(&self, commit: &AnyCommit) -> Result<CommitId, LedgerError> {
         let this = self.clone();
         let commit = commit.clone();
         run_blocking(move || this.put_commit_sync(&commit)).await
     }
-    async fn get_commit(&self, id: &CommitId) -> Result<Option<Commit>, LedgerError> {
+    async fn get_commit(&self, id: &CommitId) -> Result<Option<AnyCommit>, LedgerError> {
         let this = self.clone();
         let id = id.clone();
         run_blocking(move || this.get_commit_sync(&id)).await
@@ -301,6 +278,10 @@ impl RefStore for FileStore {
 
 #[cfg(feature = "postgres")]
 pub use postgres::PgRefStore;
+#[cfg(feature = "postgres")]
+mod postgres_immutable;
+#[cfg(feature = "postgres")]
+pub use postgres_immutable::{PostgresImmutableStore, V1Binding};
 
 /// PostgreSQL-backed ref coordination. Immutable objects and commits stay on the
 /// filesystem `FileStore`; only the mutable ref head is delegated here so that
@@ -461,10 +442,15 @@ impl Ledger {
     /// Compose the ledger with an externally provided ref backend (e.g. PostgreSQL),
     /// keeping immutable objects and commits on the filesystem `store`.
     pub fn with_ref_store(store: Arc<FileStore>, refs: Arc<dyn RefStore>) -> Self {
-        Self {
-            immutable: store as Arc<dyn ImmutableStore>,
-            refs,
-        }
+        Self::with_stores(store as Arc<dyn ImmutableStore>, refs)
+    }
+    /// Compose the ledger over any shared immutable store and ref backend (ADR-0012).
+    pub fn with_stores(immutable: Arc<dyn ImmutableStore>, refs: Arc<dyn RefStore>) -> Self {
+        Self { immutable, refs }
+    }
+    /// The immutable store this ledger reads and writes (for replica/qualification tests).
+    pub fn immutable_store(&self) -> &Arc<dyn ImmutableStore> {
+        &self.immutable
     }
     pub async fn head(&self) -> Result<Option<CommitId>, LedgerError> {
         self.refs.head().await
@@ -475,7 +461,9 @@ impl Ledger {
         self.immutable
             .put_content(&patch_id.0, &patch_bytes)
             .await?;
-        let commit = Commit {
+        // The bootstrap write path still produces v1 envelopes; the v2 write path arrives
+        // with the authenticated principal and graph binding (Plan 0004 P1.3/P1.4).
+        let commit = AnyCommit::V1(Commit {
             parents: request.expected_head.clone().into_iter().collect(),
             patch: patch_id,
             author: request.author,
@@ -484,7 +472,7 @@ impl Ledger {
             recorded_time: OffsetDateTime::now_utc()
                 .format(&Rfc3339)
                 .map_err(storage)?,
-        };
+        });
         let id = self.immutable.put_commit(&commit).await?;
         self.advance_ref(request.expected_head.as_ref(), &id)
             .await?;
@@ -492,12 +480,16 @@ impl Ledger {
     }
     /// Enforce the ref-target-existence invariant uniformly for every ref backend, then
     /// perform the atomic swap. The ref store is a pure primitive that does not see commits.
+    ///
+    /// The check is *typed*: the target must decode as a commit envelope whose id matches,
+    /// not merely exist as some immutable object. Otherwise a patch id (or any stored
+    /// blob) could become HEAD and reconstruction would fail on a "valid" ref.
     pub(crate) async fn advance_ref(
         &self,
         expected: Option<&CommitId>,
         new: &CommitId,
     ) -> Result<(), LedgerError> {
-        if !self.immutable.exists(&new.0).await? {
+        if self.immutable.get_commit(new).await?.is_none() {
             return Err(LedgerError::MissingTarget(new.clone()));
         }
         self.refs.compare_and_set(expected, new).await
@@ -518,18 +510,18 @@ impl Ledger {
                 .get_commit(&current)
                 .await?
                 .ok_or_else(|| LedgerError::NotFound(current.0.clone()))?;
-            // Protocol v1 defines parent zero as the state reconstruction parent.
+            // Parent zero is the state reconstruction parent in every envelope version.
             // Additional merge parents carry ancestry and provenance.
-            cursor = c.parents.first().cloned();
+            cursor = c.parents().first().cloned();
             chain.push(c);
         }
         let mut state = BTreeSet::new();
         for commit in chain.iter().rev() {
             let bytes = self
                 .immutable
-                .get_content(&commit.patch.0)
+                .get_content(&commit.patch().0)
                 .await?
-                .ok_or_else(|| LedgerError::NotFound(commit.patch.0.clone()))?;
+                .ok_or_else(|| LedgerError::NotFound(commit.patch().0.clone()))?;
             let patch = Patch::from_canonical_bytes(&bytes).map_err(storage)?;
             for op in patch.operations() {
                 match op.kind {
@@ -574,11 +566,15 @@ mod tests {
         let id = ContentId::for_bytes(b"x");
         FileStore::open(t.path())
             .unwrap()
-            .put(&id, b"x")
+            .put_content(&id, b"x")
             .await
             .unwrap();
         assert_eq!(
-            FileStore::open(t.path()).unwrap().get(&id).await.unwrap(),
+            FileStore::open(t.path())
+                .unwrap()
+                .get_content(&id)
+                .await
+                .unwrap(),
             Some(b"x".to_vec())
         );
     }
@@ -595,13 +591,16 @@ mod tests {
             let id = id.clone();
             handles.push(tokio::spawn(async move {
                 barrier.wait().await;
-                store.put(&id, b"same").await
+                store.put_content(&id, b"same").await
             }));
         }
         for handle in handles {
             handle.await.unwrap().unwrap();
         }
-        assert_eq!(store.get(&id).await.unwrap(), Some(b"same".to_vec()));
+        assert_eq!(
+            store.get_content(&id).await.unwrap(),
+            Some(b"same".to_vec())
+        );
     }
     #[tokio::test]
     async fn commit_with_missing_patch_is_rejected() {
@@ -617,8 +616,106 @@ mod tests {
             recorded_time: "r".into(),
         };
         assert!(matches!(
-            CommitStore::put_commit(&store, &commit).await,
+            store.put_commit(&AnyCommit::V1(commit)).await,
             Err(LedgerError::MissingPatch(_))
+        ));
+    }
+    #[tokio::test]
+    async fn existing_non_commit_object_cannot_become_head() {
+        // Regression for the `exists`-based target check: a patch is a real immutable
+        // object, but it is not a commit and must never be installable as HEAD.
+        let t = tempfile::tempdir().unwrap();
+        let ledger = Ledger::open(t.path()).unwrap();
+        let patch = Patch::new([Operation {
+            kind: OperationKind::Add,
+            quad: "<urn:s> <urn:p> \"v\" .".parse().unwrap(),
+        }])
+        .unwrap();
+        let patch_id = patch.id();
+        ledger
+            .immutable
+            .put_content(&patch_id.0, &patch.canonical_bytes())
+            .await
+            .unwrap();
+        assert!(ledger.immutable.exists(&patch_id.0).await.unwrap());
+        let masquerading = CommitId(patch_id.0.clone());
+        assert_eq!(
+            ledger.immutable.get_commit(&masquerading).await.unwrap(),
+            None
+        );
+        assert!(matches!(
+            ledger.advance_ref(None, &masquerading).await,
+            Err(LedgerError::MissingTarget(_))
+        ));
+        assert_eq!(ledger.head().await.unwrap(), None);
+        // An arbitrary blob (not even a patch) is rejected the same way.
+        let blob = ContentId::for_bytes(b"not a commit");
+        ledger
+            .immutable
+            .put_content(&blob, b"not a commit")
+            .await
+            .unwrap();
+        assert!(matches!(
+            ledger.advance_ref(None, &CommitId(blob)).await,
+            Err(LedgerError::MissingTarget(_))
+        ));
+    }
+    #[tokio::test]
+    async fn store_holds_v1_and_v2_commits_side_by_side() {
+        use ledger_core::{Actor, CommitV2, GraphId, LedgerTimestamp, PrincipalId, PrincipalType};
+        let t = tempfile::tempdir().unwrap();
+        let store = FileStore::open(t.path()).unwrap();
+        let patch = Patch::new([Operation {
+            kind: OperationKind::Add,
+            quad: "<urn:s> <urn:p> \"v\" .".parse().unwrap(),
+        }])
+        .unwrap();
+        store
+            .put_content(&patch.id().0, &patch.canonical_bytes())
+            .await
+            .unwrap();
+        let v1 = AnyCommit::V1(Commit {
+            parents: vec![],
+            patch: patch.id(),
+            author: "a".into(),
+            message: "v1 genesis".into(),
+            event_time: "e".into(),
+            recorded_time: "r".into(),
+        });
+        let v1_id = store.put_commit(&v1).await.unwrap();
+        let v2 = AnyCommit::V2(CommitV2 {
+            graph_id: GraphId::new("graph-1").unwrap(),
+            parents: vec![v1_id.clone()],
+            patch: patch.id(),
+            actor: Actor {
+                principal_id: PrincipalId::new("urn:sculpin:agent:a").unwrap(),
+                principal_type: PrincipalType::Agent,
+                on_behalf_of: None,
+            },
+            activity: "test".into(),
+            event_time: None,
+            recorded_at: LedgerTimestamp::parse_rfc3339("2026-09-26T00:00:00Z").unwrap(),
+            evidence_refs: vec![],
+            source_system: None,
+            message: "v2 child of a v1 parent".into(),
+        });
+        let v2_id = store.put_commit(&v2).await.unwrap();
+        let read_v1 = store.get_commit(&v1_id).await.unwrap().unwrap();
+        let read_v2 = store.get_commit(&v2_id).await.unwrap().unwrap();
+        assert_eq!(read_v1.version(), 1);
+        assert_eq!(read_v2.version(), 2);
+        assert_eq!(read_v2.parents(), &[v1_id]);
+        assert_eq!(read_v2.graph_id().unwrap().as_str(), "graph-1");
+        assert_eq!(read_v1, v1);
+        assert_eq!(read_v2, v2);
+        // A v2 commit whose parent is missing is rejected like a v1 one.
+        let mut orphan = v2.clone();
+        if let AnyCommit::V2(inner) = &mut orphan {
+            inner.parents = vec![CommitId(ContentId::for_bytes(b"absent"))];
+        }
+        assert!(matches!(
+            store.put_commit(&orphan).await,
+            Err(LedgerError::MissingParent(_))
         ));
     }
     #[tokio::test]
@@ -638,7 +735,9 @@ mod tests {
             event_time: "2026-01-01T00:00:00Z".into(),
         };
         let c1 = ledger.commit(req(None)).await.unwrap();
-        let stored = ledger.immutable.get_commit(&c1).await.unwrap().unwrap();
+        let AnyCommit::V1(stored) = ledger.immutable.get_commit(&c1).await.unwrap().unwrap() else {
+            panic!("bootstrap write path produces v1 envelopes");
+        };
         assert!(OffsetDateTime::parse(&stored.recorded_time, &Rfc3339).is_ok());
         assert_ne!(stored.recorded_time, "2026-01-01T00:00:00Z");
         let c2 = ledger.commit(req(Some(c1.clone()))).await.unwrap();

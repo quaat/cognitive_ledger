@@ -119,7 +119,7 @@ Before production use, configurable limits MUST cover HTTP body size, patch oper
 
 ### Storage and durability
 
-Immutable object durability and mutable-ref durability have distinct implementations but the same acknowledgement rule: data and containing directory entries MUST be synchronized before success is returned. A branch must never expose a commit whose patch or parents are absent. PostgreSQL transactional CAS for the mutable ref is now implemented (per ADR-0007), but immutable commit/patch objects remain node-local on the filesystem, so a shared immutable object store is still required before multi-replica horizontal deployment. PostgreSQL stores mutable ref/outbox metadata, while immutable object storage remains behind a separate interface.
+Immutable object durability and mutable-ref durability have distinct implementations but the same acknowledgement rule: data and containing directory entries MUST be synchronized before success is returned. A branch must never expose a commit whose patch or parents are absent. PostgreSQL transactional CAS for the mutable ref is implemented (ADR-0007), and a shared PostgreSQL immutable store with a verified commit index is implemented behind the version-neutral `ImmutableStore` interface (ADR-0012). A shared ref MUST NOT reference node-local content: the filesystem immutable backend is single-host only, and only the shared backend is a supported multi-replica topology. PostgreSQL stores mutable ref/outbox metadata and, in the shared backend, immutable content; the interface keeps object-store backends possible.
 
 ### Compatibility and migrations
 

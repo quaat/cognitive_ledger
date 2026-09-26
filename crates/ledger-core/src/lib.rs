@@ -262,17 +262,6 @@ pub(crate) fn read_field(rest: &mut &[u8]) -> Result<String, LedgerError> {
     Ok(value)
 }
 
-#[async_trait::async_trait]
-pub trait ObjectStore: Send + Sync {
-    async fn put(&self, id: &ContentId, bytes: &[u8]) -> Result<(), LedgerError>;
-    async fn get(&self, id: &ContentId) -> Result<Option<Vec<u8>>, LedgerError>;
-}
-#[async_trait::async_trait]
-pub trait CommitStore: Send + Sync {
-    async fn put_commit(&self, commit: &Commit) -> Result<CommitId, LedgerError>;
-    async fn get_commit(&self, id: &CommitId) -> Result<Option<Commit>, LedgerError>;
-}
-
 /// The immutable content boundary the ledger service depends on. It unifies content and
 /// commit persistence behind one object-safe async trait so `Ledger` no longer holds a
 /// concrete filesystem store, enabling shared (e.g. PostgreSQL/S3) backends without
@@ -286,12 +275,18 @@ pub trait CommitStore: Send + Sync {
 /// backend's write path being content-addressed and partial-write-free, not on `exists`
 /// itself. A backend that cannot guarantee that (e.g. an object store where a truncated
 /// upload is visible) MUST make `exists` verify integrity instead.
+///
+/// Commit operations are version-neutral: they take and return [`AnyCommit`], so a store
+/// holds v1 and v2 envelopes side by side and a decoder change never touches the storage
+/// boundary. `put_commit` MUST verify that every parent is an existing *commit* (not merely
+/// an existing object) and that the patch exists; `get_commit` MUST return `None` for an
+/// id that names a non-commit object rather than reinterpreting its bytes.
 #[async_trait::async_trait]
 pub trait ImmutableStore: Send + Sync {
     async fn put_content(&self, id: &ContentId, bytes: &[u8]) -> Result<(), LedgerError>;
     async fn get_content(&self, id: &ContentId) -> Result<Option<Vec<u8>>, LedgerError>;
-    async fn put_commit(&self, commit: &Commit) -> Result<CommitId, LedgerError>;
-    async fn get_commit(&self, id: &CommitId) -> Result<Option<Commit>, LedgerError>;
+    async fn put_commit(&self, commit: &AnyCommit) -> Result<CommitId, LedgerError>;
+    async fn get_commit(&self, id: &CommitId) -> Result<Option<AnyCommit>, LedgerError>;
     async fn exists(&self, id: &ContentId) -> Result<bool, LedgerError>;
 }
 

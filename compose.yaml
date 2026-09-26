@@ -8,9 +8,12 @@ services:
     environment:
       LEDGER_DATA_DIR: /data
       LEDGER_ADDR: 0.0.0.0:8080
-      # Delegate the mutable ref head to PostgreSQL (ADR-0004/0007); immutable
-      # objects stay on the /data volume.
+      # Delegate the mutable ref head (ADR-0004/0007) AND the immutable objects
+      # (ADR-0012 shared store) to PostgreSQL: the only topology in which a shared ref
+      # never references node-local content. /data is kept only for the filesystem
+      # backend (LEDGER_IMMUTABLE_BACKEND=filesystem, single host).
       LEDGER_DATABASE_URL: postgres://ledger:ledger-development-only@postgres:5432/ledger?sslmode=disable
+      LEDGER_IMMUTABLE_BACKEND: postgres
     volumes: [ledger-data:/data]
     ports: ["8080:8080"]
     depends_on:

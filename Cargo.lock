@@ -788,6 +788,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "ledger-api",
+ "ledger-core",
  "ledger-store",
  "tokio",
  "tracing",

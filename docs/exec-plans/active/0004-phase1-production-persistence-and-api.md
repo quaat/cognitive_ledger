@@ -66,6 +66,15 @@ new version, dual-read, golden vectors).
 - prepare idempotency: a same-key/same-digest retry returns the original candidate id; a
   different digest returns `IDEMPOTENCY_CONFLICT`.
 - `graphs.knowledge_base_id` is non-unique; a test creates two graphs referencing one KB.
+- `graphs` migration tests (ADR-0010): same `graph_id` under two tenants fails (global
+  uniqueness); `UPDATE graphs SET tenant_id` fails while other columns update; two graphs
+  per KB succeed; the 0001 upgrade backfills a `status='bootstrap'` row for `'default'`
+  and clean install equals upgrade.
+- v1 graph-binding policy (ADR-0010): a `V1Binding::Reject` store refuses v1 writes and
+  still reads them; a `BindTo` store indexes them under the bootstrap graph; one commit
+  id can never be indexed under two graphs.
+- `commit_index` is verified: re-derivation from bytes matches every row (ADR-0012).
+- typed ref target: an existing non-commit object (patch or blob) can never become HEAD.
 - the graph model arrives as a new monotonic migration; 0001 is never rewritten.
 - multi-replica / shared-ref PostgreSQL is unsupported until the shared immutable store
   ships in this phase.
@@ -139,8 +148,26 @@ P1.1 (persistent protocol) implemented and gated green on 2026-09-26:
   `crates/ledger-core/tests/golden_v2.rs` verifies them from the Rust side.
 - `docs/design/canonicalization.md` gains the v2 section; ADR-0010 pins the `graph_id`
   representation.
-Not started: P1.2–P1.5. The v2 envelope is **not** yet wired into `ImmutableStore`,
-`Ledger`, or the API — that is P1.2/P1.3 work, now unblocked.
+P0-bridging task (2026-09-26, six items from the owner's P1.1 review), all landed:
+1. ADR-0010: `graph_id` globally unique, `tenant_id` binding immutable, and the four
+   `graphs` migration tests specified (executable when the `graphs` migration lands).
+2. ADR-0010: production v1 graph-binding policy defined and made executable as
+   `V1Binding::{Reject, BindTo}` on `PostgresImmutableStore`.
+3. `ImmutableStore::put_commit/get_commit` are version-neutral over `AnyCommit`; the
+   legacy v1-only `ObjectStore`/`CommitStore` traits were removed (unused since
+   ADR-0012). `FileStore` and `Ledger` hold v1 and v2 commits side by side.
+4. `Ledger::advance_ref` uses the typed `get_commit` check again (the `exists` probe
+   from the ADR-0012 refactor let any object become HEAD); regression tests cover a
+   patch and an arbitrary blob masquerading as a commit.
+5. ADR-0012 specifies `immutable_objects` + verified `commit_index`/`commit_parents` as
+   the P1.2 foundation P1.3's transactional graph/lineage predicates build on.
+6. P1.1 gate re-run green (below); **P1.2 begun**: migrations 0002/0003,
+   `PostgresImmutableStore` (content-addressed publish, typed parent/patch checks and
+   index rows in one transaction, digest-verified reads, `verify_commit_index`),
+   `Ledger::with_stores`, server `LEDGER_IMMUTABLE_BACKEND=postgres`, compose harness on
+   the shared backend, and the ignored PostgreSQL suite `tests/pg_immutable_store.rs`.
+P1.2 remaining: `graphs`/`refs` migrations with the ADR-0010 tests, filesystem →
+PostgreSQL content migration path, then P1.3.
 
 ## Test evidence
 - 2026-09-26 `python3 scripts/golden/commit_v2_reference.py check`: exit 0, "all 18
@@ -168,6 +195,19 @@ Not started: P1.2–P1.5. The v2 envelope is **not** yet wired into `ImmutableSt
   pre-existing Docker-gated PostgreSQL CAS test. First run surfaced two unit tests that
   compared a decoded commit against an unsorted sample (structural `Eq` vs canonical
   order); the sample was corrected, no protocol change.
+
+- 2026-09-26 bridging task: `cargo fmt`, `./scripts/lint.sh`, `cargo test --workspace`
+  exit 0 (`ledger-core` 23 lib + 9 golden_v2 + 3 golden v1; `ledger-store` 8 lib incl.
+  `existing_non_commit_object_cannot_become_head` and
+  `store_holds_v1_and_v2_commits_side_by_side`). Real PostgreSQL (compose
+  `postgres:17.2`, `LEDGER_TEST_DATABASE_URL`): `pg_cas_race` 1 passed;
+  `pg_immutable_store` 3 passed — `replica_b_reconstructs_what_replica_a_committed`
+  (two independent pools, B reconstructs A's commits and continues the line),
+  `commit_index_is_verified_typed_and_idempotent`, `v1_binding_policy_is_enforced_on_write`.
+  Full `./scripts/test-integration.sh` (image build, CAS race, replica suite, HTTP
+  commit/restart with `LEDGER_IMMUTABLE_BACKEND=postgres`): exit 0, "INTEGRATION OK" —
+  ref head and reconstructed state survived a ledger-container restart with no local
+  objects, so the shared-backend topology holds end to end.
 
 ## Completion criteria
 The Phase 1 gate passes with recorded evidence, the carried-forward obligations each have

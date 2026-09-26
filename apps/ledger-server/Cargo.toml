@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 axum.workspace = true
 ledger-api = { path = "../../crates/ledger-api" }
+ledger-core = { path = "../../crates/ledger-core" }
 ledger-store = { path = "../../crates/ledger-store", features = ["postgres"] }
 tokio.workspace = true
 tracing.workspace = true
