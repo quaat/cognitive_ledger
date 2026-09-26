@@ -23,7 +23,7 @@
 //! atomicity is verified, production protected semantic acceptance (Phase 2) is not
 //! enabled, and no validation record is ever fabricated.
 
-use crate::{PgGraphs, PostgresImmutableStore, V1Binding, db_error, storage};
+use crate::{PgGraphs, PostgresImmutableStore, V1Binding, db_error};
 use ledger_core::{
     AnyCommit, AuthenticatedPrincipal, CommitId, CommitV2, ContentId, GraphId, LedgerError,
     LedgerTimestamp, PatchId,
@@ -364,7 +364,9 @@ fn map_decision_insert(error: sqlx::Error, candidate: &CommitId) -> LedgerError 
         sqlx::Error::Database(e) if e.is_unique_violation() => LedgerError::LineageMismatch(
             format!("candidate {candidate} already has a terminal decision"),
         ),
-        _ => storage(error),
+        // Anything else keeps the retryable-vs-fault classification (dropped connection →
+        // DEPENDENCY_UNAVAILABLE 503, retry with the same key).
+        _ => db_error(error),
     }
 }
 
@@ -889,7 +891,7 @@ impl WorkflowRepository {
             sqlx::Error::Database(d) if d.is_unique_violation() => LedgerError::LineageMismatch(
                 format!("candidate {candidate_id} already has a proposal"),
             ),
-            _ => storage(e),
+            _ => db_error(e),
         })?;
         let proposal_id: i64 = row.try_get("proposal_id").map_err(db_error)?;
         self.fail_at(FailPoint::AfterDecision)?;

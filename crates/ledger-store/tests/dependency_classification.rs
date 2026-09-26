@@ -21,6 +21,20 @@ fn is_dependency(result: Result<impl std::fmt::Debug, LedgerError>) -> bool {
     matches!(result, Err(LedgerError::DependencyUnavailable(_)))
 }
 
+#[test]
+fn postgres_shutdown_and_connection_sqlstates_are_unavailable_not_faults() {
+    for code in [
+        "08000", "08003", "08006", "08001", "08004", "57P01", "57P02", "57P03", "53300", "53400",
+    ] {
+        assert!(ledger_store::sqlstate_is_unavailable(code), "{code}");
+    }
+    for code in [
+        "23505", "23503", "42P01", "22P02", "40001", "57014", "P0001", "XX000",
+    ] {
+        assert!(!ledger_store::sqlstate_is_unavailable(code), "{code}");
+    }
+}
+
 #[tokio::test]
 async fn unreachable_database_is_classified_as_a_dependency_failure_everywhere() {
     let store = unreachable_store();

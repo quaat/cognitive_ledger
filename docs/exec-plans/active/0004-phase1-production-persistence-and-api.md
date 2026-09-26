@@ -686,6 +686,14 @@ Scope: make PR #1 merge-ready without redesign. Changes:
   `DependencyUnavailable` on every public store surface). The `.cargo/audit.toml`
   justification named the wrong JWT crypto backend (`ring` → `aws-lc-rs`).
 
+- **Codex third pass** (on the head above): two P2, both fixed — the workflow's
+  proposal/decision insert fallbacks still mapped non-unique-violation SQLx errors with the
+  generic classifier (now `db_error`, so a dropped connection mid-prepare/accept/reject is
+  the retryable 503), and `db_error` treated PostgreSQL shutdown/failover/connection
+  responses (SQLSTATE class 08, 57P01/57P02/57P03, 53300/53400) and `WorkerCrashed` as
+  faults (now `DependencyUnavailable`; `sqlstate_is_unavailable` is unit-tested against
+  both the unavailable set and ordinary error classes).
+
 Evidence for this pass: `./scripts/check-fast.sh` exit 0; PostgreSQL suites 1/9/7/8/14/10
 and `./scripts/test-integration.sh` exit 0 on the closure content; CI on the final head
 must show `ci-fast`, `ci-integration` and `ci-security` green (recorded in the PR).

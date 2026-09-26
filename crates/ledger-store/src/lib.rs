@@ -251,12 +251,26 @@ fn storage(e: impl std::fmt::Display) -> LedgerError {
 /// dependency failure (503 at the boundary), anything else is a storage error (500).
 #[cfg(feature = "postgres")]
 pub(crate) fn db_error(e: sqlx::Error) -> LedgerError {
-    match e {
-        sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed | sqlx::Error::Io(_) => {
+    match &e {
+        sqlx::Error::PoolTimedOut
+        | sqlx::Error::PoolClosed
+        | sqlx::Error::Io(_)
+        | sqlx::Error::WorkerCrashed => LedgerError::DependencyUnavailable(e.to_string()),
+        sqlx::Error::Database(d) if d.code().is_some_and(|code| sqlstate_is_unavailable(&code)) => {
             LedgerError::DependencyUnavailable(e.to_string())
         }
-        other => LedgerError::Storage(other.to_string()),
+        _ => LedgerError::Storage(e.to_string()),
     }
+}
+
+/// SQLSTATEs PostgreSQL returns while it is shutting down, restarting, failing over or
+/// losing the connection: class 08 (connection exception), 57P01 `admin_shutdown`, 57P02
+/// `crash_shutdown`, 57P03 `cannot_connect_now`, 53300 `too_many_connections`, 53400
+/// `configuration_limit_exceeded`. Requests hitting these are retryable (503), not
+/// storage faults (500).
+#[cfg(feature = "postgres")]
+pub fn sqlstate_is_unavailable(code: &str) -> bool {
+    code.starts_with("08") || matches!(code, "57P01" | "57P02" | "57P03" | "53300" | "53400")
 }
 fn sync_directory(path: &Path) -> Result<(), LedgerError> {
     fs::File::open(path)
