@@ -7,13 +7,41 @@
 //! database's transactional CAS, never from an application-side mutex.
 #![cfg(feature = "postgres")]
 
-use ledger_core::{CommitId, ContentId, LedgerError, RefStore};
-use ledger_store::PgRefStore;
+use ledger_core::{AnyCommit, Commit, CommitId, GraphId, ImmutableStore, LedgerError, RefStore};
+use ledger_rdf::{Operation, OperationKind, Patch};
+use ledger_store::{PgRefStore, PostgresImmutableStore, V1Binding};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn commit_id(seed: &[u8]) -> CommitId {
-    CommitId(ContentId::for_bytes(seed))
+/// Since migration 0006 a ref may only point at an indexed commit of its graph, so the
+/// race targets are real v1 commits published under the bootstrap graph.
+async fn published_commit(url: &str, seed: &str) -> CommitId {
+    let store =
+        PostgresImmutableStore::connect(url, V1Binding::BindTo(GraphId::new("default").unwrap()))
+            .await
+            .unwrap();
+    let patch = Patch::new([Operation {
+        kind: OperationKind::Add,
+        quad: format!("<urn:cas-race:{seed}> <urn:p> \"v\" .")
+            .parse()
+            .unwrap(),
+    }])
+    .unwrap();
+    store
+        .put_content(&patch.id().0, &patch.canonical_bytes())
+        .await
+        .unwrap();
+    store
+        .put_commit(&AnyCommit::V1(Commit {
+            parents: vec![],
+            patch: patch.id(),
+            author: "urn:agent:cas-race".into(),
+            message: seed.into(),
+            event_time: "e".into(),
+            recorded_time: unique_branch(),
+        }))
+        .await
+        .unwrap()
 }
 
 /// A branch name unique to this process/run so parallel or repeated runs against a
@@ -46,22 +74,22 @@ async fn two_connections_cannot_both_advance_same_head() {
     );
 
     // Genesis via connection A; both connections must observe it.
-    let genesis = commit_id(b"cas-race-genesis");
+    let genesis = published_commit(&url, "genesis").await;
     store_a.compare_and_set(None, &genesis).await.unwrap();
     assert_eq!(store_a.head().await.unwrap(), Some(genesis.clone()));
     assert_eq!(store_b.head().await.unwrap(), Some(genesis.clone()));
 
     // A second genesis attempt from the other connection must lose, not silently
     // overwrite: the INSERT ... ON CONFLICT DO NOTHING affects zero rows.
-    let rival_genesis = commit_id(b"cas-race-genesis-rival");
+    let rival_genesis = published_commit(&url, "genesis-rival").await;
     assert!(matches!(
         store_b.compare_and_set(None, &rival_genesis).await,
         Err(LedgerError::HeadChanged { .. })
     ));
 
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
-    let target_a = commit_id(b"cas-race-writer-a");
-    let target_b = commit_id(b"cas-race-writer-b");
+    let target_a = published_commit(&url, "writer-a").await;
+    let target_b = published_commit(&url, "writer-b").await;
 
     let handle_a = {
         let store = Arc::clone(&store_a);

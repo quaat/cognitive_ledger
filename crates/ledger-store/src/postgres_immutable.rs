@@ -81,13 +81,15 @@ impl PostgresImmutableStore {
         Self::from_pool(pool, v1_binding).await
     }
 
-    /// Compose over an existing pool. Runs migrations.
+    /// Compose over an existing pool. Runs all migrations first.
     pub async fn from_pool(pool: PgPool, v1_binding: V1Binding) -> Result<Self, LedgerError> {
-        sqlx::migrate!("../../migrations")
-            .run(&pool)
-            .await
-            .map_err(storage)?;
-        Ok(Self { pool, v1_binding })
+        crate::schema::migrate_all(&pool).await?;
+        Ok(Self::from_pool_migrated(pool, v1_binding))
+    }
+
+    /// Compose over a pool whose schema the caller has already migrated.
+    pub fn from_pool_migrated(pool: PgPool, v1_binding: V1Binding) -> Self {
+        Self { pool, v1_binding }
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -191,6 +193,131 @@ impl PostgresImmutableStore {
             verified += 1;
         }
         Ok(verified)
+    }
+
+    /// The referenced patch must exist, hash to its id (digest-verified read → corruption
+    /// otherwise), and decode as a canonical RDF patch (`InvalidPatch` otherwise).
+    pub(crate) async fn validate_patch_of(&self, commit: &AnyCommit) -> Result<(), LedgerError> {
+        let Some(patch_bytes) = self.get_content(&commit.patch().0).await? else {
+            return Err(LedgerError::MissingPatch(commit.patch().clone()));
+        };
+        validate_patch_bytes(commit.patch(), &patch_bytes)?;
+        Ok(())
+    }
+
+    /// Publish a commit inside a caller-owned transaction (already pinned to READ
+    /// COMMITTED): typed same-graph parent checks, graph existence and v1 binding policy,
+    /// object publication, index rows, and verification of the authoritative row. The
+    /// workflow repository reuses this so candidate publication and idempotency commit
+    /// together; `put_commit` wraps it in its own transaction. The caller MUST have run
+    /// [`Self::validate_patch_of`] (or hold the patch bytes verified) first.
+    pub(crate) async fn publish_commit_in(
+        &self,
+        tx: &mut PgConnection,
+        commit: &AnyCommit,
+    ) -> Result<CommitId, LedgerError> {
+        let graph_id = self.graph_for(commit)?;
+        let bytes = commit.canonical_bytes()?;
+        let id = commit.id()?;
+        let id_s = id.to_string();
+
+        for parent in commit.parents() {
+            let row = sqlx::query("SELECT graph_id FROM commit_index WHERE id = $1")
+                .bind(parent.to_string())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(storage)?;
+            let Some(row) = row else {
+                return Err(LedgerError::MissingParent(parent.clone()));
+            };
+            let parent_graph: String = row.try_get("graph_id").map_err(storage)?;
+            if parent_graph != graph_id.as_str() {
+                return Err(LedgerError::CrossGraphParent {
+                    parent: parent.clone(),
+                    parent_graph,
+                    graph: graph_id.to_string(),
+                });
+            }
+        }
+        // Re-check existence inside the transaction so the FK on patch_id cannot surface
+        // as an untyped error if the patch row is somehow absent here.
+        let patch_present = sqlx::query("SELECT 1 FROM immutable_objects WHERE id = $1")
+            .bind(commit.patch().to_string())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(storage)?;
+        if patch_present.is_none() {
+            return Err(LedgerError::MissingPatch(commit.patch().clone()));
+        }
+        let graph_row = sqlx::query("SELECT status FROM graphs WHERE graph_id = $1")
+            .bind(graph_id.as_str())
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(storage)?;
+        let Some(graph_row) = graph_row else {
+            return Err(LedgerError::UnknownGraph(graph_id.to_string()));
+        };
+        if commit.graph_id().is_none() {
+            // ADR-0010: v1 history may only be bound to the bootstrap graph or to a graph
+            // that is explicitly receiving an audited import.
+            let status: String = graph_row.try_get("status").map_err(storage)?;
+            if status != "bootstrap" && status != "importing" {
+                return Err(LedgerError::InvalidCommit(format!(
+                    "v1 commits may only be bound to a graph in status bootstrap or importing; \
+                     {graph_id} is {status}"
+                )));
+            }
+        }
+
+        publish_object(&mut *tx, &id.0, &bytes).await?;
+        let parent_count = i16::try_from(commit.parents().len())
+            .map_err(|_| LedgerError::InvalidCommit("parent count exceeds index range".into()))?;
+        sqlx::query(
+            "INSERT INTO commit_index (id, graph_id, version, patch_id, parent_count) \
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(&id_s)
+        .bind(graph_id.as_str())
+        .bind(i16::from(commit.version()))
+        .bind(commit.patch().to_string())
+        .bind(parent_count)
+        .execute(&mut *tx)
+        .await
+        .map_err(storage)?;
+        for (position, parent) in commit.parents().iter().enumerate() {
+            let position = i16::try_from(position)
+                .map_err(|_| LedgerError::InvalidCommit("parent position exceeds range".into()))?;
+            sqlx::query(
+                "INSERT INTO commit_parents (commit_id, position, parent_id) VALUES ($1, $2, $3) \
+                 ON CONFLICT (commit_id, position) DO NOTHING",
+            )
+            .bind(&id_s)
+            .bind(position)
+            .bind(parent.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(storage)?;
+        }
+
+        // Authoritative verification: whatever row now exists (ours, or a concurrent or
+        // pre-existing one) must agree with this commit and the requested binding.
+        let row = sqlx::query(
+            "SELECT graph_id, version, patch_id, parent_count FROM commit_index WHERE id = $1",
+        )
+        .bind(&id_s)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(storage)?;
+        IndexRow::from_row(&row)?.check_against(
+            commit,
+            &id.0,
+            CheckMode::Publish {
+                requested_graph: &graph_id,
+            },
+        )?;
+        let parents = fetch_parent_rows(&mut *tx, &id_s).await?;
+        check_parent_rows(&parents, commit, &id.0)?;
+        Ok(id)
     }
 }
 
@@ -329,130 +456,22 @@ impl ImmutableStore for PostgresImmutableStore {
         Ok(Some(bytes))
     }
 
-    /// One transaction: typed same-graph parent checks, patch existence, object
+    /// One transaction: typed same-graph parent checks, patch validity, object
     /// publication, index rows, then verification of the *authoritative* index row and
     /// parent rows against the commit. Concurrent publication of the same id under an
     /// incompatible binding is resolved by the database (the second inserter waits on the
     /// unique index, does nothing, reads the winner's row, and fails with
     /// `GraphBindingConflict`); identical concurrent publications both succeed.
     async fn put_commit(&self, commit: &AnyCommit) -> Result<CommitId, LedgerError> {
-        let graph_id = self.graph_for(commit)?;
-        let bytes = commit.canonical_bytes()?;
-        let id = commit.id()?;
-        let id_s = id.to_string();
-        // The referenced patch must exist, hash to its id (digest-verified read → corruption
-        // otherwise), and decode as a canonical RDF patch. Rows are write-once, so checking
-        // before the transaction is exact and keeps parsing out of the lock window.
-        let Some(patch_bytes) = self.get_content(&commit.patch().0).await? else {
-            return Err(LedgerError::MissingPatch(commit.patch().clone()));
-        };
-        validate_patch_bytes(commit.patch(), &patch_bytes)?;
+        // Patch validity is checked before the transaction: rows are write-once, so the
+        // check is exact and keeps parsing out of the lock window.
+        self.validate_patch_of(commit).await?;
         let mut tx = self.pool.begin().await.map_err(storage)?;
-        // The conflict-resolution contract below (loser reads the winner's committed row
-        // after its blocked INSERT) is a READ COMMITTED property; pin it regardless of
-        // the server's default_transaction_isolation.
         sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
             .execute(&mut *tx)
             .await
             .map_err(storage)?;
-
-        for parent in commit.parents() {
-            let row = sqlx::query("SELECT graph_id FROM commit_index WHERE id = $1")
-                .bind(parent.to_string())
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(storage)?;
-            let Some(row) = row else {
-                return Err(LedgerError::MissingParent(parent.clone()));
-            };
-            let parent_graph: String = row.try_get("graph_id").map_err(storage)?;
-            if parent_graph != graph_id.as_str() {
-                return Err(LedgerError::CrossGraphParent {
-                    parent: parent.clone(),
-                    parent_graph,
-                    graph: graph_id.to_string(),
-                });
-            }
-        }
-        // Re-check existence inside the transaction so the FK on patch_id cannot surface
-        // as an untyped error if the patch row is somehow absent here.
-        let patch_present = sqlx::query("SELECT 1 FROM immutable_objects WHERE id = $1")
-            .bind(commit.patch().to_string())
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(storage)?;
-        if patch_present.is_none() {
-            return Err(LedgerError::MissingPatch(commit.patch().clone()));
-        }
-        let graph_row = sqlx::query("SELECT status FROM graphs WHERE graph_id = $1")
-            .bind(graph_id.as_str())
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(storage)?;
-        let Some(graph_row) = graph_row else {
-            return Err(LedgerError::UnknownGraph(graph_id.to_string()));
-        };
-        if commit.graph_id().is_none() {
-            // ADR-0010: v1 history may only be bound to the bootstrap graph or to a graph
-            // that is explicitly receiving an audited import.
-            let status: String = graph_row.try_get("status").map_err(storage)?;
-            if status != "bootstrap" && status != "importing" {
-                return Err(LedgerError::InvalidCommit(format!(
-                    "v1 commits may only be bound to a graph in status bootstrap or importing; \
-                     {graph_id} is {status}"
-                )));
-            }
-        }
-
-        publish_object(&mut tx, &id.0, &bytes).await?;
-        let parent_count = i16::try_from(commit.parents().len())
-            .map_err(|_| LedgerError::InvalidCommit("parent count exceeds index range".into()))?;
-        sqlx::query(
-            "INSERT INTO commit_index (id, graph_id, version, patch_id, parent_count) \
-             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO NOTHING",
-        )
-        .bind(&id_s)
-        .bind(graph_id.as_str())
-        .bind(i16::from(commit.version()))
-        .bind(commit.patch().to_string())
-        .bind(parent_count)
-        .execute(&mut *tx)
-        .await
-        .map_err(storage)?;
-        for (position, parent) in commit.parents().iter().enumerate() {
-            let position = i16::try_from(position)
-                .map_err(|_| LedgerError::InvalidCommit("parent position exceeds range".into()))?;
-            sqlx::query(
-                "INSERT INTO commit_parents (commit_id, position, parent_id) VALUES ($1, $2, $3) \
-                 ON CONFLICT (commit_id, position) DO NOTHING",
-            )
-            .bind(&id_s)
-            .bind(position)
-            .bind(parent.to_string())
-            .execute(&mut *tx)
-            .await
-            .map_err(storage)?;
-        }
-
-        // Authoritative verification: whatever row now exists (ours, or a concurrent or
-        // pre-existing one) must agree with this commit and the requested binding.
-        let row = sqlx::query(
-            "SELECT graph_id, version, patch_id, parent_count FROM commit_index WHERE id = $1",
-        )
-        .bind(&id_s)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(storage)?;
-        IndexRow::from_row(&row)?.check_against(
-            commit,
-            &id.0,
-            CheckMode::Publish {
-                requested_graph: &graph_id,
-            },
-        )?;
-        let parents = fetch_parent_rows(&mut *tx, &id_s).await?;
-        check_parent_rows(&parents, commit, &id.0)?;
-
+        let id = self.publish_commit_in(&mut tx, commit).await?;
         tx.commit().await.map_err(storage)?;
         Ok(id)
     }

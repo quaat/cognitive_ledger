@@ -108,12 +108,23 @@ async fn migrate(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let graph = GraphId::new(args.graph.clone())?;
     // Read-only: a mistyped source path is an error, never a freshly created empty store.
     let source = FileStore::open_existing(&args.source)?;
+    // Schema order matters for a legacy database whose shared ref already points at
+    // filesystem-only content: bring the schema to the content level (0005), import and
+    // verify the content, and only then apply the workflow schema (0006), whose guard
+    // requires every ref head to be an indexed commit of its graph.
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&args.database_url)
+        .await?;
+    ledger_store::schema::migrate_up_to(&pool, ledger_store::schema::CONTENT_SCHEMA_VERSION)
+        .await?;
     let destination =
-        PostgresImmutableStore::connect(&args.database_url, V1Binding::BindTo(graph)).await?;
-    let refs = PgRefStore::connect_ref(&args.database_url, &args.graph, &args.branch).await?;
+        PostgresImmutableStore::from_pool_migrated(pool.clone(), V1Binding::BindTo(graph));
+    let refs = PgRefStore::with_ref_migrated(pool.clone(), &args.graph, &args.branch);
     let report = FsToPgMigration::new(source, destination, refs)?
         .run()
         .await?;
+    ledger_store::schema::migrate_all(&pool).await?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {

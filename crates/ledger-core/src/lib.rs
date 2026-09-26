@@ -70,6 +70,18 @@ pub enum LedgerError {
         before: Option<CommitId>,
         after: Option<CommitId>,
     },
+    #[error("LINEAGE_MISMATCH: {0}")]
+    LineageMismatch(String),
+    #[error("IDEMPOTENCY_CONFLICT: the idempotency key was already used with a different request")]
+    IdempotencyConflict,
+    #[error(
+        "GRAPH_NOT_ACTIVE: graph {graph} is {status}; normal acceptance requires an active graph"
+    )]
+    GraphNotActive { graph: String, status: String },
+    #[error("BASE_MISMATCH: the request deletes a quad absent from the base state: {0}")]
+    BaseMismatch(String),
+    #[error("NO_EFFECTIVE_CHANGE: every requested operation is a no-op against the base state")]
+    NoEffectiveChange,
     #[error("graph {0} already exists")]
     GraphAlreadyExists(String),
     #[error("graph {0} does not exist")]

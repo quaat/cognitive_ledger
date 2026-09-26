@@ -326,19 +326,62 @@ async fn interrupted_migration_resumes_to_the_same_result() {
     assert_eq!(refs.head().await.unwrap(), None);
 }
 
+/// The test URL with its database name replaced (`…/ledger?…` → `…/<name>?…`).
+fn url_for_database(base: &str, name: &str) -> String {
+    let (head, query) = match base.split_once('?') {
+        Some((h, q)) => (h, Some(q)),
+        None => (base, None),
+    };
+    let slash = head.rfind('/').expect("database url has a path");
+    let mut url = format!("{}/{name}", &head[..slash]);
+    if let Some(q) = query {
+        url.push('?');
+        url.push_str(q);
+    }
+    url
+}
+
+async fn fresh_database(prefix: &str) -> (String, sqlx::PgPool) {
+    let base = database_url();
+    let admin = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&base)
+        .await
+        .unwrap();
+    let name = unique(prefix).replace('-', "_").to_lowercase();
+    sqlx::query(&format!("CREATE DATABASE {name}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let url = url_for_database(&base, &name);
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&url)
+        .await
+        .unwrap();
+    (url, pool)
+}
+
+/// The pre-P1.2 deployed topology (filesystem objects + PostgreSQL ref) can only exist on
+/// a database below migration 0006, because 0006 requires every ref head to be an indexed
+/// commit. Upgrading such a database is a two-step cutover: the schema stops at the
+/// content level, content is imported and verified against the existing shared ref, and
+/// only then does the workflow schema apply. A wrong source directory never succeeds.
 #[tokio::test]
 #[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
-async fn head_in_shared_refs_topology_is_verified_and_wrong_source_is_refused() {
-    // The deployed pre-P1.2 topology: FileStore objects + PgRefStore head. `refs/main` on
-    // disk is never written; HEAD lives only in PostgreSQL.
+async fn legacy_shared_ref_topology_upgrades_only_after_content_is_imported() {
+    let (url, pool) = fresh_database("ledger_legacy").await;
+    ledger_store::schema::migrate_up_to(&pool, ledger_store::schema::CONTENT_SCHEMA_VERSION)
+        .await
+        .unwrap();
+    // Legacy topology: HEAD lives only in the shared refs table; refs/main is never written.
     let dir = tempfile::tempdir().unwrap();
-    let branch = unique("topology");
     let fs = Arc::new(FileStore::open(dir.path()).unwrap());
-    let refs: Arc<dyn RefStore> = Arc::new(
-        PgRefStore::connect_ref(&database_url(), "default", &branch)
-            .await
-            .unwrap(),
-    );
+    let refs: Arc<dyn RefStore> = Arc::new(PgRefStore::with_ref_migrated(
+        pool.clone(),
+        "default",
+        "main",
+    ));
     let legacy = Ledger::with_ref_store(fs.clone(), refs.clone());
     let salt = unique("t");
     let c1 = legacy
@@ -351,31 +394,59 @@ async fn head_in_shared_refs_topology_is_verified_and_wrong_source_is_refused() 
         })
         .await
         .unwrap();
-    assert_eq!(
-        fs.head().await.unwrap(),
-        None,
-        "filesystem ref is not used in this topology"
-    );
+    assert_eq!(fs.head().await.unwrap(), None);
     assert_eq!(refs.head().await.unwrap(), Some(c1.clone()));
+
+    // Upgrading straight to the workflow schema is refused with an actionable message.
+    let error = ledger_store::schema::migrate_all(&pool).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("not indexed commits of their graph"),
+        "{error}"
+    );
+    assert!(error.to_string().contains(&c1.to_string()), "{error}");
+    // A failed sqlx run keeps its advisory lock on that pooled connection: reconnect.
+    pool.close().await;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&url)
+        .await
+        .unwrap();
 
     // Wrong source directory: an unrelated (empty) store must not "succeed".
     let wrong = tempfile::tempdir().unwrap();
     FileStore::open(wrong.path()).unwrap();
-    let error = migration(wrong.path(), &branch)
-        .await
-        .run()
-        .await
-        .unwrap_err();
+    let destination = PostgresImmutableStore::from_pool_migrated(
+        pool.clone(),
+        V1Binding::BindTo(GraphId::new("default").unwrap()),
+    );
+    let error = FsToPgMigration::new(
+        FileStore::open_existing(wrong.path()).unwrap(),
+        destination.clone(),
+        PgRefStore::with_ref_migrated(pool.clone(), "default", "main"),
+    )
+    .unwrap()
+    .run()
+    .await
+    .unwrap_err();
     assert!(
         matches!(error, LedgerError::MissingTarget(ref h) if *h == c1),
         "{error}"
     );
-    // A mistyped path is an error, not an empty store.
     assert!(FileStore::open_existing(dir.path().join("does-not-exist")).is_err());
 
     // The right source: HEAD is taken from the shared ref, content is imported and
     // verified against it, and the existing ref is reported as already migrated.
-    let report = migration(dir.path(), &branch).await.run().await.unwrap();
+    let report = FsToPgMigration::new(
+        FileStore::open_existing(dir.path()).unwrap(),
+        destination.clone(),
+        PgRefStore::with_ref_migrated(pool.clone(), "default", "main"),
+    )
+    .unwrap()
+    .run()
+    .await
+    .unwrap();
     assert_eq!(report.outcome, MigrationOutcome::AlreadyMigrated);
     assert_eq!(report.source_head, None);
     assert_eq!(
@@ -383,9 +454,32 @@ async fn head_in_shared_refs_topology_is_verified_and_wrong_source_is_refused() 
         Some(c1.to_string().as_str())
     );
     assert_eq!(report.head_state_quads, Some(1));
-    let destination = destination_ledger(&branch).await;
-    assert_eq!(destination.verify_head().await.unwrap(), Some(c1.clone()));
-    assert_eq!(destination.state_at(&c1).await.unwrap().len(), 1);
+
+    // Now the workflow schema applies, and the shared ref is a schema-guaranteed target.
+    ledger_store::schema::migrate_all(&pool).await.unwrap();
+    let shared: Arc<dyn ImmutableStore> = Arc::new(destination);
+    let upgraded = Ledger::with_stores(
+        shared,
+        Arc::new(PgRefStore::with_ref_migrated(
+            pool.clone(),
+            "default",
+            "main",
+        )),
+    );
+    assert_eq!(upgraded.verify_head().await.unwrap(), Some(c1.clone()));
+    assert_eq!(upgraded.state_at(&c1).await.unwrap().len(), 1);
+    let row =
+        sqlx::query("SELECT version FROM refs WHERE graph_id = 'default' AND branch = 'main'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let version: i64 = sqlx::Row::try_get(&row, "version").unwrap();
+    assert_eq!(version, 1);
+    // The cutover tool's first step (content schema only) is a no-op on a database that is
+    // already fully upgraded, so the tool can be re-run after a cutover.
+    ledger_store::schema::migrate_up_to(&pool, ledger_store::schema::CONTENT_SCHEMA_VERSION)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -564,14 +658,21 @@ async fn destination_collision_and_conflicting_head_abort_without_overwriting() 
     let stored: Vec<u8> = sqlx::Row::try_get(&row, "bytes").unwrap();
     assert_eq!(stored, b"damaged", "immutable bytes are never overwritten");
 
-    // Conflicting destination HEAD: the ref already points elsewhere.
+    // Conflicting destination HEAD: the ref already points elsewhere. Since 0006 a ref
+    // must target an indexed commit, so import the history on a helper branch first and
+    // point the target branch at the *older* commit.
     let dir = tempfile::tempdir().unwrap();
     let (_source, commits) = seed_v1_history(dir.path(), &unique("conflict")).await;
+    migration(dir.path(), &unique("conflict-import"))
+        .await
+        .run()
+        .await
+        .unwrap();
     let branch = unique("conflict");
     let refs = PgRefStore::connect_ref(&database_url(), "default", &branch)
         .await
         .unwrap();
-    let elsewhere = CommitId(ContentId::for_bytes(b"some other history"));
+    let elsewhere = commits[0].clone();
     refs.compare_and_set(None, &elsewhere).await.unwrap();
     let error = migration(dir.path(), &branch)
         .await
@@ -628,9 +729,15 @@ async fn cutover_fails_closed_when_refs_move_during_migration() {
         "stale source state never installs a ref"
     );
 
-    // 2. An existing destination HEAD moves during the run.
+    // 2. An existing destination HEAD moves during the run (content pre-imported on a
+    //    helper branch so the FK allows the pre-set ref).
     let dir = tempfile::tempdir().unwrap();
     let (_source, commits) = seed_v1_history(dir.path(), &unique("mv-dst")).await;
+    migration(dir.path(), &unique("mv-dst-import"))
+        .await
+        .run()
+        .await
+        .unwrap();
     let branch = unique("mv-dst");
     let refs = PgRefStore::connect_ref(&database_url(), "default", &branch)
         .await

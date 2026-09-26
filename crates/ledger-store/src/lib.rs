@@ -5,7 +5,7 @@ use ledger_core::{
     AnyCommit, COMMIT_V1_HEADER, COMMIT_V2_HEADER, Commit, CommitId, ContentId, ImmutableStore,
     LedgerError, PatchId, RefStore,
 };
-use ledger_rdf::{OperationKind, Patch, Quad};
+use ledger_rdf::{Patch, Quad};
 use std::{
     collections::{BTreeSet, HashSet},
     fs::{self, OpenOptions},
@@ -425,11 +425,20 @@ pub use postgres::PgRefStore;
 #[cfg(feature = "postgres")]
 mod postgres_immutable;
 #[cfg(feature = "postgres")]
+pub mod schema;
+#[cfg(feature = "postgres")]
 pub use postgres_immutable::{PostgresImmutableStore, V1Binding};
 #[cfg(feature = "postgres")]
 mod postgres_graphs;
 #[cfg(feature = "postgres")]
 pub use postgres_graphs::{GraphRecord, GraphStatus, NewGraph, PgGraphs};
+#[cfg(feature = "postgres")]
+mod postgres_workflow;
+#[cfg(feature = "postgres")]
+pub use postgres_workflow::{
+    AcceptRequest, Accepted, FailPoint, PostgresLedgerStore, PrepareRequest, Prepared,
+    RejectRequest, Rejected, RequestScope, ValidationPolicy, WorkflowRepository,
+};
 #[cfg(feature = "postgres")]
 mod migrate_fs_to_pg;
 #[cfg(feature = "postgres")]
@@ -484,22 +493,29 @@ mod postgres {
         }
 
         /// Compose over an existing pool and coordinate a specific (graph, branch)
-        /// ref. Runs migrations. The schema is structurally ready for named graphs
-        /// and branches; Milestone 0002 only exercises ('default', 'main').
+        /// ref. Runs all migrations first.
         pub async fn with_ref(
             pool: sqlx::PgPool,
             graph_id: impl Into<String>,
             branch: impl Into<String>,
         ) -> Result<Self, LedgerError> {
-            sqlx::migrate!("../../migrations")
-                .run(&pool)
-                .await
-                .map_err(storage)?;
-            Ok(Self {
+            crate::schema::migrate_all(&pool).await?;
+            Ok(Self::with_ref_migrated(pool, graph_id, branch))
+        }
+
+        /// Compose over a pool whose schema the caller has already migrated (an explicit
+        /// migration entry point, or an administrative tool that must run against a
+        /// partially upgraded database).
+        pub fn with_ref_migrated(
+            pool: sqlx::PgPool,
+            graph_id: impl Into<String>,
+            branch: impl Into<String>,
+        ) -> Self {
+            Self {
                 pool,
                 graph_id: graph_id.into(),
                 branch: branch.into(),
-            })
+            }
         }
 
         /// The graph this ref store coordinates.
@@ -540,17 +556,42 @@ mod postgres {
             expected: Option<&CommitId>,
             new: &CommitId,
         ) -> Result<(), LedgerError> {
+            // The raw primitive writes no ref event, so it is confined to graphs that are
+            // not yet serving normal acceptance (bootstrap/importing, ADR-0013); accepted
+            // transitions on active graphs go through WorkflowRepository. The status is
+            // share-locked in the same transaction as the move, so an activation cannot
+            // slip in between the check and the update.
+            let mut tx = self.pool.begin().await.map_err(storage)?;
+            let status: Option<String> =
+                sqlx::query("SELECT status FROM graphs WHERE graph_id = $1 FOR SHARE")
+                    .bind(&self.graph_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(storage)?
+                    .map(|row| row.try_get("status").map_err(storage))
+                    .transpose()?;
+            match status.as_deref() {
+                Some("bootstrap" | "importing") => {}
+                Some(other) => {
+                    return Err(LedgerError::InvalidCommit(format!(
+                        "raw ref movement is not permitted on graph {} ({other}); accepted \
+                         transitions go through WorkflowRepository",
+                        self.graph_id
+                    )));
+                }
+                None => return Err(LedgerError::UnknownGraph(self.graph_id.clone())),
+            }
             let new_s = new.to_string();
             let rows = match expected {
                 Some(expected) => sqlx::query(
-                    "UPDATE refs SET head = $1, updated_at = now() \
+                    "UPDATE refs SET head = $1, version = version + 1, updated_at = now() \
                      WHERE graph_id = $2 AND branch = $3 AND head = $4",
                 )
                 .bind(&new_s)
                 .bind(&self.graph_id)
                 .bind(&self.branch)
                 .bind(expected.to_string())
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(storage)?
                 .rows_affected(),
@@ -561,11 +602,12 @@ mod postgres {
                 .bind(&self.graph_id)
                 .bind(&self.branch)
                 .bind(&new_s)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(storage)?
                 .rows_affected(),
             };
+            tx.commit().await.map_err(storage)?;
             if rows == 1 {
                 Ok(())
             } else {
@@ -703,16 +745,7 @@ impl Ledger {
                 .await?
                 .ok_or_else(|| LedgerError::NotFound(commit.patch().0.clone()))?;
             let patch = validate_patch_bytes(commit.patch(), &bytes)?;
-            for op in patch.operations() {
-                match op.kind {
-                    OperationKind::Add => {
-                        state.insert(op.quad.clone());
-                    }
-                    OperationKind::Delete => {
-                        state.remove(&op.quad);
-                    }
-                }
-            }
+            ledger_rdf::apply_patch(&mut state, &patch);
         }
         Ok(state)
     }

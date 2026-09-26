@@ -356,9 +356,13 @@ async fn refs_and_commits_cannot_reference_unknown_graphs_and_graphs_with_histor
         .create(&new_graph(&with_ref, "tenant-a", None))
         .await
         .unwrap();
+    let anchor = store
+        .put_commit(&v2(&with_ref, &p.id(), "anchor"))
+        .await
+        .unwrap();
     sqlx::query("INSERT INTO refs (graph_id, branch, head) VALUES ($1, 'main', $2)")
         .bind(&with_ref)
-        .bind("sha256:0000000000000000000000000000000000000000000000000000000000000000")
+        .bind(anchor.to_string())
         .execute(pool)
         .await
         .unwrap();
@@ -401,9 +405,13 @@ async fn refs_and_commits_cannot_reference_unknown_graphs_and_graphs_with_histor
         .unwrap();
     // The bootstrap graph: give it a ref of our own first so this holds regardless of
     // which other suites ran before, then confirm it cannot be deleted.
+    let bootstrap_anchor = store
+        .put_commit(&v2("default", &p.id(), "bootstrap anchor"))
+        .await
+        .unwrap();
     sqlx::query("INSERT INTO refs (graph_id, branch, head) VALUES ('default', $1, $2)")
         .bind(unique("bootstrap-anchor"))
-        .bind("sha256:0000000000000000000000000000000000000000000000000000000000000000")
+        .bind(bootstrap_anchor.to_string())
         .execute(pool)
         .await
         .unwrap();
@@ -468,13 +476,15 @@ async fn immutable_tables_are_write_once_and_ref_identity_is_immutable() {
         .execute(pool)
         .await
         .unwrap();
-    sqlx::query("UPDATE refs SET head = $3 WHERE graph_id = $1 AND branch = $2")
-        .bind(&graph)
-        .bind(&branch)
-        .bind(child_id.to_string())
-        .execute(pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE refs SET head = $3, version = version + 1 WHERE graph_id = $1 AND branch = $2",
+    )
+    .bind(&graph)
+    .bind(&branch)
+    .bind(child_id.to_string())
+    .execute(pool)
+    .await
+    .unwrap();
     let rename =
         sqlx::query("UPDATE refs SET branch = 'renamed' WHERE graph_id = $1 AND branch = $2")
             .bind(&graph)
@@ -705,14 +715,8 @@ async fn upgrade_from_bootstrap_state_converges_with_clean_install() {
     //    upgrade fully. Compare the resulting schema with a clean install.
     let (_up_url, up) = fresh_database("ledger_up").await;
     migrator_up_to(1).run(&up).await.unwrap();
-    let head = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
-    sqlx::query("INSERT INTO refs (graph_id, branch, head) VALUES ('default', 'main', $1)")
-        .bind(head)
-        .execute(&up)
-        .await
-        .unwrap();
-    migrator_up_to(3).run(&up).await.unwrap();
-    // A genuine v1 commit indexed under 'default' by the pre-0004 store.
+    // The bootstrap ref points at the v1 commit the pre-0004 store had written; since
+    // 0006 the ref FK requires exactly that (a fake head would fail the upgrade guard).
     let p = patch("bootstrap");
     let legacy = AnyCommit::V1(Commit {
         parents: vec![],
@@ -724,6 +728,14 @@ async fn upgrade_from_bootstrap_state_converges_with_clean_install() {
     });
     let legacy_bytes = legacy.canonical_bytes().unwrap();
     let legacy_id = legacy.id().unwrap();
+    let head_string = legacy_id.to_string();
+    let head = head_string.as_str();
+    sqlx::query("INSERT INTO refs (graph_id, branch, head) VALUES ('default', 'main', $1)")
+        .bind(head)
+        .execute(&up)
+        .await
+        .unwrap();
+    migrator_up_to(3).run(&up).await.unwrap();
     for (id, bytes) in [
         (p.id().0.to_string(), p.canonical_bytes()),
         (legacy_id.to_string(), legacy_bytes),
@@ -798,6 +810,15 @@ async fn upgrade_from_bootstrap_state_converges_with_clean_install() {
     assert!(upgraded.contains("constraint refs.refs_graph_fk"));
     assert!(upgraded.contains("constraint commit_index.commit_index_graph_fk"));
     assert!(upgraded.contains("trigger graphs.graphs_identity_immutable"));
+    assert!(upgraded.contains("constraint refs.refs_head_fk"));
+    assert!(upgraded.contains("trigger refs.refs_version_monotonic"));
+    let row =
+        sqlx::query("SELECT version FROM refs WHERE graph_id = 'default' AND branch = 'main'")
+            .fetch_one(&up)
+            .await
+            .unwrap();
+    let version: i64 = row.get("version");
+    assert_eq!(version, 1, "existing refs start at version 1 after upgrade");
     assert_eq!(upgraded, fresh, "upgrade and clean install must converge");
 }
 

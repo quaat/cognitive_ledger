@@ -93,7 +93,7 @@ Validation failure MUST NOT corrupt existing history. Rejected proposals and the
 
 ### Refs, branch events, and history
 
-Branches are named mutable references to immutable commits. Every create, advance, fast-forward, merge, delete, or administrative repair MUST be an atomic CAS operation and eventually produce an auditable ref event. Force updates and silent rebases are prohibited. Deleting or moving a ref does not delete commits. Garbage collection, when introduced, requires an explicit retention policy and must never race reachability publication.
+Branches are named mutable references to immutable commits. Every create, advance, fast-forward, merge, delete, or administrative repair MUST be an atomic CAS operation and eventually produce an auditable ref event. *(Status 2026-09-26: genesis and advance on PostgreSQL run as one transaction with a monotonic ref version, a ref event, a decision, a projection-outbox row and a durable idempotency result, with lineage enforced against the verified commit index — ADR-0013, Plan 0004 P1.3. Merge, delete and administrative repair are later phases.)* Force updates and silent rebases are prohibited. Deleting or moving a ref does not delete commits. Garbage collection, when introduced, requires an explicit retention policy and must never race reachability publication.
 
 ### Three-way merge semantics (planned)
 

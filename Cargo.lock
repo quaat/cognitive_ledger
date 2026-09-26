@@ -791,6 +791,7 @@ dependencies = [
  "ledger-core",
  "ledger-store",
  "serde_json",
+ "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",

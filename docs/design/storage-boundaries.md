@@ -22,13 +22,27 @@ same-graph parent relation from bytes and fail on any tampering. Reads distingui
 one database agree and reconstruct each other's commits; this is the only supported
 multi-replica topology, because a shared ref must never reference node-local content.
 
+## Atomic workflow persistence (PostgreSQL, ADR-0013)
+`WorkflowRepository` (reached through the `PostgresLedgerStore` composition root) makes
+every accepted transition one transaction: idempotency result, active-graph check, ref row
+lock, lineage predicates against the verified `commit_index`/`commit_parents`, ref advance
+with `version + 1`, `ref_events` row, accepted `decisions` row, `projection_outbox` row.
+`prepare` is a transaction too (effective delta, requested + effective patch, v2 candidate,
+proposal, idempotency), so a retried prepare replays the exact original `CommitId`.
+`reject` records a decision without moving the ref; `mark_superseded` is explicit. Fault
+injection (`FailPoint`) proves that no failure before COMMIT leaves any mutable effect and
+that a lost response after COMMIT replays. Raw `PgRefStore` CAS is the bootstrap/admin
+primitive only (it bumps `version`, writes no event); production accepted transitions go
+through the repository. Migration 0006's composite FK means a PostgreSQL ref can only
+target an indexed commit of its graph.
+
 ## Runtime configuration (`ledger-server`)
 | Variable | Meaning |
 |---|---|
 | `LEDGER_ADDR` | Listen address. Default `127.0.0.1:8080` (loopback until the authenticated API exists, P1.4); containers and operators set `0.0.0.0:8080` explicitly — the Dockerfile does. |
 | `LEDGER_DATA_DIR` | Filesystem root for the filesystem backend (default `./data`). |
 | `LEDGER_DATABASE_URL` | When set: PostgreSQL holds the ref head **and, by default, the immutable objects**. Unset: filesystem-only development mode. Set but empty, or not valid Unicode: startup error (no silent filesystem fallback). Carries credentials; never logged. |
-| `LEDGER_IMMUTABLE_BACKEND` | `postgres` (default when a database URL is set) or `filesystem`. `filesystem` is single-host only and logs a conspicuous warning: refs in the shared database would point at node-local content. `postgres` without a database URL is a configuration error (no silent fallback to node-local objects). Any other value refuses to start. |
+| `LEDGER_IMMUTABLE_BACKEND` | `postgres` (default when a database URL is set). `filesystem` is accepted only without a database URL (development mode); combined with a database URL it is refused since migration 0006 (PostgreSQL refs must target indexed commits). `postgres` without a database URL is a configuration error. Any other value refuses to start. |
 | (shutdown) | Graceful shutdown on SIGINT and, on Unix, SIGTERM: stop accepting, drain open connections, exit after at most 30 s regardless (PostgreSQL rolls back any unfinished publication). |
 | (startup) | With any backend the server verifies that the current HEAD resolves in the configured immutable store and refuses to start otherwise. |
 

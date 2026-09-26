@@ -1,5 +1,8 @@
 //! Restricted deterministic RDF patch protocol for the walking skeleton.
 
+mod effective_delta;
+pub use effective_delta::{DeltaError, DeltaPolicy, apply_patch, effective_delta};
+
 use ledger_core::{ContentId, PatchId};
 use oxttl::NQuadsParser;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};

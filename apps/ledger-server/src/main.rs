@@ -1,5 +1,5 @@
-use ledger_core::{GraphId, ImmutableStore};
-use ledger_store::{FileStore, Ledger, PgRefStore, PostgresImmutableStore, V1Binding};
+use ledger_core::{GraphId, ImmutableStore, RefStore};
+use ledger_store::{Ledger, PgRefStore, PostgresLedgerStore, V1Binding};
 use std::{env, future::Future, sync::Arc, time::Duration};
 use tracing::{info, warn};
 
@@ -14,11 +14,9 @@ enum Backend {
     /// No database: filesystem refs and objects (development only).
     FilesystemOnly,
     /// PostgreSQL refs and PostgreSQL immutable objects — the shared, multi-replica-safe
-    /// default whenever a database URL is present.
+    /// topology whenever a database URL is present (and, since migration 0006, the only
+    /// one PostgreSQL refs permit).
     SharedPostgres,
-    /// PostgreSQL refs with node-local filesystem objects. Explicit single-host opt-in;
-    /// a second replica would read refs whose content it does not have.
-    SingleHostFilesystem,
 }
 
 /// Pure selection so the defaulting rules are unit-testable:
@@ -27,7 +25,7 @@ enum Backend {
 /// url absent,  backend absent|filesystem → filesystem development mode
 /// url absent,  backend postgres          → configuration error (no silent fallback)
 /// url present, backend absent|postgres   → shared PostgreSQL
-/// url present, backend filesystem        → explicit single-host mode
+/// url present, backend filesystem        → configuration error since migration 0006
 /// url ""                                 → configuration error (set it or unset it)
 /// ```
 fn select_backend(database_url: Option<&str>, backend: Option<&str>) -> Result<Backend, String> {
@@ -46,7 +44,16 @@ fn select_backend(database_url: Option<&str>, backend: Option<&str>) -> Result<B
                 .into(),
         ),
         (Some(_), None | Some("postgres")) => Ok(Backend::SharedPostgres),
-        (Some(_), Some("filesystem")) => Ok(Backend::SingleHostFilesystem),
+        // Since migration 0006 a PostgreSQL ref must point at an indexed commit of its
+        // graph (refs → commit_index FK), so node-local objects behind shared refs cannot
+        // work at all: refuse instead of failing on the first commit.
+        (Some(_), Some("filesystem")) => Err(
+            "LEDGER_IMMUTABLE_BACKEND=filesystem with LEDGER_DATABASE_URL is no longer supported \
+             (migration 0006 requires every PostgreSQL ref to target an indexed commit); use the \
+             shared PostgreSQL backend, or unset LEDGER_DATABASE_URL for filesystem-only \
+             development mode"
+                .into(),
+        ),
         (_, Some(other)) => Err(format!(
             "LEDGER_IMMUTABLE_BACKEND must be 'postgres' (default with a database URL) or \
              'filesystem', got {other:?}"
@@ -90,30 +97,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let url = database_url
                 .as_deref()
                 .expect("selected only with a database url");
-            let refs = Arc::new(PgRefStore::connect(url).await?);
             let bootstrap = GraphId::new("default")?;
-            let store: Arc<dyn ImmutableStore> =
-                Arc::new(PostgresImmutableStore::connect(url, V1Binding::BindTo(bootstrap)).await?);
+            // One pool for immutable content, graph authority and the workflow repository
+            // (P1.3). The HTTP surface still uses the bootstrap v1 write path through the
+            // raw ref primitive until the authenticated API (P1.4) routes prepare/accept.
+            let store = PostgresLedgerStore::connect(url, V1Binding::BindTo(bootstrap)).await?;
+            let refs: Arc<dyn RefStore> = Arc::new(PgRefStore::with_ref_migrated(
+                store.pool().clone(),
+                "default",
+                "main",
+            ));
+            let immutable: Arc<dyn ImmutableStore> = Arc::new(store.immutable().clone());
             info!("ref coordination: postgresql; immutable objects: postgresql (shared)");
             warn!(
                 "bootstrap topology: v1 commits are bound to the non-production graph 'default' \
-                 (ADR-0010); this is not a multi-tenant deployment"
+                 (ADR-0010) through the raw ref primitive (no ref events); production accepted \
+                 transitions use WorkflowRepository once the authenticated API lands (P1.4)"
             );
-            Ledger::with_stores(store, refs)
-        }
-        Backend::SingleHostFilesystem => {
-            let url = database_url
-                .as_deref()
-                .expect("selected only with a database url");
-            let refs = Arc::new(PgRefStore::connect(url).await?);
-            let store = Arc::new(FileStore::open(&data)?);
-            warn!(
-                data_dir = %data,
-                "SINGLE-HOST MODE: shared PostgreSQL refs point at node-local filesystem \
-                 objects; a second replica sharing this database would read refs whose \
-                 content it does not have. Run exactly one ledger process against it."
-            );
-            Ledger::with_ref_store(store, refs)
+            Ledger::with_stores(immutable, refs)
         }
     };
     // Refuse to serve a HEAD whose content (commit and patch) is not valid in the
@@ -222,11 +223,9 @@ mod tests {
     }
 
     #[test]
-    fn filesystem_objects_with_shared_refs_is_an_explicit_opt_in() {
-        assert_eq!(
-            select_backend(Some("postgres://x"), Some("filesystem")),
-            Ok(Backend::SingleHostFilesystem)
-        );
+    fn filesystem_objects_with_shared_refs_is_refused_since_migration_0006() {
+        let error = select_backend(Some("postgres://x"), Some("filesystem")).unwrap_err();
+        assert!(error.contains("migration 0006"), "{error}");
     }
 
     #[test]

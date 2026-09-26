@@ -80,6 +80,60 @@ with the same digest returns the original candidate, and a different digest retu
 `IDEMPOTENCY_CONFLICT`. This matters most once autonomous agents are the callers and
 retries are automatic.
 
+## Implementation clarifications (P1.3, 2026-09-26)
+- **Repository shape.** `WorkflowRepository` (`ledger-store`, PostgreSQL only) exposes
+  `prepare`, `accept`, `reject`, `mark_superseded`; `PostgresLedgerStore` is the
+  composition root sharing one pool with the immutable store and graph authority, so the
+  candidate publication helper runs inside the workflow transaction.
+- **Prepare is transactional too.** Effective-delta reduction (ADR-0008, strict on
+  protected refs), requested-patch and effective-patch publication, v2 candidate
+  publication, the proposal row and the idempotency result commit together. A crash leaves
+  no candidate; a retry replays the exact original `CommitId`.
+- **Idempotency rows are results, not reservations.** Every workflow transaction first
+  takes a transaction-scoped advisory lock on its idempotency scope `(tenant, principal,
+  graph, operation, key)` and then reads the stored result, so identical concurrent
+  requests serialize deterministically: the second waits for the first to commit and
+  replays its result (genesis included); a different digest is `IDEMPOTENCY_CONFLICT`.
+  The result row is inserted inside the transaction, so a visible row is always a
+  completed result and a rolled-back attempt leaves nothing.
+- **Tenant and proposal binding.** The repository verifies the graph belongs to the
+  principal's tenant (a foreign or missing graph is `UNKNOWN_GRAPH`, so nothing leaks) and
+  that the candidate has a proposal bound to exactly the requested graph, branch and
+  expected head; commits that never went through `prepare` are not accepted or rejected.
+  Branch names, idempotency keys and reasons are bounded up front and by CHECK constraints.
+- **Lineage predicates run against the verified index inside the transaction**, after
+  `SELECT … FOR UPDATE` on the ref row: candidate indexed under the requested graph;
+  genesis = ref absent, `expected_head = None`, `parent_count = 0`; advance = ref head
+  equals `expected_head` and `parents[0] = expected_head`; anything else is
+  `LINEAGE_MISMATCH` (or `HEAD_CHANGED` when the ref moved). Merge (second parent) waits
+  for Phase 5; reset is unsupported.
+- **Schema guarantee.** Migration 0006 adds `refs.version` (monotonic by trigger),
+  `refs.protected`, the composite FK `refs(graph_id, head) → commit_index(graph_id, id)`,
+  and append-only `proposals`, `ref_events`, `decisions`, `projection_outbox` (delivery
+  columns mutable), `idempotency`. Consequence: PostgreSQL refs can only target indexed
+  commits, so the legacy "filesystem objects + PostgreSQL ref" topology is refused after
+  0006; its cutover migrates the schema to 0005, imports content, then continues.
+- **Graph lifecycle.** Normal prepare/accept require `graphs.status = 'active'`
+  (`GRAPH_NOT_ACTIVE`). Bootstrap and importing graphs move only through the
+  administrative paths (raw ref primitive, cutover tool).
+- **Decisions.** A candidate carries at most one terminal decision (accepted, rejected,
+  superseded), enforced by a unique index on `decisions.candidate_commit`; deciding it
+  again (sequentially or concurrently) is `LINEAGE_MISMATCH`. Composite foreign keys tie an
+  accepted decision and its outbox row to the exact ref event (same graph, branch, version
+  and commit). Supersession is an explicit call
+  for a proposal whose expected head is no longer the ref head; nothing supersedes
+  automatically. `validation_ids` is empty in P1.3 and no validation record is
+  fabricated: P1.3 verifies atomicity under `ValidationPolicy::NoValidation`, which is
+  **not** production protected semantic acceptance (Phase 2).
+- **Raw `PgRefStore` CAS** remains for bootstrap/admin/tests, bumps `version`, writes no
+  ref event, and is refused on `active` graphs (only `bootstrap`/`importing` graphs may be
+  moved by it; the status is share-locked in the same transaction as the move). A graph
+  imported this way and later activated therefore has refs at `version ≥ 1` with no
+  genesis event: its audit trail starts at its first workflow `advance`, and consumers
+  (Phase 3 projector, replay) MUST NOT assume a genesis event exists for every ref. It is the bootstrap v1 write path of the HTTP surface until the
+  authenticated API (P1.4) routes `prepare`/`accept` through the repository.
+  `refs.protected` is set at creation and immutable until Phase 4 branch policy.
+
 ## Alternatives considered
 - **Separate writes per concern.** A crash between writes yields partial acceptance: a
   moved ref with no decision, or a missing outbox event that strands the projection.

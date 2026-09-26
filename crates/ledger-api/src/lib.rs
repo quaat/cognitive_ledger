@@ -134,6 +134,31 @@ impl From<LedgerError> for ApiError {
                 code: "GRAPH_BINDING_CONFLICT",
                 message: e.to_string(),
             },
+            LedgerError::LineageMismatch(_) => Self {
+                status: StatusCode::CONFLICT,
+                code: "LINEAGE_MISMATCH",
+                message: e.to_string(),
+            },
+            LedgerError::IdempotencyConflict => Self {
+                status: StatusCode::CONFLICT,
+                code: "IDEMPOTENCY_CONFLICT",
+                message: e.to_string(),
+            },
+            LedgerError::BaseMismatch(_) => Self {
+                status: StatusCode::PRECONDITION_FAILED,
+                code: "BASE_MISMATCH",
+                message: e.to_string(),
+            },
+            LedgerError::NoEffectiveChange => Self {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "NO_EFFECTIVE_CHANGE",
+                message: e.to_string(),
+            },
+            LedgerError::GraphNotActive { .. } => Self {
+                status: StatusCode::CONFLICT,
+                code: "GRAPH_NOT_ACTIVE",
+                message: e.to_string(),
+            },
             LedgerError::GraphAlreadyExists(_) => Self {
                 status: StatusCode::CONFLICT,
                 code: "GRAPH_ALREADY_EXISTS",

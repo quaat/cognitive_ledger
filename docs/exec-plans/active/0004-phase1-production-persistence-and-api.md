@@ -333,6 +333,76 @@ semantic acceptance (Phase 2).
 **Not in P1.3.** Merge/second-parent semantics, reset, projector, HTTP auth, branches,
 role qualification (documented direction only).
 
+### P1.3 status — complete (2026-09-26)
+Delivered exactly as designed above, with these decisions made during implementation:
+- Idempotency is serialized by a per-scope transaction advisory lock taken before the
+  stored result is read, so identical concurrent requests (genesis included) replay
+  deterministically instead of racing to `HEAD_CHANGED`/`LINEAGE_MISMATCH`.
+- The repository verifies graph ownership against the principal's tenant (foreign or
+  missing graph → `UNKNOWN_GRAPH`, nothing leaks); accept/reject require a proposal bound
+  to the requested graph, branch and expected head, so only `prepare`d candidates (and
+  therefore effective-delta patches) are ever decided; a decided candidate is refused
+  (`LINEAGE_MISMATCH`) and the schema enforces one terminal decision per candidate.
+- Migration 0006 consequences: PostgreSQL refs can only target indexed commits of their
+  graph, so the legacy "filesystem objects + PostgreSQL ref" topology is refused by the
+  server; `ledger-admin migrate-fs-to-pg` cuts such databases over in schema order
+  (content schema → import → workflow schema). Raw `PgRefStore` CAS is confined to
+  `bootstrap`/`importing` graphs. `refs.protected` is immutable until Phase 4.
+- Branch names, idempotency keys and reasons are bounded up front and by CHECK constraints.
+- No validation record is written; acceptance runs under an explicit
+  `ValidationPolicy::NoValidation`. P1.3 atomicity verified ≠ production protected semantic
+  acceptance (Phase 2).
+Executed: `cargo fmt --check`, clippy `-D warnings`, `cargo test --workspace` (ledger-rdf 12
+incl. the seeded effective-delta property test; ledger-server 7), doc links 44, architecture,
+golden 18/18 with `git diff -- crates/ledger-core fixtures` showing only error variants. Real
+PostgreSQL 17.2 (fresh volume, 37 tests): `pg_cas_race` 1, `pg_immutable_store` 9,
+`pg_graphs_migration` 6 (upgrade converges through 0006, `version = 1` backfilled),
+`pg_fs_migration` 8 (incl. the legacy shared-ref topology cutover in schema order and the
+no-op partial migration on an upgraded database), `pg_workflow` 13: genesis+advance counts
+(1 event, 1 decision, 1 outbox row each), strict effective delta with no persistence on
+refusal, materialized-vs-reconstructed identity, prepare idempotency incl. a two-replica
+race yielding one candidate and one indexed commit, acceptance idempotency incl. a 6-writer
+same-HEAD race (one accepted) and 4-way same-key acceptance (one effect, identical ids,
+late replay), concurrent genesis (same key → one effect and replays; different candidates →
+one winner, `HEAD_CHANGED` naming it), lineage matrix with the firing rule asserted,
+graph lifecycle incl. tenant-scoped bootstrap refusal, fault injection at 7 accept + 4
+prepare + 3 reject points plus a genesis failure after the ref insert (no mutable effect,
+retry succeeds once, lost response replays identical ids), rejection/supersession incl.
+decided-candidate refusals, concurrent accept-vs-reject (exactly one decision), foreign
+tenant/bounds/raw-CAS refusals, and database-level invariants (composite FKs, version
+trigger on insert and update, write-once audit tables, outbox identity, idempotency
+uniqueness). Full `./scripts/test-integration.sh` exit 0 with all 37 database tests and the
+HTTP restart scenario ("shared backend confirmed"). Differential: seam-only, live Fluree
+deferred by policy (not passed). Not executed: the 1,000-writer race (P1.5), crash/kill
+fault injection (P1.5), database role split (P1.5).
+
+Independent reviews (Opus; storage/concurrency, invariant, test, security, then a second
+storage + invariant round on the fixes). Confirmed findings, all fixed before closure:
+identical concurrent genesis returned `HEAD_CHANGED` and same-key retries could return
+`LINEAGE_MISMATCH` instead of replaying (advisory lock per idempotency scope); one terminal
+decision per candidate only enforced in code (unique index + typed mapping of the unique
+violation); proposals not bound to their ref and commits without a proposal acceptable
+(binding + proposal required); no tenant ownership check and `mark_superseded` unscoped
+(tenant check with `UNKNOWN_GRAPH`, graph-scoped supersession with active-graph check);
+`migrate_up_to` would fail on an upgraded database (`ignore_missing`); unbounded branch,
+key and reason inputs (bounds + CHECKs); raw CAS movable on active graphs and racy status
+check (refused, share-locked); prepare could starve the pool by reconstructing through the
+pool while holding its transaction (reconstruction on the transaction connection);
+reject vs supersede deadlock through `FOR UPDATE` vs FK key-share (`FOR NO KEY UPDATE`);
+test suites that could pass for the wrong reason (rule messages asserted, commit-index
+counts, shared request objects, full identity equality on replays). Accepted with
+documentation: the repository trusts the API layer's request digest (P1.4 defines the
+canonical request); an imported graph's audit trail starts at its first workflow advance;
+`mark_superseded` has no idempotency key (explicit operator action); graph lifecycle
+transitions do not exist yet (status share-locked during workflows so a future transition
+cannot interleave); database role split remains P1.5 and the production security gate is
+not passed.
+
+**P1.4 (authenticated HTTP boundary) is next.** The API must route writes through
+`WorkflowRepository::prepare`/`accept` with the authenticated principal, define the
+canonical request bytes for the digest, retire the bootstrap v1 write path and flip the
+shared store to `V1Binding::Reject`.
+
 ## Test evidence
 - 2026-09-26 `python3 scripts/golden/commit_v2_reference.py check`: exit 0, "all 18
   commit v2 vectors (positive and negative) match the reference encoder";

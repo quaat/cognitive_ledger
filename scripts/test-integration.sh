@@ -34,6 +34,10 @@ cargo test -p ledger-store --features postgres --test pg_graphs_migration -- --i
 # --- 1d. Administrative filesystem -> PostgreSQL migration (ADR-0012) -------------------
 cargo test -p ledger-store --features postgres --test pg_fs_migration -- --ignored --nocapture
 
+# --- 1e. Atomic workflow persistence (ADR-0013, P1.3): prepare/accept/reject in one
+#         transaction, idempotency under concurrency, lineage, fault injection, DB invariants
+cargo test -p ledger-store --features postgres --test pg_workflow -- --ignored --nocapture
+
 # --- 2. HTTP commit / state / restart durability ----------------------------------
 curl --fail --silent --retry 10 --retry-delay 2 "${BASE}/health" >/dev/null
 
