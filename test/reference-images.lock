@@ -1,0 +1,8 @@
+{
+  "image": "fluree/server",
+  "version": "4.2.1",
+  "digest": "sha256:14da004ab020f7ae4e19696941206f027ef7dda7ba985a82ea101fee1039f770",
+  "purpose": "Official fluree/server image used only for semantic differential testing (test reference only; never a runtime or compiled dependency)",
+  "status": "PINNED_RUNTIME_DEFERRED: digest verified and recorded, but the container is NOT run in CI pending BUSL-1.1 license sign-off. Enable via the 'differential' compose profile only after legal approval.",
+  "license": "BUSL-1.1"
+}

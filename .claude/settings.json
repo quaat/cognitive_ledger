@@ -1,0 +1,27 @@
+{
+  "model": "claude-fable-5-1",
+  "statusLine": {
+    "type": "command",
+    "command": "bash /home/thomas/.claude/statusline-command.sh"
+  },
+  "env": {
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-5-5"
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [{"type": "command", "command": "python3 scripts/agent-hooks/pre-command.py"}]
+      },
+      {
+        "matcher": "Write|Edit|MultiEdit",
+        "hooks": [{"type": "command", "command": "python3 scripts/agent-hooks/protect-secrets.py"}]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [{"type": "command", "command": "./scripts/check-fast.sh sanity", "timeout": 30}]
+      }
+    ]
+  }
+}

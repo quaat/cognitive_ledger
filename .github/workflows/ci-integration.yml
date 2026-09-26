@@ -1,0 +1,13 @@
+name: ci-integration
+on:
+  pull_request:
+  workflow_dispatch:
+permissions: {contents: read}
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - run: docker compose config --quiet
+      - run: ./scripts/test-integration.sh

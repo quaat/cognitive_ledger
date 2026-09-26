@@ -1,0 +1,6 @@
+parents=[sha256:73399c34028c2686df761ff8e508ebfb7aa40bb982ff9bcfe9dfc0d432ef903c]
+patch=sha256:a9fbb5cc86eaab26b5c738c991d72bdec24a9f98ac650f41e45fd667ebad2c43
+author=urn:agent:bootstrap
+message=linear golden commit
+event_time=2026-09-24T11:00:00Z
+recorded_time=2026-09-24T11:01:00Z

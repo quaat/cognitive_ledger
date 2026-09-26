@@ -1,0 +1,10 @@
+/target/
+/data/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.*
+.DS_Store
+__pycache__/

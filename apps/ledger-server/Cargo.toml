@@ -1,0 +1,20 @@
+[package]
+name = "ledger-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+axum.workspace = true
+ledger-api = { path = "../../crates/ledger-api" }
+ledger-core = { path = "../../crates/ledger-core" }
+ledger-store = { path = "../../crates/ledger-store", features = ["postgres"] }
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

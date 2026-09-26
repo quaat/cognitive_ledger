@@ -1,0 +1,21 @@
+{
+  "graph_id": "0b0a2a1c-2e3d-4f50-8a61-72b384c5d6e7",
+  "parents": ["sha256:73399c34028c2686df761ff8e508ebfb7aa40bb982ff9bcfe9dfc0d432ef903c"],
+  "patch": "sha256:a9fbb5cc86eaab26b5c738c991d72bdec24a9f98ac650f41e45fd667ebad2c43",
+  "actor": {
+    "principal_id": "urn:sculpin:agent:feedback-curator",
+    "principal_type": "agent",
+    "on_behalf_of": "urn:sculpin:human:reviewer-42"
+  },
+  "activity": "cognitive-correction",
+  "event_time": "2026-09-24T13:00:00+02:00",
+  "recorded_at": "2026-09-24T11:01:00Z",
+  "evidence_refs": [
+    "urn:sculpin:evidence:feedback:0042",
+    "urn:sculpin:evidence:feedback:9001",
+    "https://example.org/evidence/report-17",
+    "urn:sculpin:evidence:feedback:9001"
+  ],
+  "source_system": "sculpin-agent-api",
+  "message": "golden v2 linear commit"
+}

@@ -1,0 +1,16 @@
+{
+  "graph_id": "urn:sculpin:graph:team.alpha",
+  "parents": [
+    "sha256:73399c34028c2686df761ff8e508ebfb7aa40bb982ff9bcfe9dfc0d432ef903c",
+    "sha256:f7b76600843a19a9db61d1dbc83e46cbdebe11ac38c20828830b1f224491f70b"
+  ],
+  "patch": "sha256:a9fbb5cc86eaab26b5c738c991d72bdec24a9f98ac650f41e45fd667ebad2c43",
+  "actor": {
+    "principal_id": "urn:sculpin:human:reviewer-42",
+    "principal_type": "human"
+  },
+  "activity": "merge",
+  "recorded_at": "2026-09-24T12:01:00.250000Z",
+  "evidence_refs": ["urn:sculpin:evidence:merge-review:7"],
+  "message": "golden v2 merge commit (event_time absent)"
+}

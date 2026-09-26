@@ -1,0 +1,30 @@
+[package]
+name = "ledger-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+axum.workspace = true
+jsonwebtoken.workspace = true
+ledger-core = { path = "../ledger-core" }
+ledger-rdf = { path = "../ledger-rdf" }
+ledger-store = { path = "../ledger-store", features = ["postgres"] }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+futures-util = { version = "0.3", default-features = false }
+sqlx.workspace = true
+tempfile.workspace = true
+tower.workspace = true
+hex.workspace = true
+
+[lints]
+workspace = true

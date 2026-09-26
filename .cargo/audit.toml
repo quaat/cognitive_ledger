@@ -1,0 +1,24 @@
+# cargo-audit configuration (scripts/check-supply-chain.sh; .github/workflows/ci-security.yml).
+#
+# The ONLY tolerated advisory. Justification (2026-09-26, Plan 0004 P1.4 closure):
+#
+#   RUSTSEC-2023-0071  rsa 0.9.x  "Marvin Attack" timing side channel in RSA decryption.
+#
+#   Lockfile path:  sqlx 0.8.6 -> sqlx-mysql (OPTIONAL, never enabled) -> rsa 0.9.10
+#   Cargo.lock records optional dependencies of resolved packages regardless of the
+#   features a workspace enables, so `rsa` is present in the lockfile although no feature
+#   of this workspace activates `sqlx-mysql` (`cargo tree --target all -e normal,build -i
+#   rsa` prints nothing). No produced ledger binary compiles or links `rsa`; the ledger
+#   performs no RSA decryption; JWT verification uses the `jsonwebtoken` crate's `aws-lc-rs`
+#   backend (workspace Cargo.toml selects `aws_lc_rs`, not `rust_crypto`), so `rsa` is not
+#   linked. Elimination would require abandoning the `sqlx` facade crate for
+#   its per-database sub-crates, which is not a reasonable trade for a lockfile-only entry.
+#
+#   Guard: scripts/check-supply-chain.sh fails the gate if `rsa` ever becomes reachable in
+#   the feature-resolved graph for any target, if its lockfile dependents are anything other
+#   than `sqlx-mysql`, or if its version leaves the 0.9 line (a fixed `rsa >= 0.10`, or an
+#   sqlx release without the mysql path, is the trigger to delete this exception).
+#
+#   Review trigger: every sqlx upgrade, and the Plan 0005 supply-chain slice.
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]

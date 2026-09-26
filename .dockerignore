@@ -1,0 +1,24 @@
+.bash_profile
+.bashrc
+.claude/
+data/
+docs/
+# The API contract is compiled into ledger-api (include_str!) and must reach the build.
+!docs/api/openapi.json
+.git/
+.gitconfig
+.idea/
+# into the image build (they bloat context transfer and disk, and bust caching).
+# Keep the build context small: never ship local build artifacts, VCS, or docs
+.mcp.json
+*.md
+.profile
+.ripgreprc
+**/*.rs.bk
+target/
+test/
+tests/differential/
+.vscode/
+*.zip
+.zprofile
+.zshrc
