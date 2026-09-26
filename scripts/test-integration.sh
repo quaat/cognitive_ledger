@@ -23,8 +23,16 @@ trap 'docker compose down --remove-orphans --volumes' EXIT
 export LEDGER_TEST_DATABASE_URL="postgres://ledger:ledger-development-only@localhost:${PG_HOST_PORT}/ledger?sslmode=disable"
 cargo test -p ledger-store --features postgres --test pg_cas_race -- --ignored --nocapture
 
-# --- 1b. Shared PostgreSQL immutable store: two replicas, one content (ADR-0012) ------
+# --- 1b. Shared PostgreSQL immutable store (ADR-0012): two replicas, truthful publication,
+#         incompatible-binding race, same-graph ancestry, verified commit index -----------
 cargo test -p ledger-store --features postgres --test pg_immutable_store -- --ignored --nocapture
+
+# --- 1c. Graph authority schema (ADR-0010, migration 0004): constraints, FK integrity,
+#         clean-install vs upgrade convergence, unknown-graph refusal ---------------------
+cargo test -p ledger-store --features postgres --test pg_graphs_migration -- --ignored --nocapture
+
+# --- 1d. Administrative filesystem -> PostgreSQL migration (ADR-0012) -------------------
+cargo test -p ledger-store --features postgres --test pg_fs_migration -- --ignored --nocapture
 
 # --- 2. HTTP commit / state / restart durability ----------------------------------
 curl --fail --silent --retry 10 --retry-delay 2 "${BASE}/health" >/dev/null
@@ -62,5 +70,15 @@ STATE=$(curl --fail --silent "${BASE}/v1/states/${C2}")
 echo "${STATE}" | grep -q 'urn:temperature' || { echo "FAIL: reconstructed state missing temperature quad: ${STATE}" >&2; exit 1; }
 echo "${STATE}" | grep -q 'urn:humidity' || { echo "FAIL: reconstructed state missing humidity quad: ${STATE}" >&2; exit 1; }
 echo "state reconstructed across restart from the shared PostgreSQL immutable store"
+
+# Prove the default backend really is PostgreSQL: the commits are rows in the shared
+# store, and the ledger container holds no immutable objects of its own.
+IN_PG=$(docker compose exec -T postgres psql -U ledger -d ledger -tAc "select count(*) from immutable_objects where id in ('${C1}','${C2}')")
+[ "${IN_PG}" = "2" ] || { echo "FAIL: commits not in PostgreSQL immutable_objects (count=${IN_PG})" >&2; exit 1; }
+INDEXED=$(docker compose exec -T postgres psql -U ledger -d ledger -tAc "select count(*) from commit_index where id in ('${C1}','${C2}') and graph_id = 'default'")
+[ "${INDEXED}" = "2" ] || { echo "FAIL: commits not indexed under the bootstrap graph (count=${INDEXED})" >&2; exit 1; }
+LOCAL_OBJECTS=$(docker compose exec -T ledger sh -c 'find /data -type f 2>/dev/null | wc -l')
+[ "${LOCAL_OBJECTS}" = "0" ] || { echo "FAIL: ledger container holds ${LOCAL_OBJECTS} node-local object file(s)" >&2; exit 1; }
+echo "shared backend confirmed: 2 commits in PostgreSQL, 2 indexed under 'default', 0 node-local object files"
 
 echo "INTEGRATION OK"

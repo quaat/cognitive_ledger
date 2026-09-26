@@ -17,9 +17,9 @@ The implementation is already a credible walking skeleton rather than a disposab
 
 - `ledger-core` provides strict SHA-256 content identifiers, versioned canonical commit bytes, ordered zero/one/two-parent commits and infrastructure-free storage interfaces.
 - `ledger-rdf` parses standards-based N-Quads, rejects persistent blank nodes, normalizes operations, rejects add/delete contradictions and produces deterministic patch bytes.
-- `ledger-store` provides content-verified immutable filesystem objects, durable file publication, state reconstruction, filesystem CAS and a PostgreSQL-backed CAS `RefStore`.
+- `ledger-store` provides content-verified immutable filesystem objects, durable file publication, state reconstruction, filesystem CAS and a PostgreSQL-backed CAS `RefStore`. *(Status 2026-09-26: it now also provides the shared `PostgresImmutableStore` with a verified commit index, the ADR-0010 graph authority schema, and the filesystem→PostgreSQL migration — Plan 0004 P1.2.)*
 - `ledger-api` exposes a deliberately minimal HTTP surface with no query language.
-- `ledger-server` composes filesystem immutable storage with PostgreSQL ref coordination.
+- `ledger-server` composes filesystem immutable storage with PostgreSQL ref coordination. *(Status 2026-09-26: with a database URL it defaults to PostgreSQL for both refs and immutable content; filesystem content is an explicit single-host opt-in.)*
 - Golden fixtures pin commit and patch identities.
 - Integration tests exercise concurrent PostgreSQL CAS and container restart reconstruction.
 - The repository already contains ADR discipline, execution plans, independent-review agents, CI separation and architecture checks.
@@ -225,7 +225,9 @@ Before protocol freeze:
 
 This is the most important implementation-level architecture issue.
 
-Today, PostgreSQL makes mutable HEAD coordination safe between processes, but immutable commits and patches remain on the ledger container’s local filesystem.
+> **Historical (resolved in Plan 0004 P1.2, 2026-09-26).** The gap described in this section is closed: `PostgresImmutableStore` ships as the default shared backend, and the filesystem backend is single-host only. The text below is kept as the rationale for ADR-0012.
+
+At the time of writing, PostgreSQL made mutable HEAD coordination safe between processes, but immutable commits and patches remained on the ledger container’s local filesystem.
 
 That means two replicas sharing PostgreSQL do **not** yet form a valid horizontally scaled service:
 
@@ -290,7 +292,7 @@ Keep the object-store interface so S3-backed immutable commits remain possible i
 
 An alternative is S3/MinIO for all immutable objects. If selected, it must be shared by every replica and its consistency/durability guarantees must become part of deployment qualification.
 
-Do not claim horizontal correctness while PostgreSQL heads reference node-local immutable files.
+Do not claim horizontal correctness while PostgreSQL heads reference node-local immutable files. *(Enforced since P1.2 by the server default and the two-replica integration evidence.)*
 
 ---
 

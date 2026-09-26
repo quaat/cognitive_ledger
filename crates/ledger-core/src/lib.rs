@@ -45,6 +45,26 @@ pub enum LedgerError {
     InvalidIdentifier { field: &'static str, reason: String },
     #[error("invalid timestamp: {0}")]
     InvalidTimestamp(String),
+    #[error(
+        "GRAPH_BINDING_CONFLICT: commit {commit} is indexed under graph {indexed}, not {requested}"
+    )]
+    GraphBindingConflict {
+        commit: CommitId,
+        indexed: String,
+        requested: String,
+    },
+    #[error(
+        "CROSS_GRAPH_PARENT: parent {parent} belongs to graph {parent_graph}, child belongs to {graph}"
+    )]
+    CrossGraphParent {
+        parent: CommitId,
+        parent_graph: String,
+        graph: String,
+    },
+    #[error("graph {0} already exists")]
+    GraphAlreadyExists(String),
+    #[error("graph {0} does not exist")]
+    UnknownGraph(String),
     #[error("storage error: {0}")]
     Storage(String),
 }
@@ -129,7 +149,9 @@ pub struct Commit {
     pub recorded_time: String,
 }
 
-pub(crate) const COMMIT_HEADER: &[u8] = b"sculpin-commit-v1\0";
+/// Header bytes of the bootstrap v1 envelope (see [`COMMIT_V2_HEADER`] for v2).
+pub const COMMIT_V1_HEADER: &[u8] = b"sculpin-commit-v1\0";
+pub(crate) const COMMIT_HEADER: &[u8] = COMMIT_V1_HEADER;
 /// Alias naming the bootstrap envelope explicitly alongside [`CommitV2`].
 pub type CommitV1 = Commit;
 impl Commit {
@@ -281,6 +303,16 @@ pub(crate) fn read_field(rest: &mut &[u8]) -> Result<String, LedgerError> {
 /// boundary. `put_commit` MUST verify that every parent is an existing *commit* (not merely
 /// an existing object) and that the patch exists; `get_commit` MUST return `None` for an
 /// id that names a non-commit object rather than reinterpreting its bytes.
+///
+/// Idempotency is truthful, never assumed: publishing bytes under an id that already
+/// holds *different* bytes is `ObjectCollision`, and publishing a commit whose
+/// authoritative index row disagrees with the commit (another graph binding, other
+/// parents) fails explicitly. `ON CONFLICT DO NOTHING` is never treated as success.
+///
+/// Same-graph ancestry: a graph is a self-contained version DAG. A production, indexed
+/// store MUST reject a commit whose effective graph (the v2 envelope's `graph_id`, or the
+/// configured v1 binding) differs from any parent's graph (`CrossGraphParent`). Cross-graph
+/// relationships are expressed by merge coordination later, never by parent edges.
 #[async_trait::async_trait]
 pub trait ImmutableStore: Send + Sync {
     async fn put_content(&self, id: &ContentId, bytes: &[u8]) -> Result<(), LedgerError>;

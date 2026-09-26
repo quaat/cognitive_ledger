@@ -166,8 +166,51 @@ P0-bridging task (2026-09-26, six items from the owner's P1.1 review), all lande
    index rows in one transaction, digest-verified reads, `verify_commit_index`),
    `Ledger::with_stores`, server `LEDGER_IMMUTABLE_BACKEND=postgres`, compose harness on
    the shared backend, and the ignored PostgreSQL suite `tests/pg_immutable_store.rs`.
-P1.2 remaining: `graphs`/`refs` migrations with the ADR-0010 tests, filesystem →
-PostgreSQL content migration path, then P1.3.
+**P1.2 (shared persistence) complete, 2026-09-26.** Closing work, all with real-PostgreSQL
+evidence:
+- Integrity corrections: truthful publication (`publish_object` reads back the
+  authoritative row; different bytes are `ObjectCollision`; a damaged seeded row makes a
+  later publication fail hard); `put_commit` verifies the authoritative index row and
+  ordered parents after its conflict-free inserts, so concurrent incompatible v1 bindings
+  resolve to exactly one graph with the loser getting `GraphBindingConflict` (5 barrier
+  rounds plus a deterministic blocked-path test via `pg_stat_activity`, commit and
+  rollback variants); same-graph ancestry (`CrossGraphParent`) for v2→v2, merge, and
+  v2→v1 shapes; `put_content` refuses commit-envelope bytes; corrupt or unknown-version
+  envelopes are errors, not "absent"; a patch may not be an indexed commit; v1 history
+  binds only to `bootstrap`/`importing` graphs; READ COMMITTED pinned per transaction.
+- Server: with a database URL the shared PostgreSQL backend is the default;
+  `LEDGER_IMMUTABLE_BACKEND=filesystem` is an explicit single-host opt-in with a loud
+  warning; selection is a pure, unit-tested function; startup runs `Ledger::verify_head`
+  and refuses a HEAD that does not resolve in the configured store. Compose binds ports to
+  loopback.
+- Migration 0004 (`graphs`, ADR-0010): globally unique `graph_id`, immutable
+  `graph_id`/`tenant_id` (trigger covering `ON CONFLICT DO UPDATE`), many graphs per KB,
+  `refs`/`commit_index` FKs with RESTRICT, bootstrap `default` row on clean install and
+  upgrade, fail-closed guard naming unowned graphs from both `refs` and `commit_index`
+  with a tested re-run after the operator remedy. Migration 0005: write-once triggers on
+  the immutable tables and immutable ref identity. Upgrade-from-0001 and clean install
+  converge on a literal schema snapshot (columns, constraints, indexes, triggers,
+  function bodies).
+- Filesystem → PostgreSQL migration (`FsToPgMigration`, `ledger-admin migrate-fs-to-pg`):
+  read-only source, HEAD resolved from the filesystem ref or the existing shared `refs`
+  row (both topologies; wrong or partial source is `MissingTarget`), graph-membership
+  check before publication, topological import, scoped index verification, both-backend
+  state comparison, ref installed only afterwards; the v1 binding must name the target
+  ref's graph and a ref is never installed onto another graph's history.
+- Independent reviews (storage/concurrency, invariant, test, security; Opus) — every
+  confirmed P0/P1 finding fixed before closure: ref-to-graph binding gap in the migration
+  (all four), shared-refs topology HEAD resolution and wrong-source success
+  (storage), argument echo of a misplaced database URL and argv binding to any graph
+  (security/storage), source opened read-write (security), silent skips in
+  `list_objects` (security/invariant), order-dependent bootstrap-delete test, no negative
+  `verify_commit_index` test, race test not proving the blocked path, unfaithful
+  interruption simulation, guard's `commit_index` branch untested (test). Accepted with
+  documentation instead of code: filesystem/PostgreSQL acceptance-rule difference
+  (filesystem is not a qualification target), v1 `graph_id` not byte-derivable (policy),
+  memory O(source) in the admin tool, no catch-up with a moved destination ref, role
+  separation for trigger ownership, error-body graph ids (P1.4) — all in `tech-debt.md`
+  or ADR-0012.
+P1.3 (atomic workflow persistence) is next and is **not** started here.
 
 ## Test evidence
 - 2026-09-26 `python3 scripts/golden/commit_v2_reference.py check`: exit 0, "all 18
@@ -208,6 +251,21 @@ PostgreSQL content migration path, then P1.3.
   commit/restart with `LEDGER_IMMUTABLE_BACKEND=postgres`): exit 0, "INTEGRATION OK" —
   ref head and reconstructed state survived a ledger-container restart with no local
   objects, so the shared-backend topology holds end to end.
+
+- 2026-09-26 P1.2 closure gates: `./scripts/check-fast.sh` exit 0 (fmt check, doc links
+  44 files, architecture, clippy `-D warnings`, `cargo test --workspace`: ledger-core
+  23+9+3, ledger-store 9 lib incl. `filesystem_store_is_strict_about_content_headers_and_layout`,
+  ledger-server 4 backend-selection tests); `python3 scripts/golden/commit_v2_reference.py
+  check` all 18 vectors match; `git diff HEAD -- crates/ledger-core fixtures` touches only
+  error variants/docs — no protocol identity change. Real PostgreSQL 17.2 (fresh compose
+  volume): `pg_cas_race` 1, `pg_immutable_store` 8, `pg_graphs_migration` 6,
+  `pg_fs_migration` 7 — 22 passed, 0 failed (one first-run failure was the blocked-path
+  test deadlocking on its own single-connection poll pool; fixed in the test, store
+  unchanged). Full `./scripts/test-integration.sh` exit 0 with the default backend:
+  "shared backend confirmed: 2 commits in PostgreSQL, 2 indexed under 'default', 0
+  node-local object files"; HEAD and state survived the ledger-container restart.
+  `./scripts/test-differential.sh` exit 0 seam-only: the live Fluree comparison is
+  DEFERRED by policy (BUSL-1.1 sign-off), not passed.
 
 ## Completion criteria
 The Phase 1 gate passes with recorded evidence, the carried-forward obligations each have

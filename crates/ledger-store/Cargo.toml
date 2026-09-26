@@ -10,6 +10,9 @@ async-trait.workspace = true
 fs2 = "0.4.3"
 ledger-core = { path = "../ledger-core" }
 ledger-rdf = { path = "../ledger-rdf" }
+serde.workspace = true
+sha2.workspace = true
+hex.workspace = true
 sqlx = { workspace = true, optional = true }
 time.workspace = true
 tokio = { workspace = true }

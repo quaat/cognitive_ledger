@@ -41,7 +41,9 @@ Projection    graph_id, ref, target, projection_head
   re-homing a graph to another tenant is a new graph plus an explicit, audited import,
   never a mutation of the existing row. (P0-bridging amendment, 2026-09-26.)
 - `graph_id` is identity-bearing in the commit v2 envelope (ADR-0009): a commit belongs
-  to exactly one graph.
+  to exactly one graph, and a graph is a self-contained version DAG: every parent of a
+  commit belongs to the same graph (`CrossGraphParent` otherwise). Cross-graph
+  relationships are merge coordination (Phase 5), never parent edges.
 - `Ref` carries a `protection_policy` (`main` defaults to protected) and a monotonic
   `version` for optimistic concurrency and ref-event ordering (ADR-0013).
 - `Projection` records which commit a downstream Fuseki graph currently represents.
@@ -91,9 +93,14 @@ commit content. The policy, executable in `PostgresImmutableStore` (ADR-0012):
 - A v1 commit is indexed only under a binding the store was configured with
   (`V1Binding::BindTo(graph_id)`). Production deployments configure
   `V1Binding::Reject`: writing a v1 commit to a production store fails closed
-  (`InvalidCommit`). The only supported `BindTo` target is the bootstrap `default` graph
-  used by the pre-v2 write path in dev/single-host deployments and by an explicit,
-  audited import of pre-production history.
+  (`InvalidCommit`). A `BindTo` target MUST be a graph whose `status` is `bootstrap`
+  (the `default` graph of the pre-v2 write path) or `importing` (a graph explicitly
+  receiving an audited import of pre-production history); the store refuses to bind v1
+  history to an `active` or `archived` graph. Binding a v1 commit that is already indexed
+  under another graph is `GraphBindingConflict`, never a re-home.
+- The audited graph import path (registering a graph with `status='importing'`, importing
+  history, then activating it) is defined by this policy but has no operator surface yet;
+  migration 0004 fails closed on unowned graphs until it exists (tech-debt).
 - A v1 commit remains readable everywhere (dual read); the policy governs *writing and
   indexing*, not reading.
 - When the v2 write path lands (P1.3/P1.4) the server's default becomes `Reject`; until

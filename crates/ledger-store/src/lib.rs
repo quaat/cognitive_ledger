@@ -2,7 +2,8 @@
 
 use fs2::FileExt;
 use ledger_core::{
-    AnyCommit, Commit, CommitId, ContentId, ImmutableStore, LedgerError, PatchId, RefStore,
+    AnyCommit, COMMIT_V1_HEADER, COMMIT_V2_HEADER, Commit, CommitId, ContentId, ImmutableStore,
+    LedgerError, PatchId, RefStore,
 };
 use ledger_rdf::{OperationKind, Patch, Quad};
 use std::{
@@ -18,11 +19,77 @@ use std::{
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
+/// Every object the ledger stores starts with a `sculpin-` header. Anything in that
+/// family that is not an RDF patch is a commit envelope (v1, v2, or a version this build
+/// does not know). Classifying by header lets stores fail closed on corrupt or
+/// future-version commits instead of treating them as opaque content.
+fn is_commit_family(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"sculpin-") && !bytes.starts_with(b"sculpin-rdf-patch-")
+}
+
+/// Decode a stored object as a commit, distinguishing three cases: not a commit at all
+/// (`Ok(None)`), a commit this build understands (`Ok(Some)`), and a commit-family object
+/// that is corrupt or of an unknown version (`Err`). Known-header bytes with an invalid
+/// body are `CorruptObject`; unknown commit headers propagate `UnknownCommitVersion`.
+pub fn decode_commit_object(
+    id: &ContentId,
+    bytes: &[u8],
+) -> Result<Option<AnyCommit>, LedgerError> {
+    if !is_commit_family(bytes) {
+        return Ok(None);
+    }
+    match AnyCommit::from_canonical_bytes(bytes) {
+        Ok(commit) => {
+            if commit.id()?.0 != *id {
+                return Err(LedgerError::CorruptObject {
+                    id: id.clone(),
+                    reason: "commit ID mismatch".into(),
+                });
+            }
+            Ok(Some(commit))
+        }
+        Err(LedgerError::UnknownCommitVersion(header)) => {
+            Err(LedgerError::UnknownCommitVersion(header))
+        }
+        Err(e) if bytes.starts_with(COMMIT_V1_HEADER) || bytes.starts_with(COMMIT_V2_HEADER) => {
+            Err(LedgerError::CorruptObject {
+                id: id.clone(),
+                reason: format!("commit envelope with a known header does not decode: {e}"),
+            })
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// `put_content` is for patches and other non-commit objects only; commit envelopes must
+/// go through `put_commit` so parent, graph and index checks always run.
+pub(crate) fn reject_commit_bytes_as_content(bytes: &[u8]) -> Result<(), LedgerError> {
+    if is_commit_family(bytes) {
+        return Err(LedgerError::InvalidCommit(
+            "commit envelopes are published through put_commit, not put_content".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 pub struct FileStore {
     root: PathBuf,
 }
 impl FileStore {
+    /// Open a store for read-only use, refusing to create anything: the object root must
+    /// already exist. A mistyped path is an error, not an empty store.
+    pub fn open_existing(root: impl AsRef<Path>) -> Result<Self, LedgerError> {
+        let root = root.as_ref().to_owned();
+        let objects = root.join("objects/sha256");
+        if !objects.is_dir() {
+            return Err(LedgerError::Storage(format!(
+                "{} is not an existing ledger store (missing objects/sha256)",
+                root.display()
+            )));
+        }
+        Ok(Self { root })
+    }
     pub fn open(root: impl AsRef<Path>) -> Result<Self, LedgerError> {
         let root = root.as_ref().to_owned();
         fs::create_dir_all(root.join("objects/sha256")).map_err(storage)?;
@@ -36,7 +103,9 @@ impl FileStore {
         sync_directory(&root.join("refs"))?;
         Ok(Self { root })
     }
-    fn object_path(&self, id: &ContentId) -> PathBuf {
+    /// Where an object's bytes live (`objects/sha256/<2 hex>/<62 hex>`). Public for
+    /// migration/fault-injection tooling; ordinary code goes through `ImmutableStore`.
+    pub fn object_path(&self, id: &ContentId) -> PathBuf {
         let h = id.digest_hex();
         self.root.join("objects/sha256").join(&h[..2]).join(&h[2..])
     }
@@ -150,8 +219,19 @@ impl FileStore {
     }
     fn put_commit_sync(&self, commit: &AnyCommit) -> Result<CommitId, LedgerError> {
         for parent in commit.parents() {
-            if self.get_commit_sync(parent)?.is_none() {
+            let Some(stored) = self.get_commit_sync(parent)? else {
                 return Err(LedgerError::MissingParent(parent.clone()));
+            };
+            // The filesystem store keeps no graph index; it can still refuse the one
+            // cross-graph edge it can see, a v2 parent bound to another graph.
+            if let (Some(child_graph), Some(parent_graph)) = (commit.graph_id(), stored.graph_id())
+                && child_graph != parent_graph
+            {
+                return Err(LedgerError::CrossGraphParent {
+                    parent: parent.clone(),
+                    parent_graph: parent_graph.to_string(),
+                    graph: child_graph.to_string(),
+                });
             }
         }
         if self.get_object_sync(&commit.patch().0)?.is_none() {
@@ -162,23 +242,53 @@ impl FileStore {
         self.put_object_sync(&id.0, &bytes)?;
         Ok(id)
     }
-    /// Typed read: an object that exists but is not a decodable commit envelope (a patch,
-    /// say) yields `None`, never a reinterpretation. Bytes that decode but do not hash to
-    /// their own id are corruption.
+    /// Typed read: an object that exists but is not a commit envelope (a patch, say)
+    /// yields `None`, never a reinterpretation; a commit-family object that does not
+    /// decode is corruption or an unknown version and is an error, not "absent".
     fn get_commit_sync(&self, id: &CommitId) -> Result<Option<AnyCommit>, LedgerError> {
         let Some(bytes) = self.get_object_sync(&id.0)? else {
             return Ok(None);
         };
-        let Ok(commit) = AnyCommit::from_canonical_bytes(&bytes) else {
-            return Ok(None);
+        decode_commit_object(&id.0, &bytes)
+    }
+    /// Enumerate every immutable object id in this store (migration/verification use).
+    /// Only well-formed object paths are returned; anything else under the object root —
+    /// stray files, symlinks, directories posing as objects — is reported as corruption
+    /// rather than skipped. In-flight `.<digest>.tmp-*` files of a concurrent writer are
+    /// the one tolerated exception.
+    pub fn list_objects(&self) -> Result<Vec<ContentId>, LedgerError> {
+        let unexpected = |path: &Path, what: &str| LedgerError::CorruptObject {
+            id: ContentId::for_bytes(path.to_string_lossy().as_bytes()),
+            reason: format!("{what} in object root: {}", path.display()),
         };
-        if commit.id()? != *id {
-            return Err(LedgerError::CorruptObject {
-                id: id.0.clone(),
-                reason: "commit ID mismatch".into(),
-            });
+        let mut ids = Vec::new();
+        let base = self.root.join("objects/sha256");
+        for shard in fs::read_dir(&base).map_err(storage)? {
+            let shard = shard.map_err(storage)?;
+            let shard_meta = fs::symlink_metadata(shard.path()).map_err(storage)?;
+            if !shard_meta.is_dir() {
+                return Err(unexpected(&shard.path(), "non-directory shard entry"));
+            }
+            let prefix = shard.file_name().to_string_lossy().into_owned();
+            for entry in fs::read_dir(shard.path()).map_err(storage)? {
+                let entry = entry.map_err(storage)?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') && name.contains(".tmp-") {
+                    continue;
+                }
+                let meta = fs::symlink_metadata(entry.path()).map_err(storage)?;
+                if !meta.is_file() {
+                    return Err(unexpected(&entry.path(), "non-regular object entry"));
+                }
+                let id = format!("sha256:{prefix}{name}");
+                ids.push(
+                    ContentId::from_str(&id)
+                        .map_err(|_| unexpected(&entry.path(), "malformed object path"))?,
+                );
+            }
         }
-        Ok(Some(commit))
+        ids.sort();
+        Ok(ids)
     }
     fn head_sync(&self) -> Result<Option<CommitId>, LedgerError> {
         match fs::read_to_string(self.head_path()) {
@@ -232,6 +342,7 @@ where
 #[async_trait::async_trait]
 impl ImmutableStore for FileStore {
     async fn put_content(&self, id: &ContentId, bytes: &[u8]) -> Result<(), LedgerError> {
+        reject_commit_bytes_as_content(bytes)?;
         let this = self.clone();
         let id = id.clone();
         let bytes = bytes.to_vec();
@@ -282,6 +393,14 @@ pub use postgres::PgRefStore;
 mod postgres_immutable;
 #[cfg(feature = "postgres")]
 pub use postgres_immutable::{PostgresImmutableStore, V1Binding};
+#[cfg(feature = "postgres")]
+mod postgres_graphs;
+#[cfg(feature = "postgres")]
+pub use postgres_graphs::{GraphRecord, GraphStatus, NewGraph, PgGraphs};
+#[cfg(feature = "postgres")]
+mod migrate_fs_to_pg;
+#[cfg(feature = "postgres")]
+pub use migrate_fs_to_pg::{FsToPgMigration, MigrationOutcome, MigrationReport};
 
 /// PostgreSQL-backed ref coordination. Immutable objects and commits stay on the
 /// filesystem `FileStore`; only the mutable ref head is delegated here so that
@@ -348,6 +467,16 @@ mod postgres {
                 graph_id: graph_id.into(),
                 branch: branch.into(),
             })
+        }
+
+        /// The graph this ref store coordinates.
+        pub fn graph_id(&self) -> &str {
+            &self.graph_id
+        }
+
+        /// The branch this ref store coordinates.
+        pub fn branch(&self) -> &str {
+            &self.branch
         }
 
         async fn read_head(&self) -> Result<Option<CommitId>, LedgerError> {
@@ -454,6 +583,19 @@ impl Ledger {
     }
     pub async fn head(&self) -> Result<Option<CommitId>, LedgerError> {
         self.refs.head().await
+    }
+    /// Startup/qualification check: the current HEAD, if any, must resolve to a commit in
+    /// *this* immutable store. A shared ref whose content lives elsewhere (the node-local
+    /// filesystem of another host, an unmigrated store) is refused here rather than
+    /// discovered on the first read.
+    pub async fn verify_head(&self) -> Result<Option<CommitId>, LedgerError> {
+        let head = self.refs.head().await?;
+        if let Some(head) = &head
+            && self.immutable.get_commit(head).await?.is_none()
+        {
+            return Err(LedgerError::MissingTarget(head.clone()));
+        }
+        Ok(head)
     }
     pub async fn commit(&self, request: CommitRequest) -> Result<CommitId, LedgerError> {
         let patch_bytes = request.patch.canonical_bytes();
@@ -658,6 +800,65 @@ mod tests {
         assert!(matches!(
             ledger.advance_ref(None, &CommitId(blob)).await,
             Err(LedgerError::MissingTarget(_))
+        ));
+    }
+    #[tokio::test]
+    async fn filesystem_store_is_strict_about_content_headers_and_layout() {
+        use std::io::Write as _;
+        let t = tempfile::tempdir().unwrap();
+        // A mistyped path is an error, never a freshly created store.
+        assert!(FileStore::open_existing(t.path().join("missing")).is_err());
+        let store = FileStore::open(t.path()).unwrap();
+        assert!(FileStore::open_existing(t.path()).is_ok());
+        // Commit envelopes cannot be smuggled in as content.
+        let patch = Patch::new([Operation {
+            kind: OperationKind::Add,
+            quad: "<urn:s> <urn:p> \"v\" .".parse().unwrap(),
+        }])
+        .unwrap();
+        store
+            .put_content(&patch.id().0, &patch.canonical_bytes())
+            .await
+            .unwrap();
+        let commit = AnyCommit::V1(Commit {
+            parents: vec![],
+            patch: patch.id(),
+            author: "a".into(),
+            message: "m".into(),
+            event_time: "e".into(),
+            recorded_time: "r".into(),
+        });
+        let bytes = commit.canonical_bytes().unwrap();
+        assert!(matches!(
+            store.put_content(&commit.id().unwrap().0, &bytes).await,
+            Err(LedgerError::InvalidCommit(_))
+        ));
+        // A known commit header with a broken body is corruption, not "absent"; an
+        // unknown commit version fails closed.
+        for (header, expect_unknown) in [
+            (COMMIT_V1_HEADER, false),
+            (COMMIT_V2_HEADER, false),
+            (b"sculpin-cognitive-commit-v9\0".as_slice(), true),
+        ] {
+            let mut broken = header.to_vec();
+            broken.extend_from_slice(b"garbage");
+            let id = ContentId::for_bytes(&broken);
+            let path = store.object_path(&id);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::File::create(&path).unwrap().write_all(&broken).unwrap();
+            let result = store.get_commit(&CommitId(id)).await;
+            if expect_unknown {
+                assert!(matches!(result, Err(LedgerError::UnknownCommitVersion(_))));
+            } else {
+                assert!(matches!(result, Err(LedgerError::CorruptObject { .. })));
+            }
+        }
+        // Listing is strict: a stray regular file at shard level is reported, not skipped.
+        assert!(store.list_objects().is_ok());
+        fs::write(t.path().join("objects/sha256/stray"), b"x").unwrap();
+        assert!(matches!(
+            store.list_objects(),
+            Err(LedgerError::CorruptObject { .. })
         ));
     }
     #[tokio::test]

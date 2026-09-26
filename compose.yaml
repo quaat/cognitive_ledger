@@ -8,14 +8,14 @@ services:
     environment:
       LEDGER_DATA_DIR: /data
       LEDGER_ADDR: 0.0.0.0:8080
-      # Delegate the mutable ref head (ADR-0004/0007) AND the immutable objects
-      # (ADR-0012 shared store) to PostgreSQL: the only topology in which a shared ref
-      # never references node-local content. /data is kept only for the filesystem
-      # backend (LEDGER_IMMUTABLE_BACKEND=filesystem, single host).
+      # With a database URL the server defaults to PostgreSQL for BOTH the mutable ref
+      # head (ADR-0004/0007) and the immutable objects (ADR-0012 shared store): the only
+      # topology in which a shared ref never references node-local content. /data is
+      # used only when LEDGER_IMMUTABLE_BACKEND=filesystem is set explicitly (single host).
       LEDGER_DATABASE_URL: postgres://ledger:ledger-development-only@postgres:5432/ledger?sslmode=disable
-      LEDGER_IMMUTABLE_BACKEND: postgres
     volumes: [ledger-data:/data]
-    ports: ["8080:8080"]
+    # Loopback only: an unauthenticated development ledger must not be reachable from the LAN.
+    ports: ["127.0.0.1:8080:8080"]
     depends_on:
       postgres:
         condition: service_healthy
@@ -30,8 +30,8 @@ services:
       POSTGRES_USER: ledger
       POSTGRES_PASSWORD: ledger-development-only
       POSTGRES_DB: ledger
-    # Published for the host-run PostgreSQL CAS race test (scripts/test-integration.sh).
-    ports: ["55432:5432"]
+    # Published on loopback only for the host-run PostgreSQL tests (scripts/test-integration.sh).
+    ports: ["127.0.0.1:55432:5432"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ledger"]
       interval: 5s

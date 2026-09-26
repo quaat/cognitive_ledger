@@ -53,11 +53,12 @@ qualification forbids it. If "S3 for all immutable objects" is chosen instead, t
 must be shared by every replica and its consistency/durability guarantees become part of
 deployment qualification.
 
-Operational constraint until Phase 1 lands the shared immutable store: because `PgRefStore`
-(mutable ref CAS) is already usable while immutable commit/patch objects remain node-local,
-a multi-replica / shared-ref PostgreSQL deployment is NOT permitted yet — the current
-supported topology is single-writer / single-host. Multi-replica deployment is gated on the
-`PostgresImmutableStore` (or a shared object store) shipping.
+Operational status (Plan 0004 P1.2, 2026-09-26): `PostgresImmutableStore` has shipped and
+is the server default whenever a database URL is configured. `LEDGER_IMMUTABLE_BACKEND=filesystem`
+(shared PostgreSQL refs over node-local objects) remains available as an explicit,
+loudly-warned single-host mode for development; it is not a qualified deployment topology
+and MUST NOT run with more than one ledger process. Deployment qualification requires the
+shared backend.
 
 ## P1.2 PostgreSQL foundation: `immutable_objects` + verified `commit_index`
 (P0-bridging amendment, 2026-09-26.) The PostgreSQL backend stores content and a
@@ -98,7 +99,26 @@ Rules:
   `new_head.parents[0] == expected_head` is a join on `commit_parents` where
   `position = 0`; genesis is `parent_count = 0`.
 - Filesystem and PostgreSQL backends are both version-neutral over `AnyCommit`
-  (ADR-0009 dual read); the bootstrap `FileStore` keeps no index.
+  (ADR-0009 dual read); the bootstrap `FileStore` keeps no index and therefore accepts
+  some histories PostgreSQL rejects (a v2 child of a v1 parent in another graph): the
+  filesystem backend is a single-host development store, not a qualification target.
+- Publication is *truthful*: after `INSERT … ON CONFLICT DO NOTHING` the authoritative
+  row is read back; identical bytes are idempotent success, different bytes are
+  `ObjectCollision`, and an index row under another graph is `GraphBindingConflict`.
+  `put_content` refuses commit-envelope bytes so no commit can bypass `put_commit`. The
+  conflict-resolution contract is a READ COMMITTED property and is pinned per transaction.
+- Migration 0005 adds database-level write-once triggers (`immutable_objects`,
+  `commit_index`, `commit_parents`: no UPDATE/DELETE; `refs`: identity columns immutable,
+  only `head` moves). They guard against accidental administrative statements; a role that
+  owns the tables can disable them, so runtime/migration role separation is a deployment
+  decision (tech-debt).
+- The filesystem→PostgreSQL migration is an administrative command
+  (`ledger-admin migrate-fs-to-pg`), never a startup conversion; it resolves HEAD from the
+  filesystem ref or the shared `refs` row (whichever exists; both must agree), requires the
+  HEAD to be among the imported commits, verifies bytes, the scoped index, and the
+  reconstructed state on both backends, checks every commit is indexed under the target
+  graph, and only then installs an absent ref. The server refuses to start when its HEAD
+  does not resolve in the configured store (`Ledger::verify_head`).
 
 ## Alternatives considered
 - **Keep filesystem-only.** Not horizontally correct; the failure above is unavoidable.
@@ -118,6 +138,10 @@ Rules:
 
 ## Gate
 With two replicas sharing one production store, a commit written by replica A is
-reconstructable by replica B; no shared ref resolves to node-local content. The
-`commit_index` re-derives byte-for-byte from `immutable_objects`; a v1 write against a
-`Reject`-configured store fails closed; identical concurrent writes are idempotent.
+reconstructable by replica B; no shared ref resolves to node-local content. Every
+byte-derivable `commit_index` column (version, patch, parent count, v2 graph, ordered
+parents) re-derives from `immutable_objects`, parents share the child's graph, and the
+check *fails* on each tampered column; a v1 row's `graph_id` is binding policy, not bytes,
+and is checked only relationally. A v1 write against a `Reject`-configured store fails
+closed; identical concurrent writes are idempotent; incompatible concurrent bindings
+resolve to exactly one authoritative row with the loser failing explicitly.

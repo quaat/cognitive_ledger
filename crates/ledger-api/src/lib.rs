@@ -129,13 +129,25 @@ impl From<LedgerError> for ApiError {
                 code: "NOT_FOUND",
                 message: e.to_string(),
             },
+            LedgerError::GraphBindingConflict { .. } => Self {
+                status: StatusCode::CONFLICT,
+                code: "GRAPH_BINDING_CONFLICT",
+                message: e.to_string(),
+            },
+            LedgerError::GraphAlreadyExists(_) => Self {
+                status: StatusCode::CONFLICT,
+                code: "GRAPH_ALREADY_EXISTS",
+                message: e.to_string(),
+            },
             LedgerError::MissingParent(_)
             | LedgerError::MissingPatch(_)
             | LedgerError::MissingTarget(_)
             | LedgerError::InvalidContentId(_)
             | LedgerError::InvalidCommit(_)
             | LedgerError::InvalidIdentifier { .. }
-            | LedgerError::InvalidTimestamp(_) => Self::bad_request(e.to_string()),
+            | LedgerError::InvalidTimestamp(_)
+            | LedgerError::CrossGraphParent { .. }
+            | LedgerError::UnknownGraph(_) => Self::bad_request(e.to_string()),
             _ => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "INTERNAL",
