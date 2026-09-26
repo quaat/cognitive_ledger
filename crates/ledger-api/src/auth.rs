@@ -355,13 +355,23 @@ impl OidcAuthenticator {
                 "jwks document too large".into(),
             ));
         }
-        let bytes = response.bytes().await.map_err(|e| {
-            AuthError::KeySourceUnavailable(format!("jwks read failed: {}", redact(&e)))
-        })?;
-        if bytes.len() > MAX_JWKS_BYTES {
-            return Err(AuthError::KeySourceUnavailable(
-                "jwks document too large".into(),
-            ));
+        // Read the body incrementally and stop at the cap: a chunked or Content-Length-less
+        // response from a broken or hostile issuer must not be buffered whole.
+        let mut response = response;
+        let mut bytes: Vec<u8> = Vec::new();
+        loop {
+            let chunk = response.chunk().await.map_err(|e| {
+                AuthError::KeySourceUnavailable(format!("jwks read failed: {}", redact(&e)))
+            })?;
+            let Some(chunk) = chunk else {
+                break;
+            };
+            if bytes.len() + chunk.len() > MAX_JWKS_BYTES {
+                return Err(AuthError::KeySourceUnavailable(
+                    "jwks document too large".into(),
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
         }
         serde_json::from_slice(&bytes)
             .map_err(|e| AuthError::KeySourceUnavailable(format!("jwks decode failed: {e}")))
@@ -640,32 +650,72 @@ mod tests {
         document: Arc<std::sync::Mutex<String>>,
         hits: Arc<std::sync::atomic::AtomicUsize>,
         fail: Arc<std::sync::atomic::AtomicBool>,
+        /// When set, answer with an endless-looking chunked body (no Content-Length) of this
+        /// many 64 KiB chunks; the server counts how many chunks were actually pulled.
+        oversized_chunks: Arc<std::sync::atomic::AtomicUsize>,
+        chunks_sent: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     async fn jwks_server(initial: &str) -> Jwks {
         let document = Arc::new(std::sync::Mutex::new(initial.to_owned()));
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (d, h, f) = (document.clone(), hits.clone(), fail.clone());
+        let oversized_chunks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let chunks_sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (d, h, f, o, c) = (
+            document.clone(),
+            hits.clone(),
+            fail.clone(),
+            oversized_chunks.clone(),
+            chunks_sent.clone(),
+        );
         let app = axum::Router::new().route(
             "/keys",
             axum::routing::get(move || {
                 let d = d.clone();
                 let h = h.clone();
                 let f = f.clone();
+                let o = o.clone();
+                let c = c.clone();
                 async move {
                     h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let headers = [(axum::http::header::CONTENT_TYPE, "application/json")];
                     if f.load(std::sync::atomic::Ordering::SeqCst) {
                         return (
                             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                            [(axum::http::header::CONTENT_TYPE, "application/json")],
-                            String::new(),
+                            headers,
+                            axum::body::Body::empty(),
+                        );
+                    }
+                    let n = o.load(std::sync::atomic::Ordering::SeqCst);
+                    if n > 0 {
+                        // Chunked and paced: each 64 KiB chunk is produced only when the
+                        // transport asks for it and after a short pause, so the number of
+                        // chunks produced tracks how far the client actually read.
+                        let stream =
+                            futures_util::stream::unfold((0usize, c), move |(i, c)| async move {
+                                if i >= n {
+                                    return None;
+                                }
+                                tokio::time::sleep(Duration::from_millis(2)).await;
+                                c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                Some((
+                                    Ok::<_, std::convert::Infallible>(axum::body::Bytes::from(
+                                        vec![b'{'; 64 * 1024],
+                                    )),
+                                    (i + 1, c),
+                                ))
+                            });
+                        return (
+                            axum::http::StatusCode::OK,
+                            headers,
+                            axum::body::Body::from_stream(stream),
                         );
                     }
                     (
                         axum::http::StatusCode::OK,
-                        [(axum::http::header::CONTENT_TYPE, "application/json")],
-                        d.lock().unwrap().clone(),
+                        headers,
+                        axum::body::Body::from(d.lock().unwrap().clone()),
                     )
                 }
             }),
@@ -678,6 +728,8 @@ mod tests {
             document,
             hits,
             fail,
+            oversized_chunks,
+            chunks_sent,
         }
     }
 
@@ -1056,6 +1108,40 @@ mod tests {
             auth.authenticate(&forged).await,
             Err(AuthError::Unauthenticated(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn oidc_stops_reading_an_oversized_chunked_jwks_at_the_cap() {
+        let server = jwks_server(JWKS_INITIAL).await;
+        // 64 chunks × 64 KiB = 4 MiB, sent without Content-Length.
+        server
+            .oversized_chunks
+            .store(64, std::sync::atomic::Ordering::SeqCst);
+        let auth = oidc(&server.url);
+        let t = sign(
+            jsonwebtoken::Algorithm::RS256,
+            "kid-a",
+            &rsa(RSA_A),
+            &claims(),
+        );
+        match auth.authenticate(&t).await {
+            Err(AuthError::KeySourceUnavailable(m)) => assert!(m.contains("too large"), "{m}"),
+            other => panic!("expected KeySourceUnavailable(too large), got {other:?}"),
+        }
+        // The client hung up at the cap: far fewer than 64 chunks were ever produced
+        // (256 KiB cap = 4 chunks, plus transport read-ahead).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let sent = server.chunks_sent.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            (5..=16).contains(&sent),
+            "server produced {sent} chunks; the client kept reading past the cap"
+        );
+        // A well-formed document afterwards still works.
+        server
+            .oversized_chunks
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        let auth = oidc(&server.url);
+        auth.authenticate(&t).await.unwrap();
     }
 
     #[tokio::test]

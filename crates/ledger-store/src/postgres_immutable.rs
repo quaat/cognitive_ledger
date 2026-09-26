@@ -8,7 +8,7 @@
 //! therefore means "identical, already published" or an explicit error — never a silent
 //! success over foreign bytes or a foreign graph binding.
 
-use crate::{decode_commit_object, reject_commit_bytes_as_content, storage, validate_patch_bytes};
+use crate::{db_error, decode_commit_object, reject_commit_bytes_as_content, validate_patch_bytes};
 use ledger_core::{AnyCommit, CommitId, ContentId, GraphId, ImmutableStore, LedgerError};
 use sqlx::{PgConnection, PgPool, Row, postgres::PgPoolOptions};
 use std::str::FromStr;
@@ -49,13 +49,13 @@ pub(crate) async fn publish_object(
     .bind(bytes)
     .execute(&mut *conn)
     .await
-    .map_err(storage)?;
+    .map_err(db_error)?;
     let row = sqlx::query("SELECT bytes FROM immutable_objects WHERE id = $1")
         .bind(&id_s)
         .fetch_one(&mut *conn)
         .await
-        .map_err(storage)?;
-    let stored: Vec<u8> = row.try_get("bytes").map_err(storage)?;
+        .map_err(db_error)?;
+    let stored: Vec<u8> = row.try_get("bytes").map_err(db_error)?;
     if stored != bytes {
         return Err(LedgerError::ObjectCollision(id.clone()));
     }
@@ -77,7 +77,7 @@ impl PostgresImmutableStore {
             .acquire_timeout(std::time::Duration::from_secs(10))
             .connect(database_url)
             .await
-            .map_err(storage)?;
+            .map_err(db_error)?;
         Self::from_pool(pool, v1_binding).await
     }
 
@@ -120,9 +120,9 @@ impl PostgresImmutableStore {
         let ids: Vec<String> = sqlx::query("SELECT id FROM commit_index ORDER BY id")
             .fetch_all(&self.pool)
             .await
-            .map_err(storage)?
+            .map_err(db_error)?
             .iter()
-            .map(|row| row.try_get("id").map_err(storage))
+            .map(|row| row.try_get("id").map_err(db_error))
             .collect::<Result<_, _>>()?;
         self.verify_ids(&ids).await
     }
@@ -149,13 +149,13 @@ impl PostgresImmutableStore {
             .bind(id)
             .fetch_optional(&self.pool)
             .await
-            .map_err(storage)?;
+            .map_err(db_error)?;
             let content_id = ContentId::from_str(id)?;
             let Some(row) = row else {
                 return Err(LedgerError::NotFound(content_id));
             };
             let mismatch = |reason: &str| corrupt(&content_id, reason);
-            let bytes: Vec<u8> = row.try_get("bytes").map_err(storage)?;
+            let bytes: Vec<u8> = row.try_get("bytes").map_err(db_error)?;
             if ContentId::for_bytes(&bytes) != content_id {
                 return Err(mismatch("bytes do not hash to id"));
             }
@@ -167,11 +167,11 @@ impl PostgresImmutableStore {
                 .bind(commit.patch().to_string())
                 .fetch_optional(&self.pool)
                 .await
-                .map_err(storage)?;
+                .map_err(db_error)?;
             let Some(patch_row) = patch_row else {
                 return Err(mismatch("referenced patch is missing"));
             };
-            let patch_bytes: Vec<u8> = patch_row.try_get("bytes").map_err(storage)?;
+            let patch_bytes: Vec<u8> = patch_row.try_get("bytes").map_err(db_error)?;
             validate_patch_bytes(commit.patch(), &patch_bytes)
                 .map_err(|e| mismatch(&format!("referenced patch is invalid: {e}")))?;
             let parents = fetch_parent_rows(&self.pool, id).await?;
@@ -181,11 +181,11 @@ impl PostgresImmutableStore {
                     .bind(parent_id)
                     .fetch_optional(&self.pool)
                     .await
-                    .map_err(storage)?;
+                    .map_err(db_error)?;
                 let Some(parent_graph) = parent_graph else {
                     return Err(mismatch("indexed parent is not itself indexed"));
                 };
-                let parent_graph: String = parent_graph.try_get("graph_id").map_err(storage)?;
+                let parent_graph: String = parent_graph.try_get("graph_id").map_err(db_error)?;
                 if parent_graph != indexed.graph_id {
                     return Err(mismatch("indexed parent belongs to another graph"));
                 }
@@ -226,11 +226,11 @@ impl PostgresImmutableStore {
                 .bind(parent.to_string())
                 .fetch_optional(&mut *tx)
                 .await
-                .map_err(storage)?;
+                .map_err(db_error)?;
             let Some(row) = row else {
                 return Err(LedgerError::MissingParent(parent.clone()));
             };
-            let parent_graph: String = row.try_get("graph_id").map_err(storage)?;
+            let parent_graph: String = row.try_get("graph_id").map_err(db_error)?;
             if parent_graph != graph_id.as_str() {
                 return Err(LedgerError::CrossGraphParent {
                     parent: parent.clone(),
@@ -245,7 +245,7 @@ impl PostgresImmutableStore {
             .bind(commit.patch().to_string())
             .fetch_optional(&mut *tx)
             .await
-            .map_err(storage)?;
+            .map_err(db_error)?;
         if patch_present.is_none() {
             return Err(LedgerError::MissingPatch(commit.patch().clone()));
         }
@@ -253,14 +253,14 @@ impl PostgresImmutableStore {
             .bind(graph_id.as_str())
             .fetch_optional(&mut *tx)
             .await
-            .map_err(storage)?;
+            .map_err(db_error)?;
         let Some(graph_row) = graph_row else {
             return Err(LedgerError::UnknownGraph(graph_id.to_string()));
         };
         if commit.graph_id().is_none() {
             // ADR-0010: v1 history may only be bound to the bootstrap graph or to a graph
             // that is explicitly receiving an audited import.
-            let status: String = graph_row.try_get("status").map_err(storage)?;
+            let status: String = graph_row.try_get("status").map_err(db_error)?;
             if status != "bootstrap" && status != "importing" {
                 return Err(LedgerError::InvalidCommit(format!(
                     "v1 commits may only be bound to a graph in status bootstrap or importing; \
@@ -283,7 +283,7 @@ impl PostgresImmutableStore {
         .bind(parent_count)
         .execute(&mut *tx)
         .await
-        .map_err(storage)?;
+        .map_err(db_error)?;
         for (position, parent) in commit.parents().iter().enumerate() {
             let position = i16::try_from(position)
                 .map_err(|_| LedgerError::InvalidCommit("parent position exceeds range".into()))?;
@@ -296,7 +296,7 @@ impl PostgresImmutableStore {
             .bind(parent.to_string())
             .execute(&mut *tx)
             .await
-            .map_err(storage)?;
+            .map_err(db_error)?;
         }
 
         // Authoritative verification: whatever row now exists (ours, or a concurrent or
@@ -307,7 +307,7 @@ impl PostgresImmutableStore {
         .bind(&id_s)
         .fetch_one(&mut *tx)
         .await
-        .map_err(storage)?;
+        .map_err(db_error)?;
         IndexRow::from_row(&row)?.check_against(
             commit,
             &id.0,
@@ -341,10 +341,10 @@ struct IndexRow {
 impl IndexRow {
     fn from_row(row: &sqlx::postgres::PgRow) -> Result<Self, LedgerError> {
         Ok(Self {
-            graph_id: row.try_get("graph_id").map_err(storage)?,
-            version: row.try_get("version").map_err(storage)?,
-            patch_id: row.try_get("patch_id").map_err(storage)?,
-            parent_count: row.try_get("parent_count").map_err(storage)?,
+            graph_id: row.try_get("graph_id").map_err(db_error)?,
+            version: row.try_get("version").map_err(db_error)?,
+            patch_id: row.try_get("patch_id").map_err(db_error)?,
+            parent_count: row.try_get("parent_count").map_err(db_error)?,
         })
     }
 
@@ -401,12 +401,12 @@ async fn fetch_parent_rows<'e>(
     .bind(commit_id)
     .fetch_all(executor)
     .await
-    .map_err(storage)?;
+    .map_err(db_error)?;
     rows.iter()
         .map(|row| {
             Ok((
-                row.try_get("position").map_err(storage)?,
-                row.try_get("parent_id").map_err(storage)?,
+                row.try_get("position").map_err(db_error)?,
+                row.try_get("parent_id").map_err(db_error)?,
             ))
         })
         .collect()
@@ -436,7 +436,7 @@ fn check_parent_rows(
 impl ImmutableStore for PostgresImmutableStore {
     async fn put_content(&self, id: &ContentId, bytes: &[u8]) -> Result<(), LedgerError> {
         reject_commit_bytes_as_content(bytes)?;
-        let mut conn = self.pool.acquire().await.map_err(storage)?;
+        let mut conn = self.pool.acquire().await.map_err(db_error)?;
         publish_object(&mut conn, id, bytes).await
     }
 
@@ -445,11 +445,11 @@ impl ImmutableStore for PostgresImmutableStore {
             .bind(id.to_string())
             .fetch_optional(&self.pool)
             .await
-            .map_err(storage)?;
+            .map_err(db_error)?;
         let Some(row) = row else {
             return Ok(None);
         };
-        let bytes: Vec<u8> = row.try_get("bytes").map_err(storage)?;
+        let bytes: Vec<u8> = row.try_get("bytes").map_err(db_error)?;
         if &ContentId::for_bytes(&bytes) != id {
             return Err(corrupt(id, "stored bytes do not hash to id"));
         }
@@ -466,13 +466,13 @@ impl ImmutableStore for PostgresImmutableStore {
         // Patch validity is checked before the transaction: rows are write-once, so the
         // check is exact and keeps parsing out of the lock window.
         self.validate_patch_of(commit).await?;
-        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let mut tx = self.pool.begin().await.map_err(db_error)?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
             .execute(&mut *tx)
             .await
-            .map_err(storage)?;
+            .map_err(db_error)?;
         let id = self.publish_commit_in(&mut tx, commit).await?;
-        tx.commit().await.map_err(storage)?;
+        tx.commit().await.map_err(db_error)?;
         Ok(id)
     }
 
@@ -491,7 +491,7 @@ impl ImmutableStore for PostgresImmutableStore {
             .bind(id.to_string())
             .fetch_optional(&self.pool)
             .await
-            .map_err(storage)?;
+            .map_err(db_error)?;
         Ok(row.is_some())
     }
 }

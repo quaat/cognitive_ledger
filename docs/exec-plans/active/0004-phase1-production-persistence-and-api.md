@@ -677,6 +677,15 @@ Scope: make PR #1 merge-ready without redesign. Changes:
   export byte limit, request timeout and concurrency cap (now shares the edge middleware
   and read guards with the shared router; unit test over a temporary store).
 
+- **Codex re-review** (final head before merge): two P2, both fixed — the JWKS body was
+  buffered whole before the 256 KiB check when the issuer omitted `Content-Length` or used
+  chunked transfer (now read chunk by chunk and abandoned at the cap; paced chunked test
+  proves the client stops reading), and `PostgresImmutableStore` mapped SQLx errors with
+  the generic `storage` classifier so a dropped connection during publication became 500
+  instead of the documented retryable 503 (now `db_error`; a lazy-pool test asserts
+  `DependencyUnavailable` on every public store surface). The `.cargo/audit.toml`
+  justification named the wrong JWT crypto backend (`ring` → `aws-lc-rs`).
+
 Evidence for this pass: `./scripts/check-fast.sh` exit 0; PostgreSQL suites 1/9/7/8/14/10
 and `./scripts/test-integration.sh` exit 0 on the closure content; CI on the final head
 must show `ci-fast`, `ci-integration` and `ci-security` green (recorded in the PR).
