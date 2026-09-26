@@ -356,6 +356,38 @@ supply-chain, upgrade, backup harnesses), `docs/` (operations runbook, security)
   Validate `FUZZ_SANITIZER=address` on a compatible host and record a longer (hours) run
   before the final qualification decision.
 
+### Slice 7 — upgrade from the previous release (§7, 2026-09-27): executed, PASS
+- `scripts/upgrade.sh [rev] [commits]`: builds the previous release (`f027fbf`, the merged
+  Phase-1 baseline at schema 0007; the repository has no tags yet) from git, runs it against
+  a fresh PostgreSQL (owner URL, self-migrating), writes commits through its API recording
+  keys/bodies/answers/states, then upgrades in the documented order (stop → owner
+  `ledger-admin migrate --runtime-role` → new image as the runtime identity) and checks:
+  schema at the required level with the checksums of the already-applied migrations
+  untouched, runtime identity connected, identical head/version and states, verbatim replay
+  of every old prepare/accept key (`replayed: true`, identical identifiers, ref unchanged),
+  a new commit on top, `ledger-admin verify`, and clean-install vs upgraded schema
+  convergence (`pg_dump --schema-only`, normalized, diff empty — grants included).
+- Evidence (`docs/quality/evidence/upgrade-2026-09-27.md`): 25 commits before, schema
+  7 → 9, 25 states identical, 50 keys replayed identically, version 26 after, verifier
+  clean, schemas identical (592 lines); `UPGRADE OK`.
+
+### Slice 8 — backup/restore smoke (§8, 2026-09-27): executed, PASS
+- `scripts/backup-restore.sh`: under a sustained 50-writer load over 10 graphs, take
+  `pg_dump -Fc` and `pg_basebackup -c fast -X stream` (local socket; a production
+  deployment uses a `replication` role over TLS — runbook), restore the dump into a new
+  database (`pg_restore --no-owner`) and start a second PostgreSQL instance from the base
+  backup; for each: `ledger-admin verify` → `VERIFY OK`, every ref's `(version, head)`
+  chain an exact contiguous prefix of the live chain, and a server on the restored database
+  (runtime identity) serving the restored heads with matching versions and reconstructing
+  states identical to the live server at the same commit ids. The load generator's own
+  gate (invariants, landings matched to `ref_events`, verifier) applied to the live database.
+- Evidence (`docs/quality/evidence/backup-restore-2026-09-27.md`): dump at 209 commits,
+  base backup at 599, live at 861 when the load stopped (899 events at comparison time);
+  dump restore 10 refs / 184 events, base-backup instance 10 refs / 313 events, both exact
+  prefixes; 10 + 10 restored heads served, states identical; both verifies clean;
+  `BACKUP RESTORE OK`. First attempt failed on the missing network replication entry in
+  `pg_hba.conf` (procedure corrected to the local socket and documented).
+
 ### Slice 9 — adversarial resource limits (§9, 2026-09-26): executed
 - `pg_api::expensive_operations_are_admission_controlled_under_a_slow_database`: owner
   holds `ACCESS EXCLUSIVE` on `immutable_objects`; two expensive reads occupy both slots
@@ -408,6 +440,28 @@ supply-chain, upgrade, backup harnesses), `docs/` (operations runbook, security)
   releases the slot while the PostgreSQL statement runs on (bounded by session limits);
   rotation latency under the 60 s refresh throttle; a bounded admission queue as a possible
   refinement; the live Entra ID issuer test remains pending.
+
+### Slice 10 — performance baselines (§10, 2026-09-27): first run recorded, depth 10,000 in progress
+- `ledger-stress bench` + `scripts/bench.sh`: single client, linear history, prepare / accept /
+  ref read / state read at depths 1, 100, 1,000, 10,000 (20 samples each). First run aborted
+  at depth 5,902 by client-token expiry (the build takes hours because prepare reconstructs
+  the parent state; fixed with a 12 h token) after recording depths 1–1,000:
+  accept ≈3–4 ms and ref read ≈1 ms flat; prepare 4.8 → 20.5 → 194.7 ms p50 and state read
+  11 → 30 → 211 ms p50, i.e. ≈0.19 ms per ancestor commit. `docs/quality/performance-baselines.md`
+  holds the table and the checkpoint policy proposal (content-addressed snapshots every k
+  commits, written after COMMIT, verifiable by digest, cache-only for correctness; ADR needed
+  before Phase 4). The depth-10,000 rerun is running; its row is appended when it completes.
+
+## Qualification decision (§22–23, interim, 2026-09-27)
+**Production-qualified: NO.** Executed and passing: slices 1 (least privilege), 2 (supply
+chain, image), 3 (1,000 writers), 4 (kill injection), 5 except the live issuer, 6 bounded
+fuzzing, 7 (upgrade), 8 (backup/restore), 9 (adversarial limits), §20 verifier, §21 runbook.
+Open before the gate can pass: **live Entra ID issuer smoke test (pending, no tenant
+credentials available to the runs)**; AddressSanitizer fuzz runs and a multi-hour fuzz
+campaign (deferred: ASan runtime crashes at start-up on the qualification host); depth-10,000
+baseline row (running); final independent reviews of slices 6–10 with no open P0/P1. Deferred
+design work recorded in tech-debt (checkpoints, admission budget for accept, cancellation of
+abandoned statements, deterministic post-commit crash switch).
 
 ## Sub-agent decomposition (§42)
 storage/concurrency (role split, kill injection), API/security (multi-replica auth,

@@ -20,6 +20,7 @@
 //!   --contended-seconds 60 --graphs 100 --commits-per-writer 3 --out target/stress/<run>
 //! ```
 
+mod bench;
 mod fault;
 
 use ledger_core::{GraphId, TenantId};
@@ -185,10 +186,16 @@ fn mint(c: &Config, subject: &str) -> String {
     mint_claims(&c.issuer, &c.audience, &c.secret, subject)
 }
 
-/// Development HS256 token for one writer subject (the tenant and roles are fixed).
+/// Development HS256 token for one writer subject (the tenant and roles are fixed), valid
+/// for one hour.
 fn mint_claims(issuer: &str, audience: &str, secret: &str, subject: &str) -> String {
+    mint_claims_ttl(issuer, audience, secret, subject, 3600)
+}
+
+/// `mint_claims` with an explicit validity (the depth benchmark runs for hours).
+fn mint_claims_ttl(issuer: &str, audience: &str, secret: &str, subject: &str, ttl: u64) -> String {
     let claims = json!({
-        "iss": issuer, "aud": audience, "exp": now_secs() + 3600, "nbf": now_secs() - 30,
+        "iss": issuer, "aud": audience, "exp": now_secs() + ttl, "nbf": now_secs() - 30,
         "tid": TENANT, "oid": subject, "sculpin_principal_type": "agent", "roles": ROLES,
     });
     jsonwebtoken::encode(
@@ -1290,6 +1297,10 @@ async fn main() -> ExitCode {
     if argv.peek().map(String::as_str) == Some("fault") {
         argv.next();
         return fault::run(argv).await;
+    }
+    if argv.peek().map(String::as_str) == Some("bench") {
+        argv.next();
+        return bench::run(argv).await;
     }
     let cfg = match parse(argv) {
         Ok(c) => c,

@@ -39,8 +39,15 @@ roles. Never give a serving container the owner URL (the server warns if it sees
 
 ## Upgrades
 Stop every replica (0007 note in `migrations/README.md`), run step 2 with the new
-`ledger-admin`, start the new build. A build started against another schema level refuses
-to serve; nothing upgrades implicitly.
+`ledger-admin` (`migrate --runtime-role <role>` under the owner identity), start the new
+build. A build started against another schema level refuses to serve; nothing upgrades
+implicitly. The path from the previous release is exercised by `scripts/upgrade.sh`
+(previous image built from git, data written through its API, upgrade in this order, then:
+schema at the required level with the checksums of already-applied migrations untouched,
+identical heads/versions and reconstructed states, verbatim replay of the previous
+release's idempotency keys, new writes, `ledger-admin verify`, and a `pg_dump --schema-only`
+diff between the upgraded database and a clean install, which must be empty). Run it
+before every release; its evidence is recorded in the active Plan 0005 document.
 
 ## Runtime limits
 - HTTP: `LEDGER_LIMIT_*` (body, operations, terms, metadata, reconstruction depth/quads/
@@ -69,10 +76,25 @@ never repairs. Run it after every upgrade, restore or incident; the integration 
 it after every end-to-end scenario.
 
 ## Backup, restore, failure recovery
-Plan 0005 items 8–9 (pending): `pg_dump`/`pg_restore` and base-backup qualification with
-head/state digests before and after; kill-injection recovery evidence. Until they land,
-run `ledger-admin verify` as the post-recovery check and retry ambiguous requests with their
-original idempotency keys.
+- **Logical backup:** `pg_dump -Fc` of the ledger database (a consistent snapshot even
+  under writes). Restore with `pg_restore --no-owner` into a new database as the owner
+  identity, then `ledger-admin verify --database-url <owner url of the restored database>`
+  must print `VERIFY OK` before any server is pointed at it. Grants for the runtime role
+  are part of the dump (the role must exist in the target cluster; it is cluster-wide).
+- **Physical backup:** `pg_basebackup -c fast -X stream` by a role with `replication`
+  privilege (the development compose has no network replication entry in `pg_hba.conf`;
+  production grants it to a dedicated backup role over TLS). A new instance started from
+  the copy is verified the same way.
+- **What restore preserves:** every ref's event chain is an exact prefix of the live chain
+  as of the snapshot, and a server on the restored database serves the restored heads and
+  reconstructs states identical to the live server for the same commit ids (content
+  identity makes the comparison exact). `scripts/backup-restore.sh` proves both variants
+  under live load; run it per release.
+- **Failure recovery:** a killed replica is restarted; a killed PostgreSQL recovers from
+  its WAL and running replicas reconnect without restart (`/ready` returns 200 again).
+  After any recovery run `ledger-admin verify`; clients retry ambiguous requests with their
+  original `Idempotency-Key` and receive the durable outcome (`replayed: true`) or a fresh
+  execution, never a duplicate. Evidence: `docs/quality/evidence/fault-injection-*.md`.
 
 ## Development-only switches (never in production)
 `LEDGER_AUTH_MODE=dev-hs256`, `LEDGER_ALLOW_INSECURE_NON_LOOPBACK=allow-insecure-non-loopback-development-only`,
@@ -82,6 +104,8 @@ The server refuses the unvalidated-acceptance switch together with production au
 
 ## Required gates before a release
 `./scripts/check-fast.sh`, `./scripts/check-supply-chain.sh`, the real PostgreSQL suites
-(including `pg_least_privilege`), `./scripts/test-integration.sh`; and, once Plan 0005 is
-complete, its stress, fault, multi-replica, fuzz, upgrade, backup/restore and performance
-evidence.
+(including `pg_least_privilege`), `./scripts/test-integration.sh`, `./scripts/fuzz.sh`
+(bounded, also in CI); per release the qualification runs `scripts/stress.sh`,
+`scripts/fault.sh`, `scripts/backup-restore.sh`, `scripts/upgrade.sh` and `scripts/bench.sh`
+(baselines in `docs/quality/performance-baselines.md`), each recorded in the active plan.
+The live identity-provider smoke test is a release prerequisite as long as it is pending.
