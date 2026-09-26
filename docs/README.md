@@ -10,3 +10,4 @@
 - [Execution plans](exec-plans/README.md) and [technical debt](exec-plans/tech-debt.md)
 - Quality: [gates](quality/quality-gates.md), [testing](quality/test-strategy.md), [differential](quality/differential-testing.md), [performance](quality/performance-testing.md), [security](quality/security.md)
 - [Generated evidence policy](generated/README.md)
+- [Original background material](reference/original/README.md) (historical inputs, non-normative)

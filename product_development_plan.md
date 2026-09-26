@@ -1,5 +1,14 @@
 # Sculpin Cognitive Ledger — Updated Production Development Plan
 
+> **Terminology note (P0 sign-off, 2026-09-26).** Where this plan says "Jena", read
+> "the Sculpin semantic validation/reasoning layer". Sculpin currently validates with
+> pySHACL and Python reasoning workers; Jena is a possible implementation detail, not an
+> architectural dependency of the ledger (ADR-0014). Where §3.1 lists `correlation_id`
+> in the commit envelope, ADR-0009 has since removed it (tracing metadata lives on
+> proposal/ref-event/decision records) and canonicalizes `evidence_refs[]` as a sorted,
+> unique set. Where §6 implies one ledger graph per KB, ADR-0010 allows many graphs per
+> KB. The ADRs are authoritative where they and this plan differ.
+
 ## 1. Updated architectural assessment
 
 The Cognitive Ledger should continue as an **independent, narrowly scoped knowledge-evolution service**. Its role is not to become Sculpin’s RDF database. It should own immutable cognitive changes, historical state, proposals, branches, provenance, decisions and merge coordination. Sculpin/Jena should continue to own ontology semantics, reasoning and SHACL; Fuseki should remain the query-oriented semantic store; the Virtual A-Box should continue to provide transient external context. This separation is already explicit in the architecture specification.

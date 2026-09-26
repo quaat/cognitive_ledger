@@ -73,10 +73,38 @@ contract findings. No implementation begins until the identity/atomicity ADRs ar
 accepted and reviewed.
 
 ## Current status
-Complete (2026-09-26). Docs reconciled, ADR-0008…ADR-0014 accepted, contracts written,
-top-level guidance and specialist agents updated, and independent reviews passed with all
-raised items folded back into the ADRs. Ready to close; Phase 1 (Plan 0004) is the next
-active milestone, pending owner sign-off on the persistent-identity decisions.
+Complete and signed off (2026-09-26). Docs reconciled, ADR-0008…ADR-0014 accepted,
+contracts written, top-level guidance and specialist agents updated, and independent
+reviews passed with all raised items folded back into the ADRs. The owner's conditional
+sign-off review was applied as the amendments below; Phase 1 (Plan 0004) is active.
+
+## P0 sign-off amendments (2026-09-26)
+The owner gave conditional sign-off with six tightening items, all applied before the
+architecture was frozen and before P1 writes persistent data:
+1. ADR-0010: `LedgerGraph` ↔ KB relaxed from 1:1 to many-graphs-per-KB; the graph is the
+   authorization/privacy boundary, branches are not.
+2. ADR-0009: `evidence_refs[]` canonicalized as a sorted unique set (order never affects
+   `CommitId`); `correlation_id` removed from the envelope (tracing metadata lives on
+   proposal/ref-event/decision records); `source_system` defined as caller-declared,
+   bounded, non-authoritative — `actor` is the only trusted provenance. ADR-0011 and the
+   validation design doc updated to match.
+3. ADR-0013: per-operation lineage predicates inside the transaction (`new_head.graph_id
+   == graph_id`; genesis no parent; advance `parents[0] == expected_head`; merge
+   `parents[1]` = source HEAD; reset only as a distinct audited operation), with tests for
+   backward, sideways, and cross-graph CAS.
+4. ADR-0013/ADR-0014: idempotency covers prepare, because `recorded_at` is
+   identity-bearing and a lost prepare response would otherwise mint a second candidate.
+5. Sculpin-reality wording: `ARCHITECTURE.md`, `AGENTS.md`, `CLAUDE.md`, the product
+   spec, `core-beliefs.md`, `tech-debt.md`, and the roadmap header now say "Sculpin
+   semantic validation/reasoning layer" with pySHACL/Python as the current
+   implementation and Jena as a possible implementation detail only.
+6. `product_development_plan.md` confirmed tracked in Git (commit 04b08ab); the
+   doc-link gate is green against the committed tree. The root-level `plan.md`,
+   `background.md` (a byte-identical duplicate of `plan.md`), and `ledger.md` were moved
+   non-destructively to `docs/reference/original/` as non-normative background material.
+The effective-delta decision, commit versioning strategy, authenticated-principal
+boundary, PostgreSQL immutable-store default, two-phase protocol, proposal/validation/
+decision separation, and validator-agnosticism were confirmed without change.
 
 ## Decisions made
 Captured as ADR-0008 … ADR-0014 (see `../decisions/README.md`). This plan does not
@@ -137,6 +165,11 @@ rather than skipped.
     immutable store ships (ADR-0012).
 A decisions-only phase adds no runtime tests; Plan 0004 owns the executable evidence
 (golden vectors, migration/upgrade, multi-process correctness) for these decisions.
+- Sign-off amendment pass (2026-09-26): `scripts/check-doc-links.py` exit 0 (44 files
+  scanned, including the new `docs/reference/original/`), `scripts/check-architecture.py`
+  exit 0, `.claude/settings.json` parses. `cargo fmt --check` was not executed (the
+  toolchain is unavailable in the sandboxed session) and is not applicable: the amendment
+  commit changes Markdown only.
 
 ## Deferred work
 All implementation of the P0 decisions moves to Phase 1+ plans. Skolemization,

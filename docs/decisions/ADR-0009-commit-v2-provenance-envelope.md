@@ -26,11 +26,14 @@ actor:            principal_id, principal_type (human|agent|service),
 activity
 event_time        (RFC3339, normalized — ADR-0011)
 recorded_at       (server-assigned)
-evidence_refs[]   (durable references only)
-source_system
-correlation_id
+evidence_refs[]   (durable references only; a SET — canonicalized sorted + unique)
+source_system     (caller-declared, bounded; informational, NOT trusted provenance)
 message           (bounded length — ADR-0011)
 ```
+
+Amended at P0 sign-off (2026-09-26): `correlation_id` was removed from the envelope and
+`evidence_refs[]` changed from "caller order preserved + deduplicated" to a sorted, unique
+set. Neither change affects released bytes — no v2 history exists yet.
 
 Explicit exclusions from the commit envelope:
 
@@ -41,6 +44,19 @@ Explicit exclusions from the commit envelope:
   revalidated later against a different semantic context.
 - **raw JWTs/access tokens, arbitrary PII, full feedback/conversation text** — store
   durable evidence references instead (privacy/retention, plan §30).
+- **`correlation_id`** — operational tracing metadata, not knowledge-history identity. It
+  lives on the proposal, ref event, decision, and traces (ADR-0011, ADR-0013). Including
+  it would make two otherwise identical commits differ by request plumbing.
+
+### Trusted versus declared provenance
+`actor` is the **only** trusted provenance in the envelope: it is populated exclusively
+from the authenticated principal (ADR-0011). `source_system` is caller-declared: it is
+bounded (ADR-0011 caps), stored and hashed as given, and is informational only. Consumers,
+audit tooling, and the ledger itself MUST NOT treat `source_system` as authenticated
+origin, and the API MUST NOT let it masquerade as such (no default derived from
+credentials, no authorization decision keyed on it). If an authenticated origin is ever
+needed it becomes a new principal attribute under ADR-0011, not a reinterpretation of this
+field.
 
 Retain the existing deterministic binary canonicalization approach; there is no need to
 switch to JSON/JCS. v1 remains readable forever (dual-read); unknown envelope versions
@@ -68,14 +84,19 @@ retrofitted once v2 history exists:
   the canonical encoding MUST distinguish *absent* from *empty*, and a caller MUST NOT be
   able to forge "absent" by sending an empty value. Pin both cases in golden vectors.
 - **List fields**: `parents[]` is ordered and identity-bearing (parent zero is the
-  reconstruction parent, ADR-0006). `evidence_refs[]` preserves caller order and is
-  identity-bearing but deduplicated; freeze this rule so two logically identical commits
-  cannot diverge on `CommitId`.
+  reconstruction parent, ADR-0006). `evidence_refs[]` is a *set*: the canonical encoding
+  sorts the references bytewise on their canonical UTF-8 form and removes duplicates, so
+  the order a caller supplies never influences `CommitId`. Identical evidence therefore
+  yields identical identity regardless of agent ordering. If evidence priority or ranking
+  ever matters it MUST be modelled explicitly (a new field in a new envelope version),
+  never inferred from position. Pin a vector where the same references are supplied in
+  two orders and once with a duplicate, all yielding one `CommitId`.
 - **`recorded_at`** is server-assigned and identity-bearing, so a `CommitId` is
   re-verifiable but not derivable from logical inputs alone; the golden "logical commit"
   includes a pinned `recorded_at`.
 
 ## Gate
 Same v2 logical commit → same canonical bytes → same `CommitId` across builds and
-platforms, proven by repository-owned golden vectors (including the absent-vs-empty and
-list-ordering cases above), before v2 is used for any persistent history.
+platforms, proven by repository-owned golden vectors (including the absent-vs-empty,
+`parents[]` ordering, and `evidence_refs[]` order-independence/dedup cases above), before
+v2 is used for any persistent history.

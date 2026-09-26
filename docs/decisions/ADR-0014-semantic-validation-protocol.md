@@ -19,7 +19,9 @@ Adopt the two-phase protocol and coordination contracts specified in
 [validation-protocol](../design/validation-protocol.md):
 
 - **Prepare** creates an immutable candidate commit (ADR-0009) with an effective patch
-  (ADR-0008) against a resolved base, moving no accepted ref.
+  (ADR-0008) against a resolved base, moving no accepted ref. Prepare is idempotent under
+  `Idempotency-Key` (ADR-0013) because `recorded_at` is server-assigned and
+  identity-bearing.
 - **Accept** requires an immutable `ValidationRecord` and runs the atomic acceptance
   transaction (ADR-0013).
 - `SemanticExecutionContext`, `ValidationRecord`, `ProposalRecord`, and `DecisionRecord`

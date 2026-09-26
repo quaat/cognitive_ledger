@@ -17,6 +17,7 @@ but the underlying protocol stays separable.
 ### Phase A — prepare candidate
 ```
 authenticate (ADR-0011)
+check Idempotency-Key; replay the stored candidate on a same-digest retry (ADR-0013)
 resolve graph/ref (ADR-0010)
 verify expected HEAD
 parse + normalize RDF
@@ -29,13 +30,15 @@ No accepted ref moves. A failed CAS later cannot lose the candidate.
 
 ### Phase B — validate and accept
 Sculpin fetches the candidate state, builds a `SemanticExecutionContext`, runs its own
-SHACL/OWL/domain/external checks (Jena or pySHACL — opaque to the ledger), and returns an
+SHACL/OWL/domain/external checks (today pySHACL/Python reasoning; the implementation is
+opaque to the ledger), and returns an
 immutable `ValidationRecord`. Then:
 ```
 accept(candidate, validation_id, expected_head)
 ```
-runs the atomic acceptance transaction (ADR-0013). Rejection records a decision and moves
-no ref.
+runs the atomic acceptance transaction (ADR-0013), including the target-existence and
+lineage predicates (`new_head.graph_id == graph_id`, `new_head.parents[0] == expected_head`
+for a normal advance). Rejection records a decision and moves no ref.
 
 ## Contracts
 
@@ -54,6 +57,7 @@ ProposalRecord
     evidence_refs[]
     validation_ids[]
     decision_id?
+    correlation_id?      (tracing metadata — here, never in the commit; ADR-0009)
 ```
 
 ### SemanticExecutionContext

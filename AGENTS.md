@@ -12,7 +12,7 @@ Sculpin Cognitive Ledger is a narrow, Git-like RDF history service—not a graph
 
 ## Non-negotiable boundaries
 - Ledger owns immutable changes/commits, DAG history, refs, provenance, reconstruction, and merge coordination.
-- Sculpin/Jena owns semantics, SHACL, reasoning, and domain rules. Fuseki owns queryable projections. The virtual A-box owns transient context.
+- The Sculpin semantic validation/reasoning layer (currently pySHACL + Python reasoning; Jena is at most an implementation detail) owns semantics, SHACL, reasoning, and domain rules. Fuseki owns queryable projections. The virtual A-box owns transient context.
 - Never add SPARQL, OWL/SHACL engines, general graph indexing, or other database scope here.
 - Fluree is an external differential-test reference only: no copied source, runtime, or compiled dependency.
 - Never rewrite history unsafely. Every ref movement is CAS and must target existing immutable content.

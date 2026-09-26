@@ -8,7 +8,7 @@ The Cognitive Ledger records immutable RDF changes, content-addressed commit his
 | Owner | Responsibility |
 |---|---|
 | Cognitive Ledger | change history, immutable commits/DAG, refs, provenance, reconstruction and merge coordination |
-| Sculpin/Jena | semantics, RDF reasoning, SHACL and domain rules |
+| Sculpin semantic validation/reasoning layer (currently pySHACL + Python reasoning) | semantics, RDF reasoning, SHACL and domain rules |
 | Fuseki | queryable RDF projections |
 | Virtual A-box | transient external context |
 
@@ -87,7 +87,7 @@ W3C PROV-O SHOULD be the interoperability model for exported provenance. Commit 
 
 ### Validation and acceptance
 
-The ledger coordinates validation but does not implement semantics. A candidate state is reconstructed from immutable history and supplied to Sculpin/Jena with explicit ontology/shapes versions and any allowed transient virtual A-box context. Jena owns SHACL, OWL/RDFS reasoning, and domain rules. A validation record eventually MUST contain at least candidate commit/state identity, semantic-context identifiers, validator identity/version, outcome, recorded time, and an immutable report reference or digest.
+The ledger coordinates validation but does not implement semantics. A candidate state is reconstructed from immutable history and supplied to the Sculpin semantic validation/reasoning layer with explicit ontology/shapes versions and any allowed transient virtual A-box context. That layer owns SHACL, OWL/RDFS reasoning, and domain rules; its implementation (today pySHACL and Python reasoning workers, possibly Jena later) is opaque to the ledger (ADR-0014). A validation record eventually MUST contain at least candidate commit/state identity, semantic-context identifiers, validator identity/version, outcome, recorded time, and an immutable report reference or digest.
 
 Validation failure MUST NOT corrupt existing history. Rejected proposals and their validation/decision provenance SHOULD remain auditable without moving an accepted ref. Whether a policy permits commits while semantic validation is unavailable must be explicit per branch/workflow; projection availability alone MUST NOT decide ledger validity.
 
@@ -99,7 +99,7 @@ Branches are named mutable references to immutable commits. Every create, advanc
 
 Merge uses a bounded common-ancestor search and three graph states: base, target, and source. Fast-forward and already-contained cases do not synthesize unnecessary content. Divergent histories produce a two-parent commit whose first parent is the target head and whose patch transforms the target state into the candidate merged state.
 
-Structural conflict detection operates on RDF changes, including competing changes to the same subject/predicate/graph. RDF permits multiple objects, so structural overlap alone is not necessarily a semantic conflict. Sculpin/Jena evaluates the merged candidate with SHACL, reasoning, and domain rules. Merge preview MUST be side-effect free; merge apply MUST re-check both expected heads/ref preconditions and fail rather than applying a stale preview.
+Structural conflict detection operates on RDF changes, including competing changes to the same subject/predicate/graph. RDF permits multiple objects, so structural overlap alone is not necessarily a semantic conflict. Sculpin's semantic validation layer evaluates the merged candidate with SHACL, reasoning, and domain rules. Merge preview MUST be side-effect free; merge apply MUST re-check both expected heads/ref preconditions and fail rather than applying a stale preview.
 
 ### Projection behavior
 

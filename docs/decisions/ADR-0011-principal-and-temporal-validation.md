@@ -28,7 +28,10 @@ on_behalf_of?
   override actor, tenant, or `on_behalf_of`.
 - Trust sources: OIDC (Sculpin's Entra) for humans and trusted workload/service identity
   for agents and services. `principal_type` is derived from the verified identity, never
-  claimed by the caller. `correlation_id` is propagated for tracing.
+  claimed by the caller. `correlation_id` is propagated for tracing and recorded on the
+  proposal, ref event, and decision records (ADR-0013); it is **not** part of the commit
+  envelope (ADR-0009). `source_system`, if supplied, is bounded and stored as
+  caller-declared, informational metadata; it is never treated as authenticated origin.
 - Temporal fields: `event_time` is parsed as an RFC 3339 date-time, normalized to a single
   serialization (UTC, fixed precision) before hashing, and may be optional per policy;
   malformed values are rejected. `recorded_at` is always server-assigned.
