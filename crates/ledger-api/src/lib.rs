@@ -133,7 +133,9 @@ impl From<LedgerError> for ApiError {
             | LedgerError::MissingPatch(_)
             | LedgerError::MissingTarget(_)
             | LedgerError::InvalidContentId(_)
-            | LedgerError::InvalidCommit(_) => Self::bad_request(e.to_string()),
+            | LedgerError::InvalidCommit(_)
+            | LedgerError::InvalidIdentifier { .. }
+            | LedgerError::InvalidTimestamp(_) => Self::bad_request(e.to_string()),
             _ => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "INTERNAL",

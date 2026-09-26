@@ -28,7 +28,12 @@ Projection    graph_id, ref, target, projection_head
   evolution of the *same* cognitive state and are never the security boundary between
   distinct cognitive models. Amended at P0 sign-off (2026-09-26) from the original 1:1
   wording, before any schema or API crystallised.
-- `tenant_id` scopes every entity and every authorization check (ADR-0011).
+- `tenant_id` scopes every entity and every authorization check (ADR-0011). It is not
+  part of the commit envelope: a graph belongs to exactly one tenant, so `graph_id`
+  determines it.
+- Representation (frozen with commit v2 in Phase 1): `graph_id` is an opaque,
+  ledger-generated ASCII token matching `[A-Za-z0-9._:-]{1,128}` (a UUID or URN-like
+  token both fit). It is validated, never parsed; nothing derives meaning from its shape.
 - `graph_id` is identity-bearing in the commit v2 envelope (ADR-0009): a commit belongs
   to exactly one graph.
 - `Ref` carries a `protection_policy` (`main` defaults to protected) and a monotonic

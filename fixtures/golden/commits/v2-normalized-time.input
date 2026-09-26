@@ -1,0 +1,15 @@
+{
+  "graph_id": "0b0a2a1c-2e3d-4f50-8a61-72b384c5d6e7",
+  "parents": ["sha256:73399c34028c2686df761ff8e508ebfb7aa40bb982ff9bcfe9dfc0d432ef903c"],
+  "patch": "sha256:a9fbb5cc86eaab26b5c738c991d72bdec24a9f98ac650f41e45fd667ebad2c43",
+  "actor": {
+    "principal_id": "urn:sculpin:service:ingest",
+    "principal_type": "service"
+  },
+  "activity": "external-sync",
+  "event_time": "2026-09-24T12:30:15.1234567+02:00",
+  "recorded_at": "2026-09-24T09:30:15.999999999-01:00",
+  "evidence_refs": ["urn:sculpin:evidence:sync:1"],
+  "source_system": "external-connector",
+  "message": ""
+}

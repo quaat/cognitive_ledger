@@ -1,0 +1,14 @@
+{
+  "graph_id": "0b0a2a1c-2e3d-4f50-8a61-72b384c5d6e7",
+  "parents": [],
+  "patch": "sha256:a9fbb5cc86eaab26b5c738c991d72bdec24a9f98ac650f41e45fd667ebad2c43",
+  "actor": {
+    "principal_id": "urn:sculpin:agent:feedback-curator",
+    "principal_type": "agent"
+  },
+  "activity": "cognitive-genesis",
+  "event_time": "2026-09-24T10:00:00Z",
+  "recorded_at": "2026-09-24T10:01:00.000000Z",
+  "evidence_refs": [],
+  "message": "golden v2 genesis commit"
+}

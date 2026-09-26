@@ -1,5 +1,16 @@
 //! Infrastructure-free protocol types and storage boundaries.
 
+mod commit_v2;
+mod identity;
+mod temporal;
+
+pub use commit_v2::{AnyCommit, COMMIT_V2_HEADER, CommitV2};
+pub use identity::{
+    Actor, AuthenticatedPrincipal, GraphId, MAX_EVIDENCE_REFS, MAX_GRAPH_ID_BYTES,
+    MAX_IDENTIFIER_BYTES, MAX_MESSAGE_BYTES, PrincipalId, PrincipalType, TenantId,
+};
+pub use temporal::LedgerTimestamp;
+
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use sha2::{Digest, Sha256};
 use std::{fmt, str::FromStr};
@@ -28,6 +39,12 @@ pub enum LedgerError {
     CorruptObject { id: ContentId, reason: String },
     #[error("invalid commit encoding: {0}")]
     InvalidCommit(String),
+    #[error("unknown commit version (header {0:?})")]
+    UnknownCommitVersion(String),
+    #[error("invalid {field}: {reason}")]
+    InvalidIdentifier { field: &'static str, reason: String },
+    #[error("invalid timestamp: {0}")]
+    InvalidTimestamp(String),
     #[error("storage error: {0}")]
     Storage(String),
 }
@@ -98,6 +115,8 @@ macro_rules! typed_id {
 typed_id!(PatchId);
 typed_id!(CommitId);
 
+/// The bootstrap `sculpin-commit-v1` envelope. Readable forever (dual read, ADR-0009);
+/// new persistent history uses [`CommitV2`].
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Commit {
     /// Ordered parents. Parent zero is the reconstruction/mainline parent.
@@ -110,7 +129,9 @@ pub struct Commit {
     pub recorded_time: String,
 }
 
-const COMMIT_HEADER: &[u8] = b"sculpin-commit-v1\0";
+pub(crate) const COMMIT_HEADER: &[u8] = b"sculpin-commit-v1\0";
+/// Alias naming the bootstrap envelope explicitly alongside [`CommitV2`].
+pub type CommitV1 = Commit;
 impl Commit {
     fn validate_shape(&self) -> Result<(), LedgerError> {
         if self.parents.len() > 2 {
@@ -217,7 +238,7 @@ impl<'de> Deserialize<'de> for Commit {
     }
 }
 
-fn encode_field(out: &mut Vec<u8>, field: &str) -> Result<(), LedgerError> {
+pub(crate) fn encode_field(out: &mut Vec<u8>, field: &str) -> Result<(), LedgerError> {
     let len = u32::try_from(field.len())
         .map_err(|_| LedgerError::InvalidCommit("field exceeds u32".into()))?;
     out.extend_from_slice(&len.to_be_bytes());
@@ -225,7 +246,7 @@ fn encode_field(out: &mut Vec<u8>, field: &str) -> Result<(), LedgerError> {
     Ok(())
 }
 
-fn read_field(rest: &mut &[u8]) -> Result<String, LedgerError> {
+pub(crate) fn read_field(rest: &mut &[u8]) -> Result<String, LedgerError> {
     if rest.len() < 4 {
         return Err(LedgerError::InvalidCommit("truncated length".into()));
     }

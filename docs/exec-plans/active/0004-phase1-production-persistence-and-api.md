@@ -126,6 +126,49 @@ content; v2 golden vectors stable across builds; effective-delta identity proper
 fault injection at the acceptance boundary shows no partial acceptance. Fast + integration
 gates green before closing.
 
+## Current status
+P1.1 (persistent protocol) implemented and gated green on 2026-09-26:
+- `ledger-core` gains `GraphId`, `TenantId`, `PrincipalId`, `PrincipalType`, `Actor`,
+  `AuthenticatedPrincipal` (identity caps frozen: 128-byte graph id, 512-byte tokens,
+  4096-byte message, 64 evidence refs), `LedgerTimestamp` (RFC 3339 → UTC microsecond
+  canonical form), `CommitV2` with a strict encoder/decoder, and `AnyCommit` dual read;
+  v1 `Commit` and its vectors are untouched. `time` (already a workspace dependency) is
+  added to `ledger-core`; the architecture check still passes.
+- Golden vectors `fixtures/golden/commits/v2-*` (five positive, thirteen negative) generated
+  by the independent Python reference encoder `scripts/golden/commit_v2_reference.py`;
+  `crates/ledger-core/tests/golden_v2.rs` verifies them from the Rust side.
+- `docs/design/canonicalization.md` gains the v2 section; ADR-0010 pins the `graph_id`
+  representation.
+Not started: P1.2–P1.5. The v2 envelope is **not** yet wired into `ImmutableStore`,
+`Ledger`, or the API — that is P1.2/P1.3 work, now unblocked.
+
+## Test evidence
+- 2026-09-26 `python3 scripts/golden/commit_v2_reference.py check`: exit 0, "all 18
+  commit v2 vectors (positive and negative) match the reference encoder";
+  `v2-linear.sha256` == `v2-evidence-reordered.sha256` (`sha256:979f8d93…eb11d`),
+  pinning evidence order-independence.
+- 2026-09-26 independent read-only reviews (invariant reviewer; static compile/clippy
+  reviewer): byte layout, absent-vs-empty, set semantics, caps, and dual read confirmed
+  sound; no compile or clippy failures found by inspection. Confirmed defects, all fixed
+  in the same change: `LedgerTimestamp` kept sub-microsecond nanoseconds so equality
+  disagreed with identity (now truncated at construction); UTC years outside 0001..=9999
+  could be encoded but not decoded or could panic in offset conversion (now rejected via
+  `checked_to_offset` + explicit range); offset hours/minutes and trailing-newline
+  acceptance differed between the Python reference and Rust (both now bound 00–23/00–59
+  and use full-match). Decisions recorded in `canonicalization.md`: tokens are opaque
+  byte strings (no Unicode normalization, no IRI grammar in identity); core reads no
+  clock (`try_from_offset_date_time` takes the service layer's instant).
+- 2026-09-26 `scripts/check-doc-links.py` and `scripts/check-architecture.py`: exit 0.
+- 2026-09-26 `./scripts/check-fast.sh` (fmt check, doc links, architecture, clippy with
+  `-D warnings`, `cargo test --workspace`): exit 0. `ledger-core` lib: 23 passed;
+  `tests/golden_v2.rs`: 9 passed (Rust reproduces every v2 `.hex`/`.sha256` produced by
+  the Python reference byte-for-byte, all 12 decodable negatives rejected with the
+  expected error kind, unknown version fails closed, v1 vectors still read through
+  `AnyCommit`); `tests/golden.rs` v1: 3 passed. The single ignored test is the
+  pre-existing Docker-gated PostgreSQL CAS test. First run surfaced two unit tests that
+  compared a decoded commit against an unsorted sample (structural `Eq` vs canonical
+  order); the sample was corrected, no protocol change.
+
 ## Completion criteria
 The Phase 1 gate passes with recorded evidence, the carried-forward obligations each have
 an executable test, and independent storage/concurrency, invariant, security, and test
