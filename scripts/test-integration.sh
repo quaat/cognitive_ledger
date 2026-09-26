@@ -1,8 +1,61 @@
 #!/usr/bin/env bash
+# Genuine Docker-backed integration evidence for Plan 0002:
+#   1. The PostgreSQL ref CAS is lost-update-safe under two independent connections.
+#   2. The HTTP server commits/reconstructs over real HTTP and its PostgreSQL-backed
+#      ref head plus filesystem objects survive a container restart.
+# No step is a local-filesystem stand-in for a container, and no skipped external
+# test is reported as a pass.
 set -euo pipefail
+
 command -v docker >/dev/null || { echo 'Docker integration unavailable: docker executable not found' >&2; exit 69; }
+command -v curl >/dev/null || { echo 'curl is required for the HTTP scenario' >&2; exit 69; }
+
+PG_HOST_PORT=55432
+BASE=http://localhost:8080
+
 docker compose config --quiet
-docker compose up --build -d --wait ledger postgres fuseki
-trap 'docker compose down --remove-orphans' EXIT
-curl --fail --retry 10 --retry-delay 2 http://localhost:8080/health
-cargo test -p ledger-testkit --test walking_skeleton
+docker compose up --build -d --wait ledger postgres
+trap 'docker compose down --remove-orphans --volumes' EXIT
+
+# --- 1. Real-PostgreSQL two-connection CAS race -----------------------------------
+export LEDGER_TEST_DATABASE_URL="postgres://ledger:ledger-development-only@localhost:${PG_HOST_PORT}/ledger?sslmode=disable"
+cargo test -p ledger-store --features postgres --test pg_cas_race -- --ignored --nocapture
+
+# --- 2. HTTP commit / state / restart durability ----------------------------------
+curl --fail --silent --retry 10 --retry-delay 2 "${BASE}/health" >/dev/null
+
+json_field() { python3 -c 'import sys,json; print(json.load(sys.stdin)["'"$1"'"])'; }
+
+# Build the commit body with Python so RDF literals (which contain double quotes)
+# are always escaped into valid JSON, then POST it. $1=expected head ("null" or a
+# commit id), $2=N-Quad, $3=message.
+commit() {
+  python3 -c 'import json,sys; exp=None if sys.argv[1]=="null" else sys.argv[1]; print(json.dumps({"expected_head":exp,"operations":[{"op":"add","quad":sys.argv[2]}],"author":"urn:agent:integration","message":sys.argv[3],"event_time":"2026-09-25T00:00:00Z"}))' "$1" "$2" "$3" \
+    | curl --fail --silent -X POST "${BASE}/v1/commits" -H 'content-type: application/json' --data @- \
+    | json_field id
+}
+
+C1=$(commit null '<urn:material:a> <urn:temperature> "80" .' 'genesis')
+echo "genesis commit: ${C1}"
+
+HEAD=$(curl --fail --silent "${BASE}/v1/refs/main" | json_field head)
+[ "${HEAD}" = "${C1}" ] || { echo "FAIL: head ${HEAD} != genesis ${C1}" >&2; exit 1; }
+
+C2=$(commit "${C1}" '<urn:material:a> <urn:humidity> "40" .' 'second')
+echo "second commit: ${C2}"
+
+# Restart only the ledger process; PostgreSQL (ref head) and the /data volume
+# (immutable objects) must carry state across the restart.
+docker compose restart ledger
+curl --fail --silent --retry 20 --retry-delay 2 "${BASE}/health" >/dev/null
+
+HEAD_AFTER=$(curl --fail --silent "${BASE}/v1/refs/main" | json_field head)
+[ "${HEAD_AFTER}" = "${C2}" ] || { echo "FAIL: head after restart ${HEAD_AFTER} != ${C2}" >&2; exit 1; }
+echo "ref head survived restart: ${HEAD_AFTER}"
+
+STATE=$(curl --fail --silent "${BASE}/v1/states/${C2}")
+echo "${STATE}" | grep -q 'urn:temperature' || { echo "FAIL: reconstructed state missing temperature quad: ${STATE}" >&2; exit 1; }
+echo "${STATE}" | grep -q 'urn:humidity' || { echo "FAIL: reconstructed state missing humidity quad: ${STATE}" >&2; exit 1; }
+echo "state reconstructed across restart from filesystem objects"
+
+echo "INTEGRATION OK"

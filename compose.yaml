@@ -1,29 +1,42 @@
+# Development / integration-test harness only. The baked credentials
+# (`ledger-development-only`) and `sslmode=disable` are intentional for local and CI
+# use and MUST NOT be reused as a production deployment: a real deployment injects
+# LEDGER_DATABASE_URL with managed secrets and TLS. This file is not a deploy artifact.
 services:
   ledger:
     build: .
     environment:
       LEDGER_DATA_DIR: /data
       LEDGER_ADDR: 0.0.0.0:8080
+      # Delegate the mutable ref head to PostgreSQL (ADR-0004/0007); immutable
+      # objects stay on the /data volume.
+      LEDGER_DATABASE_URL: postgres://ledger:ledger-development-only@postgres:5432/ledger?sslmode=disable
     volumes: [ledger-data:/data]
     ports: ["8080:8080"]
+    depends_on:
+      postgres:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/health"]
       interval: 5s
       timeout: 3s
       retries: 12
   postgres:
-    image: postgres:17.2-bookworm
+    image: postgres:17.2-bookworm@sha256:3267c505060a0052e5aa6e5175a7b41ab6b04da2f8c4540fc6e98a37210aa2d3
     environment:
       POSTGRES_USER: ledger
       POSTGRES_PASSWORD: ledger-development-only
       POSTGRES_DB: ledger
+    # Published for the host-run PostgreSQL CAS race test (scripts/test-integration.sh).
+    ports: ["55432:5432"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ledger"]
       interval: 5s
       timeout: 3s
       retries: 12
   fuseki:
-    image: stain/jena-fuseki:5.2.0
+    image: stain/jena-fuseki:5.1.0@sha256:b1d0c96f19adddef417520184471ac816cf36c6e72936a88ea02b29f4305929a
+    profiles: [projection]
     environment:
       ADMIN_PASSWORD: development-only
     healthcheck:
@@ -32,7 +45,10 @@ services:
       timeout: 3s
       retries: 12
   fluree-reference:
-    image: ${FLUREE_IMAGE:-fluree/server:unresolved-pin}
+    # Test-reference only (BUSL-1.1). Pinned by digest but gated behind the
+    # 'differential' profile and NOT run in CI pending license sign-off; see
+    # test/reference-images.lock.
+    image: fluree/server:4.2.1@sha256:14da004ab020f7ae4e19696941206f027ef7dda7ba985a82ea101fee1039f770
     profiles: [differential]
     healthcheck:
       test: ["CMD-SHELL", "wget --spider -q http://127.0.0.1:8090 || exit 1"]

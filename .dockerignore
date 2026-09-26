@@ -1,0 +1,9 @@
+# Keep the build context small: never ship local build artifacts, VCS, or docs
+# into the image build (they bloat context transfer and disk, and bust caching).
+target/
+.git/
+**/*.rs.bk
+docs/
+test/
+tests/differential/
+*.md

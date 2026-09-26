@@ -1,8 +1,22 @@
 #!/usr/bin/env bash
+# Differential seam against the pinned Fluree reference.
+#
+# Per the accepted decision, the Fluree image (BUSL-1.1) is pinned by digest but
+# its container is NOT booted in CI pending license sign-off. This script therefore
+# verifies the pin is present and validates the deterministic change model seam, but
+# deliberately does NOT run the live comparison. Seam validation is not a
+# differential pass — the live comparison is explicitly deferred, never faked.
 set -euo pipefail
-command -v docker >/dev/null || { echo 'Differential test unavailable: docker executable not found' >&2; exit 69; }
-image=$(jq -r '.image // empty' test/reference-images.lock)
-[[ -n "$image" ]] || { echo 'Differential test blocked: pin a verified Fluree image digest in test/reference-images.lock' >&2; exit 69; }
-FLUREE_IMAGE="$image" docker compose --profile differential up -d --wait fluree-reference
-trap 'FLUREE_IMAGE="$image" docker compose --profile differential down --remove-orphans' EXIT
+
+LOCK=test/reference-images.lock
+
+digest=$(python3 -c 'import json;print(json.load(open("'"$LOCK"'")).get("digest") or "")')
+[[ -n "$digest" ]] || { echo "Differential blocked: pin a verified Fluree image digest in $LOCK" >&2; exit 69; }
+status=$(python3 -c 'import json;print(json.load(open("'"$LOCK"'")).get("status") or "")')
+
+# Deterministic seam check (no live reference => seam-only, not a differential pass).
 python3 tests/differential/compare_states.py tests/differential/scenario.json
+
+echo "Fluree image pinned: ${digest}"
+echo "LIVE differential comparison DEFERRED (container not started): ${status}"
+echo "Enable by adding a reference-state capture step once BUSL-1.1 sign-off is recorded."

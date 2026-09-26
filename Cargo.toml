@@ -16,6 +16,7 @@ license = "Apache-2.0"
 rust-version = "1.89"
 
 [workspace.dependencies]
+async-trait = "0.1.83"
 axum = "0.8.4"
 hex = "0.4.3"
 oxrdf = "=0.3.4"
@@ -23,6 +24,7 @@ oxttl = "0.2.4"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
 sha2 = "0.10.9"
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "migrate"] }
 tempfile = "3.20.0"
 thiserror = "2.0.12"
 time = { version = "0.3.55", features = ["formatting", "parsing"] }

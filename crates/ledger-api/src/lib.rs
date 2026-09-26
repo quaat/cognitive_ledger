@@ -32,7 +32,9 @@ struct Head {
     head: Option<CommitId>,
 }
 async fn head(State(l): State<Arc<Ledger>>) -> Result<Json<Head>, ApiError> {
-    Ok(Json(Head { head: l.head()? }))
+    Ok(Json(Head {
+        head: l.head().await?,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -71,13 +73,15 @@ async fn commit(
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
     let patch = Patch::new(operations).map_err(|e| ApiError::bad_request(e.to_string()))?;
-    let id = l.commit(CommitRequest {
-        expected_head: body.expected_head,
-        patch,
-        author: body.author,
-        message: body.message,
-        event_time: body.event_time,
-    })?;
+    let id = l
+        .commit(CommitRequest {
+            expected_head: body.expected_head,
+            patch,
+            author: body.author,
+            message: body.message,
+            event_time: body.event_time,
+        })
+        .await?;
     Ok((StatusCode::CREATED, Json(CommitResponse { id })))
 }
 #[derive(Serialize)]
@@ -90,7 +94,8 @@ async fn state_at(
 ) -> Result<Json<StateResponse>, ApiError> {
     let id = CommitId::from_str(&id).map_err(|e| ApiError::bad_request(e.to_string()))?;
     let quads = l
-        .state_at(&id)?
+        .state_at(&id)
+        .await?
         .into_iter()
         .map(|q| q.to_string())
         .collect();
@@ -194,8 +199,8 @@ mod tests {
             message: "m".into(),
             event_time: "e".into(),
         };
-        let c1 = ledger.commit(request(None)).unwrap();
-        let _c2 = ledger.commit(request(Some(c1.clone()))).unwrap();
+        let c1 = ledger.commit(request(None)).await.unwrap();
+        let _c2 = ledger.commit(request(Some(c1.clone()))).await.unwrap();
         let json = format!(
             r#"{{"expected_head":"{c1}","operations":[{{"op":"add","quad":"<urn:x> <urn:p> <urn:o> ."}}],"author":"a","message":"m","event_time":"e"}}"#
         );
@@ -236,6 +241,6 @@ mod tests {
             .await
             .unwrap();
         assert!(response.status().is_client_error());
-        assert_eq!(ledger.head().unwrap(), None);
+        assert_eq!(ledger.head().await.unwrap(), None);
     }
 }

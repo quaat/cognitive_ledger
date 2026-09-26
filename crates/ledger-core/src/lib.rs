@@ -241,17 +241,24 @@ fn read_field(rest: &mut &[u8]) -> Result<String, LedgerError> {
     Ok(value)
 }
 
+#[async_trait::async_trait]
 pub trait ObjectStore: Send + Sync {
-    fn put(&self, id: &ContentId, bytes: &[u8]) -> Result<(), LedgerError>;
-    fn get(&self, id: &ContentId) -> Result<Option<Vec<u8>>, LedgerError>;
+    async fn put(&self, id: &ContentId, bytes: &[u8]) -> Result<(), LedgerError>;
+    async fn get(&self, id: &ContentId) -> Result<Option<Vec<u8>>, LedgerError>;
 }
+#[async_trait::async_trait]
 pub trait CommitStore: Send + Sync {
-    fn put_commit(&self, commit: &Commit) -> Result<CommitId, LedgerError>;
-    fn get_commit(&self, id: &CommitId) -> Result<Option<Commit>, LedgerError>;
+    async fn put_commit(&self, commit: &Commit) -> Result<CommitId, LedgerError>;
+    async fn get_commit(&self, id: &CommitId) -> Result<Option<Commit>, LedgerError>;
 }
+
+/// A pure atomic ref primitive. Implementations swap the stored ref if and only if the
+/// current value equals `expected`; they know nothing about commit contents. The
+/// application service enforces that `new` targets an existing immutable commit.
+#[async_trait::async_trait]
 pub trait RefStore: Send + Sync {
-    fn head(&self) -> Result<Option<CommitId>, LedgerError>;
-    fn compare_and_set(
+    async fn head(&self) -> Result<Option<CommitId>, LedgerError>;
+    async fn compare_and_set(
         &self,
         expected: Option<&CommitId>,
         new: &CommitId,

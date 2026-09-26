@@ -12,6 +12,7 @@ ledger-store = { path = "../ledger-store" }
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true }
 
 [lints]
 workspace = true
