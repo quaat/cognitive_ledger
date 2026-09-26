@@ -65,4 +65,10 @@ an independent reference encoder, `scripts/golden/commit_v2_reference.py` (`chec
 recomputes them), and are verified by `crates/ledger-core/tests/golden_v2.rs`; neither
 side ever rewrites a committed vector.
 
+A header-only patch (`sculpin-rdf-patch-v1\n`, zero operations) is a valid canonical
+patch *object*; the workflow write path never commits one, because an empty effective
+delta is `NO_EFFECTIVE_CHANGE` (ADR-0008). Stores require a commit's patch to hash to its
+id and decode canonically; bytes that hash correctly but are not canonical are
+`INVALID_PATCH`, bytes that do not hash are corruption.
+
 Skolemization is deliberately not implemented. A future general RDF ingress may accept blank-node input only after a deterministic Sculpin-controlled skolemization protocol and hostile-input limits are accepted.

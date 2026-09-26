@@ -15,6 +15,13 @@
 //! `refs` table and never writes `refs/main`. Whichever exists is the HEAD; if both
 //! exist they must agree; and in every case the HEAD must be among the imported commits,
 //! so a wrong or partial `--source` cannot report success.
+//!
+//! This is an offline cutover tool, not online replication: source writers MUST be
+//! quiesced. It therefore detects movement instead of tolerating it — the source HEAD and
+//! an existing destination HEAD are re-read immediately before cutover and any change
+//! aborts (`MigrationSourceMoved`, `HeadChanged`); an absent destination is installed by
+//! CAS, and only a concurrently installed *identical* HEAD counts as idempotent success.
+//! After a reported success the destination HEAD always equals the verified HEAD.
 
 use crate::{FileStore, Ledger, PgRefStore, PostgresImmutableStore, V1Binding};
 use ledger_core::{AnyCommit, CommitId, ContentId, GraphId, ImmutableStore, LedgerError, RefStore};
@@ -25,6 +32,15 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     sync::Arc,
 };
+
+/// The two race windows of the cutover step, exposed to deterministic tests.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CutoverPhase {
+    /// After all verification, before the heads are re-read and the ref is installed.
+    BeforeCutover,
+    /// After the ref step, before the final agreement check.
+    AfterRefInstall,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -95,6 +111,16 @@ impl FsToPgMigration {
     }
 
     pub async fn run(&self) -> Result<MigrationReport, LedgerError> {
+        self.run_with_hook(|_| async {}).await
+    }
+
+    /// `hook` runs at the two cutover windows ([`CutoverPhase`]) so tests can move refs at
+    /// the exact race points deterministically; production callers use [`Self::run`].
+    pub async fn run_with_hook<F, Fut>(&self, hook: F) -> Result<MigrationReport, LedgerError>
+    where
+        F: Fn(CutoverPhase) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
         // 1–4. Enumerate, verify every source object against its id, classify. A
         // commit-family object that does not decode is an error, never "content".
         let ids = self.source.list_objects()?;
@@ -236,11 +262,38 @@ impl FsToPgMigration {
             head_state_digest = Some(state_digest(&source_state));
         }
 
-        // 11. Only now touch the ref, and never overwrite a differing head. A concurrent
-        // identical migration that installed the same HEAD first is idempotent success.
+        hook(CutoverPhase::BeforeCutover).await;
+
+        // 11. Cutover, failing closed on any movement since the run started. The verified
+        // HEAD is the only value a ref may end up holding.
+        let source_head_now = self.source.head().await?;
+        if source_head_now != source_head {
+            return Err(LedgerError::MigrationSourceMoved {
+                before: source_head,
+                after: source_head_now,
+            });
+        }
+        let destination_head_now = self.destination_refs.head().await?;
         let outcome = match (&head, &destination_head_before) {
-            (None, _) => MigrationOutcome::ContentOnlyNoHead,
-            (Some(_), Some(_)) => MigrationOutcome::AlreadyMigrated,
+            (None, _) => {
+                if destination_head_now != destination_head_before {
+                    return Err(LedgerError::HeadChanged {
+                        expected: destination_head_before,
+                        actual: destination_head_now,
+                    });
+                }
+                MigrationOutcome::ContentOnlyNoHead
+            }
+            (Some(head), Some(existing)) => {
+                // The ref existed and was verified as `head`; it must still be exactly that.
+                if destination_head_now.as_ref() != Some(existing) {
+                    return Err(LedgerError::HeadChanged {
+                        expected: Some(head.clone()),
+                        actual: destination_head_now,
+                    });
+                }
+                MigrationOutcome::AlreadyMigrated
+            }
             (Some(head), None) => match self.destination_refs.compare_and_set(None, head).await {
                 Ok(()) => MigrationOutcome::RefInstalled,
                 Err(LedgerError::HeadChanged {
@@ -250,7 +303,19 @@ impl FsToPgMigration {
                 Err(e) => return Err(e),
             },
         };
+        hook(CutoverPhase::AfterRefInstall).await;
+        // Final agreement check. If this fails after `RefInstalled`, the ref *was*
+        // installed and a writer moved it afterwards — a quiescence violation; the error
+        // names the mover's HEAD so the operator can tell the two cases apart.
         let destination_head_after = self.destination_refs.head().await?;
+        if let Some(head) = &head
+            && destination_head_after.as_ref() != Some(head)
+        {
+            return Err(LedgerError::HeadChanged {
+                expected: Some(head.clone()),
+                actual: destination_head_after,
+            });
+        }
 
         Ok(MigrationReport {
             source_objects: ids.len(),

@@ -392,10 +392,138 @@ async fn commit_bytes_are_refused_as_content_and_corrupt_envelopes_are_errors_no
         unreachable!()
     };
     inner.patch = ledger_core::PatchId(genesis.0.clone());
+    let commit_as_patch = AnyCommit::V2(inner);
+    let cap_id = commit_as_patch.id().unwrap();
     assert!(matches!(
-        store.put_commit(&AnyCommit::V2(inner)).await,
-        Err(LedgerError::InvalidCommit(_))
+        store.put_commit(&commit_as_patch).await,
+        Err(LedgerError::InvalidPatch { .. })
     ));
+    assert!(!store.exists(&cap_id.0).await.unwrap());
+}
+
+/// A commit's patch must be a *canonical RDF patch*, not merely existing non-commit content.
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn commit_patch_must_be_a_canonical_rdf_patch() {
+    let url = database_url();
+    let store = PostgresImmutableStore::connect(&url, V1Binding::Reject)
+        .await
+        .unwrap();
+    let graph = unique("graph");
+    create_graph(store.pool(), &graph, "tenant-a").await;
+    let refused_index_free =
+        |store: PostgresImmutableStore, commit: AnyCommit, why: &'static str| async move {
+            let id = commit.id().unwrap();
+            match store.put_commit(&commit).await {
+                Err(LedgerError::InvalidPatch { reason, .. }) => {
+                    assert!(
+                        reason.contains(why),
+                        "reason {reason:?} should mention {why:?}"
+                    );
+                }
+                other => panic!("expected InvalidPatch, got {other:?}"),
+            }
+            assert!(!store.exists(&id.0).await.unwrap(), "no commit object");
+            let indexed = sqlx::query("SELECT 1 FROM commit_index WHERE id = $1")
+                .bind(id.to_string())
+                .fetch_optional(store.pool())
+                .await
+                .unwrap();
+            assert!(indexed.is_none(), "no index row");
+            let parents = sqlx::query("SELECT 1 FROM commit_parents WHERE commit_id = $1")
+                .bind(id.to_string())
+                .fetch_optional(store.pool())
+                .await
+                .unwrap();
+            assert!(parents.is_none(), "no parent rows");
+        };
+    // 1. Arbitrary blob used as a patch.
+    let blob = unique("blob").into_bytes();
+    let blob_id = ContentId::for_bytes(&blob);
+    store.put_content(&blob_id, &blob).await.unwrap();
+    let mut with_blob = v2(&graph, vec![], &patch("x"), "blob patch");
+    if let AnyCommit::V2(inner) = &mut with_blob {
+        inner.patch = ledger_core::PatchId(blob_id);
+    }
+    refused_index_free(store.clone(), with_blob, "unknown header").await;
+    // 2. Non-canonical patch bytes under a correctly computed content id (operations out
+    //    of canonical order).
+    let salt = unique("nc");
+    let noncanonical = format!(
+        "sculpin-rdf-patch-v1\nA <urn:s:{salt}> <urn:p> \"b\" .\nA <urn:s:{salt}> <urn:p> \"a\" .\n"
+    )
+    .into_bytes();
+    assert!(
+        Patch::from_canonical_bytes(&noncanonical).is_err(),
+        "fixture is non-canonical"
+    );
+    let nc_id = ContentId::for_bytes(&noncanonical);
+    store.put_content(&nc_id, &noncanonical).await.unwrap();
+    let mut with_nc = v2(&graph, vec![], &patch("x"), "noncanonical patch");
+    if let AnyCommit::V2(inner) = &mut with_nc {
+        inner.patch = ledger_core::PatchId(nc_id);
+    }
+    refused_index_free(store.clone(), with_nc, "not canonical").await;
+    // 3. Malformed RDF under the patch header.
+    let malformed = format!(
+        "sculpin-rdf-patch-v1\nA <urn:s:{}> <urn:p> .\n",
+        unique("m")
+    )
+    .into_bytes();
+    assert!(matches!(
+        Patch::from_canonical_bytes(&malformed),
+        Err(ledger_rdf::RdfError::InvalidQuad(_))
+    ));
+    let bad_id = ContentId::for_bytes(&malformed);
+    store.put_content(&bad_id, &malformed).await.unwrap();
+    let mut with_bad = v2(&graph, vec![], &patch("x"), "malformed patch");
+    if let AnyCommit::V2(inner) = &mut with_bad {
+        inner.patch = ledger_core::PatchId(bad_id);
+    }
+    refused_index_free(store.clone(), with_bad, "not a canonical N-Quad").await;
+    // 4. A healthy canonical patch is accepted and verifies.
+    let healthy = patch(&unique("ok"));
+    store
+        .put_content(&healthy.id().0, &healthy.canonical_bytes())
+        .await
+        .unwrap();
+    let ok = store
+        .put_commit(&v2(&graph, vec![], &healthy, "healthy"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .verify_commits(std::slice::from_ref(&ok))
+            .await
+            .unwrap(),
+        1
+    );
+    // 5. A child with a parent and a bad patch leaves no parent rows either.
+    let mut child_bad = v2(
+        &graph,
+        vec![ok.clone()],
+        &patch("x"),
+        "child with blob patch",
+    );
+    if let AnyCommit::V2(inner) = &mut child_bad {
+        inner.patch = ledger_core::PatchId(ContentId::for_bytes(&blob));
+    }
+    refused_index_free(store.clone(), child_bad, "unknown header").await;
+    // 6. A *corrupted* stored patch (bytes no longer hash to the id) is storage
+    //    corruption, not a client error, and publishes nothing.
+    let good = patch(&unique("corrupt-me"));
+    sqlx::query("INSERT INTO immutable_objects (id, bytes) VALUES ($1, $2)")
+        .bind(good.id().to_string())
+        .bind(b"sculpin-rdf-patch-v1\nA <urn:s> <urn:p> \"tampered\" .\n".as_slice())
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let on_corrupt = v2(&graph, vec![], &good, "on corrupt patch");
+    assert!(matches!(
+        store.put_commit(&on_corrupt).await,
+        Err(LedgerError::CorruptObject { ref id, .. }) if *id == good.id().0
+    ));
+    assert!(!store.exists(&on_corrupt.id().unwrap().0).await.unwrap());
 }
 
 #[tokio::test]

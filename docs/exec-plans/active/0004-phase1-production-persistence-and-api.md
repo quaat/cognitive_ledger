@@ -212,6 +212,127 @@ evidence:
   or ADR-0012.
 P1.3 (atomic workflow persistence) is next and is **not** started here.
 
+### P1.2 production-hardening pass (prerequisite for P1.3; scope fixed 2026-09-26)
+1. A commit's referenced patch must be a valid canonical RDF patch (not merely existing,
+   non-commit content) in `FileStore::put_commit`, `PostgresImmutableStore::put_commit`
+   and `verify_commits`; typed `InvalidPatch` error; no commit object/index row on refusal.
+2. `FsToPgMigration` fails closed on moving refs: source HEAD re-read before cutover
+   (`MigrationSourceMoved`), an existing destination HEAD re-read (`HeadChanged`), absent
+   destination installed by CAS with a concurrently installed identical HEAD as idempotent
+   success; after success the destination HEAD equals the verified HEAD. Deterministic
+   hook-based tests, no sleeps. Source writers must be quiesced; no online catch-up.
+3. Backend selection fails closed on `LEDGER_IMMUTABLE_BACKEND=postgres` without a
+   database URL; bare-server default listen address becomes `127.0.0.1:8080` (containers
+   set `0.0.0.0:8080` explicitly); every combination unit-tested.
+4. Graceful shutdown on SIGINT and, on Unix, SIGTERM; no platform-specific compile failure.
+
+Status: **done (2026-09-26)**. Independent reviews (storage/concurrency, invariant, test,
+security; Opus) found no P0; every confirmed finding was fixed before the gate: a stored
+patch whose bytes no longer hash to its id was labelled `InvalidPatch` (a 400) on the
+PostgreSQL path instead of corruption — now `CorruptObject` on both backends, with
+`InvalidPatch` reserved for hash-correct non-canonical bytes and its reason bounded (no
+stored RDF text is echoed; the API reports it generically); the SIGTERM test only proved
+registration — shutdown is now a tested selector (`shutdown_on`) with a bounded 30 s drain;
+verification's non-canonical-patch branch, a corrupted-patch publication on each backend, a
+ref appearing during a no-HEAD run, and a ref moved after installation had no tests — all
+added (the cutover hook now has two phases); an empty or non-Unicode database URL selected
+filesystem mode silently — now a startup error; `verify_head` also checks the HEAD's patch.
+Accepted with documentation: the tool detects rather than prevents source movement
+(quiescence is an operational requirement), history written before the patch-validity rule
+fails closed at migration/startup and needs repair, `.dockerignore` tightened.
+
+### P1.2 hardening evidence (2026-09-26)
+`cargo fmt --check`, clippy `-D warnings`, `cargo test --workspace` (ledger-server now 7
+tests incl. `shutdown_resolves_on_either_signal_and_names_it` and the six backend-selection
+combinations; ledger-store 9 lib), `check-doc-links` 44 files, `check-architecture`,
+golden 18/18 all exit 0. Real PostgreSQL (fresh volume): `pg_cas_race` 1,
+`pg_immutable_store` 9 (incl. `commit_patch_must_be_a_canonical_rdf_patch`: blob,
+non-canonical, malformed, healthy, child-with-parent, corrupted-stored-patch),
+`pg_graphs_migration` 6 (tamper test now covers hash-mismatch and non-canonical patch
+branches; upgrade-guard retry reconnects because a failed sqlx run keeps its advisory lock
+on the pooled connection), `pg_fs_migration` 9 (six cutover scenarios) — 25 passed. Full
+Docker integration `./scripts/test-integration.sh` exit 0: image build, all 25 database
+tests, HTTP commit + ledger-container restart, "shared backend confirmed: 2 commits in
+PostgreSQL, 2 indexed under 'default', 0 node-local object files".
+
+## P1.3 design — atomic workflow persistence (ADR-0013; fixed before implementation)
+
+**Schema (migration 0006, additive; 0001–0005 untouched).**
+- `refs`: `version BIGINT NOT NULL DEFAULT 1` (monotonic; a trigger requires
+  `NEW.version = OLD.version + 1` on every head change), `protected BOOLEAN NOT NULL
+  DEFAULT true` (strict effective-delta policy), composite FK `(graph_id, head) →
+  commit_index(graph_id, id)`. The migration first raises an actionable error listing any
+  existing ref whose head is not an indexed commit of its graph; nothing is repaired.
+- `proposals` (append-only): candidate commit (FK to `commit_index(graph_id,id)`,
+  unique), requested patch id (FK `immutable_objects`), effective patch id, graph, branch,
+  expected head, principal fields, tenant, created_at. Records what the caller asked for
+  versus what actually changed (ADR-0008); raw intent never enters commit identity.
+- `ref_events` (append-only): graph, branch, old/new head, old/new version, operation
+  (`genesis` | `advance`), principal fields, tenant, reason, recorded_at; unique
+  `(graph, branch, new_version)`; FK new head → `commit_index(graph_id,id)`.
+- `decisions` (append-only): candidate, optional proposal, graph, branch, decision
+  (`accepted` | `rejected` | `superseded`), principal fields, tenant, reason,
+  `validation_ids TEXT[]` (empty in P1.3; Phase 2 fills it — no schema replacement),
+  optional ref_event id (accepted only), decided_at. At most one terminal decision per
+  proposal. No dummy validation record is ever written.
+- `projection_outbox`: graph, branch, commit, ref_version, event kind (`ref_advanced`),
+  ref_event id, created_at, delivery metadata nullable; unique `(graph, branch,
+  ref_version)`; FK to the ref event. P1.3 writes rows only; no consumer.
+- `idempotency`: PK `(tenant, principal, graph, operation, key)`, request digest,
+  result columns (candidate / ref version / decision id / error code), created_at,
+  completed_at. A row is inserted inside the workflow transaction and therefore becomes
+  visible only as a completed result: a loser blocked on the unique index reads the
+  winner's completed row after commit (same digest → replay; different digest →
+  `IDEMPOTENCY_CONFLICT`); a rolled-back winner leaves no row, so the loser proceeds.
+- Write-once triggers on `proposals`, `ref_events`, `decisions`; `projection_outbox`
+  identity columns immutable (delivery columns mutable for Phase 3); `idempotency`
+  rows immutable.
+
+**Repository (`ledger-store`, PostgreSQL only).** A composition root
+`PostgresLedgerStore { pool, immutable, graphs, workflows }` shares one pool.
+`WorkflowRepository` exposes `prepare`, `accept`, `reject`, `mark_superseded`, each ONE
+transaction pinned to READ COMMITTED:
+- `prepare`: idempotency reservation → graph must be `active` → ref read (`expected_head`
+  must equal the current head, `HEAD_CHANGED` otherwise) → base state reconstructed →
+  `effective_delta(base, requested, policy)` (strict on protected refs) → requested patch
+  and effective patch published as content → candidate v2 commit published through the
+  shared in-transaction publication helper (refactored out of
+  `PostgresImmutableStore::put_commit`, not duplicated) → proposal row → idempotency
+  result → commit. Candidate identity and idempotency commit together, so a lost response
+  replays the exact original `CommitId`.
+- `accept`: idempotency reservation → graph `active` → `SELECT … FOR UPDATE` on the ref row
+  (absent row = genesis path) → candidate must be indexed under the requested graph →
+  lineage: genesis (`expected_head = None`, ref absent, `parent_count = 0`) or advance
+  (ref head = `expected_head`, `parents[0] = expected_head`), else `LINEAGE_MISMATCH` /
+  `HEAD_CHANGED` → ref update with `version + 1` → ref_event → accepted decision → outbox
+  → idempotency result → commit. Any failure rolls back every mutable record; the
+  candidate stays as an unattached proposal.
+- `reject`: idempotency + rejected decision, atomically; no ref move, no outbox.
+- `mark_superseded`: explicit call for a proposal whose expected head is no longer the
+  ref head; no automatic supersession in P1.3.
+- Fault injection: `WorkflowRepository::with_failpoint(FailPoint)` aborts the transaction
+  at after-reservation, after-lineage, after-ref-update, after-ref-event, after-decision,
+  after-outbox, before-commit. Lost response = commit, drop the result, retry.
+
+**Effective delta (`ledger-rdf`, pure).** `effective_delta(base, requested, policy) →
+Result<Patch, DeltaError>`: strict — delete-absent is `BASE_MISMATCH`, add-present is
+dropped, empty result is `NO_EFFECTIVE_CHANGE`; permissive — no-ops dropped, empty result
+still `NO_EFFECTIVE_CHANGE`. Deterministic seeded property tests: idempotence,
+add-present collapse, delete-absent strict rejection, mixed reduction, empty rejection,
+identical identity from a supplied state versus full reconstruction (checkpoints repeat
+this in Phase 6).
+
+**Policies.** Normal acceptance requires `graphs.status = 'active'`; bootstrap/import
+graphs move only through the administrative paths. Raw `PgRefStore` CAS remains for
+filesystem/dev/bootstrap/admin/tests and now bumps `version`; production accepted
+transitions go through `WorkflowRepository`, and the bootstrap v1 write path is labelled
+as such until the authenticated API (P1.4) routes `prepare`/`accept`. P1.3 atomicity is
+verified with an explicit no-validation policy; that is **not** production protected
+semantic acceptance (Phase 2).
+
+**Not in P1.3.** Merge/second-parent semantics, reset, projector, HTTP auth, branches,
+role qualification (documented direction only).
+
 ## Test evidence
 - 2026-09-26 `python3 scripts/golden/commit_v2_reference.py check`: exit 0, "all 18
   commit v2 vectors (positive and negative) match the reference encoder";

@@ -1,9 +1,22 @@
-# Keep the build context small: never ship local build artifacts, VCS, or docs
-# into the image build (they bloat context transfer and disk, and bust caching).
-target/
-.git/
-**/*.rs.bk
+.bash_profile
+.bashrc
+.claude/
+data/
 docs/
+.git/
+.gitconfig
+.idea/
+# into the image build (they bloat context transfer and disk, and bust caching).
+# Keep the build context small: never ship local build artifacts, VCS, or docs
+.mcp.json
+*.md
+.profile
+.ripgreprc
+**/*.rs.bk
+target/
 test/
 tests/differential/
-*.md
+.vscode/
+*.zip
+.zprofile
+.zshrc

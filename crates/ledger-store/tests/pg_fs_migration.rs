@@ -9,7 +9,7 @@ use ledger_core::{
 };
 use ledger_rdf::{Operation, OperationKind, Patch};
 use ledger_store::{
-    CommitRequest, FileStore, FsToPgMigration, Ledger, MigrationOutcome, PgRefStore,
+    CommitRequest, CutoverPhase, FileStore, FsToPgMigration, Ledger, MigrationOutcome, PgRefStore,
     PostgresImmutableStore, V1Binding,
 };
 use std::sync::Arc;
@@ -587,4 +587,190 @@ async fn destination_collision_and_conflicting_head_abort_without_overwriting() 
         Some(elsewhere),
         "never overwritten silently"
     );
+}
+
+/// The cutover windows: refs move between verification and the ref step, or right after
+/// the ref step. Deterministic via `run_with_hook`; no sleeps.
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn cutover_fails_closed_when_refs_move_during_migration() {
+    // 1. Filesystem source HEAD moves during the run.
+    let dir = tempfile::tempdir().unwrap();
+    let (_source, commits) = seed_v1_history(dir.path(), &unique("mv-src")).await;
+    let branch = unique("mv-src");
+    let fs = FileStore::open_existing(dir.path()).unwrap();
+    let error = migration(dir.path(), &branch)
+        .await
+        .run_with_hook(|phase| {
+            let (fs, commits) = (&fs, &commits);
+            async move {
+                if phase == CutoverPhase::BeforeCutover {
+                    // A writer rewinds/moves the source ref while we are cutting over.
+                    fs.compare_and_set(Some(&commits[1]), &commits[0])
+                        .await
+                        .unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, LedgerError::MigrationSourceMoved { before: Some(ref b), after: Some(ref a) }
+            if *b == commits[1] && *a == commits[0]),
+        "{error}"
+    );
+    let refs = PgRefStore::connect_ref(&database_url(), "default", &branch)
+        .await
+        .unwrap();
+    assert_eq!(
+        refs.head().await.unwrap(),
+        None,
+        "stale source state never installs a ref"
+    );
+
+    // 2. An existing destination HEAD moves during the run.
+    let dir = tempfile::tempdir().unwrap();
+    let (_source, commits) = seed_v1_history(dir.path(), &unique("mv-dst")).await;
+    let branch = unique("mv-dst");
+    let refs = PgRefStore::connect_ref(&database_url(), "default", &branch)
+        .await
+        .unwrap();
+    refs.compare_and_set(None, &commits[1]).await.unwrap();
+    let mover = PgRefStore::connect_ref(&database_url(), "default", &branch)
+        .await
+        .unwrap();
+    let error = migration(dir.path(), &branch)
+        .await
+        .run_with_hook(|phase| {
+            let (mover, commits) = (&mover, &commits);
+            async move {
+                if phase == CutoverPhase::BeforeCutover {
+                    mover
+                        .compare_and_set(Some(&commits[1]), &commits[0])
+                        .await
+                        .unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, LedgerError::HeadChanged { expected: Some(ref e), actual: Some(ref a) }
+            if *e == commits[1] && *a == commits[0]),
+        "{error}"
+    );
+    assert_eq!(
+        refs.head().await.unwrap(),
+        Some(commits[0].clone()),
+        "never overwritten"
+    );
+
+    // 3. Absent destination installed concurrently with the *same* HEAD: idempotent.
+    let dir = tempfile::tempdir().unwrap();
+    let (_source, commits) = seed_v1_history(dir.path(), &unique("mv-same")).await;
+    let branch = unique("mv-same");
+    let twin = PgRefStore::connect_ref(&database_url(), "default", &branch)
+        .await
+        .unwrap();
+    let report = migration(dir.path(), &branch)
+        .await
+        .run_with_hook(|phase| {
+            let (twin, commits) = (&twin, &commits);
+            async move {
+                if phase == CutoverPhase::BeforeCutover {
+                    twin.compare_and_set(None, &commits[1]).await.unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(report.outcome, MigrationOutcome::AlreadyMigrated);
+    assert_eq!(
+        report.destination_head_after.as_deref(),
+        Some(commits[1].to_string().as_str())
+    );
+
+    // 4. Absent destination installed concurrently with a *different* HEAD: HEAD_CHANGED.
+    let dir = tempfile::tempdir().unwrap();
+    let (_source, commits) = seed_v1_history(dir.path(), &unique("mv-diff")).await;
+    let branch = unique("mv-diff");
+    let rival = PgRefStore::connect_ref(&database_url(), "default", &branch)
+        .await
+        .unwrap();
+    let error = migration(dir.path(), &branch)
+        .await
+        .run_with_hook(|phase| {
+            let (rival, commits) = (&rival, &commits);
+            async move {
+                if phase == CutoverPhase::BeforeCutover {
+                    rival.compare_and_set(None, &commits[0]).await.unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, LedgerError::HeadChanged { expected: None, actual: Some(ref a) } if *a == commits[0]),
+        "{error}"
+    );
+    assert_eq!(rival.head().await.unwrap(), Some(commits[0].clone()));
+
+    // 5. No HEAD on either side, and a destination ref appears during the run: the
+    //    content-only outcome must not be reported over an unverified ref.
+    let dir = tempfile::tempdir().unwrap();
+    let fs = Arc::new(FileStore::open(dir.path()).unwrap());
+    let p = quad_patch(&[&format!("<urn:s:{}> <urn:p> \"v\" .", unique("nohead"))]);
+    fs.put_content(&p.id().0, &p.canonical_bytes())
+        .await
+        .unwrap();
+    let branch = unique("mv-nohead");
+    let appearing = PgRefStore::connect_ref(&database_url(), "default", &branch)
+        .await
+        .unwrap();
+    let error = migration(dir.path(), &branch)
+        .await
+        .run_with_hook(|phase| {
+            let (appearing, commits) = (&appearing, &commits);
+            async move {
+                if phase == CutoverPhase::BeforeCutover {
+                    appearing.compare_and_set(None, &commits[0]).await.unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, LedgerError::HeadChanged { expected: None, actual: Some(ref a) } if *a == commits[0]),
+        "{error}"
+    );
+
+    // 6. The ref is installed and a writer moves it before the final agreement check: the
+    //    run reports HEAD_CHANGED naming the mover's HEAD (installed-then-moved), never Ok.
+    let dir = tempfile::tempdir().unwrap();
+    let (_source, commits) = seed_v1_history(dir.path(), &unique("mv-after")).await;
+    let branch = unique("mv-after");
+    let mover = PgRefStore::connect_ref(&database_url(), "default", &branch)
+        .await
+        .unwrap();
+    let error = migration(dir.path(), &branch)
+        .await
+        .run_with_hook(|phase| {
+            let (mover, commits) = (&mover, &commits);
+            async move {
+                if phase == CutoverPhase::AfterRefInstall {
+                    mover
+                        .compare_and_set(Some(&commits[1]), &commits[0])
+                        .await
+                        .unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, LedgerError::HeadChanged { expected: Some(ref e), actual: Some(ref a) }
+            if *e == commits[1] && *a == commits[0]),
+        "{error}"
+    );
+    assert_eq!(mover.head().await.unwrap(), Some(commits[0].clone()));
 }

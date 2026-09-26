@@ -148,6 +148,8 @@ impl From<LedgerError> for ApiError {
             | LedgerError::InvalidTimestamp(_)
             | LedgerError::CrossGraphParent { .. }
             | LedgerError::UnknownGraph(_) => Self::bad_request(e.to_string()),
+            // No client can reference a stored patch id yet: an invalid stored patch is a
+            // server-side fault and is reported generically like corruption.
             _ => Self {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 code: "INTERNAL",

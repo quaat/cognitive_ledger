@@ -61,6 +61,38 @@ pub fn decode_commit_object(
     }
 }
 
+/// A commit's referenced patch must be a canonical ledger patch whose bytes hash to the
+/// referenced id — not merely some stored non-commit blob (ImmutableStore contract).
+/// Bytes that do not hash to the id are storage corruption (`CorruptObject`); bytes that
+/// hash correctly but are not a canonical patch are `InvalidPatch`. The reason is bounded
+/// and never echoes stored RDF text.
+pub(crate) fn validate_patch_bytes(id: &PatchId, bytes: &[u8]) -> Result<Patch, LedgerError> {
+    if ContentId::for_bytes(bytes) != id.0 {
+        return Err(LedgerError::CorruptObject {
+            id: id.0.clone(),
+            reason: "stored bytes do not hash to the patch id".into(),
+        });
+    }
+    Patch::from_canonical_bytes(bytes).map_err(|e| LedgerError::InvalidPatch {
+        id: id.clone(),
+        reason: bounded_reason(&e),
+    })
+}
+
+/// Error classification only: which decode rule failed, without the offending text.
+fn bounded_reason(error: &ledger_rdf::RdfError) -> String {
+    match error {
+        ledger_rdf::RdfError::InvalidQuad(_) => "an operation is not a canonical N-Quad".into(),
+        ledger_rdf::RdfError::BlankNode => "blank nodes are forbidden".into(),
+        ledger_rdf::RdfError::ConflictingOperation(_) => "a quad is both added and deleted".into(),
+        ledger_rdf::RdfError::InvalidPatch(message) => {
+            let mut m = message.clone();
+            m.truncate(120);
+            m
+        }
+    }
+}
+
 /// `put_content` is for patches and other non-commit objects only; commit envelopes must
 /// go through `put_commit` so parent, graph and index checks always run.
 pub(crate) fn reject_commit_bytes_as_content(bytes: &[u8]) -> Result<(), LedgerError> {
@@ -234,9 +266,10 @@ impl FileStore {
                 });
             }
         }
-        if self.get_object_sync(&commit.patch().0)?.is_none() {
+        let Some(patch_bytes) = self.get_object_sync(&commit.patch().0)? else {
             return Err(LedgerError::MissingPatch(commit.patch().clone()));
-        }
+        };
+        validate_patch_bytes(commit.patch(), &patch_bytes)?;
         let bytes = commit.canonical_bytes()?;
         let id = commit.id()?;
         self.put_object_sync(&id.0, &bytes)?;
@@ -400,7 +433,7 @@ pub use postgres_graphs::{GraphRecord, GraphStatus, NewGraph, PgGraphs};
 #[cfg(feature = "postgres")]
 mod migrate_fs_to_pg;
 #[cfg(feature = "postgres")]
-pub use migrate_fs_to_pg::{FsToPgMigration, MigrationOutcome, MigrationReport};
+pub use migrate_fs_to_pg::{CutoverPhase, FsToPgMigration, MigrationOutcome, MigrationReport};
 
 /// PostgreSQL-backed ref coordination. Immutable objects and commits stay on the
 /// filesystem `FileStore`; only the mutable ref head is delegated here so that
@@ -585,15 +618,20 @@ impl Ledger {
         self.refs.head().await
     }
     /// Startup/qualification check: the current HEAD, if any, must resolve to a commit in
-    /// *this* immutable store. A shared ref whose content lives elsewhere (the node-local
-    /// filesystem of another host, an unmigrated store) is refused here rather than
+    /// *this* immutable store whose patch is a valid canonical patch. A shared ref whose
+    /// content lives elsewhere (the node-local filesystem of another host, an unmigrated
+    /// store) or whose head predates the patch-validity rule is refused here rather than
     /// discovered on the first read.
     pub async fn verify_head(&self) -> Result<Option<CommitId>, LedgerError> {
         let head = self.refs.head().await?;
-        if let Some(head) = &head
-            && self.immutable.get_commit(head).await?.is_none()
-        {
-            return Err(LedgerError::MissingTarget(head.clone()));
+        if let Some(head) = &head {
+            let Some(commit) = self.immutable.get_commit(head).await? else {
+                return Err(LedgerError::MissingTarget(head.clone()));
+            };
+            let Some(patch_bytes) = self.immutable.get_content(&commit.patch().0).await? else {
+                return Err(LedgerError::MissingPatch(commit.patch().clone()));
+            };
+            validate_patch_bytes(commit.patch(), &patch_bytes)?;
         }
         Ok(head)
     }
@@ -664,7 +702,7 @@ impl Ledger {
                 .get_content(&commit.patch().0)
                 .await?
                 .ok_or_else(|| LedgerError::NotFound(commit.patch().0.clone()))?;
-            let patch = Patch::from_canonical_bytes(&bytes).map_err(storage)?;
+            let patch = validate_patch_bytes(commit.patch(), &bytes)?;
             for op in patch.operations() {
                 match op.kind {
                     OperationKind::Add => {
@@ -680,7 +718,7 @@ impl Ledger {
     }
     pub async fn patch(&self, id: &PatchId) -> Result<Option<Patch>, LedgerError> {
         match self.immutable.get_content(&id.0).await? {
-            Some(b) => Ok(Some(Patch::from_canonical_bytes(&b).map_err(storage)?)),
+            Some(b) => Ok(Some(validate_patch_bytes(id, &b)?)),
             None => Ok(None),
         }
     }
@@ -853,6 +891,80 @@ mod tests {
                 assert!(matches!(result, Err(LedgerError::CorruptObject { .. })));
             }
         }
+        // A commit whose patch is an arbitrary blob (existing, non-commit content) is
+        // refused and the commit object is not published.
+        let blob = b"not a patch at all".to_vec();
+        let blob_id = ContentId::for_bytes(&blob);
+        store.put_content(&blob_id, &blob).await.unwrap();
+        let with_blob = AnyCommit::V1(Commit {
+            parents: vec![],
+            patch: PatchId(blob_id),
+            author: "a".into(),
+            message: "blob".into(),
+            event_time: "e".into(),
+            recorded_time: "r".into(),
+        });
+        assert!(matches!(
+            store.put_commit(&with_blob).await,
+            Err(LedgerError::InvalidPatch { .. })
+        ));
+        assert!(!store.exists(&with_blob.id().unwrap().0).await.unwrap());
+        // Hash-correct but non-canonical, and malformed, patch bytes are refused the same way.
+        for (content, why) in [
+            (
+                b"sculpin-rdf-patch-v1\nA <urn:s> <urn:p> \"b\" .\nA <urn:s> <urn:p> \"a\" .\n"
+                    .to_vec(),
+                "not canonical",
+            ),
+            (
+                b"sculpin-rdf-patch-v1\nA <urn:s> <urn:p> .\n".to_vec(),
+                "not a canonical N-Quad",
+            ),
+        ] {
+            let content_id = ContentId::for_bytes(&content);
+            store.put_content(&content_id, &content).await.unwrap();
+            let commit = AnyCommit::V1(Commit {
+                parents: vec![],
+                patch: PatchId(content_id),
+                author: "a".into(),
+                message: why.into(),
+                event_time: "e".into(),
+                recorded_time: "r".into(),
+            });
+            match store.put_commit(&commit).await {
+                Err(LedgerError::InvalidPatch { reason, .. }) => {
+                    assert!(reason.contains(why), "{reason}")
+                }
+                other => panic!("{other:?}"),
+            }
+            assert!(!store.exists(&commit.id().unwrap().0).await.unwrap());
+        }
+        // A stored patch whose bytes no longer hash to their id is corruption.
+        let healthy = Patch::new([Operation {
+            kind: OperationKind::Add,
+            quad: "<urn:s> <urn:p> \"healthy\" .".parse().unwrap(),
+        }])
+        .unwrap();
+        let path = store.object_path(&healthy.id().0);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            b"sculpin-rdf-patch-v1\nA <urn:s> <urn:p> \"swapped\" .\n",
+        )
+        .unwrap();
+        let on_corrupt = AnyCommit::V1(Commit {
+            parents: vec![],
+            patch: healthy.id(),
+            author: "a".into(),
+            message: "corrupt".into(),
+            event_time: "e".into(),
+            recorded_time: "r".into(),
+        });
+        assert!(matches!(
+            store.put_commit(&on_corrupt).await,
+            Err(LedgerError::CorruptObject { .. })
+        ));
+        assert!(!store.exists(&on_corrupt.id().unwrap().0).await.unwrap());
         // Listing is strict: a stray regular file at shard level is reported, not skipped.
         assert!(store.list_objects().is_ok());
         fs::write(t.path().join("objects/sha256/stray"), b"x").unwrap();

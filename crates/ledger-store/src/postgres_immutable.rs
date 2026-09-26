@@ -8,7 +8,7 @@
 //! therefore means "identical, already published" or an explicit error — never a silent
 //! success over foreign bytes or a foreign graph binding.
 
-use crate::{decode_commit_object, reject_commit_bytes_as_content, storage};
+use crate::{decode_commit_object, reject_commit_bytes_as_content, storage, validate_patch_bytes};
 use ledger_core::{AnyCommit, CommitId, ContentId, GraphId, ImmutableStore, LedgerError};
 use sqlx::{PgConnection, PgPool, Row, postgres::PgPoolOptions};
 use std::str::FromStr;
@@ -161,6 +161,17 @@ impl PostgresImmutableStore {
                 .map_err(|e| mismatch(&format!("indexed object is not a commit: {e}")))?;
             let indexed = IndexRow::from_row(&row)?;
             indexed.check_against(&commit, &content_id, CheckMode::Verify)?;
+            let patch_row = sqlx::query("SELECT bytes FROM immutable_objects WHERE id = $1")
+                .bind(commit.patch().to_string())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(storage)?;
+            let Some(patch_row) = patch_row else {
+                return Err(mismatch("referenced patch is missing"));
+            };
+            let patch_bytes: Vec<u8> = patch_row.try_get("bytes").map_err(storage)?;
+            validate_patch_bytes(commit.patch(), &patch_bytes)
+                .map_err(|e| mismatch(&format!("referenced patch is invalid: {e}")))?;
             let parents = fetch_parent_rows(&self.pool, id).await?;
             check_parent_rows(&parents, &commit, &content_id)?;
             for (_, parent_id) in &parents {
@@ -329,6 +340,13 @@ impl ImmutableStore for PostgresImmutableStore {
         let bytes = commit.canonical_bytes()?;
         let id = commit.id()?;
         let id_s = id.to_string();
+        // The referenced patch must exist, hash to its id (digest-verified read → corruption
+        // otherwise), and decode as a canonical RDF patch. Rows are write-once, so checking
+        // before the transaction is exact and keeps parsing out of the lock window.
+        let Some(patch_bytes) = self.get_content(&commit.patch().0).await? else {
+            return Err(LedgerError::MissingPatch(commit.patch().clone()));
+        };
+        validate_patch_bytes(commit.patch(), &patch_bytes)?;
         let mut tx = self.pool.begin().await.map_err(storage)?;
         // The conflict-resolution contract below (loser reads the winner's committed row
         // after its blocked INSERT) is a READ COMMITTED property; pin it regardless of
@@ -356,6 +374,8 @@ impl ImmutableStore for PostgresImmutableStore {
                 });
             }
         }
+        // Re-check existence inside the transaction so the FK on patch_id cannot surface
+        // as an untyped error if the patch row is somehow absent here.
         let patch_present = sqlx::query("SELECT 1 FROM immutable_objects WHERE id = $1")
             .bind(commit.patch().to_string())
             .fetch_optional(&mut *tx)
@@ -363,19 +383,6 @@ impl ImmutableStore for PostgresImmutableStore {
             .map_err(storage)?;
         if patch_present.is_none() {
             return Err(LedgerError::MissingPatch(commit.patch().clone()));
-        }
-        // A patch must be content, not a commit: a commit whose "patch" is another commit
-        // would index but could never be reconstructed.
-        let patch_is_commit = sqlx::query("SELECT 1 FROM commit_index WHERE id = $1")
-            .bind(commit.patch().to_string())
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(storage)?;
-        if patch_is_commit.is_some() {
-            return Err(LedgerError::InvalidCommit(format!(
-                "patch {} names an indexed commit, not a patch",
-                commit.patch()
-            )));
         }
         let graph_row = sqlx::query("SELECT status FROM graphs WHERE graph_id = $1")
             .bind(graph_id.as_str())

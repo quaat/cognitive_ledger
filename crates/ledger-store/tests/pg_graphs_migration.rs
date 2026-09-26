@@ -604,6 +604,97 @@ async fn verify_commit_index_detects_every_tampered_column() {
         store.verify_commit_index().await,
         Err(LedgerError::CorruptObject { .. })
     ));
+    // Restore the commit bytes, then tamper the *patch* the commits reference: a patch
+    // that no longer hashes to its id, or no longer decodes as a canonical patch, fails
+    // verification of every commit that references it.
+    let child_bytes = AnyCommit::V2(CommitV2 {
+        graph_id: GraphId::new(&graph).unwrap(),
+        parents: vec![genesis.clone()],
+        patch: p.id(),
+        actor: Actor {
+            principal_id: PrincipalId::new("urn:sculpin:agent:test").unwrap(),
+            principal_type: PrincipalType::Agent,
+            on_behalf_of: None,
+        },
+        activity: "test".into(),
+        event_time: None,
+        recorded_at: LedgerTimestamp::parse_rfc3339("2026-09-26T00:00:00Z").unwrap(),
+        evidence_refs: vec![],
+        source_system: None,
+        message: "child".into(),
+    })
+    .canonical_bytes()
+    .unwrap();
+    sqlx::query("UPDATE immutable_objects SET bytes = $2 WHERE id = $1")
+        .bind(child_id.to_string())
+        .bind(child_bytes)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(store.verify_commit_index().await.unwrap(), 2);
+    sqlx::query("UPDATE immutable_objects SET bytes = $2 WHERE id = $1")
+        .bind(p.id().to_string())
+        .bind(b"sculpin-rdf-patch-v1\nA <urn:s> <urn:p> \"tampered\" .\n".as_slice())
+        .execute(&pool)
+        .await
+        .unwrap();
+    match store.verify_commit_index().await {
+        Err(LedgerError::CorruptObject { reason, .. }) => {
+            assert!(reason.contains("do not hash"), "{reason}");
+        }
+        other => panic!("{other:?}"),
+    }
+    // Hash-correct but non-canonical patch bytes referenced by an indexed commit: the
+    // decode branch of verification must fail too. Build the rows directly by SQL, as an
+    // older store (pre patch-validity rule) could have left them.
+    let noncanonical =
+        b"sculpin-rdf-patch-v1\nA <urn:s> <urn:p> \"b\" .\nA <urn:s> <urn:p> \"a\" .\n".to_vec();
+    let nc_id = ledger_core::PatchId(ledger_core::ContentId::for_bytes(&noncanonical));
+    sqlx::query("INSERT INTO immutable_objects (id, bytes) VALUES ($1, $2)")
+        .bind(nc_id.to_string())
+        .bind(&noncanonical)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let old = AnyCommit::V2(CommitV2 {
+        graph_id: GraphId::new(&graph).unwrap(),
+        parents: vec![],
+        patch: nc_id.clone(),
+        actor: Actor {
+            principal_id: PrincipalId::new("urn:sculpin:agent:old").unwrap(),
+            principal_type: PrincipalType::Agent,
+            on_behalf_of: None,
+        },
+        activity: "legacy".into(),
+        event_time: None,
+        recorded_at: LedgerTimestamp::parse_rfc3339("2026-09-25T00:00:00Z").unwrap(),
+        evidence_refs: vec![],
+        source_system: None,
+        message: "pre-rule commit".into(),
+    });
+    let old_id = old.id().unwrap();
+    sqlx::query("INSERT INTO immutable_objects (id, bytes) VALUES ($1, $2)")
+        .bind(old_id.to_string())
+        .bind(old.canonical_bytes().unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO commit_index (id, graph_id, version, patch_id, parent_count) \
+         VALUES ($1, $2, 2, $3, 0)",
+    )
+    .bind(old_id.to_string())
+    .bind(&graph)
+    .bind(nc_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    match store.verify_commits(std::slice::from_ref(&old_id)).await {
+        Err(LedgerError::CorruptObject { reason, .. }) => {
+            assert!(reason.contains("referenced patch is invalid"), "{reason}");
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -713,7 +804,7 @@ async fn upgrade_from_bootstrap_state_converges_with_clean_install() {
 #[tokio::test]
 #[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
 async fn upgrade_refuses_graphs_without_a_derivable_owner() {
-    let (_url, pool) = fresh_database("ledger_unknown").await;
+    let (url, pool) = fresh_database("ledger_unknown").await;
     migrator_up_to(3).run(&pool).await.unwrap();
     sqlx::query("INSERT INTO refs (graph_id, branch, head) VALUES ('team-alpha', 'main', $1)")
         .bind("sha256:2222222222222222222222222222222222222222222222222222222222222222")
@@ -787,6 +878,14 @@ async fn upgrade_refuses_graphs_without_a_derivable_owner() {
         .unwrap();
     sqlx::query("DELETE FROM commit_index WHERE graph_id = 'team-beta'")
         .execute(&pool)
+        .await
+        .unwrap();
+    // A failed sqlx migration run leaves its session-level advisory lock on the pooled
+    // connection that ran it; a real operator retries from a fresh process, so reconnect.
+    pool.close().await;
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&url)
         .await
         .unwrap();
     sqlx::migrate!("../../migrations").run(&pool).await.unwrap();

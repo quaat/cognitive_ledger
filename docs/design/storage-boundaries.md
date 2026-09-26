@@ -25,10 +25,11 @@ multi-replica topology, because a shared ref must never reference node-local con
 ## Runtime configuration (`ledger-server`)
 | Variable | Meaning |
 |---|---|
-| `LEDGER_ADDR` | Listen address (default `0.0.0.0:8080`). |
+| `LEDGER_ADDR` | Listen address. Default `127.0.0.1:8080` (loopback until the authenticated API exists, P1.4); containers and operators set `0.0.0.0:8080` explicitly — the Dockerfile does. |
 | `LEDGER_DATA_DIR` | Filesystem root for the filesystem backend (default `./data`). |
-| `LEDGER_DATABASE_URL` | When set: PostgreSQL holds the ref head **and, by default, the immutable objects**. Unset: filesystem-only development mode. Carries credentials; never logged. |
-| `LEDGER_IMMUTABLE_BACKEND` | `postgres` (default when a database URL is set) or `filesystem`. `filesystem` is single-host only and logs a conspicuous warning: refs in the shared database would point at node-local content. Any other value refuses to start. |
+| `LEDGER_DATABASE_URL` | When set: PostgreSQL holds the ref head **and, by default, the immutable objects**. Unset: filesystem-only development mode. Set but empty, or not valid Unicode: startup error (no silent filesystem fallback). Carries credentials; never logged. |
+| `LEDGER_IMMUTABLE_BACKEND` | `postgres` (default when a database URL is set) or `filesystem`. `filesystem` is single-host only and logs a conspicuous warning: refs in the shared database would point at node-local content. `postgres` without a database URL is a configuration error (no silent fallback to node-local objects). Any other value refuses to start. |
+| (shutdown) | Graceful shutdown on SIGINT and, on Unix, SIGTERM: stop accepting, drain open connections, exit after at most 30 s regardless (PostgreSQL rolls back any unfinished publication). |
 | (startup) | With any backend the server verifies that the current HEAD resolves in the configured immutable store and refuses to start otherwise. |
 
 ## Filesystem → PostgreSQL content migration (administrative)
@@ -49,7 +50,19 @@ HEAD through both backends and compare; only then install an absent destination 
 differs. It never assigns new ids, rewrites envelopes, deletes source content, or moves a
 ref onto unverified or foreign-graph history. Orphaned content after a failure is
 acceptable; an invalid ref is not. The target graph must be `bootstrap` or `importing`
-for v1 history (ADR-0010). On startup the server runs `Ledger::verify_head` and refuses to
+for v1 history (ADR-0010). It is an offline cutover tool: source writers MUST be quiesced;
+the tool detects movement, it cannot prevent it. Immediately before cutover it re-reads the
+heads and fails closed on any movement — a moved source HEAD is `MIGRATION_SOURCE_MOVED`,
+a moved existing destination HEAD (or one that appeared during a no-HEAD run) is
+`HEAD_CHANGED`, an absent destination is installed by CAS and only a concurrently
+installed identical HEAD counts as idempotent success. A final agreement check runs after
+the ref step; if it fails the ref *was* installed and then moved by a writer, and the error
+names the mover's HEAD. Every ref value the tool writes or accepts is the verified HEAD; a
+reported success means the destination HEAD equalled it at the final check. Migration
+impact: history written before the patch-validity rule whose "patch" is not a canonical
+patch fails closed (`INVALID_PATCH` from the destination store, `CorruptObject` from
+verification); such sources need repair before cutover, and the server refuses to start on
+such a HEAD (`verify_head` checks the head's patch too). On startup the server runs `Ledger::verify_head` and refuses to
 serve a HEAD that does not resolve in its configured store.
 
 Schema-level guards (migration 0005): `immutable_objects`, `commit_index`, `commit_parents`

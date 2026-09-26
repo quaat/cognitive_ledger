@@ -61,6 +61,15 @@ pub enum LedgerError {
         parent_graph: String,
         graph: String,
     },
+    #[error("INVALID_PATCH: patch {id} is not a valid canonical ledger patch: {reason}")]
+    InvalidPatch { id: PatchId, reason: String },
+    #[error(
+        "MIGRATION_SOURCE_MOVED: source HEAD changed during cutover (before {before:?}, after {after:?}); quiesce source writers and re-run"
+    )]
+    MigrationSourceMoved {
+        before: Option<CommitId>,
+        after: Option<CommitId>,
+    },
     #[error("graph {0} already exists")]
     GraphAlreadyExists(String),
     #[error("graph {0} does not exist")]
@@ -313,6 +322,12 @@ pub(crate) fn read_field(rest: &mut &[u8]) -> Result<String, LedgerError> {
 /// store MUST reject a commit whose effective graph (the v2 envelope's `graph_id`, or the
 /// configured v1 binding) differs from any parent's graph (`CrossGraphParent`). Cross-graph
 /// relationships are expressed by merge coordination later, never by parent edges.
+///
+/// Patch validity: a commit's `patch` MUST name stored bytes that hash to the `PatchId`
+/// **and** decode as a canonical Sculpin RDF patch (`InvalidPatch` otherwise). Existing
+/// non-commit content is not enough: `put_content` stays generic (checkpoints and other
+/// artifacts will use it), so the check is made when a commit references the patch, and
+/// again by index verification.
 #[async_trait::async_trait]
 pub trait ImmutableStore: Send + Sync {
     async fn put_content(&self, id: &ContentId, bytes: &[u8]) -> Result<(), LedgerError>;
