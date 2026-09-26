@@ -2,7 +2,8 @@
 
 use fs2::FileExt;
 use ledger_core::{
-    Commit, CommitId, CommitStore, ContentId, LedgerError, ObjectStore, PatchId, RefStore,
+    Commit, CommitId, CommitStore, ContentId, ImmutableStore, LedgerError, ObjectStore, PatchId,
+    RefStore,
 };
 use ledger_rdf::{OperationKind, Patch, Quad};
 use std::{
@@ -143,6 +144,11 @@ impl FileStore {
             Err(e) => Err(storage(e)),
         }
     }
+    /// Cheap existence probe on the object path. Deliberately reads no bytes and performs
+    /// no digest verification: it answers only "does an object file exist for this id".
+    fn exists_sync(&self, id: &ContentId) -> Result<bool, LedgerError> {
+        self.object_path(id).try_exists().map_err(storage)
+    }
     fn put_commit_sync(&self, commit: &Commit) -> Result<CommitId, LedgerError> {
         for parent in &commit.parents {
             if self.get_commit_sync(parent)?.is_none() {
@@ -244,6 +250,35 @@ impl CommitStore for FileStore {
         let this = self.clone();
         let id = id.clone();
         run_blocking(move || this.get_commit_sync(&id)).await
+    }
+}
+#[async_trait::async_trait]
+impl ImmutableStore for FileStore {
+    async fn put_content(&self, id: &ContentId, bytes: &[u8]) -> Result<(), LedgerError> {
+        let this = self.clone();
+        let id = id.clone();
+        let bytes = bytes.to_vec();
+        run_blocking(move || this.put_object_sync(&id, &bytes)).await
+    }
+    async fn get_content(&self, id: &ContentId) -> Result<Option<Vec<u8>>, LedgerError> {
+        let this = self.clone();
+        let id = id.clone();
+        run_blocking(move || this.get_object_sync(&id)).await
+    }
+    async fn put_commit(&self, commit: &Commit) -> Result<CommitId, LedgerError> {
+        let this = self.clone();
+        let commit = commit.clone();
+        run_blocking(move || this.put_commit_sync(&commit)).await
+    }
+    async fn get_commit(&self, id: &CommitId) -> Result<Option<Commit>, LedgerError> {
+        let this = self.clone();
+        let id = id.clone();
+        run_blocking(move || this.get_commit_sync(&id)).await
+    }
+    async fn exists(&self, id: &ContentId) -> Result<bool, LedgerError> {
+        let this = self.clone();
+        let id = id.clone();
+        run_blocking(move || this.exists_sync(&id)).await
     }
 }
 #[async_trait::async_trait]
@@ -412,20 +447,24 @@ pub struct CommitRequest {
 }
 #[derive(Clone)]
 pub struct Ledger {
-    store: Arc<FileStore>,
+    immutable: Arc<dyn ImmutableStore>,
     refs: Arc<dyn RefStore>,
 }
 impl Ledger {
     /// Open a ledger whose immutable objects and mutable ref both live on the filesystem.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, LedgerError> {
-        let store = Arc::new(FileStore::open(root)?);
-        let refs: Arc<dyn RefStore> = store.clone();
-        Ok(Self { store, refs })
+        let file = Arc::new(FileStore::open(root)?);
+        let immutable: Arc<dyn ImmutableStore> = file.clone();
+        let refs: Arc<dyn RefStore> = file;
+        Ok(Self { immutable, refs })
     }
     /// Compose the ledger with an externally provided ref backend (e.g. PostgreSQL),
     /// keeping immutable objects and commits on the filesystem `store`.
     pub fn with_ref_store(store: Arc<FileStore>, refs: Arc<dyn RefStore>) -> Self {
-        Self { store, refs }
+        Self {
+            immutable: store as Arc<dyn ImmutableStore>,
+            refs,
+        }
     }
     pub async fn head(&self) -> Result<Option<CommitId>, LedgerError> {
         self.refs.head().await
@@ -433,7 +472,9 @@ impl Ledger {
     pub async fn commit(&self, request: CommitRequest) -> Result<CommitId, LedgerError> {
         let patch_bytes = request.patch.canonical_bytes();
         let patch_id = request.patch.id();
-        self.store.put(&patch_id.0, &patch_bytes).await?;
+        self.immutable
+            .put_content(&patch_id.0, &patch_bytes)
+            .await?;
         let commit = Commit {
             parents: request.expected_head.clone().into_iter().collect(),
             patch: patch_id,
@@ -444,7 +485,7 @@ impl Ledger {
                 .format(&Rfc3339)
                 .map_err(storage)?,
         };
-        let id = self.store.put_commit(&commit).await?;
+        let id = self.immutable.put_commit(&commit).await?;
         self.advance_ref(request.expected_head.as_ref(), &id)
             .await?;
         Ok(id)
@@ -456,7 +497,7 @@ impl Ledger {
         expected: Option<&CommitId>,
         new: &CommitId,
     ) -> Result<(), LedgerError> {
-        if self.store.get_commit(new).await?.is_none() {
+        if !self.immutable.exists(&new.0).await? {
             return Err(LedgerError::MissingTarget(new.clone()));
         }
         self.refs.compare_and_set(expected, new).await
@@ -473,7 +514,7 @@ impl Ledger {
                 });
             }
             let c = self
-                .store
+                .immutable
                 .get_commit(&current)
                 .await?
                 .ok_or_else(|| LedgerError::NotFound(current.0.clone()))?;
@@ -485,8 +526,8 @@ impl Ledger {
         let mut state = BTreeSet::new();
         for commit in chain.iter().rev() {
             let bytes = self
-                .store
-                .get(&commit.patch.0)
+                .immutable
+                .get_content(&commit.patch.0)
                 .await?
                 .ok_or_else(|| LedgerError::NotFound(commit.patch.0.clone()))?;
             let patch = Patch::from_canonical_bytes(&bytes).map_err(storage)?;
@@ -504,7 +545,7 @@ impl Ledger {
         Ok(state)
     }
     pub async fn patch(&self, id: &PatchId) -> Result<Option<Patch>, LedgerError> {
-        match self.store.get(&id.0).await? {
+        match self.immutable.get_content(&id.0).await? {
             Some(b) => Ok(Some(Patch::from_canonical_bytes(&b).map_err(storage)?)),
             None => Ok(None),
         }
@@ -576,7 +617,7 @@ mod tests {
             recorded_time: "r".into(),
         };
         assert!(matches!(
-            store.put_commit(&commit).await,
+            CommitStore::put_commit(&store, &commit).await,
             Err(LedgerError::MissingPatch(_))
         ));
     }
@@ -597,7 +638,7 @@ mod tests {
             event_time: "2026-01-01T00:00:00Z".into(),
         };
         let c1 = ledger.commit(req(None)).await.unwrap();
-        let stored = ledger.store.get_commit(&c1).await.unwrap().unwrap();
+        let stored = ledger.immutable.get_commit(&c1).await.unwrap().unwrap();
         assert!(OffsetDateTime::parse(&stored.recorded_time, &Rfc3339).is_ok());
         assert_ne!(stored.recorded_time, "2026-01-01T00:00:00Z");
         let c2 = ledger.commit(req(Some(c1.clone()))).await.unwrap();

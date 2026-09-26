@@ -252,6 +252,28 @@ pub trait CommitStore: Send + Sync {
     async fn get_commit(&self, id: &CommitId) -> Result<Option<Commit>, LedgerError>;
 }
 
+/// The immutable content boundary the ledger service depends on. It unifies content and
+/// commit persistence behind one object-safe async trait so `Ledger` no longer holds a
+/// concrete filesystem store, enabling shared (e.g. PostgreSQL/S3) backends without
+/// touching the service (ADR-0012).
+///
+/// Contract: `put_content`/`put_commit` are idempotent and MUST enforce content-addressing
+/// on the write path (bytes hashing to their id) and MUST NOT expose partially-written
+/// objects. `get_content`/`get_commit` verify the digest on read. `exists` MAY be a cheap
+/// key-presence probe that reads no bytes and does not verify the digest; therefore the
+/// ref-target-existence invariant (a ref never points to missing content) relies on the
+/// backend's write path being content-addressed and partial-write-free, not on `exists`
+/// itself. A backend that cannot guarantee that (e.g. an object store where a truncated
+/// upload is visible) MUST make `exists` verify integrity instead.
+#[async_trait::async_trait]
+pub trait ImmutableStore: Send + Sync {
+    async fn put_content(&self, id: &ContentId, bytes: &[u8]) -> Result<(), LedgerError>;
+    async fn get_content(&self, id: &ContentId) -> Result<Option<Vec<u8>>, LedgerError>;
+    async fn put_commit(&self, commit: &Commit) -> Result<CommitId, LedgerError>;
+    async fn get_commit(&self, id: &CommitId) -> Result<Option<Commit>, LedgerError>;
+    async fn exists(&self, id: &ContentId) -> Result<bool, LedgerError>;
+}
+
 /// A pure atomic ref primitive. Implementations swap the stored ref if and only if the
 /// current value equals `expected`; they know nothing about commit contents. The
 /// application service enforces that `new` targets an existing immutable commit.
