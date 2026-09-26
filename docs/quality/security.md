@@ -103,7 +103,10 @@ enables — and first re-proves the premise: `rsa` must be unreachable in the fe
 build graph of every target, have `sqlx-mysql` as its only lockfile dependent, and stay on
 the advisory's 0.9 line; any change fails the gate so the exception is re-evaluated (trigger:
 every sqlx upgrade, Plan 0005 supply-chain slice). GitHub dependency review runs on every
-pull request (Dependency graph enabled 2026-09-26).
+pull request (Dependency graph enabled 2026-09-26); its first run found GHSA-h395-gr6q-cpjc
+in `jsonwebtoken 9.3.1` (a malformed `exp`/`nbf` JSON type was treated as an absent claim),
+fixed by upgrading to `jsonwebtoken 11.1.0` on the `aws-lc-rs` backend (chosen over
+`rust_crypto`, which would have made the `rsa` crate reachable).
 
 Dependency and license findings must be classified rather than ignored. Fluree's BSL image
 is optional test infrastructure and is not shipped. The intended runtime dependency policy

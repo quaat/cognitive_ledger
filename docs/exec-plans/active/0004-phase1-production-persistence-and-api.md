@@ -654,7 +654,11 @@ Scope: make PR #1 merge-ready without redesign. Changes:
   `continue-on-error`). Local: `./scripts/check-supply-chain.sh` exit 0 (cargo-audit 0.22.2,
   1271 advisories, 282 dependencies).
 - **Dependency graph** enabled on the repository (Dependabot alerts turned on via the API;
-  SBOM endpoint now answers), so `dependency-review-action` can run.
+  SBOM endpoint now answers), so `dependency-review-action` can run. Its first run found
+  GHSA-h395-gr6q-cpjc in `jsonwebtoken 9.3.1` (malformed `exp`/`nbf` types treated as
+  absent claims; our `required_spec_claims` already covered `exp`, `nbf` was exposed) →
+  upgraded to `jsonwebtoken 11.1.0` with the `aws-lc-rs` backend (no `rsa` crate; API
+  unchanged for this code base; all OIDC/HS256 tests green).
 - **CI hygiene**: `actions/checkout@v6` in all four workflows; pinning actions by commit
   SHA recorded for Plan 0005.
 - **Old Codex threads** (walking-skeleton commit) verified against the current code and

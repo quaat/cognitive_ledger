@@ -1,4 +1,6 @@
 FROM rust:1.89-bookworm AS build
+# cmake: required by aws-lc-sys (jsonwebtoken's aws-lc-rs crypto backend).
+RUN apt-get update && apt-get install -y --no-install-recommends cmake && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
 RUN cargo build --locked --release -p ledger-server

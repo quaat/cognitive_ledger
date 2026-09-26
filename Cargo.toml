@@ -19,7 +19,10 @@ rust-version = "1.89"
 async-trait = "0.1.83"
 axum = "0.8.4"
 hex = "0.4.3"
-jsonwebtoken = "9.3.1"
+# >= 10.3.0 fixes GHSA-h395-gr6q-cpjc (malformed exp/nbf treated as absent). The aws-lc-rs
+# backend is chosen over rust_crypto so the `rsa` crate (RUSTSEC-2023-0071) stays
+# unreachable in every built binary; see .cargo/audit.toml.
+jsonwebtoken = { version = "11.1.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 reqwest = { version = "0.12.23", default-features = false, features = ["rustls-tls", "json"] }
 oxrdf = "=0.3.4"
 oxttl = "0.2.4"
