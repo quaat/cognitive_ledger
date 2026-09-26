@@ -32,19 +32,48 @@ proposal, idempotency), so a retried prepare replays the exact original `CommitI
 `reject` records a decision without moving the ref; `mark_superseded` is explicit. Fault
 injection (`FailPoint`) proves that no failure before COMMIT leaves any mutable effect and
 that a lost response after COMMIT replays. Raw `PgRefStore` CAS is the bootstrap/admin
-primitive only (it bumps `version`, writes no event); production accepted transitions go
-through the repository. Migration 0006's composite FK means a PostgreSQL ref can only
+primitive only (it bumps `version`, writes no event, and is refused on `active` graphs);
+since P1.4 no public HTTP route reaches it or `Ledger::commit` — every public write is a
+`WorkflowRepository` transaction producing a v2 commit. Migration 0007 scopes idempotency
+by the complete actor (principal id, type, on-behalf-of), records an optional bounded
+`correlation_id` on proposals, ref events and decisions (never part of any identity), and
+ties every audit row's `(graph_id, tenant_id)` to `graphs`. `ReconstructionLimits`
+(depth, quads, bytes) bound both the workflow's base reconstruction and public state
+reads. Migration 0006's composite FK means a PostgreSQL ref can only
 target an indexed commit of its graph.
 
 ## Runtime configuration (`ledger-server`)
 | Variable | Meaning |
 |---|---|
-| `LEDGER_ADDR` | Listen address. Default `127.0.0.1:8080` (loopback until the authenticated API exists, P1.4); containers and operators set `0.0.0.0:8080` explicitly — the Dockerfile does. |
+| `LEDGER_ADDR` | Listen address. Default `127.0.0.1:8080`. A non-loopback bind requires production authentication (`LEDGER_AUTH_MODE=oidc`) or the conspicuous development switch `LEDGER_ALLOW_INSECURE_NON_LOOPBACK=allow-insecure-non-loopback-development-only`; filesystem-only mode is always loopback-only. |
+| `LEDGER_AUTH_MODE` | Required with a database URL: `oidc` (production; needs `LEDGER_AUTH_ISSUER`, `LEDGER_AUTH_AUDIENCE`, https `LEDGER_AUTH_JWKS_URL`) or `dev-hs256` (development/CI; needs issuer, audience and a ≥32-byte `LEDGER_AUTH_DEV_HS256_SECRET`). There is no unauthenticated or header-trusting mode. |
+| `LEDGER_AUTH_*_CLAIM`, `LEDGER_AUTH_ROLE_MAP`, `LEDGER_AUTH_AGENT_CLIENT_IDS`, `LEDGER_AUTH_SERVICE_CLIENT_IDS` | Claims policy: tenant/principal/principal-type/roles/on-behalf-of claim names, `role=capability` map (`read|propose|review|admin`), client ids that identify agents or services. See `docs/quality/security.md`. |
+| `LEDGER_UNVALIDATED_ACCEPTANCE` | Only `allow-unvalidated-acceptance-development-only` enables `accept` without semantic validation (Phase 2); any other value refuses to start; unset → `accept` returns `VALIDATION_REQUIRED`. |
+| `LEDGER_LIMIT_BODY_BYTES`, `_PATCH_OPERATIONS`, `_TERM_BYTES`, `_METADATA_BYTES`, `_RECONSTRUCTION_DEPTH`, `_RECONSTRUCTION_QUADS`, `_RECONSTRUCTION_BYTES`, `_EXPORT_BYTES`, `_REQUEST_SECONDS`, `_CONCURRENT_EXPENSIVE` | Resource limits below the untrusted boundary (defaults in `ledger_api::ApiLimits`); exceeding one is `RESOURCE_LIMIT`. |
 | `LEDGER_DATA_DIR` | Filesystem root for the filesystem backend (default `./data`). |
 | `LEDGER_DATABASE_URL` | When set: PostgreSQL holds the ref head **and, by default, the immutable objects**. Unset: filesystem-only development mode. Set but empty, or not valid Unicode: startup error (no silent filesystem fallback). Carries credentials; never logged. |
 | `LEDGER_IMMUTABLE_BACKEND` | `postgres` (default when a database URL is set). `filesystem` is accepted only without a database URL (development mode); combined with a database URL it is refused since migration 0006 (PostgreSQL refs must target indexed commits). `postgres` without a database URL is a configuration error. Any other value refuses to start. |
 | (shutdown) | Graceful shutdown on SIGINT and, on Unix, SIGTERM: stop accepting, drain open connections, exit after at most 30 s regardless (PostgreSQL rolls back any unfinished publication). |
-| (startup) | With any backend the server verifies that the current HEAD resolves in the configured immutable store and refuses to start otherwise. |
+| (startup) | Filesystem mode verifies that HEAD resolves and serves a read-only inspection router (`/v1/refs/main`, `/v1/states/{id}`). Shared mode connects with `V1Binding::Reject`, so this process can never publish a v1 envelope. |
+
+## Public API (`ledger-api`, P1.4)
+Contract: `docs/api/openapi.json` (served at `/openapi.json`; a unit test fails if the
+document and the router disagree). Routes are graph-scoped and authenticated:
+`POST /v1/graphs/{graph}/proposals` (prepare; `propose`), `POST
+/v1/graphs/{graph}/proposals/{candidate}/accept|reject` (`review`), `GET
+/v1/graphs/{graph}/refs?name=<ref>` and `GET /v1/graphs/{graph}/commits/{commit}/state`
+(`read`, bounded). Ref names are body/query fields because they may contain `/`.
+Mutations require `Idempotency-Key`; the server computes the canonical request digest
+(`sculpin-ledger-request/v1`, golden vectors in `fixtures/golden/requests/`, reference
+encoder `scripts/golden/request_v1_reference.py`). Errors are `{code, message,
+correlation_id}`; `X-Correlation-Id` is accepted (bounded, printable ASCII) or generated
+and echoed on every response. `/health` is liveness; `/ready` checks the database.
+
+## Graph provisioning (administrative)
+`LEDGER_DATABASE_URL=… ledger-admin graph create --graph <id> --tenant <id> [--status
+active|importing] [--kb <id>] [--purpose <text>]`. Graphs are created by operators, never
+through HTTP (ADR-0010); `bootstrap` is reserved and `archived` is a lifecycle transition,
+not a creation state.
 
 ## Filesystem → PostgreSQL content migration (administrative)
 `LEDGER_DATABASE_URL=… ledger-admin migrate-fs-to-pg --source <dir> [--graph default] [--branch main] [--json]`

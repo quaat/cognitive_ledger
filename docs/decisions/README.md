@@ -23,3 +23,4 @@ and `product_development_plan.md`.
 - [ADR-0012: Production immutable-store abstraction and default](ADR-0012-production-immutable-storage.md)
 - [ADR-0013: Atomic acceptance transaction](ADR-0013-atomic-acceptance-transaction.md)
 - [ADR-0014: Two-phase semantic-validation protocol and contracts](ADR-0014-semantic-validation-protocol.md)
+- [ADR-0015: Canonical HTTP request identity](ADR-0015-canonical-request-identity.md)

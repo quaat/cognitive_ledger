@@ -398,10 +398,230 @@ transitions do not exist yet (status share-locked during workflows so a future t
 cannot interleave); database role split remains P1.5 and the production security gate is
 not passed.
 
-**P1.4 (authenticated HTTP boundary) is next.** The API must route writes through
-`WorkflowRepository::prepare`/`accept` with the authenticated principal, define the
-canonical request bytes for the digest, retire the bootstrap v1 write path and flip the
-shared store to `V1Binding::Reject`.
+## P1.4 design — authenticated HTTP and security boundary (scope fixed 2026-09-26)
+
+**Scope.**
+- Migration 0007 (additive): idempotency scoped by the *complete* actor (`principal_id`,
+  `principal_type`, `on_behalf_of`, NULL treated as a canonical absence via `UNIQUE NULLS
+  NOT DISTINCT`), backfilled deterministically from the actor of the request each row
+  recorded (proposal for prepares, decision for accepts/rejects) and failing closed on any
+  row that cannot be bound; bounded optional `correlation_id` on
+  `proposals`, `ref_events`, `decisions`; `graphs UNIQUE (graph_id, tenant_id)` and
+  composite `(graph_id, tenant_id)` FKs from `proposals`, `ref_events`, `decisions`,
+  `idempotency` so PostgreSQL itself proves a row's graph belongs to its tenant.
+- `RequestScope` carries the complete actor and a correlation id; the advisory-lock key
+  and every idempotency lookup include `principal_type` and `on_behalf_of`.
+- `ReconstructionLimits` (depth, quads, bytes) in `ledger-store`, enforced by the
+  workflow's base reconstruction and by public state reads; `RESOURCE_LIMIT` error.
+- `RequestContext { principal, capabilities, correlation_id }` produced only by verified
+  authentication: OIDC bearer tokens (signature via JWKS with rotation, issuer, audience,
+  exp/nbf; unknown key fails closed) or an HS256 development authenticator that is refused
+  on non-loopback binding unless a conspicuously named override is set. Principal type,
+  tenant and roles come only from verified claims and explicit configuration.
+- Capabilities `read | propose | review | admin` mapped from verified roles in one policy
+  component; a foreign-tenant graph is indistinguishable from a missing one.
+- Graph-scoped API: prepare / accept / reject proposals, read ref, read bounded state;
+  branch names are body fields (they may contain `/`). `POST /v1/commits` and the raw
+  v1 write path are removed from the public surface; the shared server runs
+  `V1Binding::Reject` and public writes create v2 only.
+- Canonical request identity `sculpin-ledger-request/v1` (typed, length-prefixed,
+  evidence as a sorted set; excludes key, correlation id, recorded_at, JSON order) with
+  repository-owned golden vectors and an independent Python reference encoder; the API
+  computes the digest, never the client.
+- `Idempotency-Key` required on mutations; unknown JSON fields rejected; retries return
+  identical durable results.
+- Unvalidated acceptance fails closed (`VALIDATION_REQUIRED`) unless
+  `LEDGER_UNVALIDATED_ACCEPTANCE=allow-unvalidated-acceptance-development-only` is set
+  (startup warning); no validation record is ever fabricated.
+- Configurable limits below the untrusted boundary: body bytes, operation count, term
+  length, metadata bytes, reconstruction depth/quads/bytes, request duration, concurrent
+  expensive operations.
+- Stable, redacted error envelope `{code, message, correlation_id}`; `/health` liveness,
+  `/ready` dependency check; checked-in OpenAPI enforced against the router in tests.
+- `ledger-admin graph create` for operator provisioning; the Docker integration provisions
+  a graph, authenticates, prepares and accepts a v2 candidate under the explicit CI
+  no-validation switch, restarts, and reads the accepted state back through the
+  authenticated API.
+
+**Non-goals.** Semantic validation (Phase 2), projection (Phase 3), branches/policies
+(Phase 4), merge (Phase 5), checkpoints, graph lifecycle transitions, a public graph
+administration API, role split / migrations off the runtime path (P1.5).
+
+**Migration impact.** 0007 is additive; 0001–0006 untouched. Upgrade requires every
+existing idempotency row to resolve its actor through its proposal and every audit row's
+`(graph_id, tenant_id)` to match `graphs`; mismatches fail the migration with an
+actionable error.
+
+**Security assumptions.** Tokens are validated cryptographically; tenant, principal, type
+and roles are trusted only from verified claims plus explicit configuration; the
+development authenticator is not production authentication; the database role split is
+still P1.5, so the service is **not** production-qualified after P1.4.
+
+**Acceptance evidence.** Real PostgreSQL: 0007 clean-install/upgrade convergence and
+mismatch refusal; complete-actor idempotency (replay / independent namespaces / conflict);
+canonical digest goldens; authentication (bad signature, issuer, audience, expiry, unknown
+kid), authorization (capability matrix), cross-tenant read/write indistinguishability,
+safe errors, limits, lost-response HTTP replay; Docker integration with restart through the
+v2 workflow API and proof that no v1 commit was created.
+
+### P1.4 status — complete (2026-09-26)
+
+Implemented (all in this change; protocol files untouched):
+- Migration `0007_actor_scope_and_tenant_integrity.sql` (additive; 0001–0006 unchanged):
+  complete-actor idempotency (`principal_type`, `on_behalf_of`, `UNIQUE NULLS NOT
+  DISTINCT` with equality columns leading), deterministic backfill (prepared rows from
+  their proposal's actor, accepted/rejected rows from their decision's actor) with
+  fail-closed guards, surrogate `idempotency_id`,
+  bounded `correlation_id` on `proposals`/`ref_events`/`decisions`, `graphs UNIQUE
+  (graph_id, tenant_id)` and composite tenant FKs from all four workflow tables.
+- `ledger-store`: `RequestScope.correlation_id`; advisory-lock key and every idempotency
+  lookup include the complete actor; `ReconstructionLimits` shared by the workflow's base
+  reconstruction and public reads (`PostgresLedgerStore::with_limits`, applied by
+  `AppState::new`); `prepare` refuses a candidate whose depth or resulting state would
+  exceed the limits; `ValidationPolicy::Required` enforced in `accept` after the replay
+  lookup; `LedgerError::{ResourceLimit, ValidationRequired, DependencyUnavailable}` (pool
+  timeout / connection failures → 503, not 500); reconstruction keeps patch ids only;
+  `PostgresLedgerStore::{commit_graph, ref_head, ready}` (readiness checks the schema
+  level `REQUIRED_SCHEMA_VERSION = 7`).
+- `ledger-api` (rewritten): `auth` (`Authenticator` trait; `OidcAuthenticator` with JWKS
+  single-flight refresh, one-hour maximum key age, rate-limited retries, `use=sig` filter,
+  alg pinned per key family, required `exp`/`iss`/`aud`, no-redirect size-capped fetch,
+  redacted errors; `DevHs256Authenticator` not production grade; `ClaimsPolicy` →
+  `AuthenticatedPrincipal` + `Capabilities`, refusing a type claim that disagrees with
+  configured client ids), `request_identity` (`sculpin-ledger-request/v1`, ADR-0015, 6
+  golden vectors + `scripts/golden/request_v1_reference.py`, exercised through the
+  handlers' `canonical_prepare/accept/reject`),
+  `RequestContext` extractor, correlation middleware, `ApiLimits`, envelope-preserving
+  `ValidJson`, stable error envelope with redaction, graph-scoped routes only
+  (`docs/api/openapi.json` enforced by a unit test), filesystem read-only router.
+- `ledger-server`: `LEDGER_AUTH_MODE=oidc|dev-hs256` (no unauthenticated/header mode),
+  unvalidated acceptance refused together with production authentication,
+  non-loopback refusal without production auth unless
+  `LEDGER_ALLOW_INSECURE_NON_LOOPBACK=allow-insecure-non-loopback-development-only`,
+  `LEDGER_UNVALIDATED_ACCEPTANCE` exact-value switch with startup warning, `LEDGER_LIMIT_*`,
+  shared mode `V1Binding::Reject`, no `Ledger::commit`/`PgRefStore` path; filesystem mode
+  read-only and loopback-only. `ledger-admin graph create`. Dockerfile ships `ledger-admin`;
+  compose carries the conspicuously named development switches; `.dockerignore` admits the
+  API contract.
+- Docs: security, storage boundaries (runtime table, API, provisioning), ADR-0010/0011/0013
+  implementation notes, migrations README (0007), tech-debt (stale "status read without a
+  lock" entry removed — the graph row is share-locked in the acceptance transaction; P1.4
+  entries closed; new entries for OIDC live-issuer testing, statement timeouts, digest
+  producer), README, ARCHITECTURE, docs index, test strategy, this plan, and Plan 0005
+  (P1.5) created.
+
+Evidence (2026-09-26, final code after the review fixes; real PostgreSQL 17.2 via compose,
+`LEDGER_TEST_DATABASE_URL`):
+- `./scripts/check-fast.sh` exit 0: fmt check, doc links (46 files), architecture check,
+  both Python golden checks (18 commit v2 vectors, 6 request vectors), clippy `-D
+  warnings`, `cargo test --workspace`. Unit highlights: `ledger-api` 14 lib tests (5 OIDC
+  tests against a local JWKS server: RSA+EC acceptance and identity mapping, unknown kid
+  then rotation, refresh rate limit and zero max-age withdrawal, alg confusion / missing kid
+  / missing iss-aud-exp / forged signature, unreachable key source → `KeySourceUnavailable`
+  without URL leak; claims-policy mapping and conflict refusal; dev HS256 secret length;
+  every OpenAPI route served and unknown routes/methods enveloped; database outage →
+  redacted 503 on `/ready` and on an authenticated read with liveness unaffected; request
+  timeout → 503 `RESOURCE_LIMIT`; OpenAPI ≡ routes and error codes; correlation bounds;
+  request-identity properties) + `request_goldens` 3 (all 6 vectors byte- and
+  digest-identical to the Python reference through the handlers' `canonical_*` builders;
+  reordered ≡ advance; empty `source_system` ≡ absent, empty reason refused);
+  `ledger-server` 14 (backend selection, non-loopback refusal incl. wrong switch value and
+  unresolvable bind, filesystem mode loopback-only, exact unvalidated-acceptance value and
+  its refusal with production auth, authenticator selection with no unauthenticated/header
+  mode and https-only JWKS, strict role-map parsing, shutdown).
+- Store suites: `pg_cas_race` 1, `pg_immutable_store` 9, `pg_graphs_migration` 7 (incl.
+  `migration_0007_backfills_actor_scope_and_refuses_unbound_or_mismatched_rows`: proposer
+  and reviewer rows bound to their own actors, results unchanged, write-once trigger back
+  in force, repository replay for the bound actor and a fresh proposal for a different
+  delegation, populated-upgrade schema ≡ clean install incl. trigger enablement, unbound /
+  disagreeing-actor / wrong-tenant refusals), `pg_fs_migration` 8, `pg_workflow` 14 (incl.
+  `idempotency_is_scoped_by_the_complete_actor_and_correlation_is_recorded`: replay;
+  independent namespaces by `principal_type` and by `on_behalf_of`; conflict; NULL
+  canonical duplicate refused by the DB; correlation retained on proposal/event/decision;
+  cross-tenant audit insert refused by FK) — 39 passed, 0 failed.
+- API suite `crates/ledger-api/tests/pg_api.rs`: 10 passed, 0 failed — authentication
+  (no token, forged signature, expired, wrong audience/issuer, nbf in future, missing
+  tenant/principal/type/exp/aud, unrecognised role, `alg:none` with otherwise valid claims,
+  RS256 header on the HS256 authenticator, identity headers ignored, non-Bearer schemes),
+  table-driven capability matrix (5 routes × read/propose/review/admin, exact FORBIDDEN
+  set) plus the review flow, persisted identity (proposal/decision/ref-event/idempotency
+  rows carry the token's tenant, prefixed principal, type, delegation and the client
+  correlation id; delegation is its own idempotency namespace), foreign tenant ≡
+  nonexistent (identical envelope modulo correlation id for reads and for prepare/accept/
+  reject; commit of another graph via own or foreign graph path; malformed/unknown commit;
+  row counts unchanged), lost-response replay for prepare and accept with raw JSON in a
+  different key order, reversed operations, reordered/duplicated evidence and the same
+  instant in another offset (identical durable ids; conflict on a different body;
+  independent actor namespace; ref advanced once with exactly one outbox row; stale accept
+  → `HEAD_CHANGED`; competing candidate refused without moving the ref), strict shape
+  (missing/empty/oversized/control-character key, eight client-supplied identity or
+  server-only fields, blank node, malformed quad, bad op, empty patch, 65 evidence refs,
+  empty activity/message, control characters, empty/oversized ref, `BASE_MISMATCH`,
+  reason bounds on accept/reject, malformed candidate, non-JSON content type still
+  enveloped, correlation echo in header and body, invalid correlation replaced),
+  fail-closed `VALIDATION_REQUIRED` with no decision/event/idempotency row written and
+  reject still working, limits (ops, term, metadata, transport body isolated by whitespace
+  padding, reconstruction quads refused at prepare with a replacement at capacity accepted
+  and the boundary readable, depth refused at prepare with the boundary readable, bytes
+  refused at prepare, export limit on read) → `RESOURCE_LIMIT`, readiness/OpenAPI and
+  `/v1/commits` → enveloped `NOT_FOUND`. An earlier draft assumed the same content by a
+  different actor yields the same candidate; corrected (provenance is v2 identity).
+- Docker integration `./scripts/test-integration.sh` (image build, fresh volumes) on the
+  final code: exit 0, `INTEGRATION OK`. All six PostgreSQL suites re-ran green
+  (1/9/7/8/14/10); then in the container: `ledger-admin graph create` provisioned
+  `it-graph-…` for `tenant-integration`; unauthenticated read → 401 `UNAUTHENTICATED`,
+  foreign-tenant read → 404, `POST /v1/commits` → 404; prepare, then the same prepare again
+  → 200 with the identical candidate and `replayed`; accept, then the same accept again →
+  200 replaying the same head and `ref_version`; a second prepare/accept round;
+  `docker compose restart ledger`; `/health` and `/ready` back; the authenticated ref read
+  returned the second candidate and the bounded state read returned exactly the two
+  expected quads; foreign-tenant state read → 404; SQL verification: 2 commits in
+  `immutable_objects`, exactly 4 new objects overall (2 commits + 2 patches), 2
+  `commit_index` rows with `version = 2` under the graph and no non-v2 commit anywhere,
+  `refs.version = 2` with 2 `ref_events`, 2 accepted `decisions`, 2 `projection_outbox`
+  rows, 4 `idempotency` rows (retries added none), correlation ids on every accepted
+  decision and event, 0 node-local object files. Earlier attempts failed for
+  environmental reasons only: `.dockerignore` excluded `docs/` (fixed by admitting
+  `docs/api/openapi.json`) and a full disk stopped `docker compose build`.
+- Independent read-only reviews (security, storage/concurrency, invariant, test; Opus)
+  on the first complete draft. Agreed P1s, all fixed in this change: (1) migration 0007
+  bound accept/reject idempotency rows to the proposer instead of the reviewer (would
+  have blocked every four-eyes upgrade, or silently mis-scoped rows) → per-kind binding
+  through `decisions`, guards extended, test seeds a reviewer decision and asserts the
+  actor, unchanged results, re-enabled write-once trigger (snapshot now records
+  `tgenabled`), repository replay for the bound actor, and populated-upgrade schema
+  convergence; (2) configured reconstruction limits never reached `prepare` →
+  `PostgresLedgerStore::with_limits` applied in `AppState::new`; (3) a branch could be
+  accepted past the read limits and then never read or extended → prepare checks
+  candidate depth and resulting quads/bytes (API test now proves the third commit is
+  refused at prepare and the boundary is readable); (4) OIDC path had no executable test →
+  five OIDC tests against a local JWKS server (RSA+EC, unknown kid then rotation, rate
+  limiting and max key age, alg confusion/missing kid/missing claims/forged signature,
+  unreachable key source → `KeySourceUnavailable` without URL leak); (5) `alg:none` test
+  was vacuous → real claims plus an RS256-header token; (6) persisted identity never read
+  back → API test asserts proposal/decision/ref-event/idempotency rows carry the token's
+  tenant, principal, type, delegation and the client correlation id; (7) cached JWKS keys
+  never expired → one-hour maximum age. P2s fixed: unique-constraint column order for
+  index use, reconstruction keeps patch ids only, semaphore below pool size and pool
+  timeouts → 503 `DEPENDENCY_UNAVAILABLE`, store-enforced validation policy after the
+  replay lookup, evidence/field checks before any lock or reconstruction, JWKS client
+  hardening, principal-type claim vs configuration conflict refused, unvalidated switch
+  refused with production auth, readiness checks the schema level, OpenAPI documents
+  413/500/503, unknown routes/methods use the envelope, integration script asserts exact
+  quads, replay ids, outbox/idempotency counts, correlation ids and global non-v2 count,
+  FK assertions pin constraint names, body-limit test isolates the transport limit,
+  capability matrix table-driven, foreign accept covered with unchanged row counts,
+  depth/bytes/export limits and idempotency-key/reason/ref bounds covered, `unique()`
+  collision-free. Decisions recorded: `max_depth` is an operational branch ceiling until
+  checkpoints (ADR-0013 note, tech-debt, Plan 0005); `sculpin-ledger-request/v1` frozen by
+  ADR-0015; 0007 is an offline (stop-all-replicas) upgrade (migrations README). Accepted
+  P3 risks are listed in `docs/exec-plans/tech-debt.md` (semaphore saturation and live
+  Entra issuer untested until Plan 0005; client correlation ids stored verbatim; audit
+  `tenant_id` doubles as graph tenant; candidates readable by any tenant reader).
+- Fluree live differential: DEFERRED by policy (BUSL-1.1), not passed.
+
+Security assumptions and dev-only switches: see `docs/quality/security.md`. Production
+qualification: **NO** until Plan 0005 (P1.5) passes.
 
 ## Test evidence
 - 2026-09-26 `python3 scripts/golden/commit_v2_reference.py check`: exit 0, "all 18

@@ -1,0 +1,10 @@
+{
+  "operation": "prepare",
+  "graph_id": "0b0a2a1c-2e3d-4f50-8a61-72b384c5d6e7",
+  "branch": "main",
+  "operations": [{"op": "add", "quad": "<urn:material:a> <urn:temperature> \"80\" ."}],
+  "activity": "cognitive-genesis",
+  "event_time": "2026-09-24T10:00:00Z",
+  "evidence_refs": [],
+  "message": "golden prepare genesis"
+}

@@ -130,8 +130,19 @@ retries are automatic.
   moved by it; the status is share-locked in the same transaction as the move). A graph
   imported this way and later activated therefore has refs at `version ≥ 1` with no
   genesis event: its audit trail starts at its first workflow `advance`, and consumers
-  (Phase 3 projector, replay) MUST NOT assume a genesis event exists for every ref. It is the bootstrap v1 write path of the HTTP surface until the
-  authenticated API (P1.4) routes `prepare`/`accept` through the repository.
+  (Phase 3 projector, replay) MUST NOT assume a genesis event exists for every ref. Since P1.4 the public HTTP surface routes `prepare`/`accept`/`reject` through the
+  repository with the verified principal and a server-computed request digest, and no
+  public route reaches the raw primitive or `Ledger::commit`. Migration 0007 widened the
+  idempotency scope to the complete actor (`principal_type`, `on_behalf_of` with `UNIQUE
+  NULLS NOT DISTINCT`), added a bounded `correlation_id` to proposals, ref events and
+  decisions (audit only; never part of any identity), and made `(graph_id, tenant_id)`
+  agreement between audit rows and `graphs` a schema invariant. `ValidationPolicy::Required`
+  is enforced inside `accept` after the idempotent-replay lookup, so the store, not only
+  the HTTP adapter, refuses unvalidated acceptance. `prepare` refuses (RESOURCE_LIMIT) a
+  candidate whose depth or resulting state would exceed the deployment's
+  `ReconstructionLimits`, so an accepted head is always readable and extendable under the
+  limits that accepted it; until checkpoints exist (Phase 4/5 input, Plan 0005) this makes
+  `max_depth` an operational ceiling on a branch's length.
   `refs.protected` is set at creation and immutable until Phase 4 branch policy.
 
 ## Alternatives considered

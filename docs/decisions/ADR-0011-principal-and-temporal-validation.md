@@ -51,6 +51,9 @@ on_behalf_of?
   `recorded_time`); `event_time` becomes a typed, validated field.
 - Because actor fields and the normalized `event_time` are part of v2 identity, they are
   covered by the ADR-0009 golden vectors.
-- Integration: behind a trusted gateway the ledger may consume `RequestContext` headers;
-  otherwise it validates Entra tokens directly. Either way `principal_type` comes from the
-  verified identity.
+- Integration (implemented P1.4): the ledger validates bearer tokens directly
+  (`OidcAuthenticator` against the issuer's JWKS; `DevHs256Authenticator` for
+  development/CI only) and derives tenant, principal, `principal_type` and capabilities
+  from verified claims plus explicit `ClaimsPolicy` configuration. An unsigned
+  "trusted headers" protocol was considered and rejected: a gateway integration would
+  require signed assertions and its own ADR.

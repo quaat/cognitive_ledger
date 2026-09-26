@@ -23,12 +23,12 @@
 //! atomicity is verified, production protected semantic acceptance (Phase 2) is not
 //! enabled, and no validation record is ever fabricated.
 
-use crate::{PgGraphs, PostgresImmutableStore, V1Binding, storage};
+use crate::{PgGraphs, PostgresImmutableStore, V1Binding, db_error, storage};
 use ledger_core::{
     AnyCommit, AuthenticatedPrincipal, CommitId, CommitV2, ContentId, GraphId, LedgerError,
     LedgerTimestamp, PatchId,
 };
-use ledger_rdf::{DeltaPolicy, Patch, apply_patch, effective_delta};
+use ledger_rdf::{DeltaPolicy, Patch, effective_delta};
 use sqlx::{PgConnection, PgPool, Row, postgres::PgPoolOptions};
 use std::collections::BTreeSet;
 use time::OffsetDateTime;
@@ -38,17 +38,23 @@ use time::OffsetDateTime;
 pub const MAX_BRANCH_BYTES: usize = 128;
 pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
 pub const MAX_REASON_BYTES: usize = 4096;
+pub const MAX_CORRELATION_BYTES: usize = 128;
 
 /// Who is asking, for which graph, and how the request is deduplicated. `tenant` is part
 /// of the idempotency scope through the principal (ADR-0011).
 #[derive(Clone, Debug)]
 pub struct RequestScope {
+    /// The complete authenticated actor: principal id, principal type and delegation are
+    /// all part of the idempotency scope (ADR-0013).
     pub principal: AuthenticatedPrincipal,
     pub graph: GraphId,
     pub idempotency_key: String,
     /// Digest of the canonical request as the caller submitted it (computed by the API
     /// layer); two requests with the same key must carry the same digest.
     pub request_digest: ContentId,
+    /// Operational tracing metadata (ADR-0011): recorded on the audit row the request
+    /// creates, never part of commit or request identity; a retry may carry another one.
+    pub correlation_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -74,10 +80,15 @@ pub struct Prepared {
     pub replayed: bool,
 }
 
-/// P1.3 has no semantic validation. The only policy is explicit about that; Phase 2 adds
-/// policies that require immutable `ValidationRecord`s and fills `validation_ids`.
+/// How acceptance treats semantic validation. Phase 1 has no validation service:
+/// `Required` is the production setting and makes every non-replayed accept fail with
+/// `ValidationRequired` inside the repository (the store enforces it, not only the HTTP
+/// adapter); `NoValidation` is the explicit development/CI setting. Phase 2 adds policies
+/// that require immutable `ValidationRecord`s and fills `validation_ids`. No policy ever
+/// fabricates a validation record.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ValidationPolicy {
+    Required,
     NoValidation,
 }
 
@@ -134,6 +145,7 @@ pub struct WorkflowRepository {
     pool: PgPool,
     immutable: PostgresImmutableStore,
     failpoint: Option<FailPoint>,
+    limits: crate::ReconstructionLimits,
 }
 
 /// Composition root: one pool shared by the immutable store, the graph authority and the
@@ -155,7 +167,7 @@ impl PostgresLedgerStore {
             .acquire_timeout(std::time::Duration::from_secs(10))
             .connect(database_url)
             .await
-            .map_err(storage)?;
+            .map_err(db_error)?;
         crate::schema::migrate_all(&pool).await?;
         Ok(Self::from_pool_migrated(pool, v1_binding))
     }
@@ -170,6 +182,13 @@ impl PostgresLedgerStore {
         }
     }
 
+    /// Bound every reconstruction this store performs (workflow base state and public
+    /// reads alike) with the deployment's limits.
+    pub fn with_limits(mut self, limits: crate::ReconstructionLimits) -> Self {
+        self.workflows = self.workflows.with_limits(limits);
+        self
+    }
+
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
@@ -182,6 +201,66 @@ impl PostgresLedgerStore {
     pub fn workflows(&self) -> &WorkflowRepository {
         &self.workflows
     }
+
+    /// The graph an indexed commit belongs to, or `None` when the id is not an indexed
+    /// commit. Public reads use this to enforce graph membership before reconstructing.
+    pub async fn commit_graph(&self, commit: &CommitId) -> Result<Option<GraphId>, LedgerError> {
+        let row = sqlx::query("SELECT graph_id FROM commit_index WHERE id = $1")
+            .bind(commit.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_error)?;
+        row.map(|row| {
+            let graph: String = row.try_get("graph_id").map_err(db_error)?;
+            GraphId::new(graph)
+        })
+        .transpose()
+    }
+
+    /// Current head and version of a ref (read-only, no lock).
+    pub async fn ref_head(
+        &self,
+        graph: &GraphId,
+        branch: &str,
+    ) -> Result<Option<(CommitId, i64)>, LedgerError> {
+        let row = sqlx::query("SELECT head, version FROM refs WHERE graph_id = $1 AND branch = $2")
+            .bind(graph.as_str())
+            .bind(branch)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_error)?;
+        row.map(|row| {
+            let head: String = row.try_get("head").map_err(db_error)?;
+            Ok((head.parse()?, row.try_get("version").map_err(db_error)?))
+        })
+        .transpose()
+    }
+
+    /// Readiness probe: the database answers and the schema is at least at the level
+    /// this binary requires (matters once migrations run under a separate role).
+    pub async fn ready(&self) -> Result<(), LedgerError> {
+        let row = sqlx::query("SELECT max(version) AS v FROM _sqlx_migrations WHERE success")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(db_error)?;
+        let version: Option<i64> = row.try_get("v").map_err(db_error)?;
+        if version.unwrap_or(0) < crate::schema::REQUIRED_SCHEMA_VERSION {
+            return Err(LedgerError::DependencyUnavailable(format!(
+                "schema version {} is below the required {}",
+                version.unwrap_or(0),
+                crate::schema::REQUIRED_SCHEMA_VERSION
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// A bounded reconstruction: the state plus the accounting the limits are checked against.
+#[derive(Default)]
+struct Reconstructed {
+    state: BTreeSet<ledger_rdf::Quad>,
+    bytes: usize,
+    depth: usize,
 }
 
 /// What the idempotency table remembers about a completed request.
@@ -253,6 +332,16 @@ fn validate_scope(scope: &RequestScope) -> Result<(), LedgerError> {
             ),
         });
     }
+    if let Some(correlation) = &scope.correlation_id
+        && (correlation.is_empty()
+            || correlation.len() > MAX_CORRELATION_BYTES
+            || correlation.chars().any(char::is_control))
+    {
+        return Err(LedgerError::InvalidIdentifier {
+            field: "correlation_id",
+            reason: format!("must be 1..={MAX_CORRELATION_BYTES} bytes without control characters"),
+        });
+    }
     Ok(())
 }
 
@@ -285,7 +374,29 @@ impl WorkflowRepository {
             pool,
             immutable,
             failpoint: None,
+            limits: crate::ReconstructionLimits::DEVELOPMENT,
         }
+    }
+
+    /// Bound every base-state reconstruction this repository performs.
+    pub fn with_limits(mut self, limits: crate::ReconstructionLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    pub fn limits(&self) -> &crate::ReconstructionLimits {
+        &self.limits
+    }
+
+    /// Bounded reconstruction on a pool connection for public reads; the caller has
+    /// already authorized the graph and checked the commit's membership.
+    pub async fn reconstruct(
+        &self,
+        head: &CommitId,
+        limits: &crate::ReconstructionLimits,
+    ) -> Result<BTreeSet<ledger_rdf::Quad>, LedgerError> {
+        let mut conn = self.pool.acquire().await.map_err(db_error)?;
+        Ok(Self::state_at_on(&mut conn, head, limits).await?.state)
     }
 
     /// Abort every operation's transaction at `point` (tests only).
@@ -310,15 +421,24 @@ impl WorkflowRepository {
         scope: &RequestScope,
         operation: Operation,
     ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, LedgerError> {
-        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let mut tx = self.pool.begin().await.map_err(db_error)?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
             .execute(&mut *tx)
             .await
-            .map_err(storage)?;
+            .map_err(db_error)?;
+        // The complete actor is part of the scope: two contexts sharing a principal id but
+        // differing in type or delegation never serialize or replay each other.
         let lock_key = format!(
-            "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+            "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
             scope.principal.tenant_id.as_str(),
             scope.principal.principal_id.as_str(),
+            scope.principal.principal_type.as_str(),
+            scope
+                .principal
+                .on_behalf_of
+                .as_ref()
+                .map(|p| p.as_str())
+                .unwrap_or(""),
             scope.graph.as_str(),
             operation.as_str(),
             scope.idempotency_key
@@ -327,7 +447,7 @@ impl WorkflowRepository {
             .bind(lock_key)
             .execute(&mut *tx)
             .await
-            .map_err(storage)?;
+            .map_err(db_error)?;
         Ok(tx)
     }
 
@@ -339,25 +459,34 @@ impl WorkflowRepository {
         let row = sqlx::query(
             "SELECT request_digest, result_kind, result_commit, result_ref_version, \
              result_decision_id, result_proposal_id FROM idempotency \
-             WHERE tenant_id = $1 AND principal_id = $2 AND graph_id = $3 AND operation = $4 \
-             AND idempotency_key = $5",
+             WHERE tenant_id = $1 AND principal_id = $2 AND principal_type = $3 \
+             AND on_behalf_of IS NOT DISTINCT FROM $4 AND graph_id = $5 AND operation = $6 \
+             AND idempotency_key = $7",
         )
         .bind(scope.principal.tenant_id.as_str())
         .bind(scope.principal.principal_id.as_str())
+        .bind(scope.principal.principal_type.as_str())
+        .bind(
+            scope
+                .principal
+                .on_behalf_of
+                .as_ref()
+                .map(|p| p.as_str().to_owned()),
+        )
         .bind(scope.graph.as_str())
         .bind(operation.as_str())
         .bind(&scope.idempotency_key)
         .fetch_optional(&mut *conn)
         .await
-        .map_err(storage)?;
+        .map_err(db_error)?;
         row.map(|row| {
             Ok(StoredResult {
-                request_digest: row.try_get("request_digest").map_err(storage)?,
-                result_kind: row.try_get("result_kind").map_err(storage)?,
-                result_commit: row.try_get("result_commit").map_err(storage)?,
-                result_ref_version: row.try_get("result_ref_version").map_err(storage)?,
-                result_decision_id: row.try_get("result_decision_id").map_err(storage)?,
-                result_proposal_id: row.try_get("result_proposal_id").map_err(storage)?,
+                request_digest: row.try_get("request_digest").map_err(db_error)?,
+                result_kind: row.try_get("result_kind").map_err(db_error)?,
+                result_commit: row.try_get("result_commit").map_err(db_error)?,
+                result_ref_version: row.try_get("result_ref_version").map_err(db_error)?,
+                result_decision_id: row.try_get("result_decision_id").map_err(db_error)?,
+                result_proposal_id: row.try_get("result_proposal_id").map_err(db_error)?,
             })
         })
         .transpose()
@@ -377,9 +506,10 @@ impl WorkflowRepository {
         result_proposal_id: Option<i64>,
     ) -> Result<(), LedgerError> {
         sqlx::query(
-            "INSERT INTO idempotency (tenant_id, principal_id, graph_id, operation, idempotency_key, \
-             request_digest, result_kind, result_commit, result_ref_version, result_decision_id, \
-             result_proposal_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+            "INSERT INTO idempotency (tenant_id, principal_id, principal_type, on_behalf_of, graph_id, \
+             operation, idempotency_key, request_digest, result_kind, result_commit, \
+             result_ref_version, result_decision_id, result_proposal_id) \
+             VALUES ($1, $2, $12, $13, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
         )
         .bind(scope.principal.tenant_id.as_str())
         .bind(scope.principal.principal_id.as_str())
@@ -392,9 +522,17 @@ impl WorkflowRepository {
         .bind(result_ref_version)
         .bind(result_decision_id)
         .bind(result_proposal_id)
+        .bind(scope.principal.principal_type.as_str())
+        .bind(
+            scope
+                .principal
+                .on_behalf_of
+                .as_ref()
+                .map(|p| p.as_str().to_owned()),
+        )
         .execute(&mut *conn)
         .await
-        .map_err(storage)?;
+        .map_err(db_error)?;
         Ok(())
     }
 
@@ -418,15 +556,15 @@ impl WorkflowRepository {
             .bind(scope.graph.as_str())
             .fetch_optional(&mut *conn)
             .await
-            .map_err(storage)?;
+            .map_err(db_error)?;
         let Some(row) = row else {
             return Err(LedgerError::UnknownGraph(scope.graph.to_string()));
         };
-        let tenant: String = row.try_get("tenant_id").map_err(storage)?;
+        let tenant: String = row.try_get("tenant_id").map_err(db_error)?;
         if tenant != scope.principal.tenant_id.as_str() {
             return Err(LedgerError::UnknownGraph(scope.graph.to_string()));
         }
-        let status: String = row.try_get("status").map_err(storage)?;
+        let status: String = row.try_get("status").map_err(db_error)?;
         if status != "active" {
             return Err(LedgerError::GraphNotActive {
                 graph: scope.graph.to_string(),
@@ -450,13 +588,13 @@ impl WorkflowRepository {
         .bind(candidate.to_string())
         .fetch_optional(&mut *conn)
         .await
-        .map_err(storage)?;
+        .map_err(db_error)?;
         row.map(|row| {
             Ok(ProposalBinding {
-                proposal_id: row.try_get("proposal_id").map_err(storage)?,
-                graph_id: row.try_get("graph_id").map_err(storage)?,
-                branch: row.try_get("branch").map_err(storage)?,
-                expected_head: row.try_get("expected_head").map_err(storage)?,
+                proposal_id: row.try_get("proposal_id").map_err(db_error)?,
+                graph_id: row.try_get("graph_id").map_err(db_error)?,
+                branch: row.try_get("branch").map_err(db_error)?,
+                expected_head: row.try_get("expected_head").map_err(db_error)?,
             })
         })
         .transpose()
@@ -476,8 +614,8 @@ impl WorkflowRepository {
                 .bind(candidate.to_string())
                 .fetch_optional(&mut *conn)
                 .await
-                .map_err(storage)?
-                .map(|row| row.try_get("graph_id").map_err(storage))
+                .map_err(db_error)?
+                .map(|row| row.try_get("graph_id").map_err(db_error))
                 .transpose()?;
         match indexed_graph.as_deref() {
             Some(g) if g == scope.graph.as_str() => {}
@@ -504,9 +642,9 @@ impl WorkflowRepository {
                 .bind(candidate.to_string())
                 .fetch_optional(&mut *conn)
                 .await
-                .map_err(storage)?;
+                .map_err(db_error)?;
         if let Some(row) = decided {
-            let decision: String = row.try_get("decision").map_err(storage)?;
+            let decision: String = row.try_get("decision").map_err(db_error)?;
             return Err(LedgerError::LineageMismatch(format!(
                 "candidate {candidate} already has a terminal decision ({decision})"
             )));
@@ -540,13 +678,13 @@ impl WorkflowRepository {
             .bind(branch)
             .fetch_optional(&mut *conn)
             .await
-            .map_err(storage)?;
+            .map_err(db_error)?;
         row.map(|row| {
-            let head: String = row.try_get("head").map_err(storage)?;
+            let head: String = row.try_get("head").map_err(db_error)?;
             Ok((
                 head.parse()?,
-                row.try_get("version").map_err(storage)?,
-                row.try_get("protected").map_err(storage)?,
+                row.try_get("version").map_err(db_error)?,
+                row.try_get("protected").map_err(db_error)?,
             ))
         })
         .transpose()
@@ -558,7 +696,8 @@ impl WorkflowRepository {
     async fn state_at_on(
         conn: &mut PgConnection,
         head: &CommitId,
-    ) -> Result<BTreeSet<ledger_rdf::Quad>, LedgerError> {
+        limits: &crate::ReconstructionLimits,
+    ) -> Result<Reconstructed, LedgerError> {
         async fn object(
             conn: &mut PgConnection,
             id: &ContentId,
@@ -567,11 +706,11 @@ impl WorkflowRepository {
                 .bind(id.to_string())
                 .fetch_optional(&mut *conn)
                 .await
-                .map_err(storage)?;
+                .map_err(db_error)?;
             let Some(row) = row else {
                 return Ok(None);
             };
-            let bytes: Vec<u8> = row.try_get("bytes").map_err(storage)?;
+            let bytes: Vec<u8> = row.try_get("bytes").map_err(db_error)?;
             if &ContentId::for_bytes(&bytes) != id {
                 return Err(LedgerError::CorruptObject {
                     id: id.clone(),
@@ -590,23 +729,36 @@ impl WorkflowRepository {
                     reason: "commit cycle".into(),
                 });
             }
+            if seen.len() > limits.max_depth {
+                return Err(LedgerError::ResourceLimit(format!(
+                    "reconstruction depth exceeds {} commits",
+                    limits.max_depth
+                )));
+            }
             let bytes = object(conn, &current.0)
                 .await?
                 .ok_or_else(|| LedgerError::NotFound(current.0.clone()))?;
             let commit = crate::decode_commit_object(&current.0, &bytes)?
                 .ok_or_else(|| LedgerError::NotFound(current.0.clone()))?;
             cursor = commit.parents().first().cloned();
-            chain.push(commit);
+            // Only the patch id is retained: memory is proportional to depth, not to the
+            // envelopes' metadata.
+            chain.push(commit.patch().clone());
         }
         let mut state = BTreeSet::new();
-        for commit in chain.iter().rev() {
-            let bytes = object(conn, &commit.patch().0)
+        let mut total_bytes = 0usize;
+        for patch_id in chain.iter().rev() {
+            let bytes = object(conn, &patch_id.0)
                 .await?
-                .ok_or_else(|| LedgerError::NotFound(commit.patch().0.clone()))?;
-            let patch = crate::validate_patch_bytes(commit.patch(), &bytes)?;
-            apply_patch(&mut state, &patch);
+                .ok_or_else(|| LedgerError::NotFound(patch_id.0.clone()))?;
+            let patch = crate::validate_patch_bytes(patch_id, &bytes)?;
+            crate::apply_bounded(&mut state, &mut total_bytes, &patch, limits)?;
         }
-        Ok(state)
+        Ok(Reconstructed {
+            state,
+            bytes: total_bytes,
+            depth: chain.len(),
+        })
     }
 
     /// Prepare a candidate: resolve the base, reduce the request to its effective delta,
@@ -637,9 +789,14 @@ impl WorkflowRepository {
         }
         // Base state is immutable content, read on this transaction's connection.
         let base = match &request.expected_head {
-            Some(head) => Self::state_at_on(&mut tx, head).await?,
-            None => BTreeSet::new(),
+            Some(head) => Self::state_at_on(&mut tx, head, &self.limits).await?,
+            None => Reconstructed::default(),
         };
+        let Reconstructed {
+            state: base,
+            bytes: base_bytes,
+            depth: base_depth,
+        } = base;
         let policy = if protected {
             DeltaPolicy::Strict
         } else {
@@ -652,6 +809,25 @@ impl WorkflowRepository {
                 }
                 ledger_rdf::DeltaError::NoEffectiveChange => LedgerError::NoEffectiveChange,
             })?;
+        // The candidate must itself stay within the limits, or it could be accepted and
+        // then never read or built on. The effective delta is exact (every add is absent
+        // from the base, every delete present), so the resulting size is arithmetic.
+        self.limits.check_depth(base_depth + 1)?;
+        let (adds, add_bytes, del_bytes) =
+            effective
+                .operations()
+                .iter()
+                .fold((0usize, 0usize, 0usize), |(n, a, d), op| match op.kind {
+                    ledger_rdf::OperationKind::Add => {
+                        (n + 1, a + crate::quad_line_len(&op.quad), d)
+                    }
+                    ledger_rdf::OperationKind::Delete => (n, a, d + crate::quad_line_len(&op.quad)),
+                });
+        let deletes = effective.operations().len() - adds;
+        self.limits.check_state(
+            base.len() + adds - deletes,
+            (base_bytes + add_bytes).saturating_sub(del_bytes),
+        )?;
         self.fail_at(FailPoint::AfterLineageValidation)?;
 
         // Content: the requested patch is kept for audit; the effective patch is what the
@@ -690,8 +866,9 @@ impl WorkflowRepository {
         let actor = scope.principal.actor();
         let row = sqlx::query(
             "INSERT INTO proposals (graph_id, branch, tenant_id, principal_id, principal_type, \
-             on_behalf_of, expected_head, requested_patch_id, effective_patch_id, candidate_commit) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING proposal_id",
+             on_behalf_of, expected_head, requested_patch_id, effective_patch_id, candidate_commit, \
+             correlation_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING proposal_id",
         )
         .bind(scope.graph.as_str())
         .bind(&request.branch)
@@ -703,6 +880,7 @@ impl WorkflowRepository {
         .bind(requested_id.to_string())
         .bind(effective_id.to_string())
         .bind(candidate_id.to_string())
+        .bind(scope.correlation_id.as_deref())
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| match &e {
@@ -713,7 +891,7 @@ impl WorkflowRepository {
             ),
             _ => storage(e),
         })?;
-        let proposal_id: i64 = row.try_get("proposal_id").map_err(storage)?;
+        let proposal_id: i64 = row.try_get("proposal_id").map_err(db_error)?;
         self.fail_at(FailPoint::AfterDecision)?;
         Self::record_result(
             &mut tx,
@@ -727,7 +905,7 @@ impl WorkflowRepository {
         )
         .await?;
         self.fail_at(FailPoint::BeforeCommit)?;
-        tx.commit().await.map_err(storage)?;
+        tx.commit().await.map_err(db_error)?;
         Ok(Prepared {
             proposal_id,
             candidate: candidate_id,
@@ -762,9 +940,9 @@ impl WorkflowRepository {
         .bind(proposal_id)
         .fetch_one(&mut *conn)
         .await
-        .map_err(storage)?;
-        let requested: String = row.try_get("requested_patch_id").map_err(storage)?;
-        let effective: String = row.try_get("effective_patch_id").map_err(storage)?;
+        .map_err(db_error)?;
+        let requested: String = row.try_get("requested_patch_id").map_err(db_error)?;
+        let effective: String = row.try_get("effective_patch_id").map_err(db_error)?;
         Ok(Prepared {
             proposal_id,
             candidate,
@@ -783,10 +961,14 @@ impl WorkflowRepository {
         validate_scope(scope)?;
         validate_branch(&request.branch)?;
         validate_reason(request.reason.as_deref())?;
-        let ValidationPolicy::NoValidation = request.validation;
         let mut tx = self.begin(scope, Operation::Accept).await?;
         if let Some(stored) = Self::stored_result(&mut tx, scope, Operation::Accept).await? {
             return Self::replay_accepted(&mut tx, stored, scope).await;
+        }
+        // A durable earlier acceptance replays above regardless of policy; a new
+        // acceptance without semantic validation is refused here, in the store.
+        if request.validation == ValidationPolicy::Required {
+            return Err(LedgerError::ValidationRequired);
         }
         self.fail_at(FailPoint::AfterIdempotencyCheck)?;
         Self::graph_must_be_active(&mut tx, scope).await?;
@@ -814,16 +996,16 @@ impl WorkflowRepository {
             .bind(request.candidate.to_string())
             .fetch_one(&mut *tx)
             .await
-            .map_err(storage)?;
-        let parent_count: i16 = candidate_row.try_get("parent_count").map_err(storage)?;
+            .map_err(db_error)?;
+        let parent_count: i16 = candidate_row.try_get("parent_count").map_err(db_error)?;
         let first_parent: Option<String> = sqlx::query(
             "SELECT parent_id FROM commit_parents WHERE commit_id = $1 AND position = 0",
         )
         .bind(request.candidate.to_string())
         .fetch_optional(&mut *tx)
         .await
-        .map_err(storage)?
-        .map(|row| row.try_get("parent_id").map_err(storage))
+        .map_err(db_error)?
+        .map(|row| row.try_get("parent_id").map_err(db_error))
         .transpose()?;
         if parent_count > 1 {
             return Err(LedgerError::LineageMismatch(
@@ -866,7 +1048,7 @@ impl WorkflowRepository {
                 .bind(request.candidate.to_string())
                 .execute(&mut *tx)
                 .await
-                .map_err(storage)?;
+                .map_err(db_error)?;
                 if inserted.rows_affected() != 1 {
                     // A concurrent genesis with a *different* key won (an identical key
                     // would have replayed under the advisory lock): report its head.
@@ -891,7 +1073,7 @@ impl WorkflowRepository {
                 .bind(head.to_string())
                 .execute(&mut *tx)
                 .await
-                .map_err(storage)?;
+                .map_err(db_error)?;
                 if updated.rows_affected() != 1 {
                     return Err(LedgerError::Storage(
                         "locked ref row disappeared during advance".into(),
@@ -905,8 +1087,8 @@ impl WorkflowRepository {
         let actor = scope.principal.actor();
         let event_row = sqlx::query(
             "INSERT INTO ref_events (graph_id, branch, old_head, new_head, old_version, new_version, \
-             operation, tenant_id, principal_id, principal_type, on_behalf_of, reason) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING event_id",
+             operation, tenant_id, principal_id, principal_type, on_behalf_of, reason, correlation_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING event_id",
         )
         .bind(scope.graph.as_str())
         .bind(&request.branch)
@@ -920,16 +1102,18 @@ impl WorkflowRepository {
         .bind(actor.principal_type.as_str())
         .bind(actor.on_behalf_of.as_ref().map(|p| p.as_str().to_owned()))
         .bind(request.reason.as_deref())
+        .bind(scope.correlation_id.as_deref())
         .fetch_one(&mut *tx)
         .await
-        .map_err(storage)?;
-        let ref_event_id: i64 = event_row.try_get("event_id").map_err(storage)?;
+        .map_err(db_error)?;
+        let ref_event_id: i64 = event_row.try_get("event_id").map_err(db_error)?;
         self.fail_at(FailPoint::AfterRefEvent)?;
 
         let decision_row = sqlx::query(
             "INSERT INTO decisions (proposal_id, graph_id, branch, candidate_commit, decision, \
-             tenant_id, principal_id, principal_type, on_behalf_of, reason, validation_ids, ref_event_id) \
-             VALUES ($1, $2, $3, $4, 'accepted', $5, $6, $7, $8, $9, '{}', $10) RETURNING decision_id",
+             tenant_id, principal_id, principal_type, on_behalf_of, reason, validation_ids, ref_event_id, \
+             correlation_id) \
+             VALUES ($1, $2, $3, $4, 'accepted', $5, $6, $7, $8, $9, '{}', $10, $11) RETURNING decision_id",
         )
         .bind(proposal.proposal_id)
         .bind(scope.graph.as_str())
@@ -941,10 +1125,11 @@ impl WorkflowRepository {
         .bind(actor.on_behalf_of.as_ref().map(|p| p.as_str().to_owned()))
         .bind(request.reason.as_deref())
         .bind(ref_event_id)
+        .bind(scope.correlation_id.as_deref())
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| map_decision_insert(e, &request.candidate))?;
-        let decision_id: i64 = decision_row.try_get("decision_id").map_err(storage)?;
+        let decision_id: i64 = decision_row.try_get("decision_id").map_err(db_error)?;
         self.fail_at(FailPoint::AfterDecision)?;
 
         let outbox_row = sqlx::query(
@@ -958,8 +1143,8 @@ impl WorkflowRepository {
         .bind(ref_event_id)
         .fetch_one(&mut *tx)
         .await
-        .map_err(storage)?;
-        let outbox_id: i64 = outbox_row.try_get("outbox_id").map_err(storage)?;
+        .map_err(db_error)?;
+        let outbox_id: i64 = outbox_row.try_get("outbox_id").map_err(db_error)?;
         self.fail_at(FailPoint::AfterOutbox)?;
 
         Self::record_result(
@@ -974,7 +1159,7 @@ impl WorkflowRepository {
         )
         .await?;
         self.fail_at(FailPoint::BeforeCommit)?;
-        tx.commit().await.map_err(storage)?;
+        tx.commit().await.map_err(db_error)?;
         Ok(Accepted {
             decision_id,
             ref_event_id,
@@ -1014,11 +1199,11 @@ impl WorkflowRepository {
         .bind(decision_id)
         .fetch_one(&mut *conn)
         .await
-        .map_err(storage)?;
+        .map_err(db_error)?;
         Ok(Accepted {
             decision_id,
-            ref_event_id: row.try_get("ref_event_id").map_err(storage)?,
-            outbox_id: row.try_get("outbox_id").map_err(storage)?,
+            ref_event_id: row.try_get("ref_event_id").map_err(db_error)?,
+            outbox_id: row.try_get("outbox_id").map_err(db_error)?,
             ref_version,
             head,
             replayed: true,
@@ -1071,8 +1256,8 @@ impl WorkflowRepository {
         let actor = scope.principal.actor();
         let decision_row = sqlx::query(
             "INSERT INTO decisions (proposal_id, graph_id, branch, candidate_commit, decision, \
-             tenant_id, principal_id, principal_type, on_behalf_of, reason, validation_ids) \
-             VALUES ($1, $2, $3, $4, 'rejected', $5, $6, $7, $8, $9, '{}') RETURNING decision_id",
+             tenant_id, principal_id, principal_type, on_behalf_of, reason, validation_ids, correlation_id) \
+             VALUES ($1, $2, $3, $4, 'rejected', $5, $6, $7, $8, $9, '{}', $10) RETURNING decision_id",
         )
         .bind(proposal.proposal_id)
         .bind(scope.graph.as_str())
@@ -1083,10 +1268,11 @@ impl WorkflowRepository {
         .bind(actor.principal_type.as_str())
         .bind(actor.on_behalf_of.as_ref().map(|p| p.as_str().to_owned()))
         .bind(&request.reason)
+        .bind(scope.correlation_id.as_deref())
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| map_decision_insert(e, &request.candidate))?;
-        let decision_id: i64 = decision_row.try_get("decision_id").map_err(storage)?;
+        let decision_id: i64 = decision_row.try_get("decision_id").map_err(db_error)?;
         self.fail_at(FailPoint::AfterDecision)?;
         Self::record_result(
             &mut tx,
@@ -1100,7 +1286,7 @@ impl WorkflowRepository {
         )
         .await?;
         self.fail_at(FailPoint::BeforeCommit)?;
-        tx.commit().await.map_err(storage)?;
+        tx.commit().await.map_err(db_error)?;
         Ok(Rejected {
             decision_id,
             replayed: false,
@@ -1134,26 +1320,27 @@ impl WorkflowRepository {
         graph: &GraphId,
         proposal_id: i64,
         reason: &str,
+        correlation_id: Option<&str>,
     ) -> Result<i64, LedgerError> {
         validate_reason(Some(reason))?;
-        let mut tx = self.pool.begin().await.map_err(storage)?;
+        let mut tx = self.pool.begin().await.map_err(db_error)?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
             .execute(&mut *tx)
             .await
-            .map_err(storage)?;
+            .map_err(db_error)?;
         let owner = sqlx::query("SELECT tenant_id, status FROM graphs WHERE graph_id = $1")
             .bind(graph.as_str())
             .fetch_optional(&mut *tx)
             .await
-            .map_err(storage)?;
+            .map_err(db_error)?;
         let Some(owner) = owner else {
             return Err(LedgerError::UnknownGraph(graph.to_string()));
         };
-        let tenant: String = owner.try_get("tenant_id").map_err(storage)?;
+        let tenant: String = owner.try_get("tenant_id").map_err(db_error)?;
         if tenant != principal.tenant_id.as_str() {
             return Err(LedgerError::UnknownGraph(graph.to_string()));
         }
-        let status: String = owner.try_get("status").map_err(storage)?;
+        let status: String = owner.try_get("status").map_err(db_error)?;
         if status != "active" {
             return Err(LedgerError::GraphNotActive {
                 graph: graph.to_string(),
@@ -1169,25 +1356,25 @@ impl WorkflowRepository {
         .bind(graph.as_str())
         .fetch_optional(&mut *tx)
         .await
-        .map_err(storage)?;
+        .map_err(db_error)?;
         let Some(row) = row else {
             return Err(LedgerError::LineageMismatch(
                 "unknown proposal for this graph".into(),
             ));
         };
-        let branch: String = row.try_get("branch").map_err(storage)?;
-        let candidate: String = row.try_get("candidate_commit").map_err(storage)?;
-        let expected_head: Option<String> = row.try_get("expected_head").map_err(storage)?;
-        let current_head: Option<String> = row.try_get("head").map_err(storage)?;
+        let branch: String = row.try_get("branch").map_err(db_error)?;
+        let candidate: String = row.try_get("candidate_commit").map_err(db_error)?;
+        let expected_head: Option<String> = row.try_get("expected_head").map_err(db_error)?;
+        let current_head: Option<String> = row.try_get("head").map_err(db_error)?;
         let candidate_id: CommitId = candidate.parse()?;
         let decided =
             sqlx::query("SELECT decision FROM decisions WHERE candidate_commit = $1 LIMIT 1")
                 .bind(&candidate)
                 .fetch_optional(&mut *tx)
                 .await
-                .map_err(storage)?;
+                .map_err(db_error)?;
         if let Some(row) = decided {
-            let decision: String = row.try_get("decision").map_err(storage)?;
+            let decision: String = row.try_get("decision").map_err(db_error)?;
             return Err(LedgerError::LineageMismatch(format!(
                 "candidate {candidate_id} already has a terminal decision ({decision})"
             )));
@@ -1200,8 +1387,8 @@ impl WorkflowRepository {
         let actor = principal.actor();
         let decision_row = sqlx::query(
             "INSERT INTO decisions (proposal_id, graph_id, branch, candidate_commit, decision, \
-             tenant_id, principal_id, principal_type, on_behalf_of, reason, validation_ids) \
-             VALUES ($1, $2, $3, $4, 'superseded', $5, $6, $7, $8, $9, '{}') RETURNING decision_id",
+             tenant_id, principal_id, principal_type, on_behalf_of, reason, validation_ids, correlation_id) \
+             VALUES ($1, $2, $3, $4, 'superseded', $5, $6, $7, $8, $9, '{}', $10) RETURNING decision_id",
         )
         .bind(proposal_id)
         .bind(graph.as_str())
@@ -1212,11 +1399,12 @@ impl WorkflowRepository {
         .bind(actor.principal_type.as_str())
         .bind(actor.on_behalf_of.as_ref().map(|p| p.as_str().to_owned()))
         .bind(reason)
+        .bind(correlation_id)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| map_decision_insert(e, &candidate_id))?;
-        let decision_id: i64 = decision_row.try_get("decision_id").map_err(storage)?;
-        tx.commit().await.map_err(storage)?;
+        let decision_id: i64 = decision_row.try_get("decision_id").map_err(db_error)?;
+        tx.commit().await.map_err(db_error)?;
         Ok(decision_id)
     }
 }

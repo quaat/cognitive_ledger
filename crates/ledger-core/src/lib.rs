@@ -82,6 +82,16 @@ pub enum LedgerError {
     BaseMismatch(String),
     #[error("NO_EFFECTIVE_CHANGE: every requested operation is a no-op against the base state")]
     NoEffectiveChange,
+    #[error("RESOURCE_LIMIT: {0}")]
+    ResourceLimit(String),
+    /// A required dependency (the database) did not answer in time; retry with the same
+    /// idempotency key. Never raised for a request that was refused on its merits.
+    #[error("DEPENDENCY_UNAVAILABLE: {0}")]
+    DependencyUnavailable(String),
+    #[error(
+        "VALIDATION_REQUIRED: acceptance onto protected state requires semantic validation, which is not available yet"
+    )]
+    ValidationRequired,
     #[error("graph {0} already exists")]
     GraphAlreadyExists(String),
     #[error("graph {0} does not exist")]

@@ -3,7 +3,7 @@
 //! surface belong to later phases; this module only guarantees the schema's invariants
 //! (global `graph_id` uniqueness, immutable tenant binding, many graphs per KB).
 
-use crate::storage;
+use crate::{db_error, storage};
 use ledger_core::{GraphId, LedgerError, TenantId};
 use sqlx::{PgPool, Row};
 
@@ -98,18 +98,18 @@ impl PgGraphs {
         .bind(graph_id.as_str())
         .fetch_optional(&self.pool)
         .await
-        .map_err(storage)?;
+        .map_err(db_error)?;
         let Some(row) = row else {
             return Ok(None);
         };
-        let graph_id: String = row.try_get("graph_id").map_err(storage)?;
-        let tenant_id: String = row.try_get("tenant_id").map_err(storage)?;
-        let status: String = row.try_get("status").map_err(storage)?;
+        let graph_id: String = row.try_get("graph_id").map_err(db_error)?;
+        let tenant_id: String = row.try_get("tenant_id").map_err(db_error)?;
+        let status: String = row.try_get("status").map_err(db_error)?;
         Ok(Some(GraphRecord {
             graph_id: GraphId::new(graph_id)?,
             tenant_id: TenantId::new(tenant_id)?,
-            knowledge_base_id: row.try_get("knowledge_base_id").map_err(storage)?,
-            purpose: row.try_get("purpose").map_err(storage)?,
+            knowledge_base_id: row.try_get("knowledge_base_id").map_err(db_error)?,
+            purpose: row.try_get("purpose").map_err(db_error)?,
             status: GraphStatus::parse(&status)?,
         }))
     }

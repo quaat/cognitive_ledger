@@ -129,7 +129,7 @@ async fn schema_snapshot(pool: &PgPool) -> String {
         out.push_str(&format!("index {t}.{n} {d}\n"));
     }
     for row in sqlx::query(
-        "SELECT tgrelid::regclass::text AS t, tgname, pg_get_triggerdef(oid) AS def \
+        "SELECT tgrelid::regclass::text AS t, tgname, pg_get_triggerdef(oid) || ' enabled=' || tgenabled::text AS def \
          FROM pg_trigger WHERE NOT tgisinternal ORDER BY 1, 2",
     )
     .fetch_all(pool)
@@ -916,4 +916,309 @@ async fn upgrade_refuses_graphs_without_a_derivable_owner() {
         .unwrap()
         .get("t");
     assert_eq!(t.as_deref(), Some("graphs"));
+}
+
+/// Migration 0007 binds every existing idempotency row to its proposal's complete actor
+/// and fails closed when a row cannot be bound or an audit row's tenant disagrees with
+/// its graph.
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn migration_0007_backfills_actor_scope_and_refuses_unbound_or_mismatched_rows() {
+    use ledger_core::{AuthenticatedPrincipal, PrincipalId, PrincipalType, TenantId};
+    use ledger_store::{PrepareRequest, RequestScope, WorkflowRepository};
+
+    // Happy upgrade: a P1.3 database with a proposal by an agent (on behalf of a human),
+    // its prepare idempotency row, and a REJECT by a different human reviewer with its
+    // own idempotency row (the reviewer's row must take the reviewer's actor, not the
+    // proposer's).
+    let (_url, pool) = fresh_database("ledger_0007").await;
+    migrator_up_to(6).run(&pool).await.unwrap();
+    let graphs = PgGraphs::new(pool.clone());
+    let graph = unique("g");
+    graphs
+        .create(&new_graph(&graph, "tenant-a", None))
+        .await
+        .unwrap();
+    let store = PostgresImmutableStore::from_pool_migrated(pool.clone(), V1Binding::Reject);
+    let p = patch("0007");
+    store
+        .put_content(&p.id().0, &p.canonical_bytes())
+        .await
+        .unwrap();
+    let candidate = store
+        .put_commit(&v2(&graph, &p.id(), "candidate"))
+        .await
+        .unwrap();
+    let digest = ledger_core::ContentId::for_bytes(b"req").to_string();
+    let row = sqlx::query(
+        "INSERT INTO proposals (graph_id, branch, tenant_id, principal_id, principal_type, on_behalf_of, \
+         expected_head, requested_patch_id, effective_patch_id, candidate_commit) \
+         VALUES ($1, 'main', 'tenant-a', 'urn:sculpin:agent:test', 'agent', 'urn:sculpin:human:h', NULL, $2, $2, $3) \
+         RETURNING proposal_id",
+    )
+    .bind(&graph)
+    .bind(p.id().to_string())
+    .bind(candidate.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let proposal_id: i64 = row.get("proposal_id");
+    sqlx::query(
+        "INSERT INTO idempotency (tenant_id, principal_id, graph_id, operation, idempotency_key, \
+         request_digest, result_kind, result_commit, result_proposal_id) \
+         VALUES ('tenant-a', 'urn:sculpin:agent:test', $1, 'prepare', 'k1', $2, 'prepared', $3, $4)",
+    )
+    .bind(&graph)
+    .bind(&digest)
+    .bind(candidate.to_string())
+    .bind(proposal_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let row = sqlx::query(
+        "INSERT INTO decisions (proposal_id, graph_id, branch, candidate_commit, decision, tenant_id, \
+         principal_id, principal_type, on_behalf_of, reason, validation_ids) \
+         VALUES ($1, $2, 'main', $3, 'rejected', 'tenant-a', 'urn:sculpin:human:reviewer', 'human', NULL, 'no', '{}') \
+         RETURNING decision_id",
+    )
+    .bind(proposal_id)
+    .bind(&graph)
+    .bind(candidate.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let decision_id: i64 = row.get("decision_id");
+    sqlx::query(
+        "INSERT INTO idempotency (tenant_id, principal_id, graph_id, operation, idempotency_key, \
+         request_digest, result_kind, result_decision_id, result_proposal_id) \
+         VALUES ('tenant-a', 'urn:sculpin:human:reviewer', $1, 'reject', 'k2', $2, 'rejected', $3, $4)",
+    )
+    .bind(&graph)
+    .bind(&digest)
+    .bind(decision_id)
+    .bind(proposal_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+    let scope = |key: &str| {
+        let key = key.to_owned();
+        let pool = pool.clone();
+        async move {
+            let row = sqlx::query(
+                "SELECT principal_type, on_behalf_of, request_digest, result_kind, result_commit, \
+                 result_proposal_id, result_decision_id FROM idempotency WHERE idempotency_key = $1",
+            )
+            .bind(key)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            (
+                row.get::<String, _>("principal_type"),
+                row.get::<Option<String>, _>("on_behalf_of"),
+                row.get::<String, _>("request_digest"),
+                row.get::<String, _>("result_kind"),
+                row.get::<Option<String>, _>("result_commit"),
+                row.get::<Option<i64>, _>("result_proposal_id"),
+                row.get::<Option<i64>, _>("result_decision_id"),
+            )
+        }
+    };
+    // The prepare row takes the proposer's actor; the reject row the reviewer's. Results
+    // are untouched by the backfill.
+    assert_eq!(
+        scope("k1").await,
+        (
+            "agent".to_owned(),
+            Some("urn:sculpin:human:h".to_owned()),
+            digest.clone(),
+            "prepared".to_owned(),
+            Some(candidate.to_string()),
+            Some(proposal_id),
+            None
+        )
+    );
+    assert_eq!(
+        scope("k2").await,
+        (
+            "human".to_owned(),
+            None,
+            digest.clone(),
+            "rejected".to_owned(),
+            None,
+            Some(proposal_id),
+            Some(decision_id)
+        )
+    );
+    // The write-once guard is back in force after the backfill.
+    let rewrite = sqlx::query(
+        "UPDATE idempotency SET request_digest = request_digest WHERE idempotency_key = 'k1'",
+    )
+    .execute(&pool)
+    .await;
+    assert!(
+        matches!(rewrite, Err(sqlx::Error::Database(ref e)) if e.message().contains("write-once")),
+        "{rewrite:?}"
+    );
+    // Behavioural convergence: the upgraded row replays through the repository for the
+    // complete actor it was bound to, and is invisible to the same principal without the
+    // delegation.
+    let workflows = WorkflowRepository::new(pool.clone(), store.clone());
+    let request = |on_behalf_of: Option<&str>| PrepareRequest {
+        scope: RequestScope {
+            principal: AuthenticatedPrincipal {
+                principal_id: PrincipalId::new("urn:sculpin:agent:test").unwrap(),
+                principal_type: PrincipalType::Agent,
+                tenant_id: TenantId::new("tenant-a").unwrap(),
+                on_behalf_of: on_behalf_of.map(|o| PrincipalId::new(o).unwrap()),
+            },
+            graph: GraphId::new(&graph).unwrap(),
+            idempotency_key: "k1".into(),
+            request_digest: ledger_core::ContentId::for_bytes(b"req"),
+            correlation_id: None,
+        },
+        branch: "main".into(),
+        expected_head: None,
+        requested: p.clone(),
+        activity: "a".into(),
+        event_time: None,
+        evidence_refs: vec![],
+        source_system: None,
+        message: "m".into(),
+    };
+    let replayed = workflows
+        .prepare(&request(Some("urn:sculpin:human:h")))
+        .await
+        .unwrap();
+    assert!(replayed.replayed);
+    assert_eq!(replayed.candidate, candidate);
+    assert_eq!(replayed.proposal_id, proposal_id);
+    let fresh = workflows.prepare(&request(None)).await.unwrap();
+    assert!(
+        !fresh.replayed,
+        "a different delegation is a different namespace"
+    );
+    assert_ne!(fresh.proposal_id, proposal_id);
+    // Schema convergence with a populated upgrade: identical to a clean install.
+    let (_clean_url, clean) = fresh_database("ledger_0007_clean").await;
+    sqlx::migrate!("../../migrations")
+        .run(&clean)
+        .await
+        .unwrap();
+    assert_eq!(schema_snapshot(&pool).await, schema_snapshot(&clean).await);
+    clean.close().await;
+    pool.close().await;
+
+    // Unbound row: an idempotency row without a resolvable proposal/decision fails the upgrade.
+    let (_url, pool) = fresh_database("ledger_0007_unbound").await;
+    migrator_up_to(6).run(&pool).await.unwrap();
+    PgGraphs::new(pool.clone())
+        .create(&new_graph(&graph, "tenant-a", None))
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO idempotency (tenant_id, principal_id, graph_id, operation, idempotency_key, \
+         request_digest, result_kind) \
+         VALUES ('tenant-a', 'urn:sculpin:agent:test', $1, 'reject', 'k2', $2, 'rejected')",
+    )
+    .bind(&graph)
+    .bind(&digest)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let error = sqlx::migrate!("../../migrations")
+        .run(&pool)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("cannot be bound to an actor"),
+        "{error}"
+    );
+    pool.close().await;
+
+    // Mismatched actor: an idempotency row whose principal differs from its proposal's.
+    let (_url, pool) = fresh_database("ledger_0007_actor").await;
+    migrator_up_to(6).run(&pool).await.unwrap();
+    PgGraphs::new(pool.clone())
+        .create(&new_graph(&graph, "tenant-a", None))
+        .await
+        .unwrap();
+    let store = PostgresImmutableStore::from_pool_migrated(pool.clone(), V1Binding::Reject);
+    store
+        .put_content(&p.id().0, &p.canonical_bytes())
+        .await
+        .unwrap();
+    let candidate = store
+        .put_commit(&v2(&graph, &p.id(), "candidate"))
+        .await
+        .unwrap();
+    let row = sqlx::query(
+        "INSERT INTO proposals (graph_id, branch, tenant_id, principal_id, principal_type, expected_head, \
+         requested_patch_id, effective_patch_id, candidate_commit) \
+         VALUES ($1, 'main', 'tenant-a', 'urn:sculpin:agent:test', 'agent', NULL, $2, $2, $3) RETURNING proposal_id",
+    )
+    .bind(&graph)
+    .bind(p.id().to_string())
+    .bind(candidate.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let proposal_id: i64 = row.get("proposal_id");
+    sqlx::query(
+        "INSERT INTO idempotency (tenant_id, principal_id, graph_id, operation, idempotency_key, \
+         request_digest, result_kind, result_commit, result_proposal_id) \
+         VALUES ('tenant-a', 'urn:sculpin:agent:OTHER', $1, 'prepare', 'k1', $2, 'prepared', $3, $4)",
+    )
+    .bind(&graph)
+    .bind(&digest)
+    .bind(candidate.to_string())
+    .bind(proposal_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let error = sqlx::migrate!("../../migrations")
+        .run(&pool)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("disagree"), "{error}");
+    pool.close().await;
+
+    // Mismatched tenant: an audit row whose graph belongs to another tenant fails the upgrade.
+    let (_url, pool) = fresh_database("ledger_0007_mismatch").await;
+    migrator_up_to(6).run(&pool).await.unwrap();
+    PgGraphs::new(pool.clone())
+        .create(&new_graph(&graph, "tenant-a", None))
+        .await
+        .unwrap();
+    let store = PostgresImmutableStore::from_pool_migrated(pool.clone(), V1Binding::Reject);
+    store
+        .put_content(&p.id().0, &p.canonical_bytes())
+        .await
+        .unwrap();
+    let candidate = store
+        .put_commit(&v2(&graph, &p.id(), "candidate"))
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO proposals (graph_id, branch, tenant_id, principal_id, principal_type, expected_head, \
+         requested_patch_id, effective_patch_id, candidate_commit) \
+         VALUES ($1, 'main', 'tenant-WRONG', 'urn:sculpin:agent:test', 'agent', NULL, $2, $2, $3)",
+    )
+    .bind(&graph)
+    .bind(p.id().to_string())
+    .bind(candidate.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let error = sqlx::migrate!("../../migrations")
+        .run(&pool)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("does not belong to their tenant"),
+        "{error}"
+    );
+    pool.close().await;
 }

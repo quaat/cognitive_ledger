@@ -103,6 +103,8 @@ commit content. The policy, executable in `PostgresImmutableStore` (ADR-0012):
   migration 0004 fails closed on unowned graphs until it exists (tech-debt).
 - A v1 commit remains readable everywhere (dual read); the policy governs *writing and
   indexing*, not reading.
-- When the v2 write path lands (P1.3/P1.4) the server's default becomes `Reject`; until
-  then the bootstrap topology (`BindTo("default")`) is the only supported one, and it is
-  not a multi-tenant deployment.
+- Since P1.4 the shared server connects with `V1Binding::Reject`: public writes create v2
+  commits only, and v1 history is read-only (dual read). `BindTo` remains available to
+  `ledger-admin migrate-fs-to-pg` for bootstrap/importing graphs. Graph provisioning is the
+  operator command `ledger-admin graph create` (statuses `active` or `importing`); there
+  is no HTTP graph administration API.

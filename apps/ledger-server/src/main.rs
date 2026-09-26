@@ -1,6 +1,18 @@
-use ledger_core::{GraphId, ImmutableStore, RefStore};
-use ledger_store::{Ledger, PgRefStore, PostgresLedgerStore, V1Binding};
-use std::{env, future::Future, sync::Arc, time::Duration};
+use ledger_api::{
+    AcceptancePolicy, ApiLimits, AppState,
+    auth::{
+        Capability, ClaimsPolicy, DevHs256Authenticator, OidcAuthenticator, SharedAuthenticator,
+    },
+};
+use ledger_store::{Ledger, PostgresLedgerStore, ReconstructionLimits, V1Binding};
+use std::{
+    collections::BTreeSet,
+    env,
+    future::Future,
+    net::{SocketAddr, ToSocketAddrs},
+    sync::Arc,
+    time::Duration,
+};
 use tracing::{info, warn};
 
 /// How long open connections may drain after a shutdown signal before the process exits
@@ -8,10 +20,18 @@ use tracing::{info, warn};
 /// never leaves partial state.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The only value of `LEDGER_UNVALIDATED_ACCEPTANCE` that enables acceptance without
+/// semantic validation. Deliberately long and self-describing so it cannot be set by
+/// accident or mistaken for a production knob.
+const UNVALIDATED_ACCEPTANCE_SWITCH: &str = "allow-unvalidated-acceptance-development-only";
+/// The only value of `LEDGER_ALLOW_INSECURE_NON_LOOPBACK` that permits a non-loopback bind
+/// with a non-production authenticator (containerised CI on an isolated network).
+const INSECURE_BIND_SWITCH: &str = "allow-insecure-non-loopback-development-only";
+
 /// Which persistence topology the environment selects (ADR-0012).
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Backend {
-    /// No database: filesystem refs and objects (development only).
+    /// No database: filesystem refs and objects, read-only inspection (development only).
     FilesystemOnly,
     /// PostgreSQL refs and PostgreSQL immutable objects — the shared, multi-replica-safe
     /// topology whenever a database URL is present (and, since migration 0006, the only
@@ -71,68 +91,306 @@ fn env_optional(name: &str) -> Result<Option<String>, String> {
     }
 }
 
+fn env_usize(name: &str, default: usize) -> Result<usize, String> {
+    match env_optional(name)? {
+        None => Ok(default),
+        Some(v) => v
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n > 0)
+            .ok_or_else(|| format!("{name} must be a positive integer, got {v:?}")),
+    }
+}
+
+fn env_set(name: &str) -> Result<BTreeSet<String>, String> {
+    Ok(env_optional(name)?
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+/// Whether every address the bind string resolves to is loopback. Unresolvable strings
+/// are treated as non-loopback (fail closed).
+fn is_loopback_bind(address: &str) -> bool {
+    match address.to_socket_addrs() {
+        Ok(addrs) => {
+            let addrs: Vec<SocketAddr> = addrs.collect();
+            !addrs.is_empty() && addrs.iter().all(|a| a.ip().is_loopback())
+        }
+        Err(_) => false,
+    }
+}
+
+/// Pure binding policy: a non-loopback listener requires production-grade authentication
+/// unless the conspicuous development switch is set.
+fn check_binding(
+    address: &str,
+    production_auth: bool,
+    insecure_switch: Option<&str>,
+) -> Result<(), String> {
+    if is_loopback_bind(address) || production_auth {
+        return Ok(());
+    }
+    if insecure_switch == Some(INSECURE_BIND_SWITCH) {
+        warn!(
+            %address,
+            "INSECURE NON-LOOPBACK BIND with non-production authentication permitted by \
+             LEDGER_ALLOW_INSECURE_NON_LOOPBACK; development/CI networks only"
+        );
+        return Ok(());
+    }
+    Err(format!(
+        "refusing to bind {address}: non-loopback binding requires production authentication \
+         (LEDGER_AUTH_MODE=oidc); bind 127.0.0.1 instead, or for an isolated development \
+         network set LEDGER_ALLOW_INSECURE_NON_LOOPBACK={INSECURE_BIND_SWITCH}"
+    ))
+}
+
+/// The unvalidated-acceptance switch is a development setting: it is refused together
+/// with production-grade authentication so a copied development environment cannot turn
+/// a real deployment into one that publishes unvalidated changes.
+fn check_acceptance(acceptance: AcceptancePolicy, production_auth: bool) -> Result<(), String> {
+    if acceptance == AcceptancePolicy::AllowUnvalidatedDevelopmentOnly && production_auth {
+        return Err(format!(
+            "LEDGER_UNVALIDATED_ACCEPTANCE={UNVALIDATED_ACCEPTANCE_SWITCH} is a development \
+             setting and cannot be combined with LEDGER_AUTH_MODE=oidc"
+        ));
+    }
+    Ok(())
+}
+
+/// Filesystem development mode has no authentication at all: loopback only, no override.
+fn check_filesystem_binding(address: &str) -> Result<(), String> {
+    if is_loopback_bind(address) {
+        Ok(())
+    } else {
+        Err(format!(
+            "refusing to bind {address}: filesystem development mode has no authentication \
+             and is loopback-only"
+        ))
+    }
+}
+
+fn acceptance_policy(value: Option<&str>) -> Result<AcceptancePolicy, String> {
+    match value {
+        None | Some("") => Ok(AcceptancePolicy::RequireValidation),
+        Some(v) if v == UNVALIDATED_ACCEPTANCE_SWITCH => {
+            Ok(AcceptancePolicy::AllowUnvalidatedDevelopmentOnly)
+        }
+        Some(_) => Err(format!(
+            "LEDGER_UNVALIDATED_ACCEPTANCE has an unrecognised value; the only accepted value \
+             is {UNVALIDATED_ACCEPTANCE_SWITCH} (value not shown)"
+        )),
+    }
+}
+
+fn claims_policy() -> Result<ClaimsPolicy, String> {
+    let mut policy = ClaimsPolicy::default();
+    if let Some(v) = env_optional("LEDGER_AUTH_TENANT_CLAIM")? {
+        policy.tenant_claim = v;
+    }
+    if let Some(v) = env_optional("LEDGER_AUTH_PRINCIPAL_CLAIM")? {
+        policy.principal_claim = v;
+    }
+    if let Some(v) = env_optional("LEDGER_AUTH_PRINCIPAL_TYPE_CLAIM")? {
+        policy.principal_type_claim = Some(v).filter(|s| !s.is_empty());
+    }
+    if let Some(v) = env_optional("LEDGER_AUTH_ROLES_CLAIM")? {
+        policy.roles_claim = v;
+    }
+    if let Some(v) = env_optional("LEDGER_AUTH_ON_BEHALF_OF_CLAIM")? {
+        policy.on_behalf_of_claim = Some(v).filter(|s| !s.is_empty());
+    }
+    policy.agent_client_ids = env_set("LEDGER_AUTH_AGENT_CLIENT_IDS")?;
+    policy.service_client_ids = env_set("LEDGER_AUTH_SERVICE_CLIENT_IDS")?;
+    // Optional role renames: LEDGER_AUTH_ROLE_MAP="Ledger.Reader=read,Ledger.Writer=propose,..."
+    if let Some(map) = env_optional("LEDGER_AUTH_ROLE_MAP")? {
+        policy.role_map = parse_role_map(&map)?;
+    }
+    Ok(policy)
+}
+
+fn parse_role_map(map: &str) -> Result<std::collections::BTreeMap<String, Capability>, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for entry in map.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (role, capability) = entry.split_once('=').ok_or_else(|| {
+            format!("LEDGER_AUTH_ROLE_MAP entry {entry:?} must be role=capability")
+        })?;
+        let capability = match capability.trim() {
+            "read" => Capability::Read,
+            "propose" => Capability::Propose,
+            "review" => Capability::Review,
+            "admin" => Capability::Admin,
+            other => {
+                return Err(format!(
+                    "LEDGER_AUTH_ROLE_MAP capability must be read|propose|review|admin, got {other:?}"
+                ));
+            }
+        };
+        out.insert(role.trim().to_owned(), capability);
+    }
+    if out.is_empty() {
+        return Err("LEDGER_AUTH_ROLE_MAP is set but maps no roles".into());
+    }
+    Ok(out)
+}
+
+/// Build the authenticator from the environment. There is no unauthenticated mode and no
+/// header-trusting mode: `oidc` (production) or `dev-hs256` (development/CI only).
+fn authenticator() -> Result<SharedAuthenticator, String> {
+    authenticator_from(
+        env_optional("LEDGER_AUTH_MODE")?.as_deref(),
+        env_optional("LEDGER_AUTH_ISSUER")?,
+        env_optional("LEDGER_AUTH_AUDIENCE")?,
+        env_optional("LEDGER_AUTH_JWKS_URL")?,
+        env_optional("LEDGER_AUTH_DEV_HS256_SECRET")?,
+        claims_policy()?,
+    )
+}
+
+fn required(name: &str, value: Option<String>) -> Result<String, String> {
+    value
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| format!("{name} is required for the selected LEDGER_AUTH_MODE"))
+}
+
+/// Pure authenticator selection so the refusal rules are unit-testable.
+fn authenticator_from(
+    mode: Option<&str>,
+    issuer: Option<String>,
+    audience: Option<String>,
+    jwks_url: Option<String>,
+    dev_secret: Option<String>,
+    policy: ClaimsPolicy,
+) -> Result<SharedAuthenticator, String> {
+    match mode {
+        Some("oidc") => {
+            let issuer = required("LEDGER_AUTH_ISSUER", issuer)?;
+            let audience = required("LEDGER_AUTH_AUDIENCE", audience)?;
+            let jwks = required("LEDGER_AUTH_JWKS_URL", jwks_url)?;
+            if !jwks.starts_with("https://") {
+                return Err("LEDGER_AUTH_JWKS_URL must be an https:// URL".into());
+            }
+            Ok(Arc::new(OidcAuthenticator::new(
+                issuer, audience, jwks, policy,
+            )))
+        }
+        Some("dev-hs256") => {
+            let issuer = required("LEDGER_AUTH_ISSUER", issuer)?;
+            let audience = required("LEDGER_AUTH_AUDIENCE", audience)?;
+            let secret = required("LEDGER_AUTH_DEV_HS256_SECRET", dev_secret)?;
+            warn!(
+                "DEVELOPMENT AUTHENTICATION (dev-hs256) selected: tokens are verified against a \
+                 shared secret; this is never production authentication"
+            );
+            Ok(Arc::new(DevHs256Authenticator::new(
+                issuer,
+                audience,
+                secret.as_bytes(),
+                policy,
+            )?))
+        }
+        None | Some("") => Err(
+            "LEDGER_AUTH_MODE is required for the shared PostgreSQL server: 'oidc' (production) \
+             or 'dev-hs256' (development/CI only)"
+                .into(),
+        ),
+        Some(other) => Err(format!(
+            "LEDGER_AUTH_MODE must be 'oidc' or 'dev-hs256', got {other:?}"
+        )),
+    }
+}
+
+fn limits() -> Result<ApiLimits, String> {
+    let d = ApiLimits::default();
+    Ok(ApiLimits {
+        body_bytes: env_usize("LEDGER_LIMIT_BODY_BYTES", d.body_bytes)?,
+        max_operations: env_usize("LEDGER_LIMIT_PATCH_OPERATIONS", d.max_operations)?,
+        max_term_bytes: env_usize("LEDGER_LIMIT_TERM_BYTES", d.max_term_bytes)?,
+        max_metadata_bytes: env_usize("LEDGER_LIMIT_METADATA_BYTES", d.max_metadata_bytes)?,
+        reconstruction: ReconstructionLimits {
+            max_depth: env_usize(
+                "LEDGER_LIMIT_RECONSTRUCTION_DEPTH",
+                d.reconstruction.max_depth,
+            )?,
+            max_quads: env_usize(
+                "LEDGER_LIMIT_RECONSTRUCTION_QUADS",
+                d.reconstruction.max_quads,
+            )?,
+            max_bytes: env_usize(
+                "LEDGER_LIMIT_RECONSTRUCTION_BYTES",
+                d.reconstruction.max_bytes,
+            )?,
+        },
+        max_state_export_bytes: env_usize("LEDGER_LIMIT_EXPORT_BYTES", d.max_state_export_bytes)?,
+        request_timeout: Duration::from_secs(env_usize(
+            "LEDGER_LIMIT_REQUEST_SECONDS",
+            d.request_timeout.as_secs() as usize,
+        )? as u64),
+        max_concurrent_expensive: env_usize(
+            "LEDGER_LIMIT_CONCURRENT_EXPENSIVE",
+            d.max_concurrent_expensive,
+        )?,
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
-    // Loopback by default until the authenticated API exists (P1.4); a container or
-    // operator opts into 0.0.0.0 explicitly (the Dockerfile does).
     let address = env_optional("LEDGER_ADDR")?.unwrap_or_else(|| "127.0.0.1:8080".into());
     let data = env_optional("LEDGER_DATA_DIR")?.unwrap_or_else(|| "./data".into());
     let database_url = env_optional("LEDGER_DATABASE_URL")?;
     let backend_choice = env_optional("LEDGER_IMMUTABLE_BACKEND")?;
     let backend = select_backend(database_url.as_deref(), backend_choice.as_deref())?;
-    let listener = tokio::net::TcpListener::bind(&address).await?;
+    let limits = limits()?;
 
-    // The bootstrap write path still emits v1 envelopes, so the shared store binds them to
-    // the bootstrap `default` graph (ADR-0010 policy); production flips this to `Reject`
-    // with the v2 write path.
-    let ledger = match backend {
+    let app = match backend {
         Backend::FilesystemOnly => {
-            info!("ref coordination: filesystem; immutable objects: filesystem (development)");
-            Ledger::open(&data)?
+            // Read-only inspection of a local development store: no authentication exists in
+            // this mode, so it must never be reachable beyond loopback.
+            check_filesystem_binding(&address)?;
+            let ledger = Ledger::open(&data)?;
+            match ledger.verify_head().await {
+                Ok(head) => info!(head = ?head.map(|h| h.to_string()), "HEAD resolves"),
+                Err(e) => {
+                    return Err(format!("startup refused: HEAD does not resolve ({e})").into());
+                }
+            }
+            info!("filesystem development mode: READ-ONLY inspection, no write surface");
+            ledger_api::filesystem_readonly_router(Arc::new(ledger), limits.reconstruction)
         }
         Backend::SharedPostgres => {
             let url = database_url
                 .as_deref()
                 .expect("selected only with a database url");
-            let bootstrap = GraphId::new("default")?;
-            // One pool for immutable content, graph authority and the workflow repository
-            // (P1.3). The HTTP surface still uses the bootstrap v1 write path through the
-            // raw ref primitive until the authenticated API (P1.4) routes prepare/accept.
-            let store = PostgresLedgerStore::connect(url, V1Binding::BindTo(bootstrap)).await?;
-            let refs: Arc<dyn RefStore> = Arc::new(PgRefStore::with_ref_migrated(
-                store.pool().clone(),
-                "default",
-                "main",
-            ));
-            let immutable: Arc<dyn ImmutableStore> = Arc::new(store.immutable().clone());
-            info!("ref coordination: postgresql; immutable objects: postgresql (shared)");
-            warn!(
-                "bootstrap topology: v1 commits are bound to the non-production graph 'default' \
-                 (ADR-0010) through the raw ref primitive (no ref events); production accepted \
-                 transitions use WorkflowRepository once the authenticated API lands (P1.4)"
+            let authenticator = authenticator()?;
+            check_binding(
+                &address,
+                authenticator.is_production_grade(),
+                env_optional("LEDGER_ALLOW_INSECURE_NON_LOOPBACK")?.as_deref(),
+            )?;
+            let acceptance =
+                acceptance_policy(env_optional("LEDGER_UNVALIDATED_ACCEPTANCE")?.as_deref())?;
+            check_acceptance(acceptance, authenticator.is_production_grade())?;
+            // Public writes are CommitV2 through the workflow only: no v1 envelope may be
+            // published by this process (ADR-0010 policy `Reject`), and no route reaches the
+            // raw ref primitive or `Ledger::commit`.
+            let store = PostgresLedgerStore::connect(url, V1Binding::Reject).await?;
+            info!(
+                auth = %authenticator.describe(),
+                "shared PostgreSQL topology: refs, objects and workflow in one database; v1 \
+                 writes rejected"
             );
-            Ledger::with_stores(immutable, refs)
+            ledger_api::router(AppState::new(store, authenticator, limits, acceptance))
         }
     };
-    // Refuse to serve a HEAD whose content (commit and patch) is not valid in the
-    // configured store (e.g. an unmigrated filesystem history behind a shared ref).
-    match ledger.verify_head().await {
-        Ok(head) => {
-            info!(head = ?head.map(|h| h.to_string()), "HEAD resolves in the configured store")
-        }
-        Err(e) => {
-            return Err(format!(
-                "startup refused: current HEAD does not resolve in the configured immutable \
-                 store ({e}); migrate content first (ledger-admin migrate-fs-to-pg) or fix the \
-                 backend selection"
-            )
-            .into());
-        }
-    }
-    let ledger = Arc::new(ledger);
+
+    let listener = tokio::net::TcpListener::bind(&address).await?;
     info!(%address, "ledger server listening");
 
     // Graceful shutdown: SIGINT or (Unix) SIGTERM stops accepting connections, open ones
@@ -148,10 +406,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let mut drain_rx = signalled_rx.clone();
     let mut deadline_rx = signalled_rx;
-    let server =
-        axum::serve(listener, ledger_api::router(ledger)).with_graceful_shutdown(async move {
-            let _ = drain_rx.wait_for(|signalled| *signalled).await;
-        });
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        let _ = drain_rx.wait_for(|signalled| *signalled).await;
+    });
     let deadline = async move {
         let _ = deadline_rx.wait_for(|signalled| *signalled).await;
         tokio::time::sleep(DRAIN_TIMEOUT).await;
@@ -262,6 +519,111 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn non_loopback_binding_requires_production_authentication() {
+        assert!(check_binding("127.0.0.1:8080", false, None).is_ok());
+        assert!(check_binding("[::1]:8080", false, None).is_ok());
+        assert!(check_binding("0.0.0.0:8080", true, None).is_ok());
+        let error = check_binding("0.0.0.0:8080", false, None).unwrap_err();
+        assert!(
+            error.contains("requires production authentication"),
+            "{error}"
+        );
+        // A wrong switch value does not unlock anything.
+        assert!(check_binding("0.0.0.0:8080", false, Some("yes")).is_err());
+        assert!(check_binding("0.0.0.0:8080", false, Some(INSECURE_BIND_SWITCH)).is_ok());
+        // Unresolvable binds fail closed.
+        assert!(check_binding("not an address", false, None).is_err());
+    }
+
+    #[test]
+    fn unvalidated_acceptance_needs_the_exact_conspicuous_value() {
+        assert_eq!(
+            acceptance_policy(None).unwrap(),
+            AcceptancePolicy::RequireValidation
+        );
+        assert_eq!(
+            acceptance_policy(Some("")).unwrap(),
+            AcceptancePolicy::RequireValidation
+        );
+        assert!(acceptance_policy(Some("true")).is_err());
+        assert!(acceptance_policy(Some("allow")).is_err());
+        assert_eq!(
+            acceptance_policy(Some(UNVALIDATED_ACCEPTANCE_SWITCH)).unwrap(),
+            AcceptancePolicy::AllowUnvalidatedDevelopmentOnly
+        );
+    }
+
+    #[test]
+    fn unvalidated_acceptance_cannot_be_combined_with_production_authentication() {
+        assert!(check_acceptance(AcceptancePolicy::RequireValidation, true).is_ok());
+        assert!(check_acceptance(AcceptancePolicy::RequireValidation, false).is_ok());
+        assert!(check_acceptance(AcceptancePolicy::AllowUnvalidatedDevelopmentOnly, false).is_ok());
+        let error =
+            check_acceptance(AcceptancePolicy::AllowUnvalidatedDevelopmentOnly, true).unwrap_err();
+        assert!(error.contains("cannot be combined"), "{error}");
+    }
+
+    #[test]
+    fn filesystem_mode_is_loopback_only_without_any_override() {
+        assert!(check_filesystem_binding("127.0.0.1:8080").is_ok());
+        assert!(check_filesystem_binding("0.0.0.0:8080").is_err());
+        assert!(check_filesystem_binding("nonsense").is_err());
+    }
+
+    #[test]
+    fn authenticator_selection_has_no_unauthenticated_or_header_mode() {
+        let p = ClaimsPolicy::default;
+        let s = |v: &str| Some(v.to_owned());
+        for mode in [
+            None,
+            Some(""),
+            Some("none"),
+            Some("headers"),
+            Some("trusted-headers"),
+        ] {
+            assert!(
+                authenticator_from(mode, s("i"), s("a"), s("https://j"), s("x"), p()).is_err(),
+                "{mode:?} must be refused"
+            );
+        }
+        // oidc: https-only JWKS, all three settings required.
+        assert!(
+            authenticator_from(Some("oidc"), s("i"), s("a"), s("http://j"), None, p()).is_err()
+        );
+        assert!(authenticator_from(Some("oidc"), s("i"), None, s("https://j"), None, p()).is_err());
+        let oidc =
+            authenticator_from(Some("oidc"), s("i"), s("a"), s("https://j"), None, p()).unwrap();
+        assert!(oidc.is_production_grade());
+        // dev-hs256: secret required and at least 32 bytes; never production grade.
+        assert!(
+            authenticator_from(Some("dev-hs256"), s("i"), s("a"), None, s("short"), p()).is_err()
+        );
+        assert!(authenticator_from(Some("dev-hs256"), s("i"), s("a"), None, None, p()).is_err());
+        let dev = authenticator_from(
+            Some("dev-hs256"),
+            s("i"),
+            s("a"),
+            None,
+            s("a-development-secret-of-at-least-32-bytes"),
+            p(),
+        )
+        .unwrap();
+        assert!(!dev.is_production_grade());
+    }
+
+    #[test]
+    fn role_map_parsing_is_strict() {
+        let map =
+            parse_role_map("Ledger.Reader=read, Ledger.Writer = propose,Ledger.Reviewer=review")
+                .unwrap();
+        assert_eq!(map.len(), 3);
+        assert_eq!(map["Ledger.Writer"], Capability::Propose);
+        assert!(parse_role_map("Ledger.Reader=owner").is_err());
+        assert!(parse_role_map("Ledger.Reader").is_err());
+        assert!(parse_role_map(" , ").is_err());
     }
 
     #[tokio::test]

@@ -70,6 +70,7 @@ fn scope(graph: &GraphId, key: &str, digest: &[u8]) -> RequestScope {
         graph: graph.clone(),
         idempotency_key: key.to_owned(),
         request_digest: ContentId::for_bytes(digest),
+        correlation_id: Some(format!("corr-{key}")),
     }
 }
 
@@ -1304,6 +1305,7 @@ async fn rejection_and_supersession_are_recorded_without_moving_the_ref() {
             &g,
             p1_rival.proposal_id,
             "another genesis won",
+            None,
         )
         .await
         .unwrap();
@@ -1324,7 +1326,13 @@ async fn rejection_and_supersession_are_recorded_without_moving_the_ref() {
         .await
         .unwrap();
     let still_current = wf
-        .mark_superseded(&principal("curator"), &g, current.proposal_id, "not really")
+        .mark_superseded(
+            &principal("curator"),
+            &g,
+            current.proposal_id,
+            "not really",
+            None,
+        )
         .await;
     assert!(
         matches!(still_current, Err(LedgerError::LineageMismatch(_))),
@@ -1346,7 +1354,7 @@ async fn rejection_and_supersession_are_recorded_without_moving_the_ref() {
     );
     // Superseding an already-accepted proposal is refused as a terminal-decision conflict.
     let accepted_again = wf
-        .mark_superseded(&principal("curator"), &g, p1.proposal_id, "nope")
+        .mark_superseded(&principal("curator"), &g, p1.proposal_id, "nope", None)
         .await;
     assert!(
         matches!(accepted_again, Err(LedgerError::LineageMismatch(ref m)) if m.contains("terminal decision")),
@@ -1445,6 +1453,7 @@ async fn repository_refuses_foreign_tenants_bad_branches_and_raw_ref_movement_on
             &g,
             p.proposal_id,
             "x",
+            None,
         )
         .await;
     assert!(matches!(
@@ -1662,8 +1671,8 @@ async fn database_level_invariants_hold_independently_of_repository_code() {
     assert_eq!(sqlstate(r), "23503");
     // Idempotency scope is unique.
     let r = sqlx::query(
-        "INSERT INTO idempotency (tenant_id, principal_id, graph_id, operation, idempotency_key, request_digest, result_kind) \
-         VALUES ('tenant-wf', 'urn:sculpin:agent:curator', $1, 'accept', 'a1', $2, 'accepted')",
+        "INSERT INTO idempotency (tenant_id, principal_id, principal_type, graph_id, operation, idempotency_key, request_digest, result_kind) \
+         VALUES ('tenant-wf', 'urn:sculpin:agent:curator', 'agent', $1, 'accept', 'a1', $2, 'accepted')",
     )
     .bind(g.to_string())
     .bind(ContentId::for_bytes(b"x").to_string())
@@ -1675,4 +1684,161 @@ async fn database_level_invariants_hold_independently_of_repository_code() {
         .execute(pool)
         .await;
     assert_eq!(sqlstate(r), "23000");
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn idempotency_is_scoped_by_the_complete_actor_and_correlation_is_recorded() {
+    let store = store().await;
+    let g = graph(&store, GraphStatus::Active).await;
+    let wf = store.workflows();
+    let base = prepare_request(&g, "shared-key", None, vec![add("a")]);
+    let first = wf.prepare(&base).await.unwrap();
+    // Same complete actor + same key + same request → replay.
+    let again = wf.prepare(&base).await.unwrap();
+    assert!(again.replayed && again.candidate == first.candidate);
+    // Same principal id, different principal type → an independent namespace: the request
+    // (same key, same payload) is a *new* prepare, not a replay.
+    let mut as_service = base.clone();
+    as_service.scope.principal.principal_type = PrincipalType::Service;
+    let service = wf.prepare(&as_service).await.unwrap();
+    assert!(!service.replayed);
+    assert_ne!(
+        service.candidate, first.candidate,
+        "different actor ⇒ different candidate"
+    );
+    // Same principal acting on behalf of A vs B → independent namespaces.
+    let mut for_a = base.clone();
+    for_a.scope.principal.on_behalf_of = Some(PrincipalId::new("urn:sculpin:human:a").unwrap());
+    let mut for_b = base.clone();
+    for_b.scope.principal.on_behalf_of = Some(PrincipalId::new("urn:sculpin:human:b").unwrap());
+    let a = wf.prepare(&for_a).await.unwrap();
+    let b = wf.prepare(&for_b).await.unwrap();
+    assert!(!a.replayed && !b.replayed);
+    assert_ne!(a.candidate, b.candidate);
+    assert!(
+        wf.prepare(&for_a).await.unwrap().replayed,
+        "delegated actor replays itself"
+    );
+    assert_eq!(wf.prepare(&for_a).await.unwrap().candidate, a.candidate);
+    // Same complete actor + same key + different request → conflict.
+    let mut different = base.clone();
+    different.scope.request_digest = ContentId::for_bytes(b"something else");
+    assert!(matches!(
+        wf.prepare(&different).await,
+        Err(LedgerError::IdempotencyConflict)
+    ));
+    let c = counts(&store, &g).await;
+    assert_eq!((c.proposals, c.idempotency), (4, 4));
+    let rows = sqlx::query(
+        "SELECT principal_type, on_behalf_of FROM idempotency WHERE graph_id = $1 \
+         AND idempotency_key = 'shared-key' ORDER BY principal_type, on_behalf_of NULLS FIRST",
+    )
+    .bind(g.to_string())
+    .fetch_all(store.pool())
+    .await
+    .unwrap();
+    let scopes: Vec<(String, Option<String>)> = rows
+        .iter()
+        .map(|r| (r.get("principal_type"), r.get("on_behalf_of")))
+        .collect();
+    assert_eq!(
+        scopes,
+        vec![
+            ("agent".to_owned(), None),
+            ("agent".to_owned(), Some("urn:sculpin:human:a".to_owned())),
+            ("agent".to_owned(), Some("urn:sculpin:human:b".to_owned())),
+            ("service".to_owned(), None),
+        ]
+    );
+    // NULL delegation is a canonical absence: a second row for the same scope is refused.
+    let dup = sqlx::query(
+        "INSERT INTO idempotency (tenant_id, principal_id, principal_type, on_behalf_of, graph_id, \
+         operation, idempotency_key, request_digest, result_kind) \
+         VALUES ('tenant-wf', 'urn:sculpin:agent:curator', 'agent', NULL, $1, 'prepare', \
+         'shared-key', $2, 'prepared')",
+    )
+    .bind(g.to_string())
+    .bind(ContentId::for_bytes(b"x").to_string())
+    .execute(store.pool())
+    .await;
+    assert!(
+        matches!(dup, Err(sqlx::Error::Database(ref e)) if e.code().as_deref() == Some("23505")),
+        "{dup:?}"
+    );
+
+    // Correlation ids land on the record the request created, and a retry with another
+    // correlation id replays without changing the stored one.
+    let stored_correlation = |proposal_id: i64| {
+        let pool = store.pool().clone();
+        async move {
+            let row = sqlx::query("SELECT correlation_id FROM proposals WHERE proposal_id = $1")
+                .bind(proposal_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            let corr: Option<String> = row.get("correlation_id");
+            corr
+        }
+    };
+    assert_eq!(
+        stored_correlation(first.proposal_id).await.as_deref(),
+        Some("corr-shared-key")
+    );
+    let mut retry = base.clone();
+    retry.scope.correlation_id = Some("corr-retry".into());
+    assert!(wf.prepare(&retry).await.unwrap().replayed);
+    assert_eq!(
+        stored_correlation(first.proposal_id).await.as_deref(),
+        Some("corr-shared-key"),
+        "creator's correlation retained"
+    );
+    let accepted = wf
+        .accept(&accept_request(&g, "acc", None, &first.candidate))
+        .await
+        .unwrap();
+    let row = sqlx::query(
+        "SELECT e.correlation_id AS ec, d.correlation_id AS dc FROM ref_events e \
+         JOIN decisions d ON d.ref_event_id = e.event_id WHERE e.event_id = $1",
+    )
+    .bind(accepted.ref_event_id)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    let (ec, dc): (Option<String>, Option<String>) = (row.get("ec"), row.get("dc"));
+    assert_eq!(
+        (ec.as_deref(), dc.as_deref()),
+        (Some("corr-acc"), Some("corr-acc"))
+    );
+
+    // Tenant integrity is a schema fact: an audit row whose graph belongs to another
+    // tenant is refused by PostgreSQL itself.
+    let cross = sqlx::query(
+        "INSERT INTO idempotency (tenant_id, principal_id, principal_type, on_behalf_of, graph_id, \
+         operation, idempotency_key, request_digest, result_kind) \
+         VALUES ('tenant-other', 'urn:sculpin:agent:x', 'agent', NULL, $1, 'prepare', 'k', $2, 'prepared')",
+    )
+    .bind(g.to_string())
+    .bind(ContentId::for_bytes(b"x").to_string())
+    .execute(store.pool())
+    .await;
+    assert!(
+        matches!(cross, Err(sqlx::Error::Database(ref e)) if e.code().as_deref() == Some("23503")
+            && e.constraint() == Some("idempotency_graph_tenant_fk")),
+        "{cross:?}"
+    );
+    let cross_decision = sqlx::query(
+        "INSERT INTO decisions (proposal_id, graph_id, branch, candidate_commit, decision, tenant_id, \
+         principal_id, principal_type, reason, validation_ids) \
+         VALUES (NULL, $1, 'main', $2, 'rejected', 'tenant-other', 'urn:sculpin:agent:x', 'agent', 'r', '{}')",
+    )
+    .bind(g.to_string())
+    .bind(service.candidate.to_string())
+    .execute(store.pool())
+    .await;
+    assert!(
+        matches!(cross_decision, Err(sqlx::Error::Database(ref e)) if e.code().as_deref() == Some("23503")
+            && e.constraint() == Some("decisions_graph_tenant_fk")),
+        "{cross_decision:?}"
+    );
 }

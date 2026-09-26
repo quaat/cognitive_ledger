@@ -1,0 +1,9 @@
+{
+  "operation": "accept",
+  "graph_id": "0b0a2a1c-2e3d-4f50-8a61-72b384c5d6e7",
+  "branch": "main",
+  "expected_head": "sha256:73399c34028c2686df761ff8e508ebfb7aa40bb982ff9bcfe9dfc0d432ef903c",
+  "candidate": "sha256:979f8d93bfe8d4062ff33277e90c65d1eb660b649aac0eca722ec81d968eb11d",
+  "reason": "reviewed",
+  "validation_policy": "no-validation"
+}

@@ -38,3 +38,5 @@ pub async fn migrate_up_to(pool: &PgPool, upto: i64) -> Result<(), LedgerError> 
 /// The migration version that completes the content schema (immutable objects, commit
 /// index, graphs, write-once guards) but precedes the workflow schema and its refs FK.
 pub const CONTENT_SCHEMA_VERSION: i64 = 5;
+/// The schema level this build requires at runtime (readiness fails below it).
+pub const REQUIRED_SCHEMA_VERSION: i64 = 7;

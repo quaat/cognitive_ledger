@@ -1,0 +1,7 @@
+{
+  "operation": "accept",
+  "graph_id": "0b0a2a1c-2e3d-4f50-8a61-72b384c5d6e7",
+  "branch": "main",
+  "candidate": "sha256:979f8d93bfe8d4062ff33277e90c65d1eb660b649aac0eca722ec81d968eb11d",
+  "validation_policy": "no-validation"
+}

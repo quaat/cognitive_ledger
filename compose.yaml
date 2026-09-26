@@ -13,8 +13,23 @@ services:
       # topology in which a shared ref never references node-local content. /data is
       # used only when LEDGER_IMMUTABLE_BACKEND=filesystem is set explicitly (single host).
       LEDGER_DATABASE_URL: postgres://ledger:ledger-development-only@postgres:5432/ledger?sslmode=disable
+      # DEVELOPMENT AUTHENTICATION ONLY. The server has no unauthenticated mode; this
+      # harness uses the HS256 development authenticator with a baked secret so the
+      # integration test can mint tokens. Production uses LEDGER_AUTH_MODE=oidc with the
+      # identity provider's issuer, audience and JWKS URL (docs/quality/security.md).
+      LEDGER_AUTH_MODE: dev-hs256
+      LEDGER_AUTH_ISSUER: https://dev-issuer.example/
+      LEDGER_AUTH_AUDIENCE: api://sculpin-ledger-dev
+      LEDGER_AUTH_DEV_HS256_SECRET: development-only-hs256-secret-not-for-production-use
+      # The container binds 0.0.0.0 inside its own network namespace (published on host
+      # loopback below). A non-loopback bind with non-production authentication is refused
+      # unless this conspicuous development switch is set.
+      LEDGER_ALLOW_INSECURE_NON_LOOPBACK: allow-insecure-non-loopback-development-only
+      # Phase 2 supplies semantic validation; until then `accept` fails closed unless this
+      # development/CI switch is set. Never set in production.
+      LEDGER_UNVALIDATED_ACCEPTANCE: allow-unvalidated-acceptance-development-only
     volumes: [ledger-data:/data]
-    # Loopback only: an unauthenticated development ledger must not be reachable from the LAN.
+    # Loopback only: a development ledger must not be reachable from the LAN.
     ports: ["127.0.0.1:8080:8080"]
     depends_on:
       postgres:

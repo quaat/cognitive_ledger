@@ -3,6 +3,8 @@
 .claude/
 data/
 docs/
+# The API contract is compiled into ledger-api (include_str!) and must reach the build.
+!docs/api/openapi.json
 .git/
 .gitconfig
 .idea/

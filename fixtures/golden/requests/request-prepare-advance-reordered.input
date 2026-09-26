@@ -1,0 +1,20 @@
+{
+  "message": "golden prepare advance",
+  "source_system": "sculpin-agent-api",
+  "evidence_refs": [
+    "urn:sculpin:evidence:feedback:0042",
+    "urn:sculpin:evidence:feedback:9001",
+    "https://example.org/evidence/report-17",
+    "urn:sculpin:evidence:feedback:9001"
+  ],
+  "event_time": "2026-09-24T11:00:00Z",
+  "activity": "cognitive-correction",
+  "operations": [
+    {"op": "add", "quad": "<urn:material:a> <urn:temperature> \"90\" ."},
+    {"op": "delete", "quad": "<urn:material:a> <urn:temperature> \"80\" ."}
+  ],
+  "expected_head": "sha256:73399c34028c2686df761ff8e508ebfb7aa40bb982ff9bcfe9dfc0d432ef903c",
+  "branch": "feature/curation-2026",
+  "graph_id": "0b0a2a1c-2e3d-4f50-8a61-72b384c5d6e7",
+  "operation": "prepare"
+}

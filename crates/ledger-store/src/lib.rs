@@ -19,6 +19,87 @@ use std::{
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
+/// Bounds on historical-state reconstruction, enforced identically for the workflow's
+/// base reconstruction and for public state reads so no internal caller can bypass the
+/// HTTP limits. Defaults are operational (configurable), not protocol constants.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReconstructionLimits {
+    /// Maximum number of commits walked along the first-parent chain.
+    pub max_depth: usize,
+    /// Maximum number of quads the reconstructed state may hold at any point.
+    pub max_quads: usize,
+    /// Maximum total bytes of canonical N-Quads in the reconstructed state.
+    pub max_bytes: usize,
+}
+
+impl ReconstructionLimits {
+    /// Development defaults; deployments configure their own.
+    pub const DEVELOPMENT: Self = Self {
+        max_depth: 10_000,
+        max_quads: 1_000_000,
+        max_bytes: 256 * 1024 * 1024,
+    };
+
+    fn check_depth(&self, depth: usize) -> Result<(), LedgerError> {
+        if depth > self.max_depth {
+            return Err(LedgerError::ResourceLimit(format!(
+                "reconstruction depth exceeds {} commits",
+                self.max_depth
+            )));
+        }
+        Ok(())
+    }
+
+    fn check_state(&self, quads: usize, bytes: usize) -> Result<(), LedgerError> {
+        if quads > self.max_quads {
+            return Err(LedgerError::ResourceLimit(format!(
+                "reconstructed state exceeds {} quads",
+                self.max_quads
+            )));
+        }
+        if bytes > self.max_bytes {
+            return Err(LedgerError::ResourceLimit(format!(
+                "reconstructed state exceeds {} bytes",
+                self.max_bytes
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Apply `patch` to `state` under `limits`, tracking the canonical byte total. The limit
+/// is checked once per patch (canonical order applies adds before deletes, so a
+/// replacement at capacity would otherwise fail on a transient peak that the patch
+/// itself bounds by its operation count).
+pub(crate) fn apply_bounded(
+    state: &mut BTreeSet<Quad>,
+    bytes: &mut usize,
+    patch: &Patch,
+    limits: &ReconstructionLimits,
+) -> Result<(), LedgerError> {
+    for op in patch.operations() {
+        let len = quad_line_len(&op.quad);
+        match op.kind {
+            ledger_rdf::OperationKind::Add => {
+                if state.insert(op.quad.clone()) {
+                    *bytes += len;
+                }
+            }
+            ledger_rdf::OperationKind::Delete => {
+                if state.remove(&op.quad) {
+                    *bytes = bytes.saturating_sub(len);
+                }
+            }
+        }
+    }
+    limits.check_state(state.len(), *bytes)
+}
+
+/// Bytes one quad contributes to a canonical N-Quads export (line + newline).
+pub(crate) fn quad_line_len(quad: &Quad) -> usize {
+    quad.to_string().len() + 1
+}
+
 /// Every object the ledger stores starts with a `sculpin-` header. Anything in that
 /// family that is not an RDF patch is a commit envelope (v1, v2, or a version this build
 /// does not know). Classifying by header lets stores fail closed on corrupt or
@@ -165,6 +246,17 @@ impl Drop for LockGuard {
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 fn storage(e: impl std::fmt::Display) -> LedgerError {
     LedgerError::Storage(e.to_string())
+}
+/// Classify a database error: an unreachable or exhausted database is a retryable
+/// dependency failure (503 at the boundary), anything else is a storage error (500).
+#[cfg(feature = "postgres")]
+pub(crate) fn db_error(e: sqlx::Error) -> LedgerError {
+    match e {
+        sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed | sqlx::Error::Io(_) => {
+            LedgerError::DependencyUnavailable(e.to_string())
+        }
+        other => LedgerError::Storage(other.to_string()),
+    }
 }
 fn sync_directory(path: &Path) -> Result<(), LedgerError> {
     fs::File::open(path)
@@ -436,7 +528,8 @@ pub use postgres_graphs::{GraphRecord, GraphStatus, NewGraph, PgGraphs};
 mod postgres_workflow;
 #[cfg(feature = "postgres")]
 pub use postgres_workflow::{
-    AcceptRequest, Accepted, FailPoint, PostgresLedgerStore, PrepareRequest, Prepared,
+    AcceptRequest, Accepted, FailPoint, MAX_BRANCH_BYTES, MAX_CORRELATION_BYTES,
+    MAX_IDEMPOTENCY_KEY_BYTES, MAX_REASON_BYTES, PostgresLedgerStore, PrepareRequest, Prepared,
     RejectRequest, Rejected, RequestScope, ValidationPolicy, WorkflowRepository,
 };
 #[cfg(feature = "postgres")]
@@ -717,6 +810,15 @@ impl Ledger {
         self.refs.compare_and_set(expected, new).await
     }
     pub async fn state_at(&self, id: &CommitId) -> Result<BTreeSet<Quad>, LedgerError> {
+        self.state_at_bounded(id, &ReconstructionLimits::DEVELOPMENT)
+            .await
+    }
+    /// Reconstruct under explicit limits (public reads must pass the deployment's limits).
+    pub async fn state_at_bounded(
+        &self,
+        id: &CommitId,
+        limits: &ReconstructionLimits,
+    ) -> Result<BTreeSet<Quad>, LedgerError> {
         let mut chain = Vec::new();
         let mut cursor = Some(id.clone());
         let mut seen = HashSet::new();
@@ -727,25 +829,28 @@ impl Ledger {
                     reason: "commit cycle".into(),
                 });
             }
+            limits.check_depth(seen.len())?;
             let c = self
                 .immutable
                 .get_commit(&current)
                 .await?
                 .ok_or_else(|| LedgerError::NotFound(current.0.clone()))?;
             // Parent zero is the state reconstruction parent in every envelope version.
-            // Additional merge parents carry ancestry and provenance.
+            // Additional merge parents carry ancestry and provenance. Only the patch id is
+            // retained so memory stays proportional to depth, not to envelope metadata.
             cursor = c.parents().first().cloned();
-            chain.push(c);
+            chain.push(c.patch().clone());
         }
         let mut state = BTreeSet::new();
-        for commit in chain.iter().rev() {
+        let mut total_bytes = 0usize;
+        for patch_id in chain.iter().rev() {
             let bytes = self
                 .immutable
-                .get_content(&commit.patch().0)
+                .get_content(&patch_id.0)
                 .await?
-                .ok_or_else(|| LedgerError::NotFound(commit.patch().0.clone()))?;
-            let patch = validate_patch_bytes(commit.patch(), &bytes)?;
-            ledger_rdf::apply_patch(&mut state, &patch);
+                .ok_or_else(|| LedgerError::NotFound(patch_id.0.clone()))?;
+            let patch = validate_patch_bytes(patch_id, &bytes)?;
+            apply_bounded(&mut state, &mut total_bytes, &patch, limits)?;
         }
         Ok(state)
     }
