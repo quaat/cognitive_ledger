@@ -362,7 +362,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             info!("filesystem development mode: READ-ONLY inspection, no write surface");
-            ledger_api::filesystem_readonly_router(Arc::new(ledger), limits.reconstruction)
+            ledger_api::filesystem_readonly_router(Arc::new(ledger), limits)
         }
         Backend::SharedPostgres => {
             let url = database_url

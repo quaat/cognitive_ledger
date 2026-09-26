@@ -669,8 +669,17 @@ Scope: make PR #1 merge-ready without redesign. Changes:
   `ci-integration`, `ci-security` and resolved conversations is recommended in the PR (not
   imposed).
 
-Evidence for this pass is recorded in the PR description and the final report; CI on the
-final head must show `ci-fast`, `ci-integration` and `ci-security` green.
+- **Fresh Codex review** (requested on the closure head): one P1 and two P2, all fixed —
+  `scripts/check-supply-chain.sh` propagated a `cargo tree` failure as "nothing reachable"
+  (now fails the gate on lockfile drift or resolution error); the Bearer scheme was
+  matched case-sensitively (now RFC 9110 case-insensitive, credential still required and
+  whitespace-free; unit test + API test); the filesystem read-only router bypassed the
+  export byte limit, request timeout and concurrency cap (now shares the edge middleware
+  and read guards with the shared router; unit test over a temporary store).
+
+Evidence for this pass: `./scripts/check-fast.sh` exit 0; PostgreSQL suites 1/9/7/8/14/10
+and `./scripts/test-integration.sh` exit 0 on the closure content; CI on the final head
+must show `ci-fast`, `ci-integration` and `ci-security` green (recorded in the PR).
 
 ## Test evidence
 - 2026-09-26 `python3 scripts/golden/commit_v2_reference.py check`: exit 0, "all 18

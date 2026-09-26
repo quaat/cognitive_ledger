@@ -3,10 +3,18 @@
 # proof that the exception's premise still holds (see .cargo/audit.toml).
 set -euo pipefail
 cd "$(dirname "$0")/.."
+mkdir -p target
 
 # 1. The excepted crate must be unreachable in the feature-resolved build graph of every
 #    target (it is a lockfile-only optional dependency of sqlx's MySQL driver).
-reachable=$(cargo tree --locked --target all -e normal,build -i rsa 2>/dev/null || true)
+# `cargo tree` exits non-zero when Cargo.lock does not match Cargo.toml (`--locked`) or
+# cannot resolve; that must fail the gate, not be read as "nothing reachable". It prints
+# only a stderr warning ("nothing to print") when the crate is unreachable.
+if ! reachable=$(cargo tree --locked --target all -e normal,build -i rsa 2>target/cargo-tree-rsa.err); then
+  echo "::error::cargo tree failed (lockfile drift or resolution error); the gate cannot prove the exception premise:" >&2
+  cat target/cargo-tree-rsa.err >&2
+  exit 1
+fi
 if [ -n "${reachable}" ]; then
   echo "::error::rsa is now reachable in the build graph; remove the RUSTSEC-2023-0071 exception and fix the dependency:" >&2
   echo "${reachable}" >&2

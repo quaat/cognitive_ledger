@@ -391,8 +391,15 @@ async fn authentication_is_verified_and_fails_closed() {
         .body(Body::empty())
         .unwrap();
     assert_error(&h.raw(request).await, StatusCode::NOT_FOUND, "NOT_FOUND");
-    // Other schemes and a lowercase scheme are not bearer tokens.
-    for scheme in ["Basic", "bearer", "Token"] {
+    // The scheme name is case-insensitive; other schemes are not bearer tokens.
+    let request = Request::builder()
+        .method("GET")
+        .uri(&path)
+        .header(header::AUTHORIZATION, format!("bearer {ok}"))
+        .body(Body::empty())
+        .unwrap();
+    assert_error(&h.raw(request).await, StatusCode::NOT_FOUND, "NOT_FOUND");
+    for scheme in ["Basic", "Token", "Bearer:"] {
         let request = Request::builder()
             .method("GET")
             .uri(&path)

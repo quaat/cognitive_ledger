@@ -27,7 +27,7 @@ use ledger_store::{
 use request_identity::CanonicalRequest;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     str::FromStr,
     sync::{
         Arc,
@@ -85,7 +85,7 @@ struct Shared {
     limits: ApiLimits,
     acceptance: AcceptancePolicy,
     expensive: tokio::sync::Semaphore,
-    correlation_counter: AtomicU64,
+    correlation_counter: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -113,8 +113,15 @@ impl AppState {
             authenticator,
             limits,
             acceptance,
-            correlation_counter: AtomicU64::new(0),
+            correlation_counter: Arc::new(AtomicU64::new(0)),
         }))
+    }
+
+    fn edge(&self) -> EdgeConfig {
+        EdgeConfig {
+            request_timeout: self.0.limits.request_timeout,
+            correlation_counter: self.0.correlation_counter.clone(),
+        }
     }
 }
 
@@ -154,26 +161,40 @@ pub fn router(state: AppState) -> Router {
         .method_not_allowed_fallback(unknown_route)
         .layer(DefaultBodyLimit::max(body_limit))
         .layer(middleware::from_fn_with_state(
-            state.clone(),
+            state.edge(),
             correlation_and_timeout,
         ))
         .with_state(state)
 }
 
 /// Filesystem development mode: read-only inspection of the single bootstrap ref. No
-/// mutation surface exists here; it is loopback-only by the server's binding rules.
-pub fn filesystem_readonly_router(ledger: Arc<Ledger>, limits: ReconstructionLimits) -> Router {
+/// mutation surface exists here; it is loopback-only by the server's binding rules. The
+/// same read guards as the shared router apply: reconstruction and export limits, request
+/// timeout, concurrency cap, correlation ids and the error envelope.
+pub fn filesystem_readonly_router(ledger: Arc<Ledger>, limits: ApiLimits) -> Router {
     #[derive(Clone)]
     struct FsState {
         ledger: Arc<Ledger>,
-        limits: ReconstructionLimits,
+        limits: ApiLimits,
+        expensive: Arc<tokio::sync::Semaphore>,
     }
-    async fn fs_head(State(s): State<FsState>) -> Result<Json<RefResponse>, ApiError> {
+    fn correlation(request: &Request<Body>) -> String {
+        request
+            .extensions()
+            .get::<Correlation>()
+            .map(|c| c.0.clone())
+            .unwrap_or_default()
+    }
+    async fn fs_head(
+        State(s): State<FsState>,
+        request: Request<Body>,
+    ) -> Result<Json<RefResponse>, ApiError> {
+        let correlation = correlation(&request);
         let head = s
             .ledger
             .head()
             .await
-            .map_err(|e| ApiError::from_ledger(e, ""))?;
+            .map_err(|e| ApiError::from_ledger(e, &correlation))?;
         Ok(Json(RefResponse {
             name: "main".into(),
             head,
@@ -183,24 +204,71 @@ pub fn filesystem_readonly_router(ledger: Arc<Ledger>, limits: ReconstructionLim
     async fn fs_state(
         State(s): State<FsState>,
         Path(id): Path<String>,
+        request: Request<Body>,
     ) -> Result<Json<StateResponse>, ApiError> {
-        let id = CommitId::from_str(&id).map_err(|_| ApiError::not_found(""))?;
+        let correlation = correlation(&request);
+        let id = CommitId::from_str(&id).map_err(|_| ApiError::not_found(&correlation))?;
+        let _permit = s.expensive.try_acquire().map_err(|_| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "RESOURCE_LIMIT",
+                "too many concurrent expensive operations; retry later",
+                &correlation,
+            )
+        })?;
+        let mut bounds = s.limits.reconstruction;
+        bounds.max_bytes = bounds.max_bytes.min(s.limits.max_state_export_bytes);
         let quads = s
             .ledger
-            .state_at_bounded(&id, &s.limits)
+            .state_at_bounded(&id, &bounds)
             .await
-            .map_err(|e| ApiError::from_ledger(e, ""))?;
-        Ok(Json(StateResponse {
-            commit: id,
-            quads: quads.into_iter().map(|q| q.to_string()).collect(),
-        }))
+            .map_err(|e| ApiError::from_ledger(e, &correlation))?;
+        let quads = export_quads(quads, s.limits.max_state_export_bytes, &correlation)?;
+        Ok(Json(StateResponse { commit: id, quads }))
     }
+    let edge = EdgeConfig {
+        request_timeout: limits.request_timeout,
+        correlation_counter: Arc::new(AtomicU64::new(0)),
+    };
+    let state = FsState {
+        expensive: Arc::new(tokio::sync::Semaphore::new(limits.max_concurrent_expensive)),
+        ledger,
+        limits,
+    };
     Router::new()
         .route("/health", get(health))
         .route("/ready", get(|| async { Json(Health { status: "ready" }) }))
         .route("/v1/refs/main", get(fs_head))
         .route("/v1/states/{id}", get(fs_state))
-        .with_state(FsState { ledger, limits })
+        .fallback(unknown_route)
+        .method_not_allowed_fallback(unknown_route)
+        .layer(middleware::from_fn_with_state(
+            edge,
+            correlation_and_timeout,
+        ))
+        .with_state(state)
+}
+
+/// Serialize a reconstructed state as canonical N-Quads lines under the export byte limit.
+fn export_quads(
+    quads: BTreeSet<Quad>,
+    max_bytes: usize,
+    correlation: &str,
+) -> Result<Vec<String>, ApiError> {
+    let mut total = 0usize;
+    let mut out = Vec::with_capacity(quads.len());
+    for quad in quads {
+        let line = quad.to_string();
+        total += line.len() + 1;
+        if total > max_bytes {
+            return Err(ApiError::resource_limit(
+                format!("state export exceeds {max_bytes} bytes"),
+                correlation,
+            ));
+        }
+        out.push(line);
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -217,8 +285,15 @@ fn valid_correlation(value: &str) -> bool {
         && value.bytes().all(|b| b.is_ascii_graphic())
 }
 
+/// What the correlation/timeout middleware needs from either router.
+#[derive(Clone)]
+struct EdgeConfig {
+    request_timeout: Duration,
+    correlation_counter: Arc<AtomicU64>,
+}
+
 async fn correlation_and_timeout(
-    State(state): State<AppState>,
+    State(edge): State<EdgeConfig>,
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
@@ -229,7 +304,7 @@ async fn correlation_and_timeout(
         .filter(|v| valid_correlation(v))
         .map(str::to_owned);
     let correlation = supplied.unwrap_or_else(|| {
-        let n = state.0.correlation_counter.fetch_add(1, Ordering::Relaxed);
+        let n = edge.correlation_counter.fetch_add(1, Ordering::Relaxed);
         let seed = format!(
             "{}:{n}:{}",
             std::process::id(),
@@ -240,7 +315,7 @@ async fn correlation_and_timeout(
     request
         .extensions_mut()
         .insert(Correlation(correlation.clone()));
-    let timeout = state.0.limits.request_timeout;
+    let timeout = edge.request_timeout;
     let mut response = match tokio::time::timeout(timeout, next.run(request)).await {
         Ok(response) => response,
         Err(_) => ApiError::new(
@@ -492,8 +567,7 @@ impl FromRequestParts<AppState> for RequestContext {
             .headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .filter(|t| !t.is_empty())
+            .and_then(bearer_credential)
             .ok_or_else(|| {
                 ApiError::new(
                     StatusCode::UNAUTHORIZED,
@@ -542,6 +616,18 @@ impl<T: serde::de::DeserializeOwned> axum::extract::FromRequest<AppState> for Va
             )),
         }
     }
+}
+
+/// The credential of an `Authorization` header using the Bearer scheme. Scheme names are
+/// case-insensitive (RFC 9110 §11.1); the credential itself is returned verbatim and must
+/// be non-empty. Any other scheme is not a bearer token.
+fn bearer_credential(header: &str) -> Option<&str> {
+    let (scheme, credential) = header.trim_start().split_once(char::is_whitespace)?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let credential = credential.trim();
+    (!credential.is_empty() && !credential.contains(char::is_whitespace)).then_some(credential)
 }
 
 fn idempotency_key(headers: &HeaderMap, correlation: &str) -> Result<String, ApiError> {
@@ -1135,23 +1221,8 @@ async fn read_state(
         .reconstruct(&commit, &bounds)
         .await
         .map_err(|e| ApiError::from_ledger(e, &correlation))?;
-    let mut total = 0usize;
-    let mut out = Vec::with_capacity(quads.len());
-    for quad in quads {
-        let line = quad.to_string();
-        total += line.len() + 1;
-        if total > state.0.limits.max_state_export_bytes {
-            return Err(ApiError::resource_limit(
-                format!(
-                    "state export exceeds {} bytes",
-                    state.0.limits.max_state_export_bytes
-                ),
-                &correlation,
-            ));
-        }
-        out.push(line);
-    }
-    Ok(Json(StateResponse { commit, quads: out }))
+    let quads = export_quads(quads, state.0.limits.max_state_export_bytes, &correlation)?;
+    Ok(Json(StateResponse { commit, quads }))
 }
 
 #[cfg(test)]
@@ -1360,6 +1431,49 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
         assert_eq!(body["code"], "RESOURCE_LIMIT");
         assert_eq!(body["correlation_id"], correlation.unwrap());
+    }
+
+    #[tokio::test]
+    async fn filesystem_router_is_read_only_bounded_and_enveloped() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = Arc::new(Ledger::open(dir.path()).unwrap());
+        let app = filesystem_readonly_router(
+            ledger,
+            ApiLimits {
+                max_state_export_bytes: 10,
+                ..ApiLimits::default()
+            },
+        );
+        let (status, body, correlation) = send(&app, "GET", "/v1/refs/main", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["head"].is_null());
+        assert!(correlation.is_some());
+        let (status, body, _) = send(&app, "GET", "/v1/states/not-a-commit", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["code"], "NOT_FOUND");
+        let unknown = format!("/v1/states/sha256:{}", "a".repeat(64));
+        let (status, body, _) = send(&app, "GET", &unknown, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["code"], "NOT_FOUND");
+        // No write surface at all, and unknown routes use the envelope.
+        for (method, path) in [("POST", "/v1/commits"), ("POST", "/v1/graphs/g/proposals")] {
+            let (status, body, _) = send(&app, method, path, None).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}");
+            assert_eq!(body["code"], "NOT_FOUND");
+        }
+    }
+
+    #[test]
+    fn bearer_scheme_is_case_insensitive_and_other_schemes_are_not_bearer() {
+        assert_eq!(bearer_credential("Bearer abc.def"), Some("abc.def"));
+        assert_eq!(bearer_credential("bearer abc.def"), Some("abc.def"));
+        assert_eq!(bearer_credential("BEARER  abc.def "), Some("abc.def"));
+        assert_eq!(bearer_credential("Basic abc"), None);
+        assert_eq!(bearer_credential("Token abc"), None);
+        assert_eq!(bearer_credential("Bearer"), None);
+        assert_eq!(bearer_credential("Bearer "), None);
+        assert_eq!(bearer_credential("Bearer a b"), None);
+        assert_eq!(bearer_credential("Bearerabc"), None);
     }
 
     #[test]
