@@ -4,12 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+publish = false
 
 [dependencies]
 axum.workspace = true
 ledger-api = { path = "../../crates/ledger-api" }
 ledger-core = { path = "../../crates/ledger-core" }
 ledger-store = { path = "../../crates/ledger-store", features = ["postgres"] }
+reqwest.workspace = true
+url = "2"
 serde_json.workspace = true
 sqlx.workspace = true
 tokio.workspace = true

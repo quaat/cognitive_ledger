@@ -74,15 +74,25 @@ async fn migration(dir: &std::path::Path, branch: &str) -> FsToPgMigration {
 /// A migration whose destination ref is `(graph, branch)` and whose v1 binding is that
 /// same graph.
 async fn migration_to(dir: &std::path::Path, graph: &str, branch: &str) -> FsToPgMigration {
-    let url = database_url();
+    migration_to_at(&database_url(), dir, graph, branch).await
+}
+
+/// `migration_to` against an explicit destination database (throwaway databases for tests
+/// that seed corruption; the shared database must stay clean for `ledger-admin verify`).
+async fn migration_to_at(
+    url: &str,
+    dir: &std::path::Path,
+    graph: &str,
+    branch: &str,
+) -> FsToPgMigration {
     let source = FileStore::open_existing(dir).unwrap();
     let destination = PostgresImmutableStore::connect_and_migrate(
-        &url,
+        url,
         V1Binding::BindTo(GraphId::new(graph).unwrap()),
     )
     .await
     .unwrap();
-    let refs = PgRefStore::connect_ref(&url, graph, branch).await.unwrap();
+    let refs = PgRefStore::connect_ref(url, graph, branch).await.unwrap();
     FsToPgMigration::new(source, destination, refs).unwrap()
 }
 
@@ -634,8 +644,11 @@ async fn destination_collision_and_conflicting_head_abort_without_overwriting() 
         .unwrap()
         .unwrap();
     let patch_id: ContentId = genesis.patch().0.clone();
+    // A throwaway database: this test seeds a corrupt object, which must never reach the
+    // shared database that `ledger-admin verify` inspects at the end of the harness.
+    let (collision_url, _admin_pool) = fresh_database("collide").await;
     let destination =
-        PostgresImmutableStore::connect_and_migrate(&database_url(), V1Binding::Reject)
+        PostgresImmutableStore::connect_and_migrate(&collision_url, V1Binding::Reject)
             .await
             .unwrap();
     // Since migration 0009 PostgreSQL itself refuses a mislabelled object; drop the CHECK
@@ -651,7 +664,7 @@ async fn destination_collision_and_conflicting_head_abort_without_overwriting() 
         .await
         .unwrap();
     let branch = unique("collide");
-    let error = migration(dir.path(), &branch)
+    let error = migration_to_at(&collision_url, dir.path(), "default", &branch)
         .await
         .run()
         .await
@@ -660,7 +673,7 @@ async fn destination_collision_and_conflicting_head_abort_without_overwriting() 
         matches!(error, LedgerError::ObjectCollision(ref id) if *id == patch_id),
         "{error}"
     );
-    let refs = PgRefStore::connect_ref(&database_url(), "default", &branch)
+    let refs = PgRefStore::connect_ref(&collision_url, "default", &branch)
         .await
         .unwrap();
     assert_eq!(refs.head().await.unwrap(), None);

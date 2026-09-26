@@ -22,3 +22,9 @@ tests/differential/
 *.zip
 .zprofile
 .zshrc
+# Credential-like files never enter the build context or BuildKit cache
+.env
+.env.*
+*.pem
+*.key
+credentials.*

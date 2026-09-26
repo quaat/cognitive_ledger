@@ -54,13 +54,25 @@ to serve; nothing upgrades implicitly.
 
 ## Health and readiness
 `/health` is process liveness. `/ready` answers 200 only when the database answers under
-the runtime identity and the schema level is exactly the required one.
+the runtime identity and the schema level is exactly the required one. The runtime image
+(`gcr.io/distroless/cc-debian12:nonroot`, digest-pinned in the Dockerfile) has no shell or
+curl: probe with `ledger-admin probe http://127.0.0.1:8080/ready` (exit 0 on 2xx, 1
+otherwise; the URL must be plain http to a loopback address or `localhost` without
+credentials, and is never printed), as `compose.yaml` does. Both binaries live in `/usr/local/bin`; the process runs as uid 65532.
+
+## Invariant verification
+`LEDGER_MIGRATION_DATABASE_URL=… ledger-admin verify [--json]` runs the read-only invariant
+suite (Plan 0005 §20: content addressing, index/parent consistency, ref ↔ event ↔ decision
+↔ outbox agreement, contiguous fast-forward event chains, tenant agreement, idempotency
+references, no v1 commit under a production graph) and exits non-zero on any violation. It
+never repairs. Run it after every upgrade, restore or incident; the integration harness runs
+it after every end-to-end scenario.
 
 ## Backup, restore, failure recovery
 Plan 0005 items 8–9 (pending): `pg_dump`/`pg_restore` and base-backup qualification with
 head/state digests before and after; kill-injection recovery evidence. Until they land,
-treat the documented invariant queries (`docs/quality/test-strategy.md`) as the post-
-recovery check and retry ambiguous requests with their original idempotency keys.
+run `ledger-admin verify` as the post-recovery check and retry ambiguous requests with their
+original idempotency keys.
 
 ## Development-only switches (never in production)
 `LEDGER_AUTH_MODE=dev-hs256`, `LEDGER_ALLOW_INSECURE_NON_LOOPBACK=allow-insecure-non-loopback-development-only`,

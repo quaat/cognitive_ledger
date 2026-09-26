@@ -54,3 +54,54 @@ if [ "${ignored}" != "1" ]; then
   exit 1
 fi
 cargo audit
+
+# 4. cargo-deny on the feature-resolved graph: advisories, licenses, bans (Fluree, query
+#    engines, rsa), sources (crates.io only). Policy: deny.toml.
+cargo deny --locked check advisories licenses bans sources
+
+# 5. CycloneDX SBOMs of the shipped binaries (CI uploads them as artefacts; never committed).
+#    cargo-cyclonedx reads `cargo metadata`, which lists lockfile-only optional dependencies
+#    (sqlx-mysql, rsa, sqlx-sqlite) that are never built; the SBOM is filtered to the
+#    feature-resolved build graph and must not name them.
+mkdir -p target/sbom
+rm -f apps/ledger-server/*.cdx.json
+cargo cyclonedx --manifest-path apps/ledger-server/Cargo.toml --describe binaries --format json --spec-version 1.5
+mv apps/ledger-server/*.cdx.json target/sbom/
+cargo tree --locked -p ledger-server -e normal,build --target x86_64-unknown-linux-gnu --prefix none --format '{p}' \
+  | sed -E 's/ \(.*//' | sort -u > target/sbom/reachable.txt
+python3 - <<'PY'
+import json, glob, hashlib, sys
+reachable = set()
+for line in open("target/sbom/reachable.txt"):
+    line = line.strip()
+    if not line:
+        continue
+    name, version = line.rsplit(" v", 1)
+    reachable.add((name, version))
+files = sorted(glob.glob("target/sbom/*_bin.cdx.json"))
+if len(files) < 2:
+    print("expected SBOMs for ledger-server and ledger-admin", file=sys.stderr); sys.exit(1)
+for f in files:
+    d = json.load(open(f))
+    before = len(d.get("components", []))
+    keep, dropped = [], []
+    for c in d.get("components", []):
+        key = (c.get("name"), c.get("version"))
+        (keep if key in reachable else dropped).append(c)
+    kept_refs = {c.get("bom-ref") for c in keep} | {d.get("metadata", {}).get("component", {}).get("bom-ref")}
+    d["components"] = keep
+    if "dependencies" in d:
+        d["dependencies"] = [
+            {**dep, "dependsOn": [r for r in dep.get("dependsOn", []) if r in kept_refs]}
+            for dep in d["dependencies"] if dep.get("ref") in kept_refs
+        ]
+    names = {c.get("name") for c in keep}
+    for forbidden in ("rsa", "sqlx-mysql", "sqlx-sqlite", "openssl", "openssl-sys", "native-tls"):
+        if forbidden in names:
+            print(f"{f}: {forbidden} is in the SBOM but must not be part of the shipped binary", file=sys.stderr); sys.exit(1)
+    if d.get("bomFormat") != "CycloneDX" or len(keep) < 100:
+        print(f"{f}: not a plausible CycloneDX SBOM ({len(keep)} components)", file=sys.stderr); sys.exit(1)
+    json.dump(d, open(f, "w"), indent=2)
+    digest = hashlib.sha256(open(f, "rb").read()).hexdigest()
+    print(f"{f}: CycloneDX {d.get('specVersion')} {len(keep)} components (filtered {before - len(keep)} lockfile-only: {', '.join(sorted(c.get('name') for c in dropped)[:6])}) sha256:{digest[:16]}…")
+PY

@@ -24,6 +24,39 @@ fn database_url() -> String {
     std::env::var("LEDGER_TEST_DATABASE_URL").expect("LEDGER_TEST_DATABASE_URL must be set")
 }
 
+/// The test URL with its database name replaced (`…/ledger?…` → `…/<name>?…`).
+fn url_for_database(base: &str, name: &str) -> String {
+    let (head, query) = match base.split_once('?') {
+        Some((h, q)) => (h, Some(q)),
+        None => (base, None),
+    };
+    let slash = head.rfind('/').expect("database url has a path");
+    let mut url = format!("{}/{name}", &head[..slash]);
+    if let Some(q) = query {
+        url.push('?');
+        url.push_str(q);
+    }
+    url
+}
+
+/// A throwaway database for tests that seed corruption (dropped CHECK, mislabelled
+/// objects). The shared database must stay clean: the integration harness ends with
+/// `ledger-admin verify` against it.
+async fn fresh_database(prefix: &str) -> String {
+    let base = database_url();
+    let admin = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&base)
+        .await
+        .unwrap();
+    let name = unique(prefix).replace('-', "_").to_lowercase();
+    sqlx::query(&format!("CREATE DATABASE {name}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    url_for_database(&base, &name)
+}
+
 fn unique(prefix: &str) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -407,7 +440,7 @@ async fn commit_bytes_are_refused_as_content_and_corrupt_envelopes_are_errors_no
 #[tokio::test]
 #[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
 async fn commit_patch_must_be_a_canonical_rdf_patch() {
-    let url = database_url();
+    let url = fresh_database("tamper").await;
     let store = PostgresImmutableStore::connect_and_migrate(&url, V1Binding::Reject)
         .await
         .unwrap();
@@ -537,7 +570,7 @@ async fn commit_patch_must_be_a_canonical_rdf_patch() {
 #[tokio::test]
 #[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
 async fn publication_is_truthful_against_inconsistent_stored_bytes() {
-    let url = database_url();
+    let url = fresh_database("tamper").await;
     let store = PostgresImmutableStore::connect_and_migrate(&url, V1Binding::Reject)
         .await
         .unwrap();

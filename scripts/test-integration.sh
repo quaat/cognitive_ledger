@@ -64,6 +64,9 @@ cargo test -p ledger-api --test pg_api -- --ignored --nocapture
 #         alter/drop/disable/rewrite, schema level fail-closed ----------------------------
 cargo test -p ledger-store --features postgres --test pg_least_privilege -- --ignored --nocapture
 
+# --- 1h. Invariant verifier (Plan 0005 §20): clean history passes, bypasses detected -----
+cargo test -p ledger-store --features postgres --test pg_verify -- --ignored --nocapture
+
 # --- 2. Containerised server: provision, authenticate, prepare/accept v2, restart, read ---
 curl --fail --silent --retry 10 --retry-delay 2 --retry-all-errors --retry-connrefused "${BASE}/health" >/dev/null
 curl --fail --silent "${BASE}/ready" >/dev/null
@@ -206,8 +209,15 @@ CORR=$(psql_q "select count(*) from decisions d join ref_events e on e.event_id 
 # The serving process holds only the runtime identity: no owner credentials anywhere in its
 # environment, its database sessions belong to ledger_runtime and none to the owner, and
 # the runtime role cannot alter the schema.
-docker compose exec -T ledger sh -c 'env | grep -q "^LEDGER_MIGRATION_DATABASE_URL=" && exit 1 || exit 0' || { echo "FAIL: runtime container holds the owner URL" >&2; exit 1; }
-[ "$(docker compose exec -T ledger sh -c 'env | grep -c "ledger-development-only@" || true')" = "0" ] || { echo "FAIL: runtime container holds the owner credentials" >&2; exit 1; }
+# The runtime image is distroless (no shell): inspect the container's configured environment
+# from the outside instead of exec-ing into it.
+LEDGER_CONTAINER=$(docker compose ps -q ledger)
+LEDGER_ENV=$(docker inspect --format '{{join .Config.Env "\n"}}' "${LEDGER_CONTAINER}")
+grep -qE '^LEDGER_MIGRATION' <<<"${LEDGER_ENV}" && { echo "FAIL: runtime container holds an owner/migration variable" >&2; exit 1; }
+grep -qE 'ledger-development-only@|postgres://ledger:' <<<"${LEDGER_ENV}" && { echo "FAIL: runtime container holds the owner credentials" >&2; exit 1; }
+[ "$(docker inspect --format '{{.Config.User}}' "${LEDGER_CONTAINER}")" = "65532:65532" ] || { echo "FAIL: runtime container does not run as the non-root distroless user" >&2; exit 1; }
+SHELL_PROBE=$(docker compose exec -T ledger /bin/sh -c 'true' 2>&1 || true)
+grep -qiE 'executable file not found|no such file or directory' <<<"${SHELL_PROBE}" || { echo "FAIL: runtime image appears to contain a shell: ${SHELL_PROBE}" >&2; exit 1; }
 RT_SESSIONS=$(psql_q "select count(*) from pg_stat_activity where datname = 'ledger' and usename = 'ledger_runtime' and client_addr is not null")
 OWNER_SESSIONS=$(psql_q "select count(*) from pg_stat_activity where datname = 'ledger' and usename = 'ledger' and client_addr is not null and application_name <> 'psql'")
 [ "${RT_SESSIONS}" -ge 1 ] || { echo "FAIL: the server has no sessions as ledger_runtime (${RT_SESSIONS})" >&2; exit 1; }
@@ -237,8 +247,16 @@ set -e
 [ "${OWNER_EXIT}" -ne 0 ] || { echo "FAIL: server started as the schema owner" >&2; exit 1; }
 echo "${OWNER_OUT}" | grep -q "RUNTIME_IDENTITY" || { echo "FAIL: owner-identity refusal lacks the RUNTIME_IDENTITY reason: ${OWNER_OUT}" >&2; exit 1; }
 echo "identity boundary confirmed: server sessions run as ledger_runtime, owner refused as runtime, stale schema refused, /ready follows schema drift"
-LOCAL_OBJECTS=$(docker compose exec -T ledger sh -c 'find /data -type f 2>/dev/null | wc -l')
+# Node-local object files would live in the ledger-data volume; read it from a throwaway
+# busybox container because the runtime image has no shell.
+DATA_VOLUME=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}' "${LEDGER_CONTAINER}")
+[ -n "${DATA_VOLUME}" ] || { echo "FAIL: could not resolve the ledger /data volume" >&2; exit 1; }
+LOCAL_OBJECTS=$(docker run --rm -v "${DATA_VOLUME}:/data:ro" busybox:1.37@sha256:1b0e2c1a6be1d7d9e7f5f6a5bd9d3e1b7b1b0e1a6a5b4c3d2e1f0a9b8c7d6e5f sh -c 'find /data -type f | wc -l' 2>/dev/null | tr -d '[:space:]' || true)
+[ -n "${LOCAL_OBJECTS}" ] || LOCAL_OBJECTS=$(docker run --rm -v "${DATA_VOLUME}:/data:ro" busybox:1.37 sh -c 'find /data -type f | wc -l' | tr -d '[:space:]')
 [ "${LOCAL_OBJECTS}" = "0" ] || { echo "FAIL: ledger container holds ${LOCAL_OBJECTS} node-local object file(s)" >&2; exit 1; }
 echo "invariants confirmed: 2 v2 commits indexed under ${GRAPH}, no non-v2 commit anywhere, exactly 4 new objects, refs.version=2 with 2 ref events, 2 accepted decisions, 2 outbox rows, 4 idempotency rows, correlation ids recorded, 0 node-local object files"
+# The reusable invariant suite (Plan 0005 §20) over the whole database, as the owner.
+docker compose run --rm migrate verify | tail -3 | grep -q "VERIFY OK" || { echo "FAIL: ledger-admin verify reported violations" >&2; docker compose run --rm migrate verify >&2 || true; exit 1; }
+echo "ledger-admin verify: VERIFY OK"
 
 echo "INTEGRATION OK"

@@ -25,6 +25,14 @@ enum Command {
     MigrateFs(Args),
     CreateGraph(GraphArgs),
     Migrate(MigrateArgs),
+    /// Container health probe: GET a local URL and exit 0 on 2xx (the runtime image has no
+    /// shell or curl).
+    Probe(String),
+    /// Database invariant verification (Plan 0005 §20): inspect only, exit 1 on violations.
+    Verify {
+        database_url: String,
+        json: bool,
+    },
 }
 
 struct MigrateArgs {
@@ -54,6 +62,8 @@ fn usage() -> &'static str {
     "usage: ledger-admin migrate [--runtime-role <role>] [--database-url <url>]\n\
      \x20      ledger-admin migrate-fs-to-pg --source <dir> [--database-url <url>] \
      [--graph <graph_id>] [--branch <name>] [--runtime-role <role>] [--json]\n\
+     \x20      ledger-admin verify [--database-url <url>] [--json]\n\
+     \x20      ledger-admin probe http://127.0.0.1:8080/ready\n\
      \x20      ledger-admin graph create --graph <graph_id> --tenant <tenant_id> \
      [--status active|importing] [--kb <knowledge_base_id>] [--purpose <text>] \
      [--database-url <url>]\n\
@@ -66,6 +76,30 @@ fn database_url_from_env() -> Option<String> {
     env::var("LEDGER_MIGRATION_DATABASE_URL")
         .ok()
         .filter(|u| !u.is_empty())
+}
+
+/// The probe target must be plain HTTP to loopback: scheme `http`, no userinfo, host a
+/// loopback IPv4 address, `::1` or exactly `localhost`. Parsed rather than prefix-matched,
+/// so `http://localhost.evil.com`, `http://127.0.0.1@evil.com` and similar are refused. The
+/// value is never echoed because a pasted URL may carry credentials.
+fn probe_url(raw: &str) -> Result<String, String> {
+    let url = url::Url::parse(raw).map_err(|_| "probe: URL does not parse (value not shown)")?;
+    if url.scheme() != "http" {
+        return Err("probe: only plain http to loopback is supported".into());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("probe: URL must not carry credentials".into());
+    }
+    let loopback = match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        None => false,
+    };
+    if !loopback {
+        return Err("probe: host must be a loopback address or localhost".into());
+    }
+    Ok(url.into())
 }
 
 /// A runtime role must be a plain SQL identifier; anything else (for example a database
@@ -201,6 +235,32 @@ fn parse_graph_create(mut argv: impl Iterator<Item = String>) -> Result<GraphArg
 fn parse_command(mut argv: impl Iterator<Item = String>) -> Result<Command, String> {
     match argv.next().as_deref() {
         Some("migrate") => parse_migrate(argv).map(Command::Migrate),
+        Some("verify") => {
+            let mut database_url = database_url_from_env();
+            let mut json = false;
+            while let Some(flag) = argv.next() {
+                match flag.as_str() {
+                    "--database-url" => database_url = Some(value(&mut argv, "--database-url")?),
+                    "--json" => json = true,
+                    other => return Err(format!("unknown flag {other}\n{}", usage())),
+                }
+            }
+            Ok(Command::Verify {
+                database_url: database_url.ok_or_else(|| {
+                    format!(
+                        "--database-url or LEDGER_MIGRATION_DATABASE_URL is required\n{}",
+                        usage()
+                    )
+                })?,
+                json,
+            })
+        }
+        Some("probe") => match (argv.next(), argv.next()) {
+            (Some(url), None) => probe_url(&url).map(Command::Probe),
+            _ => Err(
+                "usage: ledger-admin probe http://127.0.0.1:<port>/ready (loopback only)".into(),
+            ),
+        },
         Some("migrate-fs-to-pg") => parse(argv).map(Command::MigrateFs),
         Some("graph") => match argv.next().as_deref() {
             Some("create") => parse_graph_create(argv).map(Command::CreateGraph),
@@ -297,10 +357,107 @@ async fn main() -> ExitCode {
         Ok(command) => command,
         Err(message) => {
             eprintln!("{message}");
-            return ExitCode::from(2);
+            // Usage errors exit 1: Docker reserves healthcheck status 2.
+            return ExitCode::FAILURE;
         }
     };
     let args = match command {
+        Command::Probe(url) => {
+            // Direct loopback only: no proxy, no redirects, bounded well inside the
+            // container healthcheck's own timeout. The URL is not echoed.
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .connect_timeout(std::time::Duration::from_millis(1500))
+                .timeout(std::time::Duration::from_secs(2))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("static client configuration");
+            return match client.get(&url).send().await {
+                Ok(response) if response.status().is_success() => ExitCode::SUCCESS,
+                Ok(response) => {
+                    eprintln!("probe: HTTP {}", response.status().as_u16());
+                    ExitCode::FAILURE
+                }
+                Err(e) => {
+                    eprintln!(
+                        "probe: {}",
+                        if e.is_timeout() {
+                            "timeout"
+                        } else {
+                            "connection failed"
+                        }
+                    );
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        Command::Verify { database_url, json } => {
+            let pool = match sqlx::postgres::PgPoolOptions::new()
+                .max_connections(2)
+                .connect(&database_url)
+                .await
+            {
+                Ok(pool) => pool,
+                Err(e) => {
+                    eprintln!("verify: cannot connect: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            return match ledger_store::verify::run(&pool).await {
+                Ok(report) => {
+                    if json {
+                        let checks: Vec<serde_json::Value> = report
+                            .checks
+                            .iter()
+                            .map(|c| serde_json::json!({"check": c.name, "violations": c.violations, "sample": c.sample}))
+                            .collect();
+                        let counts: serde_json::Map<String, serde_json::Value> = report
+                            .counts
+                            .iter()
+                            .map(|(t, n)| ((*t).to_owned(), serde_json::json!(n)))
+                            .collect();
+                        println!(
+                            "{}",
+                            serde_json::json!({"clean": report.is_clean(), "checks": checks, "counts": counts})
+                        );
+                    } else {
+                        for c in &report.checks {
+                            println!(
+                                "{} {} ({} violation(s)){}",
+                                if c.violations == 0 { "ok  " } else { "FAIL" },
+                                c.name,
+                                c.violations,
+                                if c.sample.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(": {}", c.sample.join(", "))
+                                }
+                            );
+                        }
+                        for (t, n) in &report.counts {
+                            println!("count {t} = {n}");
+                        }
+                        println!(
+                            "{}",
+                            if report.is_clean() {
+                                "VERIFY OK"
+                            } else {
+                                "VERIFY FAILED"
+                            }
+                        );
+                    }
+                    if report.is_clean() {
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::FAILURE
+                    }
+                }
+                Err(e) => {
+                    eprintln!("verify failed to run: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         Command::Migrate(args) => {
             return match migrate_schema(&args).await {
                 Ok(()) => ExitCode::SUCCESS,
@@ -409,7 +566,38 @@ async fn migrate(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::role_name;
+    use super::{probe_url, role_name};
+
+    #[test]
+    fn probe_accepts_only_plain_http_loopback_without_credentials() {
+        for ok in [
+            "http://127.0.0.1:8080/ready",
+            "http://localhost:8080/ready",
+            "http://LOCALHOST/ready",
+            "http://[::1]:8080/ready",
+            "http://127.9.9.9/health",
+        ] {
+            assert!(probe_url(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://localhost.evil.com/",
+            "http://127.0.0.1.nip.io/",
+            "http://127.0.0.1@evil.com/",
+            "http://localhost:80@evil.com/",
+            "http://user:secret@127.0.0.1/ready",
+            "https://127.0.0.1/ready",
+            "http://10.0.0.1/ready",
+            "http://[::2]/ready",
+            "ftp://127.0.0.1/",
+            "not a url",
+        ] {
+            let err = probe_url(bad).unwrap_err();
+            assert!(
+                !err.contains("secret") && !err.contains("evil"),
+                "{bad}: {err}"
+            );
+        }
+    }
 
     #[test]
     fn runtime_role_must_be_a_plain_identifier() {

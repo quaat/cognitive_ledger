@@ -115,18 +115,65 @@ integrity rules against real PostgreSQL, including a non-superuser owner.
   the remaining P1.5 slices. **The service is not production-qualified until Plan 0005
   passes in full.**
 
-## Supply chain
-`scripts/check-supply-chain.sh` (blocking in `ci-security`) runs `cargo audit` with the
-single exception documented in `.cargo/audit.toml` — RUSTSEC-2023-0071 (`rsa 0.9`), a
-lockfile-only optional dependency of sqlx's MySQL driver that no feature of this workspace
-enables — and first re-proves the premise: `rsa` must be unreachable in the feature-resolved
-build graph of every target, have `sqlx-mysql` as its only lockfile dependent, and stay on
-the advisory's 0.9 line; any change fails the gate so the exception is re-evaluated (trigger:
-every sqlx upgrade, Plan 0005 supply-chain slice). GitHub dependency review runs on every
-pull request (Dependency graph enabled 2026-09-26); its first run found GHSA-h395-gr6q-cpjc
-in `jsonwebtoken 9.3.1` (a malformed `exp`/`nbf` JSON type was treated as an absent claim),
-fixed by upgrading to `jsonwebtoken 11.1.0` on the `aws-lc-rs` backend (chosen over
-`rust_crypto`, which would have made the `rsa` crate reachable).
+## Supply chain (Plan 0005 slice 2)
+`scripts/check-supply-chain.sh` (blocking in `ci-security`) runs, in order:
+1. the RUSTSEC-2023-0071 premise proof (`rsa 0.9` is a lockfile-only optional dependency
+   of sqlx's MySQL driver: unreachable in the feature-resolved graph of every target, only
+   dependent `sqlx-mysql`, still on the 0.9 line) and `cargo audit` with that single
+   documented exception (`.cargo/audit.toml`);
+2. `cargo deny check advisories licenses bans sources` against `deny.toml`: RustSec
+   advisories on the feature-resolved graph (no exception needed there; `rsa` is banned so
+   its becoming reachable is a hard failure), a permissive-only licence allow list (MIT,
+   Apache-2.0, BSD-2/3, ISC, Zlib, Unicode-3.0, Unlicense, CC0-1.0,
+   BSL-1.0, CDLA-Permissive-2.0; strong copyleft requires review), bans on Fluree and on
+   SPARQL/query engines (boundaries), duplicates reported as warnings and reviewed,
+   crates.io as the only source. Workspace crates are `publish = false`;
+3. CycloneDX 1.5 SBOMs of the two shipped binaries (`cargo cyclonedx --describe binaries`),
+   filtered to the feature-resolved build graph of `cargo tree -e normal,build` for
+   `x86_64-unknown-linux-gnu` (cargo-cyclonedx reads `cargo metadata`, which also lists the
+   lockfile-only `rsa`, `sqlx-mysql`, `sqlx-sqlite`, Windows/wasm and dev-only crates), and
+   failed if `rsa`, `sqlx-mysql`, `sqlx-sqlite`, `openssl`, `openssl-sys` or `native-tls`
+   appear; sanity-checked and uploaded as CI artefacts (never committed). `deny.toml` bans
+   the OpenSSL and native-tls crates outright (TLS is rustls, JWT crypto is aws-lc-rs).
+GitHub dependency review runs on every pull request (Dependency graph enabled 2026-09-26);
+its first run found GHSA-h395-gr6q-cpjc in `jsonwebtoken 9.3.1` (a malformed `exp`/`nbf`
+JSON type was treated as an absent claim), fixed by upgrading to `jsonwebtoken 11.1.0` on
+the `aws-lc-rs` backend (chosen over `rust_crypto`, which would have made the `rsa` crate
+reachable). Every third-party GitHub Action is pinned to an immutable commit SHA with the
+release name in a comment and checks out without persisting the token; Dependabot
+(`.github/dependabot.yml`) proposes weekly updates for Actions and the Cargo lockfile as
+ordinary gated pull requests (never auto-merged). Both container images the build depends on
+are digest-pinned: the `rust:1.89-bookworm` builder and the distroless runtime.
+
+### Container image
+The runtime image is `gcr.io/distroless/cc-debian12:nonroot` pinned by digest (glibc,
+libgcc, libstdc++, openssl libs, tzdata, ca-certificates; no shell, package manager or
+curl; uid 65532; 11 OS packages, ≈47 MB). Health probes use `ledger-admin probe` (a loopback
+GET that accepts only a parsed plain-http URL whose host is a loopback address or exactly
+`localhost`, without userinfo; no proxy, no redirects, 2 s bound, URL never echoed).
+`ci-security`'s `container` job builds the image, emits its CycloneDX SBOM and the full JSON
+report first (uploaded even when the gate fails), then fails on any CRITICAL/HIGH finding
+whether or not a fix exists: an unfixed one must be classified in `.trivyignore` with
+rationale and review trigger (it is empty), never dropped by `ignore-unfixed`. The scanner
+version is pinned to the one this classification used.
+Classification of the 2026-09-26 scan (Trivy 0.74.0; 0 CRITICAL, 0 HIGH, 17 MEDIUM, 16 LOW,
+1 UNKNOWN):
+- `libc6` 2.36 — 15 MEDIUM and 7 LOW, all `affected`/`fix_deferred` in Debian 12 (no fix
+  available): **accepted**; the ledger does not expose glibc parsing surfaces to untrusted
+  input beyond what Rust's std uses (no `wordexp`, `strfmon`, iconv, nscd, getaddrinfo-
+  driven DNS on untrusted names — the only outbound connections are PostgreSQL and the
+  configured JWKS URL). Review trigger: each distroless base refresh.
+- `libssl3` 3.0.20 — 2 MEDIUM + 4 LOW with a fix in 3.0.22 (`fixed`) plus CVE-2025-27587
+  (LOW, `affected`, no fix): **fix pending base refresh** / **not applicable** respectively;
+  the ledger links `aws-lc-rs` and `rustls`, not OpenSSL (`deny.toml` bans the OpenSSL
+  crates), so the library is unused by the process. Refresh the distroless digest when the
+  base ships 3.0.22; the CI gate would fail on it only if a finding reached HIGH.
+- `gcc-12-base`/`libgcc-s1`/`libgomp1`/`libstdc++6` CVE-2022-27943 (LOW, `affected`, a
+  libiberty demangler issue): **not applicable** (no demangling at runtime).
+- `tzdata` DLA-4792-1 (UNKNOWN, data update): **fix pending base refresh**.
+The previous `debian:bookworm-slim` base carried 4 CRITICAL and 63 HIGH unfixed findings
+(perl, util-linux, curl, systemd, zlib) in 106 packages; moving to distroless removed them
+rather than accepting them.
 
 Dependency and license findings must be classified rather than ignored. Fluree's BSL image
 is optional test infrastructure and is not shipped. The intended runtime dependency policy

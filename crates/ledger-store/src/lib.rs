@@ -560,6 +560,8 @@ mod postgres_immutable;
 #[cfg(feature = "postgres")]
 pub mod schema;
 #[cfg(feature = "postgres")]
+pub mod verify;
+#[cfg(feature = "postgres")]
 pub use postgres_immutable::{PostgresImmutableStore, V1Binding};
 #[cfg(feature = "postgres")]
 mod postgres_graphs;

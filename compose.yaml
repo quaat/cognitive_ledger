@@ -8,7 +8,7 @@ services:
   # this completed successfully and connects with the RUNTIME identity, which cannot run DDL.
   migrate:
     build: .
-    entrypoint: ["ledger-admin"]
+    entrypoint: ["/usr/local/bin/ledger-admin"]
     command: ["migrate", "--runtime-role", "ledger_runtime"]
     restart: "no"
     environment:
@@ -52,7 +52,8 @@ services:
       migrate:
         condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/ready"]
+      # The runtime image has no shell or curl; the probe is a loopback GET by ledger-admin.
+      test: ["CMD", "/usr/local/bin/ledger-admin", "probe", "http://127.0.0.1:8080/ready"]
       interval: 5s
       timeout: 3s
       retries: 12

@@ -8,3 +8,7 @@
 credentials.*
 .DS_Store
 __pycache__/
+# Generated SBOMs are CI artefacts, never committed
+*.cdx.json
+# Local repository snapshot, never committed
+cognitive_ledger.zip

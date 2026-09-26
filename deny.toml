@@ -1,0 +1,74 @@
+# cargo-deny policy (Plan 0005 slice 2; run by scripts/check-supply-chain.sh and ci-security).
+# Every finding must be classified here or fixed; nothing is ignored silently.
+
+[graph]
+# Audit what the ledger binaries are built from: all workspace members, every target we
+# ship for (the lockfile also carries Windows/wasm-only crates that never build here).
+all-features = true
+targets = [
+  { triple = "x86_64-unknown-linux-gnu" },
+  { triple = "aarch64-unknown-linux-gnu" },
+]
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+version = 2
+yanked = "deny"
+# cargo-deny evaluates the feature-resolved graph, in which rsa (RUSTSEC-2023-0071) does not
+# exist, so no exception is needed here; cargo-audit scans the raw lockfile and carries the
+# documented exception in .cargo/audit.toml. The bans entry below turns rsa becoming
+# reachable into a hard failure.
+ignore = []
+
+[licenses]
+version = 2
+# Permissive licenses only (docs/quality/security.md: strong copyleft requires review).
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "Unlicense",
+  "CC0-1.0",
+  "BSL-1.0",
+  "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+exceptions = []
+
+[bans]
+# Duplicate versions are reported (warn) and reviewed, not rejected: harmless duplicates of
+# base64/getrandom/hashbrown/rand/syn/untrusted/webpki-roots come from upstream crates.
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace path dependencies carry no version by design; only registry wildcards matter.
+allow-wildcard-paths = true
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+deny = [
+  # Fluree is test-reference-only (ADR-0005); no runtime or compiled dependency ever.
+  { crate = "fluree", reason = "test-reference-only (ADR-0005)" },
+  # The ledger owns no query/reasoning engine (AGENTS.md boundaries).
+  { crate = "oxigraph", reason = "no SPARQL/query engine in the ledger" },
+  { crate = "spargebra", reason = "no SPARQL engine in the ledger" },
+  # TLS and JWT crypto are rustls / aws-lc-rs; OpenSSL must never enter the graph (the
+  # container classification relies on the process not using libssl).
+  { crate = "openssl", reason = "TLS is rustls; JWT crypto is aws-lc-rs" },
+  { crate = "openssl-sys", reason = "TLS is rustls; JWT crypto is aws-lc-rs" },
+  { crate = "native-tls", reason = "TLS is rustls" },
+  # rsa must never become a compiled dependency (see .cargo/audit.toml).
+  { crate = "rsa", reason = "must stay a lockfile-only optional dependency; if it becomes reachable the RUSTSEC-2023-0071 exception is void" },
+]
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

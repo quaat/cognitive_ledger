@@ -960,11 +960,13 @@ dependencies = [
  "ledger-api",
  "ledger-core",
  "ledger-store",
+ "reqwest",
  "serde_json",
  "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
