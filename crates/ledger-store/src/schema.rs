@@ -82,8 +82,10 @@ pub const REQUIRED_SCHEMA_VERSION: i64 = 9;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SchemaReport {
     pub version: i64,
-    /// `md5(pg_constraint.conbin::text)` of the content-address CHECK as found now: readiness
-    /// compares it with the value start-up validated (deparse + probe), lock-free.
+    /// Fingerprint of the content-address CHECK's stored expression tree (`conbin`, with the
+    /// statement-offset `location` fields removed so re-adding the same definition from a
+    /// differently formatted statement does not change it): readiness compares it with the
+    /// value start-up validated (deparse + probe), lock-free.
     pub content_check_fingerprint: String,
 }
 
@@ -561,6 +563,7 @@ async fn verify_guard_triggers(pool: &PgPool) -> Result<(), LedgerError> {
         let rows = sqlx::query(
             "SELECT pn.nspname AS fn_schema, p.proname AS fn_name, tg.tgenabled::text AS enabled, \
                     tg.tgtype, tg.tgconstraint <> 0 AS is_constraint, tg.tgdeferrable, tg.tginitdeferred, \
+                    tg.tgqual IS NULL AS unconditional, \
                     coalesce((SELECT array_agg(a.attname::text ORDER BY a.attnum) \
                               FROM unnest(tg.tgattr::int2[]) AS x(attnum) \
                               JOIN pg_attribute a ON a.attrelid = tg.tgrelid AND a.attnum = x.attnum), \
@@ -599,6 +602,7 @@ async fn verify_guard_triggers(pool: &PgPool) -> Result<(), LedgerError> {
         let is_constraint: bool = row.try_get("is_constraint").map_err(db_error)?;
         let deferrable: bool = row.try_get("tgdeferrable").map_err(db_error)?;
         let initially_deferred: bool = row.try_get("tginitdeferred").map_err(db_error)?;
+        let unconditional: bool = row.try_get("unconditional").map_err(db_error)?;
         let mut update_columns: Vec<String> = row.try_get("update_columns").map_err(db_error)?;
         update_columns.sort();
         let mut expected_columns: Vec<String> =
@@ -606,6 +610,8 @@ async fn verify_guard_triggers(pool: &PgPool) -> Result<(), LedgerError> {
         expected_columns.sort();
         let problem = if enabled != "O" {
             Some(format!("is disabled (tgenabled = {enabled:?})"))
+        } else if !unconditional {
+            Some("carries a WHEN condition (the migrations define none)".to_owned())
         } else if fn_schema != "public" || fn_name != t.function {
             Some(format!(
                 "calls {fn_schema}.{fn_name} instead of public.{}",
@@ -667,7 +673,8 @@ fn normalize_constraint_def(def: &str) -> String {
 /// a CHECK, validated. Returns the fingerprint of its stored expression tree.
 async fn verify_content_address_check(pool: &PgPool) -> Result<String, LedgerError> {
     let rows = sqlx::query(
-        "SELECT con.contype::text AS contype, con.convalidated, md5(con.conbin::text) AS fingerprint \
+        "SELECT con.contype::text AS contype, con.convalidated, \
+                md5(regexp_replace(con.conbin::text, ':location -?[0-9]+', '', 'g')) AS fingerprint \
          FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid \
          JOIN pg_namespace n ON n.oid = c.relnamespace \
          WHERE n.nspname = 'public' AND c.relname = 'immutable_objects' AND con.conname = $1",
@@ -992,21 +999,38 @@ async fn verify_role_attributes_and_memberships(
              integrity trigger (ADR-0016)"
         )));
     }
-    let rows = sqlx::query(
+    // Every role the runtime can become (inherited or `SET ROLE`), transitively. PostgreSQL
+    // 16 records per-membership INHERIT/SET options; on 15 every membership is settable and
+    // inheritance follows the member's NOINHERIT attribute, so treat both as true.
+    let version: i32 = sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+        .fetch_one(pool)
+        .await
+        .map_err(db_error)?;
+    let options = if version >= 160_000 {
+        "am.inherit_option, am.set_option"
+    } else {
+        "true AS inherit_option, true AS set_option"
+    };
+    let rows = sqlx::query(&format!(
         "WITH RECURSIVE m AS ( \
-             SELECT am.roleid, am.inherit_option, am.set_option \
+             SELECT am.roleid, {options} \
              FROM pg_auth_members am WHERE am.member = (SELECT oid FROM pg_roles WHERE rolname = current_user) \
            UNION \
-             SELECT am.roleid, am.inherit_option, am.set_option \
+             SELECT am.roleid, {options} \
              FROM pg_auth_members am JOIN m ON am.member = m.roleid) \
          SELECT r.rolname::text AS name, r.rolsuper, r.rolcreaterole, r.rolcreatedb, r.rolreplication, \
                 r.rolbypassrls, m.inherit_option, m.set_option, \
                 (SELECT count(*) FROM pg_tables t WHERE t.schemaname = 'public' AND t.tableowner = r.rolname) AS owned, \
                 (SELECT count(*) FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace AND p.proowner = r.oid) AS owned_functions, \
                 has_schema_privilege(r.oid, 'public', 'CREATE') AS can_create, \
-                has_parameter_privilege(r.oid, 'session_replication_role', 'SET') AS can_set_srr \
+                {srr} AS can_set_srr \
          FROM m JOIN pg_roles r ON r.oid = m.roleid",
-    )
+        srr = if version >= 150_000 {
+            "has_parameter_privilege(r.oid, 'session_replication_role', 'SET')"
+        } else {
+            "false"
+        }
+    ))
     .fetch_all(pool)
     .await
     .map_err(db_error)?;
@@ -1059,6 +1083,45 @@ async fn verify_role_attributes_and_memberships(
                  runtime identity must not be able to assume more privilege (ADR-0016)"
             )));
         }
+        // Object privileges an assumable role holds must stay within the runtime model too:
+        // a NOINHERIT/SET-only parent's grants are invisible to the current_user checks but
+        // one `SET ROLE` away.
+        for model in RUNTIME_TABLE_MODEL {
+            verify_table_privileges_for(pool, &name, who, model, Exactness::Subset).await?;
+        }
+        verify_sequence_privileges_for(pool, &name, who, Exactness::Subset).await?;
+        verify_no_grant_function_execute(pool, &name, who).await?;
+    }
+    verify_no_grant_function_execute(pool, who, who).await
+}
+
+/// Whether a role must hold the model exactly (the runtime itself) or at most the model
+/// (roles the runtime can become).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Exactness {
+    Exact,
+    Subset,
+}
+
+/// `ledger_grant_runtime` hands out privileges; neither the runtime nor any role it can
+/// become may execute it (the function refuses non-owners, but defence in depth).
+async fn verify_no_grant_function_execute(
+    pool: &PgPool,
+    subject: &str,
+    who: &str,
+) -> Result<(), LedgerError> {
+    let can: bool = sqlx::query_scalar(
+        "SELECT has_function_privilege($1, 'public.ledger_grant_runtime(text)', 'EXECUTE')",
+    )
+    .bind(subject)
+    .fetch_one(pool)
+    .await
+    .map_err(db_error)?;
+    if can {
+        return Err(identity(format!(
+            "role {subject} (reachable by {who}) may execute ledger_grant_runtime; the runtime \
+             identity must not (ADR-0016)"
+        )));
     }
     Ok(())
 }
@@ -1068,18 +1131,31 @@ async fn verify_table_privileges(
     who: &str,
     model: &TablePrivileges,
 ) -> Result<(), LedgerError> {
+    verify_table_privileges_for(pool, who, who, model, Exactness::Exact).await
+}
+
+/// `subject` is the role whose privileges are examined (the runtime, or a role it can
+/// become); `who` names the runtime in messages.
+async fn verify_table_privileges_for(
+    pool: &PgPool,
+    subject: &str,
+    who: &str,
+    model: &TablePrivileges,
+    exactness: Exactness,
+) -> Result<(), LedgerError> {
     let qualified = format!("public.{}", model.table);
     let table = sqlx::query(
         "SELECT to_regclass($1) IS NOT NULL AS present, \
-                has_table_privilege(current_user, $1, 'SELECT') AS sel, \
-                has_table_privilege(current_user, $1, 'INSERT') AS ins, \
-                has_table_privilege(current_user, $1, 'UPDATE') AS upd, \
-                has_table_privilege(current_user, $1, 'DELETE') AS del, \
-                has_table_privilege(current_user, $1, 'TRUNCATE') AS trunc, \
-                has_table_privilege(current_user, $1, 'TRIGGER') AS trig, \
-                has_table_privilege(current_user, $1, 'REFERENCES') AS refs",
+                has_table_privilege($2, $1, 'SELECT') AS sel, \
+                has_table_privilege($2, $1, 'INSERT') AS ins, \
+                has_table_privilege($2, $1, 'UPDATE') AS upd, \
+                has_table_privilege($2, $1, 'DELETE') AS del, \
+                has_table_privilege($2, $1, 'TRUNCATE') AS trunc, \
+                has_table_privilege($2, $1, 'TRIGGER') AS trig, \
+                has_table_privilege($2, $1, 'REFERENCES') AS refs",
     )
     .bind(&qualified)
+    .bind(subject)
     .fetch_one(pool)
     .await
     .map_err(db_error)?;
@@ -1092,7 +1168,12 @@ async fn verify_table_privileges(
     let fix = format!(
         "run `ledger-admin migrate --runtime-role {who}` with the owner identity (ADR-0016)"
     );
-    if !table.try_get::<bool, _>("sel").map_err(db_error)? {
+    let via = if subject == who {
+        String::new()
+    } else {
+        format!(" (through membership in {subject})")
+    };
+    if exactness == Exactness::Exact && !table.try_get::<bool, _>("sel").map_err(db_error)? {
         return Err(identity(format!(
             "role {who} lacks SELECT on {qualified}; {fix}"
         )));
@@ -1107,7 +1188,7 @@ async fn verify_table_privileges(
     ] {
         if table.try_get::<bool, _>(column).map_err(db_error)? {
             return Err(identity(format!(
-                "role {who} holds {privilege} on {qualified}; the runtime identity must not \
+                "role {who} holds {privilege} on {qualified}{via}; the runtime identity must not \
                  (only the column grants of migration 0008 are allowed; ADR-0016)"
             )));
         }
@@ -1116,12 +1197,13 @@ async fn verify_table_privileges(
     // excluded above, so a true here is a genuine column grant, directly or inherited).
     let columns = sqlx::query(
         "SELECT a.attname::text AS name, \
-                has_column_privilege(current_user, a.attrelid, a.attnum, 'INSERT') AS ins, \
-                has_column_privilege(current_user, a.attrelid, a.attnum, 'UPDATE') AS upd \
+                has_column_privilege($2, a.attrelid, a.attnum, 'INSERT') AS ins, \
+                has_column_privilege($2, a.attrelid, a.attnum, 'UPDATE') AS upd \
          FROM pg_attribute a \
          WHERE a.attrelid = to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped",
     )
     .bind(&qualified)
+    .bind(subject)
     .fetch_all(pool)
     .await
     .map_err(db_error)?;
@@ -1132,18 +1214,22 @@ async fn verify_table_privileges(
         let upd: bool = column.try_get("upd").map_err(db_error)?;
         let expect_ins = model.insert_columns.contains(&name.as_str());
         let expect_upd = model.update_columns.contains(&name.as_str());
-        if ins != expect_ins {
+        let violates = |has: bool, expect: bool| match exactness {
+            Exactness::Exact => has != expect,
+            Exactness::Subset => has && !expect,
+        };
+        if violates(ins, expect_ins) {
             return Err(identity(format!(
-                "role {who} {} INSERT on {qualified}.{name}; the runtime identity's INSERT \
+                "role {who} {} INSERT on {qualified}.{name}{via}; the runtime identity's INSERT \
                  columns on {} are exactly {:?}; {fix}",
                 if ins { "holds" } else { "lacks" },
                 model.table,
                 model.insert_columns
             )));
         }
-        if upd != expect_upd {
+        if violates(upd, expect_upd) {
             return Err(identity(format!(
-                "role {who} {} UPDATE on {qualified}.{name}; the runtime identity's UPDATE \
+                "role {who} {} UPDATE on {qualified}.{name}{via}; the runtime identity's UPDATE \
                  columns on {} are exactly {:?}; {fix}",
                 if upd { "holds" } else { "lacks" },
                 model.table,
@@ -1164,16 +1250,31 @@ async fn verify_table_privileges(
 }
 
 async fn verify_sequence_privileges(pool: &PgPool, who: &str) -> Result<(), LedgerError> {
+    verify_sequence_privileges_for(pool, who, who, Exactness::Exact).await
+}
+
+async fn verify_sequence_privileges_for(
+    pool: &PgPool,
+    subject: &str,
+    who: &str,
+    exactness: Exactness,
+) -> Result<(), LedgerError> {
     let rows = sqlx::query(
         "SELECT c.relname::text AS name, \
-                has_sequence_privilege(current_user, c.oid, 'USAGE') AS usage, \
-                has_sequence_privilege(current_user, c.oid, 'SELECT') AS sel, \
-                has_sequence_privilege(current_user, c.oid, 'UPDATE') AS upd \
+                has_sequence_privilege($1, c.oid, 'USAGE') AS usage, \
+                has_sequence_privilege($1, c.oid, 'SELECT') AS sel, \
+                has_sequence_privilege($1, c.oid, 'UPDATE') AS upd \
          FROM pg_class c WHERE c.relkind = 'S' AND c.relnamespace = 'public'::regnamespace",
     )
+    .bind(subject)
     .fetch_all(pool)
     .await
     .map_err(db_error)?;
+    let via = if subject == who {
+        String::new()
+    } else {
+        format!(" (through membership in {subject})")
+    };
     let mut seen = Vec::with_capacity(rows.len());
     for row in &rows {
         let name: String = row.try_get("name").map_err(db_error)?;
@@ -1181,9 +1282,13 @@ async fn verify_sequence_privileges(pool: &PgPool, who: &str) -> Result<(), Ledg
         let sel: bool = row.try_get("sel").map_err(db_error)?;
         let upd: bool = row.try_get("upd").map_err(db_error)?;
         let expected = RUNTIME_SEQUENCES.contains(&name.as_str());
-        if usage != expected {
+        let violates = match exactness {
+            Exactness::Exact => usage != expected,
+            Exactness::Subset => usage && !expected,
+        };
+        if violates {
             return Err(identity(format!(
-                "role {who} {} USAGE on sequence public.{name}; the runtime identity has USAGE \
+                "role {who} {} USAGE on sequence public.{name}{via}; the runtime identity has USAGE \
                  on exactly {RUNTIME_SEQUENCES:?}; run `ledger-admin migrate --runtime-role {who}` \
                  with the owner identity (ADR-0016)",
                 if usage { "holds" } else { "lacks" }
@@ -1191,17 +1296,19 @@ async fn verify_sequence_privileges(pool: &PgPool, who: &str) -> Result<(), Ledg
         }
         if sel || upd {
             return Err(identity(format!(
-                "role {who} holds SELECT/UPDATE on sequence public.{name}; only USAGE is granted \
+                "role {who} holds SELECT/UPDATE on sequence public.{name}{via}; only USAGE is granted \
                  to the runtime identity (ADR-0016)"
             )));
         }
         seen.push(name);
     }
-    for expected in RUNTIME_SEQUENCES {
-        if !seen.iter().any(|s| s == expected) {
-            return Err(incompatible(format!(
-                "sequence public.{expected} is missing; refusing to serve"
-            )));
+    if exactness == Exactness::Exact {
+        for expected in RUNTIME_SEQUENCES {
+            if !seen.iter().any(|s| s == expected) {
+                return Err(incompatible(format!(
+                    "sequence public.{expected} is missing; refusing to serve"
+                )));
+            }
         }
     }
     Ok(())

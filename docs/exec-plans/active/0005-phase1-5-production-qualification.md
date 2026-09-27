@@ -378,8 +378,13 @@ supply-chain, upgrade, backup harnesses), `docs/` (operations runbook, security)
   no crash under either sanitizer; toolchain `nightly-2026-09-25 (rustc 1.100.0-nightly
   f7575a9da)`, target `x86_64-unknown-linux-gnu`, debug assertions on, 45 s per target.
   **The ASan start-up crash is therefore host-specific (local Debian/5.10 box); ASan
-  fuzzing is no longer pending.** A 900 s-per-target campaign for both sanitizers was
-  dispatched (run 36308371828); its result is recorded when it completes.
+  fuzzing is no longer pending.** Long campaign (`workflow_dispatch`, run 36308371828, 900 s
+  per target, both sanitizers, same toolchain/target): no crash across ≈1.56 G executions
+  without sanitizer (accept_body 285 M, commit_decode 269 M, patch_canonical 42 M,
+  prepare_body 118 M, quad_parse 148 M, request_identity 37 M, timestamp 664 M; cov
+  1049/666/1994/3592/1750/2667/203) and ≈0.69 G under AddressSanitizer (78 M / 121 M / 19 M
+  / 47 M / 70 M / 17 M / 340 M; cov 1623/1047/2873/5015/2345/3399/397) — 3.5 h of fuzzing in
+  total; artefacts `fuzz-none` / `fuzz-address` on the run.
 
 ### Slice 7 — upgrade from the previous release (§7, 2026-09-27): executed, PASS
 - `scripts/upgrade.sh [rev] [commits]`: builds the previous release (`f027fbf`, the merged
@@ -595,6 +600,29 @@ supply-chain, upgrade, backup harnesses), `docs/` (operations runbook, security)
   `ALTER FUNCTION refs_movement_is_audited() OWNER TO <runtime>` refused by `schema::verify`,
   start-up and readiness; healthy after restoring the owner.
 
+### Review round 5 (fresh Codex review of `d92a179`, 2026-09-27): three new P1s, fixed
+- **PostgreSQL 15 floor.** The membership walk used `pg_auth_members.inherit_option` /
+  `set_option`, which exist only from PostgreSQL 16, so on the documented floor every
+  start-up would fail. Fix: the query is version-adaptive (`server_version_num`); on 15
+  every membership is treated as inheritable and settable (which is what 15 does). Evidence: the CHECK fingerprint also strips the node-tree `location` offsets so a
+  re-added identical definition keeps its fingerprint on every version; the
+  `pg_least_privilege`, `pg_verify`, `pg_workflow`, `pg_immutable_store` and
+  `pg_graphs_migration` suites run against `postgres:15-bookworm` (15.19) in addition to
+  the compose PostgreSQL 17.2, with the tests using PostgreSQL-15 grant syntax where 16's
+  `WITH INHERIT FALSE, SET TRUE` is unavailable (results in the round-5 gate log).
+- **Privileges reachable only through `SET ROLE`.** A `NOINHERIT, SET TRUE` parent holding,
+  e.g., `UPDATE (status)` on `graphs` is invisible to the `current_user` checks yet one
+  `SET ROLE` away (and `status = importing` unlocks 0009's importing exemption). Fix: every
+  transitively assumable role is audited against the same table, column and sequence model
+  as the runtime — as a *subset* (no privilege beyond the model) — plus no EXECUTE on
+  `ledger_grant_runtime` for the runtime or any assumable role. Tests: parent with
+  `UPDATE (status)`, with EXECUTE on the grant function, with USAGE on a stray sequence —
+  each refused; a SELECT-only parent (within the model) passes.
+- **Conditional triggers.** `pg_trigger.tgqual` was not checked, so `WHEN (false)` kept
+  every structural property while the guard never fired. Fix: every guard trigger must be
+  unconditional (`tgqual IS NULL`). Test: `refs_movement_audited` recreated `WHEN (false)`
+  is refused by `schema::verify`, start-up and readiness.
+
 ### Admission-control decision (§15, 2026-09-27)
 Measured: under 1,000 concurrent clients on two replicas the 12-slot expensive semaphore per
 replica refuses the excess prepares immediately (`503 RESOURCE_LIMIT`), successful prepare p99
@@ -662,8 +690,9 @@ privilege, ADR-0016), 2 (supply chain, image), 3 (1,000 writers over two replica
 Open before the gate can pass:
 - **Live Entra ID issuer smoke test — PENDING** (no tenant credentials available to these
   runs; never marked passed). Release prerequisite.
-- The longer fuzz campaign (900 s per target, both sanitizers) dispatched on the hosted
-  runner: recorded when complete. ASan itself is no longer pending (hosted matrix passes).
+- Fuzzing: complete for this gate — hosted matrix (none/address, 45 s per target on every
+  pull request) and the 900 s-per-target campaign (run 36308371828) both clean; the weekly
+  schedule repeats the campaign.
 - Deployment decisions recorded in tech-debt that a production operator must take:
   restore semantics (PITR/WAL archiving, writer fencing, projection rebuild), checkpoint ADR
   before Phase 4, admission budget for `accept` and cancellation of abandoned statements.

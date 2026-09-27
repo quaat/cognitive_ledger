@@ -120,18 +120,20 @@ integrity rules against real PostgreSQL, including a non-superuser owner.
   a sequence grant), and the depth baselines (`docs/quality/evidence/`,
   `performance-baselines.md`). Start-up and readiness verify the database controls the
   privilege model depends on structurally: every guard trigger by table, function, timing,
-  event set, `UPDATE OF` columns and deferral flags; every guard function's body, language,
+  event set, `UPDATE OF` columns, deferral flags and absence of a `WHEN` condition; every guard function's body, language,
   return type, pinned `search_path` and schema-owner ownership against the embedded
   migrations (no `SECURITY DEFINER`); `session_replication_role = origin` with no SET/ALTER
   SYSTEM privilege on it; the runtime role's attributes and its transitive memberships (no
   settable or inherited path to a superuser, table or function owner, CREATE holder, a role
-  allowed to set `session_replication_role`, or a `pg_*` role); the content-address CHECK by presence,
+  allowed to set `session_replication_role`, a `pg_*` role, or any role whose own table,
+  column, sequence or grant-function privileges exceed the runtime model; PostgreSQL 15
+  and 16+ membership semantics both handled); the content-address CHECK by presence,
   validation, deparsed definition and a rolled-back semantic probe (start-up) and by
   expression fingerprint (readiness); the runtime role's exact per-column INSERT/UPDATE
   grants, absence of table-level writes, DELETE/TRUNCATE/TRIGGER/REFERENCES, and USAGE on
   exactly the audit sequences. ASan fuzzing passes on the hosted runner (`ci-fuzz` matrix `none`/`address`, pinned
   nightly, explicit target triple; the local host's ASan start-up crash is host-specific);
-  the long campaign result is recorded in the plan. The **live Entra ID issuer smoke test
+  a 900 s-per-target campaign under both sanitizers (≈2.2 G executions, no crash) is recorded in the plan and repeats weekly. The **live Entra ID issuer smoke test
   (`scripts/live-issuer-smoke.sh`; pending: no tenant credentials available to the runs;
   never mark it passed)** remain. **The service is not
   production-qualified until Plan 0005 passes in full.**

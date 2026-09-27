@@ -1217,6 +1217,21 @@ async fn assert_healthy(fx: &Fixture, why: &str) {
     rt.close().await;
 }
 
+/// A membership the runtime can `SET ROLE` into without inheriting it: PostgreSQL 16+
+/// syntax, or a plain GRANT on 15 (where every membership is settable).
+async fn grant_settable(fx: &Fixture, parent: &str) {
+    let version: i32 = sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+        .fetch_one(&fx.owner)
+        .await
+        .unwrap();
+    let sql = if version >= 160_000 {
+        format!("GRANT {parent} TO {} WITH INHERIT FALSE, SET TRUE", fx.role)
+    } else {
+        format!("GRANT {parent} TO {}", fx.role)
+    };
+    owner_exec(fx, &sql).await;
+}
+
 async fn owner_exec(fx: &Fixture, sql: &str) {
     sqlx::query(sql)
         .execute(&fx.owner)
@@ -1330,7 +1345,7 @@ async fn weakened_integrity_triggers_are_refused_at_startup_and_readiness() {
     )
     .await;
     assert_healthy(&fx, "all guards restored").await;
-    assert!(running.ready().await.is_ok());
+    running.ready().await.expect("readiness after restore");
     fx.teardown().await;
 }
 
@@ -1412,7 +1427,7 @@ async fn weakened_content_address_check_is_refused_at_startup_and_readiness() {
     // Healthy again (validated on add, since the table is clean).
     owner_exec(&fx, REAL).await;
     assert_healthy(&fx, "CHECK restored").await;
-    assert!(running.ready().await.is_ok());
+    running.ready().await.expect("readiness after restore");
     // The probe leaves nothing behind.
     let n: i64 = sqlx::query_scalar("SELECT count(*) FROM immutable_objects")
         .fetch_one(&fx.owner)
@@ -1617,7 +1632,7 @@ async fn replaced_guard_function_bodies_are_refused_at_startup_and_readiness() {
         wo.language, wo.body
     )).await;
     assert_healthy(&fx, "write-once guard restored").await;
-    assert!(running.ready().await.is_ok());
+    running.ready().await.expect("readiness after restore");
     fx.teardown().await;
 }
 
@@ -1630,14 +1645,14 @@ async fn settable_or_inherited_memberships_in_privileged_roles_are_refused() {
     let role = fx.role.clone();
     // A non-inheriting but settable membership in the (superuser) owner: `SET ROLE` would
     // hand the runtime credentials owner powers while every direct grant still looks exact.
-    owner_exec(
-        &fx,
-        &format!("GRANT ledger TO {role} WITH INHERIT FALSE, SET TRUE"),
-    )
-    .await;
+    grant_settable(&fx, "ledger").await;
     let m = assert_refused_by_identity(&fx, "settable owner membership").await;
+    // PostgreSQL 16+: the membership itself is reported (non-inheriting, settable). On 15 the
+    // membership inherits, so the earlier superuser/CREATE checks fire first; both refuse.
     assert!(
-        m.contains("is a member of ledger") && m.contains("set=true"),
+        m.contains("is a member of ledger")
+            || m.contains("CREATE on schema public")
+            || m.contains("superuser"),
         "{m}"
     );
     owner_exec(&fx, &format!("REVOKE ledger FROM {role}")).await;
@@ -1645,14 +1660,29 @@ async fn settable_or_inherited_memberships_in_privileged_roles_are_refused() {
     // Transitive: runtime → intermediate → owner.
     owner_exec(&fx, "DROP ROLE IF EXISTS ledger_member_mid").await;
     owner_exec(&fx, "CREATE ROLE ledger_member_mid").await;
-    owner_exec(
-        &fx,
-        "GRANT ledger TO ledger_member_mid WITH INHERIT FALSE, SET TRUE",
-    )
-    .await;
+    {
+        let version: i32 = sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+            .fetch_one(&fx.owner)
+            .await
+            .unwrap();
+        owner_exec(
+            &fx,
+            if version >= 160_000 {
+                "GRANT ledger TO ledger_member_mid WITH INHERIT FALSE, SET TRUE"
+            } else {
+                "GRANT ledger TO ledger_member_mid"
+            },
+        )
+        .await;
+    }
     owner_exec(&fx, &format!("GRANT ledger_member_mid TO {role}")).await;
     let m = assert_refused_by_identity(&fx, "transitive owner membership").await;
-    assert!(m.contains("is a member of ledger"), "{m}");
+    assert!(
+        m.contains("is a member of ledger")
+            || m.contains("CREATE on schema public")
+            || m.contains("superuser"),
+        "{m}"
+    );
     owner_exec(&fx, &format!("REVOKE ledger_member_mid FROM {role}")).await;
     owner_exec(&fx, "REVOKE ledger FROM ledger_member_mid").await;
     owner_exec(&fx, "DROP ROLE ledger_member_mid").await;
@@ -1699,16 +1729,10 @@ async fn parameter_grants_and_function_ownership_drift_are_refused() {
         "GRANT SET ON PARAMETER session_replication_role TO ledger_param_parent",
     )
     .await;
-    owner_exec(
-        &fx,
-        &format!("GRANT ledger_param_parent TO {role} WITH INHERIT FALSE, SET TRUE"),
-    )
-    .await;
+    grant_settable(&fx, "ledger_param_parent").await;
     let m = assert_refused_by_identity(&fx, "parameter grant via settable membership").await;
-    assert!(
-        m.contains("ledger_param_parent") && m.contains("session_replication_role"),
-        "{m}"
-    );
+    // 16+: reported through the membership; 15 inherits the grant, so the direct check fires.
+    assert!(m.contains("session_replication_role"), "{m}");
     owner_exec(&fx, &format!("REVOKE ledger_param_parent FROM {role}")).await;
     owner_exec(&fx, "DROP OWNED BY ledger_param_parent").await;
     owner_exec(&fx, "DROP ROLE ledger_param_parent").await;
@@ -1737,6 +1761,77 @@ async fn parameter_grants_and_function_ownership_drift_are_refused() {
     )
     .await;
     assert_healthy(&fx, "ownership restored").await;
-    assert!(running.ready().await.is_ok());
+    running.ready().await.expect("readiness after restore");
+    fx.teardown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn conditional_triggers_and_set_role_reachable_privileges_are_refused() {
+    let fx = fixture("ledger_when").await;
+    fx.migrate_and_grant().await;
+    let running = ledger_store::PostgresLedgerStore::connect(
+        &fx.runtime_db_url,
+        ledger_store::V1Binding::Reject,
+    )
+    .await
+    .unwrap();
+    // A WHEN clause keeps every structural property identical yet the guard never fires.
+    owner_exec(&fx, "DROP TRIGGER refs_movement_audited ON refs").await;
+    owner_exec(&fx, "CREATE CONSTRAINT TRIGGER refs_movement_audited AFTER INSERT OR UPDATE OF head, version ON refs \
+        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN (false) EXECUTE FUNCTION public.refs_movement_is_audited()").await;
+    let m = assert_refused_by_schema(&fx, &running, "WHEN (false) trigger").await;
+    assert!(m.contains("WHEN condition"), "{m}");
+    owner_exec(&fx, "DROP TRIGGER refs_movement_audited ON refs").await;
+    owner_exec(&fx, "CREATE CONSTRAINT TRIGGER refs_movement_audited AFTER INSERT OR UPDATE OF head, version ON refs \
+        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.refs_movement_is_audited()").await;
+    assert_healthy(&fx, "trigger restored").await;
+    // Privileges one SET ROLE away: a NOINHERIT parent holding UPDATE (status) on graphs (the
+    // 0009 importing exemption) or USAGE on a stray sequence or EXECUTE on the grant function.
+    let role = fx.role.clone();
+    owner_exec(&fx, "DROP ROLE IF EXISTS ledger_when_parent").await;
+    owner_exec(&fx, "CREATE ROLE ledger_when_parent").await;
+    owner_exec(&fx, "GRANT SELECT ON graphs TO ledger_when_parent").await;
+    owner_exec(&fx, "GRANT UPDATE (status) ON graphs TO ledger_when_parent").await;
+    grant_settable(&fx, "ledger_when_parent").await;
+    let m = assert_refused_by_identity(&fx, "SET-ROLE-reachable UPDATE (status)").await;
+    assert!(
+        m.contains("holds UPDATE on public.graphs.status") && m.contains("ledger_when_parent"),
+        "{m}"
+    );
+    owner_exec(
+        &fx,
+        "REVOKE UPDATE (status) ON graphs FROM ledger_when_parent",
+    )
+    .await;
+    // SELECT-only parent is within the model (a subset) and passes.
+    assert_healthy(&fx, "parent within the model").await;
+    owner_exec(
+        &fx,
+        "GRANT EXECUTE ON FUNCTION public.ledger_grant_runtime(text) TO ledger_when_parent",
+    )
+    .await;
+    let m =
+        assert_refused_by_identity(&fx, "SET-ROLE-reachable EXECUTE on the grant function").await;
+    assert!(m.contains("ledger_grant_runtime"), "{m}");
+    owner_exec(
+        &fx,
+        "REVOKE EXECUTE ON FUNCTION public.ledger_grant_runtime(text) FROM ledger_when_parent",
+    )
+    .await;
+    owner_exec(&fx, "CREATE SEQUENCE ledger_when_seq").await;
+    owner_exec(
+        &fx,
+        "GRANT USAGE ON SEQUENCE ledger_when_seq TO ledger_when_parent",
+    )
+    .await;
+    let m = assert_refused_by_identity(&fx, "SET-ROLE-reachable sequence USAGE").await;
+    assert!(m.contains("ledger_when_seq"), "{m}");
+    owner_exec(&fx, "DROP SEQUENCE ledger_when_seq").await;
+    owner_exec(&fx, &format!("REVOKE ledger_when_parent FROM {role}")).await;
+    owner_exec(&fx, "DROP OWNED BY ledger_when_parent").await;
+    owner_exec(&fx, "DROP ROLE ledger_when_parent").await;
+    assert_healthy(&fx, "membership removed").await;
+    running.ready().await.expect("readiness after restore");
     fx.teardown().await;
 }
