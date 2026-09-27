@@ -1,8 +1,10 @@
 # Projection state, stream leases and the projector database identity
 
 ## Status
-Accepted (2026-09-27, Plan 0007 / Phase 3). Affects persistent schema (migration 0011) and
-the database identity model (ADR-0016 amendment).
+Accepted (2026-09-27, Plan 0007 / Phase 3; amended before first release on 2026-09-28 by the
+Phase-3 review round: partial uniqueness, owner-only disabled transitions, enable rules,
+reconciliation claims, lease sizing). Affects persistent schema (migration 0011) and the
+database identity model (amends ADR-0016, see "Projector database identity").
 
 ## Context
 `projection_outbox` (migration 0006) already records, in the acceptance transaction, one row
@@ -22,6 +24,7 @@ enough to avoid wasted work.
 graph_id, branch, target_id                 PRIMARY KEY
 tenant_id                                   (graph_id, tenant_id) → graphs
 cognitive_graph                             UNIQUE (target_id, cognitive_graph)
+                                            WHERE status <> 'disabled'  (partial index)
 status             'active' | 'blocked' | 'rebuild_required' | 'disabled'
 projected_commit, projected_ref_version    both NULL or both set;
                                            (graph_id, branch, projected_ref_version, projected_commit)
@@ -33,10 +36,22 @@ created_at
 ```
 - Rows are created and disabled only by the operator (`ledger-admin projection enable |
   disable`, owner identity): the cognitive graph IRI is derived from the graph's
-  `knowledge_base_id` by the ADR-0020 mapping at enable time; a graph without one is refused.
+  `knowledge_base_id` by the ADR-0020 mapping at enable time. Enable refuses: a graph without
+  a KB id; a graph that is not `active` (bootstrap, importing, archived); any ref other than
+  `main` (ADR-0020 v1); a ref whose head was not reached by an accepted change (a bootstrap or
+  imported head has no outbox event, so nothing would ever project it — accept a change
+  first); and a cognitive graph already used by another non-disabled stream of the target
+  (checked in the enabling transaction, and by the partial unique index against races,
+  SQLSTATE 23505). Re-enabling a disabled row reactivates it.
+- The uniqueness is **partial** (`status <> 'disabled'`): disabling a stream frees its
+  cognitive graph, so the KB's feed can be switched to another ledger graph (disable + enable
+  + rebuild; ADR-0020 `TARGET_CONFLICT`) without deleting rows, which the guard forbids.
 - A guard trigger keeps the identity columns (`graph_id`, `branch`, `target_id`, `tenant_id`,
-  `cognitive_graph`, `created_at`) immutable, refuses DELETE, and never lets
-  `projected_ref_version` decrease or `lease_epoch` decrease.
+  `cognitive_graph`, `created_at`) immutable, refuses DELETE, never lets
+  `projected_ref_version`, `lease_epoch` or `rebuilds` decrease, and allows a status change
+  into or out of `'disabled'` only when `current_user` owns the table (SQLSTATE 42501
+  otherwise): the projector may move a stream among `active`, `blocked` and
+  `rebuild_required`, but can never enable or disable one.
 - A second guard trigger on `projection_outbox` makes delivery monotonic: `delivered_at` once
   set never changes, `attempts` never decreases (the 0006 trigger already freezes the
   identity columns and refuses DELETE).
@@ -65,14 +80,32 @@ rows pending and are reported as unconfigured.
 4. **Fail**: under the same fencing, record `last_error_*`, increment
    `consecutive_failures`, set `next_attempt_at` by bounded exponential backoff with jitter
    (retryable), or set `status = 'blocked'` (permanent); release the lease.
-A crashed worker's lease simply expires. The lease TTL must exceed the projector's
-reconstruction plus target timeout; if it does not, correctness still holds (ADR-0020
-conditional write), only work is repeated.
+5. **Reconcile claim**: the same claim for an `active`, unleased, **idle** stream (no
+   eligible event) whose `last_success_at` is older than the reconcile interval; the work
+   item is the recorded version, and a consistent target is acknowledged without a write
+   (refreshing `last_success_at`). This is how a target that lost its data is repaired
+   without a new acceptance (ADR-0020 "Reconciliation").
+6. **Operator claim** (`rebuild`): a named stream, ignoring backoff and `blocked` /
+   `rebuild_required` status, never a disabled or live-leased one.
 
-### Projector database identity (ADR-0016 amendment)
+A crashed worker's lease simply expires. Fencing is by `(lease_owner, lease_epoch)`: a
+re-claim by the *same* owner name after expiry gets a new epoch, so the stale attempt is
+still fenced. A step checks its elapsed time before the target write and gives up (releases)
+past 75 % of the TTL; the configuration refuses `LEDGER_PROJECTOR_LEASE_SECONDS < 4 ×
+LEDGER_PROJECTOR_TARGET_TIMEOUT_SECONDS + 30` (a step makes up to four target requests). If a
+write still outlives its lease, correctness holds (ADR-0020 guarded writes: the late write is
+a no-op against anything newer), only work is repeated.
+
+### Projector database identity (amends ADR-0016)
+ADR-0016 defined two database identities (owner, runtime). Phase 3 adds a third; the
+ADR-0016 rules (no ownership, no membership in privileged roles, exact and exhaustive
+privilege verification at start-up and readiness, owner-only grant functions) apply to it
+unchanged.
 A distinct least-privilege role `ledger_projector`, granted by the owner through
 `ledger_grant_projector(role)` (`ledger-admin migrate --projector-role`):
-- SELECT on the ledger tables (reconstruction, graphs, refs, events, outbox, state);
+- SELECT on `graphs`, `refs`, `immutable_objects`, `commit_index`, `commit_parents`,
+  `ref_events`, `projection_outbox`, `projection_state` and `_sqlx_migrations` (schema level
+  check) — nothing else: not `idempotency`, `proposals`, `decisions`, validation tables;
 - UPDATE on exactly `projection_outbox (delivered_at, attempts)` and on the progress, lease,
   backoff and error columns of `projection_state`;
 - no INSERT, DELETE, TRUNCATE, REFERENCES, TRIGGER; no sequence privileges; no membership in
@@ -96,7 +129,8 @@ outbox delivery columns: the HTTP server can never mark projection progress.
 
 ## Consequences
 - Projector replicas can run in parallel; they partition work by stream.
-- A graph's projection is observable end to end (`ledger-projector status`, metrics):
-  ledger head vs projected version, lag, oldest pending age, last error.
+- A graph's projection is observable end to end (`ledger-admin projection status [--json]`,
+  projector metrics): ledger head vs projected version, lag, pending events, oldest pending
+  age, last success, last error, rebuilds, lease.
 - The upgrade 0010 → 0011 needs the owner to run `migrate --projector-role` once; existing
   outbox backlog becomes consumable as soon as a stream is enabled.

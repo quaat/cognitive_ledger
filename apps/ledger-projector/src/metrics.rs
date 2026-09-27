@@ -21,6 +21,7 @@ pub struct Metrics {
     failures_by_code: [AtomicU64; ProjectionErrorCode::ALL.len()],
     rebuilds: AtomicU64,
     lease_lost: AtomicU64,
+    superseded: AtomicU64,
     crashed: AtomicU64,
     duration_count: AtomicU64,
     duration_micros: AtomicU64,
@@ -52,6 +53,12 @@ impl Metrics {
             }
             StepOutcome::Crashed(_) => {
                 self.crashed.fetch_add(1, Relaxed);
+            }
+            StepOutcome::Unrecorded { .. } => {
+                self.failures_retryable.fetch_add(1, Relaxed);
+            }
+            StepOutcome::Superseded => {
+                self.superseded.fetch_add(1, Relaxed);
             }
             _ => {}
         }
@@ -120,6 +127,12 @@ impl Metrics {
             "projection_lease_lost_total",
             "Acknowledgements refused because the lease was lost.",
             self.lease_lost.load(Relaxed),
+        );
+        counter(
+            &mut out,
+            "projection_superseded_total",
+            "Writes that found a newer projection already in the target.",
+            self.superseded.load(Relaxed),
         );
         let _ = writeln!(
             out,

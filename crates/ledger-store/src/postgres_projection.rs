@@ -14,6 +14,8 @@ use sqlx::{PgPool, Row};
 use std::{collections::BTreeSet, str::FromStr, time::Duration};
 
 pub const MAX_TARGET_ID_BYTES: usize = 128;
+/// The only ref projection v1 projects (ADR-0020).
+pub const PROJECTED_REF: &str = "main";
 pub const MAX_LEASE_OWNER_BYTES: usize = 256;
 
 /// One projection stream's identity.
@@ -46,6 +48,17 @@ pub struct WorkItem {
     pub commit: CommitId,
     pub ref_version: i64,
     pub head_version: i64,
+}
+
+/// Which event a claimed stream projects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkMode {
+    /// The latest accepted event beyond the recorded progress (normal processing).
+    Pending,
+    /// The ref's accepted head event (operator rebuild).
+    Head,
+    /// The recorded projection itself (reconciliation of an idle stream).
+    Recorded,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -166,6 +179,14 @@ impl ProjectionRepository {
         derive_cognitive_graph: impl FnOnce(&str) -> Result<String, String>,
     ) -> Result<String, LedgerError> {
         validate_key(key)?;
+        // v1 projects the accepted cognitive ref only; the cognitive graph IRI carries no ref
+        // name, so other refs need their own identity rules first (ADR-0020, Phase 4).
+        if key.branch != PROJECTED_REF {
+            return Err(invalid(
+                "branch",
+                format!("projection v1 projects the `{PROJECTED_REF}` ref only (ADR-0020)"),
+            ));
+        }
         let mut tx = self.pool.begin().await.map_err(db_error)?;
         let graph = sqlx::query(
             "SELECT tenant_id, knowledge_base_id, status FROM graphs WHERE graph_id = $1 FOR SHARE",
@@ -177,6 +198,33 @@ impl ProjectionRepository {
         .ok_or_else(|| invalid("graph_id", "no such graph"))?;
         let tenant: String = graph.try_get("tenant_id").map_err(db_error)?;
         let kb: Option<String> = graph.try_get("knowledge_base_id").map_err(db_error)?;
+        let status: String = graph.try_get("status").map_err(db_error)?;
+        if status != "active" {
+            return Err(invalid(
+                "graph_id",
+                format!("the graph is {status}; only active graphs are projected"),
+            ));
+        }
+        // A head moved without an accepted ref event (bootstrap/import) has no outbox event
+        // and cannot be recorded as projected (ADR-0021): accept a change first.
+        let unaccounted: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM refs r WHERE r.graph_id = $1 AND r.branch = $2 \
+             AND NOT EXISTS (SELECT 1 FROM projection_outbox o WHERE o.graph_id = r.graph_id \
+                             AND o.branch = r.branch AND o.ref_version = r.version \
+                             AND o.commit_id = r.head))",
+        )
+        .bind(key.graph_id.as_str())
+        .bind(&key.branch)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        if unaccounted {
+            return Err(invalid(
+                "branch",
+                "the ref head was not reached by an accepted change (bootstrap or import), so it \
+                 has no projection event; accept a change on it first",
+            ));
+        }
         let kb = kb.ok_or_else(|| {
             invalid(
                 "knowledge_base_id",
@@ -188,7 +236,7 @@ impl ProjectionRepository {
             derive_cognitive_graph(&kb).map_err(|reason| invalid("knowledge_base_id", reason))?;
         if let Some(existing) = sqlx::query(
             "SELECT graph_id, branch FROM projection_state WHERE target_id = $1 \
-             AND cognitive_graph = $2",
+             AND cognitive_graph = $2 AND status <> 'disabled'",
         )
         .bind(&key.target_id)
         .bind(&cognitive_graph)
@@ -218,7 +266,18 @@ impl ProjectionRepository {
         .bind(&cognitive_graph)
         .execute(&mut *tx)
         .await
-        .map_err(db_error)?;
+        .map_err(|e| match &e {
+            sqlx::Error::Database(d)
+                if d.code().as_deref() == Some("23505")
+                    && d.constraint() == Some("projection_state_graph_unique") =>
+            {
+                invalid(
+                    "cognitive_graph",
+                    "another stream of this target already projects into this cognitive graph",
+                )
+            }
+            _ => db_error(e),
+        })?;
         tx.commit().await.map_err(db_error)?;
         Ok(cognitive_graph)
     }
@@ -306,37 +365,76 @@ impl ProjectionRepository {
         row.map(|r| claim_from_row(&r, owner)).transpose()
     }
 
-    /// The latest accepted outbox event beyond the claim's recorded progress (or, when
-    /// `at_head` is set, the ref's accepted head event for a rebuild) and the head version.
-    /// `None` when there is nothing to do.
+    /// Lease an **idle** active stream (no pending events, projection recorded) whose last
+    /// successful check is older than `idle`, to re-observe its target (reconciliation:
+    /// detects a target that lost or diverged from its data without a new event).
+    pub async fn claim_reconcile(
+        &self,
+        target_id: &str,
+        owner: &str,
+        ttl: Duration,
+        idle: Duration,
+    ) -> Result<Option<Claim>, LedgerError> {
+        validate_owner(owner)?;
+        let row = sqlx::query(
+            "WITH candidate AS ( \
+                 SELECT s.graph_id, s.branch, s.target_id FROM projection_state s \
+                 WHERE s.target_id = $1 AND s.status = 'active' AND s.projected_ref_version IS NOT NULL \
+                   AND (s.lease_until IS NULL OR s.lease_until < now()) \
+                   AND (s.last_success_at IS NULL OR s.last_success_at < now() - make_interval(secs => $4)) \
+                   AND NOT EXISTS (SELECT 1 FROM projection_outbox o WHERE o.graph_id = s.graph_id \
+                                   AND o.branch = s.branch AND o.ref_version > s.projected_ref_version) \
+                 ORDER BY s.last_success_at NULLS FIRST, s.graph_id, s.branch \
+                 LIMIT 1 FOR UPDATE OF s SKIP LOCKED) \
+             UPDATE projection_state s SET lease_owner = $2, \
+                 lease_until = now() + make_interval(secs => $3), lease_epoch = s.lease_epoch + 1 \
+             FROM candidate c \
+             WHERE s.graph_id = c.graph_id AND s.branch = c.branch AND s.target_id = c.target_id \
+             RETURNING s.graph_id, s.branch, s.target_id, s.tenant_id, s.cognitive_graph, \
+                       s.projected_commit, s.projected_ref_version, s.lease_epoch, s.consecutive_failures",
+        )
+        .bind(target_id)
+        .bind(owner)
+        .bind(ttl.as_secs_f64())
+        .bind(idle.as_secs_f64())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_error)?;
+        row.map(|r| claim_from_row(&r, owner)).transpose()
+    }
+
+    /// The event a claimed stream projects under `mode`, with the ref's accepted head version
+    /// read in the same statement (so `head_version >= ref_version` always holds). `None`
+    /// when there is nothing to do. `Head` refuses a head that no accepted outbox event
+    /// reached (bootstrap/import heads, ADR-0021).
     pub async fn work_for(
         &self,
         claim: &Claim,
-        at_head: bool,
+        mode: WorkMode,
     ) -> Result<Option<WorkItem>, LedgerError> {
-        let head = sqlx::query("SELECT version FROM refs WHERE graph_id = $1 AND branch = $2")
-            .bind(claim.key.graph_id.as_str())
-            .bind(&claim.key.branch)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(db_error)?;
-        let Some(head) = head else {
-            return Ok(None);
-        };
-        let head_version: i64 = head.try_get("version").map_err(db_error)?;
-        let floor = if at_head {
-            0
-        } else {
-            claim.projected.as_ref().map_or(0, |(_, v)| *v)
+        let recorded = claim.projected.as_ref().map(|(_, v)| *v);
+        let (floor, exact) = match mode {
+            WorkMode::Pending => (recorded.unwrap_or(0), None),
+            WorkMode::Head => (0, None),
+            WorkMode::Recorded => match recorded {
+                Some(v) => (0, Some(v)),
+                None => return Ok(None),
+            },
         };
         let row = sqlx::query(
-            "SELECT outbox_id, commit_id, ref_version FROM projection_outbox \
-             WHERE graph_id = $1 AND branch = $2 AND ref_version > $3 \
-             ORDER BY ref_version DESC LIMIT 1",
+            "SELECT r.version AS head_version, r.head AS head_commit, o.outbox_id, o.commit_id, \
+                    o.ref_version \
+             FROM refs r \
+             JOIN LATERAL (SELECT outbox_id, commit_id, ref_version FROM projection_outbox \
+                           WHERE graph_id = r.graph_id AND branch = r.branch AND ref_version > $3 \
+                             AND ($4::bigint IS NULL OR ref_version = $4) \
+                           ORDER BY ref_version DESC LIMIT 1) o ON true \
+             WHERE r.graph_id = $1 AND r.branch = $2",
         )
         .bind(claim.key.graph_id.as_str())
         .bind(&claim.key.branch)
         .bind(floor)
+        .bind(exact)
         .fetch_optional(&self.pool)
         .await
         .map_err(db_error)?;
@@ -344,11 +442,20 @@ impl ProjectionRepository {
             return Ok(None);
         };
         let commit: String = row.try_get("commit_id").map_err(db_error)?;
+        let ref_version: i64 = row.try_get("ref_version").map_err(db_error)?;
+        let head_version: i64 = row.try_get("head_version").map_err(db_error)?;
+        let head_commit: String = row.try_get("head_commit").map_err(db_error)?;
+        if mode == WorkMode::Head && (ref_version != head_version || commit != head_commit) {
+            return Err(LedgerError::LineageMismatch(
+                "the ref head was not reached by an accepted change; it has no projection event"
+                    .into(),
+            ));
+        }
         Ok(Some(WorkItem {
             outbox_id: row.try_get("outbox_id").map_err(db_error)?,
             commit: CommitId::from_str(&commit)?,
-            ref_version: row.try_get("ref_version").map_err(db_error)?,
-            head_version,
+            ref_version,
+            head_version: head_version.max(ref_version),
         }))
     }
 

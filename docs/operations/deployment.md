@@ -152,10 +152,68 @@ it after every end-to-end scenario.
   original `Idempotency-Key` and receive the durable outcome (`replayed: true`) or a fresh
   execution, never a duplicate. Evidence: `docs/quality/evidence/fault-injection-*.md`.
 
+## Accepted-state projection (Phase 3, ADR-0020/0021)
+Readers' contract: [reading the projection](../design/sculpin-projection.md).
+- **Target**: an Apache Jena Fuseki (or other SPARQL 1.1 Protocol server) dataset that is
+  transactional with abort — TDB2 or the transactional in-memory dataset — exposing named
+  `query` and `update` endpoints only (`deploy/fuseki/ledger-projection.ttl`), **without** a
+  union default graph, updates protected by credentials over https. Give the projector a
+  dedicated update account and make it the only writer of the dataset's cognitive and
+  marker graphs (the marker is trusted as far as the target is). The projector proves the
+  dataset rolls a failed update back (probe at start-up and every
+  `LEDGER_PROJECTOR_PROBE_SECONDS`, default 300; claiming pauses and `/ready` fails while it
+  fails) and binds the dataset to its `LEDGER_PROJECTION_TARGET_ID` on first use: a dataset
+  bound to another target id refuses the projector (`TARGET_CONFLICT`). One dataset, one
+  target id.
+- **Identity**: create the role, then `ledger-admin migrate --runtime-role <runtime>
+  --projector-role <projector>` (distinct roles). The projector connects with it and refuses
+  to start unless the role holds exactly the projector model (ADR-0021 / ADR-0016 amendment).
+- **Enable a stream** (owner): `ledger-admin projection enable --graph <id> --target
+  <target_id>`. Refused unless the graph is `active`, has a `knowledge_base_id`, the ref is
+  `main` (v1) and its head was reached by an accepted change (a bootstrap/imported head has
+  no projection event: accept a change first). The cognitive graph is
+  `urn:sculpin:kb:<pct(kb_id)>:cognitive`; no two non-disabled streams of a target may share
+  one. Existing outbox backlog is consumed as soon as the stream is enabled. `projection
+  disable` (owner only — the projector role cannot enable or disable) frees the cognitive
+  graph; to switch a KB's feed graph: disable the old stream, enable the new one, then
+  `ledger-projector rebuild` it (the target holds the old feed's marker until then:
+  `TARGET_CONFLICT`).
+- **Run** `ledger-projector` (one or more replicas per target; they partition work by
+  stream lease) with `LEDGER_PROJECTOR_DATABASE_URL`, `LEDGER_PROJECTION_TARGET_ID`,
+  `LEDGER_PROJECTION_QUERY_URL`, `LEDGER_PROJECTION_UPDATE_URL` (https) and credentials from
+  regular files (`LEDGER_PROJECTION_USERNAME` + `LEDGER_PROJECTION_PASSWORD_FILE`, or
+  `LEDGER_PROJECTION_TOKEN_FILE`). `LEDGER_PROJECTOR_LEASE_SECONDS` (default 180) must be at
+  least 4 × `LEDGER_PROJECTOR_TARGET_TIMEOUT_SECONDS` + 30 (refused otherwise).
+  `LEDGER_PROJECTOR_RECONCILE_SECONDS` (default 300) is how often an idle stream is
+  re-observed and repaired if the target lost or changed it. `/health`, `/ready` (schema,
+  identity, probe) and `/metrics` bind `LEDGER_PROJECTOR_ADDR` (default loopback).
+- **Observe**: `ledger-admin projection status [--target <id>] [--json]` (head vs projected
+  version, lag, pending, oldest pending age, last success, last error, rebuilds, lease) and
+  metrics `projection_lag_versions`, `projection_pending`,
+  `projection_oldest_pending_seconds`, `projection_failures_total{class}`,
+  `projection_failures_by_code_total{code}`, `projection_rebuilds_total`,
+  `projection_lease_lost_total`, `projection_superseded_total`,
+  `projection_duration_seconds`. Alert on lag growth and on any `blocked` /
+  `rebuild_required` stream.
+- **Failures**: retryable target or database errors back off (1 s doubling, 5 min cap,
+  jitter); a permanent one (auth, protocol, named-graph state, size) sets the stream
+  `blocked`; a marker ahead of the ledger (e.g. after restoring an older ledger backup) or a
+  marker of another stream (`TARGET_CONFLICT`) sets `rebuild_required`. Acceptance is never
+  affected. After fixing the cause: `ledger-projector rebuild --graph <id>` (replaces the
+  cognitive graph with the accepted state at the ref head — guarded so it can never
+  overwrite a newer projection — verifies marker and containment, reactivates the stream);
+  `ledger-projector verify --graph <id>` compares target and ledger content without writing
+  (the only check that also finds a count-preserving out-of-band edit). A Fuseki that lost
+  its data is repaired by reconciliation or the same rebuild (the ledger is authoritative;
+  nothing is ever read back into it).
+
 ## Development-only switches (never in production)
 `LEDGER_AUTH_MODE=dev-hs256`, `LEDGER_ALLOW_INSECURE_NON_LOOPBACK=allow-insecure-non-loopback-development-only`,
 `LEDGER_UNVALIDATED_ACCEPTANCE=allow-unvalidated-acceptance-development-only`, the compose
-credentials, `deploy/postgres-init/` (development runtime role with a baked password).
+credentials, `deploy/postgres-init/` (development runtime and projector roles with baked
+passwords), `deploy/fuseki/development-admin-password`,
+`LEDGER_PROJECTOR_DEVELOPMENT=allow-insecure-development-only` (plain http to a loopback
+target, no target credentials).
 The server refuses the unvalidated-acceptance switch together with production auth.
 
 ## Required gates before a release

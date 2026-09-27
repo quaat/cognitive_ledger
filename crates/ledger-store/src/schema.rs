@@ -52,8 +52,6 @@ fn db_migrate(e: sqlx::migrate::MigrateError) -> LedgerError {
     }
 }
 
-/// Grant the runtime role its privileges through the versioned `ledger_grant_runtime`
-/// function installed by migration 0008 (owner connection; idempotent).
 /// `ledger_grant_projector` (0011, ADR-0021) for `role`, then the same PUBLIC-EXECUTE revoke
 /// as [`grant_runtime_role`].
 pub async fn grant_projector_role(conn: &mut PgConnection, role: &str) -> Result<(), LedgerError> {
@@ -69,6 +67,8 @@ pub async fn grant_projector_role(conn: &mut PgConnection, role: &str) -> Result
     Ok(())
 }
 
+/// Grant the runtime role its privileges through the versioned `ledger_grant_runtime`
+/// function installed by migration 0008 (owner connection; idempotent).
 pub async fn grant_runtime_role(conn: &mut PgConnection, role: &str) -> Result<(), LedgerError> {
     sqlx::query("SELECT ledger_grant_runtime($1)")
         .bind(role)
@@ -1257,7 +1257,6 @@ const EXPECTED_CONSTRAINTS: &[ExpectedConstraint] = &[
         &["graph_id", "branch", "new_version", "new_head"],
     ),
     pk("projection_state", &["graph_id", "branch", "target_id"]),
-    uq("projection_state", &["target_id", "cognitive_graph"]),
     fk(
         "projection_state",
         &["graph_id", "tenant_id"],
@@ -1298,6 +1297,13 @@ const EXPECTED_UNIQUE_INDEXES: &[(&str, &str, &[&str], &str)] = &[
         "decisions",
         &["ref_event_id"],
         "(ref_event_idISNOTNULL)",
+    ),
+    // 0011: one live stream per (target, cognitive graph) — tenant isolation (ADR-0020).
+    (
+        "projection_state_graph_unique",
+        "projection_state",
+        &["target_id", "cognitive_graph"],
+        "(status<>'disabled')",
     ),
 ];
 
@@ -2400,7 +2406,7 @@ const PROJECTOR_TABLE_MODEL: &[TablePrivileges] = &[
 ];
 
 /// A least-privilege database identity the verifier checks exactly (ADR-0016, ADR-0021).
-pub struct IdentityModel {
+pub(crate) struct IdentityModel {
     /// "runtime" or "projector" (messages).
     kind: &'static str,
     /// The `ledger-admin migrate` flag that (re)grants it.
@@ -2412,7 +2418,7 @@ pub struct IdentityModel {
     exhaustive: bool,
 }
 
-pub const RUNTIME_IDENTITY: IdentityModel = IdentityModel {
+const RUNTIME_IDENTITY: IdentityModel = IdentityModel {
     kind: "runtime",
     flag: "--runtime-role",
     adr: "ADR-0016",
@@ -2421,7 +2427,7 @@ pub const RUNTIME_IDENTITY: IdentityModel = IdentityModel {
     exhaustive: false,
 };
 
-pub const PROJECTOR_IDENTITY: IdentityModel = IdentityModel {
+const PROJECTOR_IDENTITY: IdentityModel = IdentityModel {
     kind: "projector",
     flag: "--projector-role",
     adr: "ADR-0021",
@@ -2717,6 +2723,8 @@ async fn verify_no_unlisted_table_privileges(
         "SELECT c.relname::text AS name FROM pg_class c \
          WHERE c.relnamespace = 'public'::regnamespace AND c.relkind IN ('r', 'p', 'v', 'm') \
            AND (has_table_privilege($1, c.oid, 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER') \
+                OR CASE WHEN current_setting('server_version_num')::int >= 170000 \
+                        THEN has_table_privilege($1, c.oid, 'MAINTAIN') ELSE false END \
                 OR has_any_column_privilege($1, c.oid, 'SELECT, INSERT, UPDATE, REFERENCES'))",
     )
     .bind(subject)
@@ -2763,7 +2771,9 @@ async fn verify_table_privileges_for(
                 has_table_privilege($2, $1, 'DELETE') AS del, \
                 has_table_privilege($2, $1, 'TRUNCATE') AS trunc, \
                 has_table_privilege($2, $1, 'TRIGGER') AS trig, \
-                has_table_privilege($2, $1, 'REFERENCES') AS refs",
+                has_table_privilege($2, $1, 'REFERENCES') AS refs, \
+                CASE WHEN current_setting('server_version_num')::int >= 170000 \
+                     THEN has_table_privilege($2, $1, 'MAINTAIN') ELSE false END AS maint",
     )
     .bind(&qualified)
     .bind(subject)
@@ -2794,6 +2804,7 @@ async fn verify_table_privileges_for(
         ("trunc", "TRUNCATE"),
         ("trig", "TRIGGER"),
         ("refs", "REFERENCES"),
+        ("maint", "MAINTAIN"),
     ] {
         if table.try_get::<bool, _>(column).map_err(db_error)? {
             return Err(identity(format!(

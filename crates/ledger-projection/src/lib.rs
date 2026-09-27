@@ -14,8 +14,10 @@ mod target;
 
 pub use error::{ErrorClass, ProjectionError, ProjectionErrorCode};
 pub use marker::{MarkerRead, MarkerTerm, ProjectionMarker, marker_predicates};
-pub use plan::{LedgerView, Plan, RebuildReason, plan};
-pub use target::{CognitiveGraph, MARKER_GRAPH, PROBE_GRAPH, pct_decode, pct_encode};
+pub use plan::{LedgerView, Plan, RebuildReason, plan, write_mode};
+pub use target::{
+    CognitiveGraph, MARKER_GRAPH, PROBE_GRAPH, TARGET_SUBJECT, pct_decode, pct_encode,
+};
 
 use ledger_core::ContentId;
 use ledger_rdf::Quad;
@@ -82,16 +84,23 @@ impl ProjectedState {
 pub struct Observation {
     pub marker: MarkerRead,
     pub triple_count: u64,
+    /// The highest `lp:refVersion` integer found on the marker subject, even when the
+    /// marker is malformed (the ceiling of a guarded replacement, ADR-0020).
+    pub max_ref_version: Option<i64>,
 }
 
-/// How a write treats the existing target content (ADR-0020).
+/// How a write treats the existing target content (ADR-0020). Both modes are guarded in
+/// the target transaction, so a stale worker can never move the marker backwards past
+/// something newer than it observed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WriteMode {
-    /// Applies only if the target's marker is absent or names an older ref version: a
-    /// duplicate or stale write is a no-op.
+    /// Applies only while the target's marker is absent or names only older ref versions:
+    /// a duplicate or stale write is a no-op.
     Conditional,
-    /// Replaces graph and marker unconditionally (explicit recovery only).
-    Replace,
+    /// Recovery: replaces graph and marker whatever they hold, unless the marker names a
+    /// ref version above `ceiling` (the highest version the planner observed, or the
+    /// version being written, whichever is larger).
+    Replace { ceiling: i64 },
 }
 
 /// The target boundary. Implementations are adapters (HTTP/Fuseki); they must run each
@@ -108,8 +117,19 @@ pub trait ProjectionClient: Send + Sync {
         marker: &ProjectionMarker,
         mode: WriteMode,
     ) -> Result<(), ProjectionError>;
-    /// The complete content of `graph` as canonical default-graph quads (verification).
+    /// The complete content of `graph` as default-graph quads, as the target returns them
+    /// (the target may canonicalize literal lexical forms; diagnostics and tests).
     async fn read_graph(&self, graph: &CognitiveGraph) -> Result<BTreeSet<Quad>, ProjectionError>;
+    /// Whether every triple of `state` is in `graph`, compared by the target's own term
+    /// equality (so its literal canonicalization cannot cause a false mismatch).
+    async fn contains_all(
+        &self,
+        graph: &CognitiveGraph,
+        state: &ProjectedState,
+    ) -> Result<bool, ProjectionError>;
+    /// Bind the dataset to `target_id` (first use) or verify it is bound to it: one dataset
+    /// never answers to two target ids (ADR-0020).
+    async fn bind_target(&self, target_id: &str) -> Result<(), ProjectionError>;
     /// Prove the target rolls a failed multi-operation update back completely; refuse to run
     /// against a target that does not.
     async fn probe_transactional(&self) -> Result<(), ProjectionError>;

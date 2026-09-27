@@ -81,10 +81,16 @@ cargo test -p ledger-api --test pg_validation_api -- --ignored --nocapture
 cargo test -p ledger-store --features postgres --test pg_projection -- --ignored --nocapture
 
 # --- 1l. Projection against the real Fuseki (compose `fuseki`, own TDB2 dataset): genesis,
-#         advance, duplicate/stale writes, outage + catch-up, every crash window, lost/corrupt/
-#         ahead markers and rebuild, concurrent workers, many graphs ---------------------------
+#         advance, duplicate/stale/equal-version writes, outage + catch-up, lost response,
+#         every crash window at genesis and over a predecessor, lost/corrupt/ahead/foreign
+#         markers, stale replacement vs newer projection, reconciliation, literal
+#         canonicalization, concurrent workers, many graphs ----------------------------------
+# One test at a time: TDB2 has a single writer and every commit costs ~0.5-1 s on the
+# qualification host, so twelve tests sharing one dataset in parallel queue past the client
+# timeout (a correct, retried TARGET_TIMEOUT — but not the scenario each test asserts).
+# Concurrency *within* a scenario is still exercised (two workers, two loops).
 LEDGER_TEST_FUSEKI_URL=http://127.0.0.1:53030/ledger LEDGER_TEST_FUSEKI_PASSWORD=development-only \
-  cargo test -p ledger-projector --test fuseki_projection -- --ignored --nocapture
+  cargo test -p ledger-projector --test fuseki_projection -- --ignored --nocapture --test-threads=1
 
 # --- 2. Containerised server: provision, authenticate, prepare/accept v2, restart, read ---
 curl --fail --silent --retry 10 --retry-delay 2 --retry-all-errors --retry-connrefused "${BASE}/health" >/dev/null
@@ -216,15 +222,32 @@ EXPECTED_PROJECTED='[["urn:material:a", "urn:humidity", "40"], ["urn:material:a"
 MARKER_COMMIT=$(sparql "SELECT ?c WHERE { GRAPH <urn:sculpin:ledger-projection:v1:markers> { <${COGNITIVE}> <urn:sculpin:ledger-projection:v1#commitId> ?c } }" | python3 -c 'import sys,json; print(json.load(sys.stdin)["results"]["bindings"][0]["c"]["value"])')
 [ "${MARKER_COMMIT}" = "${C2}" ] || { echo "FAIL: marker commit ${MARKER_COMMIT} != ${C2}" >&2; exit 1; }
 docker compose run --rm migrate projection status --target fuseki --json >target/integration-projection-status.json 2>/dev/null || true
-python3 - "${GRAPH}" <<'PY' <target/integration-projection-status.json || { echo "FAIL: projection status does not show the stream caught up" >&2; exit 1; }
+python3 - "${GRAPH}" target/integration-projection-status.json <<'PY' || { echo "FAIL: projection status does not show the stream caught up" >&2; exit 1; }
 import json, sys
 graph = sys.argv[1]
-status = json.loads(sys.stdin.read().strip().splitlines()[-1])
+status = json.loads(open(sys.argv[2]).read().strip().splitlines()[-1])
 row = next(s for s in status["streams"] if s["graph_id"] == graph)
 assert row["status"] == "active" and row["projected_ref_version"] == 2 and row["lag_versions"] == 0 and row["pending_events"] == 0, row
 PY
 curl --silent --fail http://127.0.0.1:59464/metrics | grep -q "projection_lag_versions{graph=\"${GRAPH}\",ref=\"main\",target=\"fuseki\",status=\"active\"} 0" || { echo "FAIL: projector metrics do not report zero lag for ${GRAPH}" >&2; exit 1; }
 echo "projection: Fuseki cognitive graph <${COGNITIVE}> holds exactly the accepted state at C2 (marker v2), status lag 0, metrics lag 0"
+# The operator verify command (projector identity, read-only on the target) agrees.
+docker compose run --rm --no-deps projector verify --graph "${GRAPH}" | grep -q "PROJECTION CONSISTENT" || { echo "FAIL: ledger-projector verify does not report the stream consistent" >&2; exit 1; }
+# A second deployment pointed at the same dataset under another target id refuses to start
+# (dataset binding, ADR-0020): it never writes a target another deployment owns.
+if OUT=$(docker compose run --rm --no-deps -e LEDGER_PROJECTION_TARGET_ID=fuseki-other projector run 2>&1); then
+  echo "FAIL: a projector with another target id started against a bound dataset" >&2; exit 1
+fi
+echo "${OUT}" | grep -q "TARGET_CONFLICT" || { echo "FAIL: the second target id was not refused with TARGET_CONFLICT: ${OUT}" >&2; exit 1; }
+# Target restart: TDB2 keeps the projection (durable commit), and the projector (restarted
+# with it: it shares the target's network namespace in development) re-probes, re-binds and
+# still verifies the stream consistent.
+docker compose restart fuseki >/dev/null
+docker compose up -d --wait --force-recreate --no-deps projector >/dev/null 2>&1 || { echo "FAIL: the projector did not become ready after a target restart" >&2; docker compose logs projector >&2; exit 1; }
+V=$(sparql "SELECT ?v WHERE { GRAPH <urn:sculpin:ledger-projection:v1:markers> { <${COGNITIVE}> <urn:sculpin:ledger-projection:v1#refVersion> ?v } }" | python3 -c 'import sys,json; b=json.load(sys.stdin)["results"]["bindings"]; print(b[0]["v"]["value"] if b else "")')
+[ "${V}" = "2" ] || { echo "FAIL: the projection did not survive a target restart (marker: '${V}')" >&2; exit 1; }
+docker compose run --rm --no-deps projector verify --graph "${GRAPH}" | grep -q "PROJECTION CONSISTENT" || { echo "FAIL: projection inconsistent after a target restart" >&2; exit 1; }
+echo "projection: verify consistent; a second target id is refused; the projection survives a target restart"
 
 # Foreign tenant still cannot see the commit after it exists.
 R=$(api GET "/v1/graphs/${GRAPH}/commits/${C2}/state" "${FOREIGN}" "" "")

@@ -28,7 +28,11 @@ pub struct ProjectionMarker {
     pub commit: CommitId,
     /// Ledger ref version (>= 1) the target represents.
     pub ref_version: i64,
+    /// `sculpin-rdf-state/v1` digest of the accepted state (ledger-computed).
     pub state_digest: ContentId,
+    /// Triples the target holds for this projection, **counted by the target inside the
+    /// write transaction** (the target may merge literals it canonicalizes to one value, so
+    /// the ledger cannot predict it). Ignored when writing.
     pub triple_count: u64,
 }
 
@@ -39,6 +43,8 @@ pub struct MarkerTerm {
     /// Datatype IRI of a literal (`None` for a plain literal).
     pub datatype: Option<String>,
     pub is_literal: bool,
+    /// Language tag of a literal (a tagged literal is never a valid marker value).
+    pub language: Option<String>,
 }
 
 /// The marker as observed in a target.
@@ -65,9 +71,10 @@ fn escape(value: &str) -> String {
 }
 
 impl ProjectionMarker {
-    /// The marker as N-Triples statements about `graph` (valid SPARQL template syntax).
+    /// The ledger-written marker statements about `graph` (valid SPARQL template syntax).
+    /// `lp:tripleCount` is not among them: the write adds it from the target's own count.
     pub fn triples(&self, graph: &CognitiveGraph) -> Vec<String> {
-        let [protocol, graph_id, branch, commit, version, digest, count] = marker_predicates();
+        let [protocol, graph_id, branch, commit, version, digest, _count] = marker_predicates();
         let s = format!("<{}>", graph.as_iri());
         let text = |v: &str| format!("\"{}\"", escape(v));
         let int = |v: String| format!("\"{v}\"^^<{XSD_INTEGER}>");
@@ -78,7 +85,6 @@ impl ProjectionMarker {
             format!("{s} <{commit}> {} .", text(&self.commit.to_string())),
             format!("{s} <{version}> {} .", int(self.ref_version.to_string())),
             format!("{s} <{digest}> {} .", text(&self.state_digest.to_string())),
-            format!("{s} <{count}> {} .", int(self.triple_count.to_string())),
         ]
     }
 
@@ -110,7 +116,8 @@ impl ProjectionMarker {
         let get = |i: usize| values[i].ok_or_else(|| format!("missing {}", predicates[i]));
         let string = |i: usize| -> Result<&str, String> {
             let term = get(i)?;
-            let plain = term.datatype.as_deref().is_none_or(|d| d == XSD_STRING);
+            let plain =
+                term.datatype.as_deref().is_none_or(|d| d == XSD_STRING) && term.language.is_none();
             if term.is_literal && plain {
                 Ok(term.value.as_str())
             } else {
@@ -172,10 +179,12 @@ mod tests {
         }
     }
 
-    /// Turn written statements back into observed pairs (what a SPARQL read reports).
+    /// Turn written statements back into observed pairs (what a SPARQL read reports), plus
+    /// the target-computed count.
     fn observed(m: &ProjectionMarker) -> Vec<(String, MarkerTerm)> {
         let graph = CognitiveGraph::for_knowledge_base("kb").unwrap();
-        m.triples(&graph)
+        let mut pairs: Vec<(String, MarkerTerm)> = m
+            .triples(&graph)
             .into_iter()
             .map(|t| {
                 let rest = t.split_once("> <").unwrap().1;
@@ -191,10 +200,21 @@ mod tests {
                         value,
                         datatype,
                         is_literal: true,
+                        language: None,
                     },
                 )
             })
-            .collect()
+            .collect();
+        pairs.push((
+            marker_predicates()[6].clone(),
+            MarkerTerm {
+                value: m.triple_count.to_string(),
+                datatype: Some(XSD_INTEGER.into()),
+                is_literal: true,
+                language: None,
+            },
+        ));
+        pairs
     }
 
     #[test]
@@ -209,7 +229,7 @@ mod tests {
             triples[4],
             "<urn:sculpin:kb:kb:cognitive> <urn:sculpin:ledger-projection:v1#refVersion> \"7\"^^<http://www.w3.org/2001/XMLSchema#integer> ."
         );
-        assert_eq!(triples.len(), 7);
+        assert_eq!(triples.len(), 6, "tripleCount is added by the target");
     }
 
     #[test]

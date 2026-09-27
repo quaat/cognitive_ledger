@@ -2,24 +2,33 @@
 //!
 //! One step: lease a stream ([`ProjectionRepository::claim`], committed), observe the
 //! target, decide with [`ledger_projection::plan`], reconstruct the accepted state and write it
-//! with one target transaction when needed, read the marker back, and acknowledge under the
-//! lease — no database transaction is ever held across a target request. Every crash window
-//! is a [`FailPoint`] the tests drive; each has a defined recovery (lease expiry, then the
-//! marker tells the next worker what the target holds).
+//! with one **guarded** target transaction when needed, read the marker back, and acknowledge
+//! under the lease — no database transaction is ever held across a target request. Every
+//! crash window is a [`FailPoint`] the tests drive; each has a defined recovery (lease expiry,
+//! then the marker tells the next worker what the target holds). Idle streams are
+//! re-observed periodically (reconciliation), so a target that lost its data is repaired
+//! without waiting for a new acceptance.
 
 pub mod metrics;
 
 use ledger_core::LedgerError;
 use ledger_projection::{
-    CognitiveGraph, ErrorClass, LedgerView, MarkerRead, Plan, ProjectedState, ProjectionClient,
-    ProjectionError, ProjectionErrorCode as Code, ProjectionMarker, WriteMode, plan,
+    CognitiveGraph, ErrorClass, LedgerView, MarkerRead, Observation, Plan, ProjectedState,
+    ProjectionClient, ProjectionError, ProjectionErrorCode as Code, ProjectionMarker, WriteMode,
+    plan, write_mode,
 };
 use ledger_store::{
     Claim, FailureDisposition, LeaseOutcome, ProjectionRepository, ReconstructionLimits, StreamKey,
-    WorkItem,
+    WorkItem, WorkMode,
 };
 use metrics::Metrics;
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 #[derive(Clone, Debug)]
 pub struct ProjectorConfig {
@@ -33,6 +42,10 @@ pub struct ProjectorConfig {
     pub backoff_max: Duration,
     pub poll_interval: Duration,
     pub concurrency: usize,
+    /// Re-observe an idle stream's target after this long without a successful check.
+    pub reconcile_interval: Duration,
+    /// Re-run the transactional probe this often (claiming pauses while it fails).
+    pub probe_interval: Duration,
 }
 
 /// Deterministic crash windows (tests only): the step returns as if the process died, leaving
@@ -52,15 +65,22 @@ pub enum FailPoint {
 pub enum StepOutcome {
     /// Nothing claimable.
     Idle,
-    /// Claimed, but no event beyond the recorded progress (lease released).
+    /// Claimed, but no event to project (lease released).
     NothingToDo,
     /// The target already represented the event (or a later one); acknowledged.
     Acknowledged { version: i64, wrote: bool },
     /// Wrote the state, verified the marker and acknowledged.
     Projected { version: i64, rebuilt: bool },
+    /// A newer projection of this stream landed first; the lease was released and the next
+    /// claim acknowledges it (not a failure).
+    Superseded,
     /// Failed and recorded (retry scheduled, blocked or rebuild required).
     Failed { code: Code, class: ErrorClass },
-    /// The lease was lost before acknowledging; another worker owns the stream now.
+    /// Failed, and the failure could not be recorded (database unavailable); the lease
+    /// expires and the next worker re-evaluates.
+    Unrecorded { code: Code },
+    /// The lease was lost (or about to expire) before writing or acknowledging; another
+    /// worker owns the stream now.
     LeaseLost,
     /// A failpoint simulated a crash; the lease is still held until it expires.
     Crashed(FailPoint),
@@ -72,24 +92,37 @@ pub struct Projector<C: ProjectionClient + ?Sized> {
     config: ProjectorConfig,
     failpoint: Option<FailPoint>,
     metrics: Arc<Metrics>,
+    /// Set while the periodic transactional probe fails: no stream is claimed.
+    paused: Arc<AtomicBool>,
 }
 
-enum Force {
-    /// Normal processing by the decision table.
-    No,
-    /// Operator rebuild: unconditional replacement at the ref's accepted head.
-    Rebuild,
-}
-
-fn ledger_failure(e: LedgerError) -> ProjectionError {
+/// Map a ledger-side failure to the projection error taxonomy: transient database conditions
+/// (unavailable, timeouts, lock waits, serialization failures) are retryable.
+pub fn ledger_failure(e: LedgerError) -> ProjectionError {
     match e {
         LedgerError::ResourceLimit(m) => ProjectionError::permanent(Code::StateTooLarge, m),
-        LedgerError::DependencyUnavailable(m) => {
+        LedgerError::DependencyUnavailable(m) | LedgerError::DependencyTimeout(m) => {
             ProjectionError::retryable(Code::LedgerUnavailable, m)
         }
         LedgerError::Storage(m) => ProjectionError::retryable(Code::LedgerUnavailable, m),
         other => ProjectionError::permanent(Code::LedgerState, other.to_string()),
     }
+}
+
+/// The marker a write produced, compared field by field except the target-computed count.
+fn same_projection(observed: &ProjectionMarker, written: &ProjectionMarker) -> bool {
+    observed.graph_id == written.graph_id
+        && observed.branch == written.branch
+        && observed.commit == written.commit
+        && observed.ref_version == written.ref_version
+        && observed.state_digest == written.state_digest
+}
+
+/// The target-side count is plausible for the state written: never more than the accepted
+/// triples (the target may merge literals it canonicalizes, never invent triples), and not
+/// zero for a non-empty state.
+fn plausible_count(count: u64, projected: &ProjectedState) -> bool {
+    count <= projected.triple_count() && (count > 0 || projected.triple_count() == 0)
 }
 
 impl<C: ProjectionClient + ?Sized> Projector<C> {
@@ -105,6 +138,7 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
             config,
             failpoint: None,
             metrics,
+            paused: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -122,12 +156,20 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
         &self.config
     }
 
+    /// Whether claiming is paused because the target failed its transactional probe.
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+    }
+
     fn crash(&self, point: FailPoint) -> bool {
         self.failpoint == Some(point)
     }
 
     /// Claim one due stream of this projector's target and process it.
     pub async fn step(&self) -> Result<StepOutcome, LedgerError> {
+        if self.is_paused() {
+            return Ok(StepOutcome::Idle);
+        }
         let Some(claim) = self
             .repo
             .claim(
@@ -139,12 +181,33 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
         else {
             return Ok(StepOutcome::Idle);
         };
-        Ok(self.process(claim, Force::No).await)
+        Ok(self.process(claim, WorkMode::Pending, false).await)
     }
 
-    /// Operator rebuild of one stream: replace the cognitive graph with the accepted state
-    /// at the ref's head, write the exact marker, verify it and the complete graph content,
-    /// and record progress. Idempotent. `Ok(None)` if the stream is leased or disabled.
+    /// Re-observe one idle stream whose last check is older than the reconcile interval; a
+    /// target that lost or diverged from its projection is rebuilt from the ledger.
+    pub async fn reconcile_step(&self) -> Result<StepOutcome, LedgerError> {
+        if self.is_paused() {
+            return Ok(StepOutcome::Idle);
+        }
+        let Some(claim) = self
+            .repo
+            .claim_reconcile(
+                &self.config.target_id,
+                &self.config.owner,
+                self.config.lease_ttl,
+                self.config.reconcile_interval,
+            )
+            .await?
+        else {
+            return Ok(StepOutcome::Idle);
+        };
+        Ok(self.process(claim, WorkMode::Recorded, false).await)
+    }
+
+    /// Operator rebuild of one stream: replace the cognitive graph with the accepted state at
+    /// the ref's head (guarded by the highest version observed), verify marker and complete
+    /// content, and record progress. Idempotent. `Ok(None)` if leased or disabled.
     pub async fn rebuild(&self, key: &StreamKey) -> Result<Option<StepOutcome>, LedgerError> {
         let Some(claim) = self
             .repo
@@ -153,17 +216,21 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
         else {
             return Ok(None);
         };
-        Ok(Some(self.process(claim, Force::Rebuild).await))
+        Ok(Some(self.process(claim, WorkMode::Head, true).await))
     }
 
-    async fn process(&self, claim: Claim, force: Force) -> StepOutcome {
-        let started = std::time::Instant::now();
-        let outcome = self.process_inner(&claim, &force).await;
+    async fn process(&self, claim: Claim, mode: WorkMode, force: bool) -> StepOutcome {
+        let started = Instant::now();
+        let outcome = self.process_inner(&claim, mode, force, started).await;
         self.metrics.record(&outcome, started.elapsed());
         match &outcome {
             StepOutcome::Failed { code, class } => tracing::warn!(
                 graph = %claim.key.graph_id, branch = %claim.key.branch, code = code.as_str(),
                 class = ?class, "projection attempt failed"
+            ),
+            StepOutcome::Unrecorded { code } => tracing::error!(
+                graph = %claim.key.graph_id, branch = %claim.key.branch, code = code.as_str(),
+                "projection attempt failed and the failure could not be recorded"
             ),
             StepOutcome::Projected { version, rebuilt } => tracing::info!(
                 graph = %claim.key.graph_id, branch = %claim.key.branch, version, rebuilt,
@@ -174,12 +241,17 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
         outcome
     }
 
-    async fn process_inner(&self, claim: &Claim, force: &Force) -> StepOutcome {
+    async fn process_inner(
+        &self,
+        claim: &Claim,
+        mode: WorkMode,
+        force: bool,
+        started: Instant,
+    ) -> StepOutcome {
         if self.crash(FailPoint::AfterClaim) {
             return StepOutcome::Crashed(FailPoint::AfterClaim);
         }
-        let rebuild = matches!(force, Force::Rebuild);
-        let work = match self.repo.work_for(claim, rebuild).await {
+        let work = match self.repo.work_for(claim, mode).await {
             Ok(Some(work)) => work,
             Ok(None) => {
                 let _ = self.repo.release(claim).await;
@@ -187,9 +259,26 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
             }
             Err(e) => return self.failed(claim, None, ledger_failure(e)).await,
         };
-        match self.project(claim, &work, rebuild).await {
+        match self.project(claim, &work, force, started).await {
             Ok(outcome) => outcome,
             Err(e) => self.failed(claim, Some(work.outbox_id), e).await,
+        }
+    }
+
+    fn view(
+        &self,
+        claim: &Claim,
+        work: &WorkItem,
+        at_marker: Option<ledger_core::CommitId>,
+    ) -> LedgerView {
+        LedgerView {
+            graph_id: claim.key.graph_id.clone(),
+            branch: claim.key.branch.clone(),
+            target_commit: work.commit.clone(),
+            target_version: work.ref_version,
+            head_version: work.head_version,
+            commit_at_marker_version: at_marker,
+            recorded_version: claim.projected.as_ref().map(|(_, v)| *v),
         }
     }
 
@@ -197,35 +286,23 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
         &self,
         claim: &Claim,
         work: &WorkItem,
-        rebuild: bool,
+        force: bool,
+        started: Instant,
     ) -> Result<StepOutcome, ProjectionError> {
         let graph = CognitiveGraph::parse(&claim.cognitive_graph)?;
         let observation = self.client.observe(&graph).await?;
-        let (mode, rebuilt) = if rebuild {
-            (WriteMode::Replace, true)
+        let (mode, rebuilt) = if force {
+            (
+                WriteMode::Replace {
+                    ceiling: work
+                        .ref_version
+                        .max(observation.max_ref_version.unwrap_or(0)),
+                },
+                true,
+            )
         } else {
-            let commit_at_marker_version = match &observation.marker {
-                MarkerRead::Present(m)
-                    if m.graph_id == claim.key.graph_id
-                        && m.branch == claim.key.branch
-                        && m.ref_version <= work.head_version =>
-                {
-                    self.repo
-                        .commit_at(&claim.key.graph_id, &claim.key.branch, m.ref_version)
-                        .await
-                        .map_err(ledger_failure)?
-                }
-                _ => None,
-            };
-            let view = LedgerView {
-                graph_id: claim.key.graph_id.clone(),
-                branch: claim.key.branch.clone(),
-                target_commit: work.commit.clone(),
-                target_version: work.ref_version,
-                head_version: work.head_version,
-                commit_at_marker_version,
-            };
-            match plan(&view, &observation) {
+            let at_marker = self.commit_at_marker(claim, work, &observation).await?;
+            match plan(&self.view(claim, work, at_marker), &observation) {
                 Plan::AlreadyProjected => {
                     return self
                         .acknowledge(claim, work, &work.commit, work.ref_version, false, false)
@@ -237,14 +314,17 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
                         .await;
                 }
                 Plan::RecoveryRequired(e) => return Err(e),
-                Plan::Write { mode, rebuild } => {
+                Plan::Write { rebuild } => {
                     if let Some(reason) = rebuild {
                         tracing::warn!(
                             graph = %claim.key.graph_id, branch = %claim.key.branch,
                             reason = reason.as_str(), "projection target is ambiguous; rebuilding"
                         );
                     }
-                    (mode, rebuild.is_some())
+                    (
+                        write_mode(rebuild, work.ref_version, &observation),
+                        rebuild.is_some(),
+                    )
                 }
             }
         };
@@ -264,8 +344,14 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
             commit: work.commit.clone(),
             ref_version: work.ref_version,
             state_digest: projected.digest().clone(),
-            triple_count: projected.triple_count(),
+            triple_count: 0, // computed by the target in the write transaction
         };
+        // Never start a target write with less than a quarter of the lease left: a write
+        // that outlives its lease is still harmless (guarded), but it is wasted work.
+        if started.elapsed() > self.config.lease_ttl.mul_f64(0.75) {
+            let _ = self.repo.release(claim).await;
+            return Ok(StepOutcome::LeaseLost);
+        }
         if self.crash(FailPoint::BeforeTargetRequest) {
             return Ok(StepOutcome::Crashed(FailPoint::BeforeTargetRequest));
         }
@@ -278,43 +364,61 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
         }
         let after = self.client.observe(&graph).await?;
         match &after.marker {
-            MarkerRead::Present(m) if *m == marker && after.triple_count == marker.triple_count => {
-            }
-            // A conditional write that found a newer marker (another worker got further):
-            // the target is ahead of this event; let the next claim acknowledge it.
             MarkerRead::Present(m)
-                if mode == WriteMode::Conditional
-                    && m.graph_id == marker.graph_id
+                if same_projection(m, &marker)
+                    && after.triple_count == m.triple_count
+                    && plausible_count(m.triple_count, &projected) => {}
+            // The guarded write found a newer projection of this stream: it won; the next
+            // claim acknowledges it.
+            MarkerRead::Present(m)
+                if m.graph_id == marker.graph_id
                     && m.branch == marker.branch
                     && m.ref_version > marker.ref_version =>
             {
-                return Err(ProjectionError::retryable(
-                    Code::VerificationFailed,
-                    "the target holds a newer projection than this event; re-evaluating",
-                ));
+                let _ = self.repo.release(claim).await;
+                return Ok(StepOutcome::Superseded);
             }
             _ => {
                 return Err(ProjectionError::retryable(
                     Code::VerificationFailed,
-                    "the target does not read back the marker and size just written",
+                    "the target does not read back the marker just written",
                 ));
             }
         }
-        if rebuild {
-            // Operator rebuild: the complete graph must be exactly the accepted state.
-            let content = self.client.read_graph(&graph).await?;
-            if content != state {
-                return Err(ProjectionError::permanent(
-                    Code::VerificationFailed,
-                    "the rebuilt graph's content differs from the accepted state",
-                ));
-            }
+        if rebuilt && !self.client.contains_all(&graph, &projected).await? {
+            return Err(ProjectionError::permanent(
+                Code::VerificationFailed,
+                "the rebuilt graph does not contain the accepted state",
+            ));
         }
         if self.crash(FailPoint::AfterMarkerVerification) {
             return Ok(StepOutcome::Crashed(FailPoint::AfterMarkerVerification));
         }
         self.acknowledge(claim, work, &work.commit, work.ref_version, true, rebuilt)
             .await
+    }
+
+    /// The ref's commit at a well-formed marker's version, when the marker is this stream's
+    /// and within the ledger's history.
+    async fn commit_at_marker(
+        &self,
+        claim: &Claim,
+        work: &WorkItem,
+        observation: &Observation,
+    ) -> Result<Option<ledger_core::CommitId>, ProjectionError> {
+        match &observation.marker {
+            MarkerRead::Present(m)
+                if m.graph_id == claim.key.graph_id
+                    && m.branch == claim.key.branch
+                    && m.ref_version <= work.head_version =>
+            {
+                self.repo
+                    .commit_at(&claim.key.graph_id, &claim.key.branch, m.ref_version)
+                    .await
+                    .map_err(ledger_failure)
+            }
+            _ => Ok(None),
+        }
     }
 
     async fn acknowledge(
@@ -366,7 +470,7 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
         error: ProjectionError,
     ) -> StepOutcome {
         let disposition = match (error.class(), error.code()) {
-            (_, Code::MarkerAhead) => FailureDisposition::RebuildRequired,
+            (_, Code::MarkerAhead | Code::TargetConflict) => FailureDisposition::RebuildRequired,
             (ErrorClass::Permanent, _) => FailureDisposition::Block,
             (ErrorClass::Retryable, _) => FailureDisposition::Retry(self.backoff(claim)),
         };
@@ -376,20 +480,54 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
             .await
         {
             Ok(LeaseOutcome::LeaseLost) => StepOutcome::LeaseLost,
-            // Could not even record the failure: the lease expires (crash semantics).
-            Ok(LeaseOutcome::Committed) | Err(_) => StepOutcome::Failed {
+            Ok(LeaseOutcome::Committed) => StepOutcome::Failed {
                 code: error.code(),
                 class: error.class(),
             },
+            // Could not even record the failure: the lease expires (crash semantics).
+            Err(_) => StepOutcome::Unrecorded { code: error.code() },
         }
     }
 
+    /// Re-run the transactional probe; claiming pauses while it fails.
+    pub async fn probe(&self) -> Result<(), ProjectionError> {
+        let result = self.client.probe_transactional().await;
+        let was = self.paused.swap(result.is_err(), Ordering::SeqCst);
+        match (&result, was) {
+            (Err(e), false) => {
+                tracing::error!(error = %e, "target failed the transactional probe; claiming paused")
+            }
+            (Ok(()), true) => {
+                tracing::info!("target passed the transactional probe; claiming resumed")
+            }
+            _ => {}
+        }
+        result
+    }
+
     /// Run `concurrency` workers until `shutdown` resolves; each finishes its current step.
+    /// Idle workers reconcile; one task re-runs the transactional probe periodically.
     pub async fn run(self: Arc<Self>, shutdown: tokio::sync::watch::Receiver<bool>)
     where
         C: 'static,
     {
         let mut workers = Vec::new();
+        {
+            let me = self.clone();
+            let mut stop = shutdown.clone();
+            workers.push(tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(me.config.probe_interval) => {}
+                        _ = stop.changed() => {}
+                    }
+                    if *stop.borrow() {
+                        break;
+                    }
+                    let _ = me.probe().await;
+                }
+            }));
+        }
         for _ in 0..self.config.concurrency.max(1) {
             let me = self.clone();
             let mut stop = shutdown.clone();
@@ -398,14 +536,10 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
                     if *stop.borrow() {
                         break;
                     }
-                    let busy = match me.step().await {
-                        Ok(StepOutcome::Idle) => false,
-                        Ok(_) => true,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "projector could not claim work");
-                            false
-                        }
-                    };
+                    let mut busy = !matches!(me.step().await, Ok(StepOutcome::Idle) | Err(_));
+                    if !busy {
+                        busy = !matches!(me.reconcile_step().await, Ok(StepOutcome::Idle) | Err(_));
+                    }
                     if !busy {
                         tokio::select! {
                             _ = tokio::time::sleep(me.config.poll_interval) => {}
@@ -421,7 +555,8 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
     }
 
     /// Compare the target's cognitive graph and marker with the accepted state at the
-    /// recorded projection (read-only; never writes the target or the ledger).
+    /// recorded projection (read-only; never writes the target or the ledger). Content is
+    /// compared by the target's own term equality plus its write-time count.
     pub async fn verify(&self, key: &StreamKey) -> Result<VerifyReport, LedgerError> {
         let streams = self.repo.status(Some(&key.target_id)).await?;
         let stream = streams
@@ -443,29 +578,36 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
             .repo
             .state_at(&key.graph_id, &commit, &self.config.reconstruction)
             .await?;
-        let observed = self.client.observe(&graph).await;
-        let content = self.client.read_graph(&graph).await;
-        let (observed, content) = match (observed, content) {
-            (Ok(o), Ok(c)) => (o, c),
-            (Err(e), _) | (_, Err(e)) => {
-                return Ok(VerifyReport {
-                    consistent: false,
-                    detail: format!("target unreadable: {e}"),
-                });
-            }
+        let projected =
+            ProjectedState::from_state(&state).map_err(|e| LedgerError::Storage(e.to_string()))?;
+        let unreadable = |e: ProjectionError| VerifyReport {
+            consistent: false,
+            detail: format!("target unreadable: {e}"),
+        };
+        let observed = match self.client.observe(&graph).await {
+            Ok(o) => o,
+            Err(e) => return Ok(unreadable(e)),
+        };
+        let contains = match self.client.contains_all(&graph, &projected).await {
+            Ok(c) => c,
+            Err(e) => return Ok(unreadable(e)),
         };
         let marker_ok = matches!(&observed.marker, MarkerRead::Present(m)
             if m.graph_id == key.graph_id && m.branch == key.branch && m.commit == commit
-                && m.ref_version == version && m.state_digest == ledger_rdf::state_digest(&state)
-                && m.triple_count == state.len() as u64);
-        let content_ok = content == state;
+                && m.ref_version == version && m.state_digest == *projected.digest()
+                && m.triple_count == observed.triple_count
+                && plausible_count(m.triple_count, &projected));
         Ok(VerifyReport {
-            consistent: marker_ok && content_ok,
+            consistent: marker_ok && contains,
             detail: format!(
                 "recorded v{version}; marker {}; content {} ({} triples in target, {} accepted)",
                 if marker_ok { "matches" } else { "DIFFERS" },
-                if content_ok { "matches" } else { "DIFFERS" },
-                content.len(),
+                if contains {
+                    "contains the accepted state"
+                } else {
+                    "is MISSING accepted triples"
+                },
+                observed.triple_count,
                 state.len()
             ),
         })
@@ -476,4 +618,23 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
 pub struct VerifyReport {
     pub consistent: bool,
     pub detail: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transient_database_conditions_are_retryable() {
+        for e in [
+            LedgerError::DependencyTimeout("lock_timeout".into()),
+            LedgerError::DependencyUnavailable("down".into()),
+            LedgerError::Storage("io".into()),
+        ] {
+            let mapped = ledger_failure(e);
+            assert!(mapped.is_retryable(), "{mapped}");
+            assert_eq!(mapped.code(), Code::LedgerUnavailable);
+        }
+        assert!(!ledger_failure(LedgerError::ResourceLimit("big".into())).is_retryable());
+    }
 }

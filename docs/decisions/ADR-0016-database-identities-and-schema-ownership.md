@@ -149,3 +149,27 @@ nothing while the ledger is the only writer, and would widen the trust surface.
 `verify_runtime_identity`'s table model, sequence model, guard-trigger, constraint and CHECK
 inventories cover the new objects; `pg_least_privilege` exercises them on PostgreSQL 15
 and 17.
+
+## Amendment: Phase 3 projector identity and grant set (2026-09-28, Plan 0007, migration 0011)
+Migration 0011 adds a **third** database identity, the projector
+([ADR-0021](ADR-0021-projection-state-leases-and-projector-identity.md)), under the same rules
+as the runtime identity: a login role that owns nothing, is no member of (and cannot `SET
+ROLE` to) the owner, the runtime role or any privileged role, and is granted only by the
+owner-only, idempotent `ledger_grant_projector(role)` (`ledger-admin migrate
+--projector-role`, which refuses the runtime role's name). Its model is exact and exhaustive:
+
+- `SELECT` on `graphs`, `refs`, `immutable_objects`, `commit_index`, `commit_parents`,
+  `ref_events`, `projection_outbox`, `projection_state`, `_sqlx_migrations`;
+- column `UPDATE` on `projection_outbox (delivered_at, attempts)` and on the progress,
+  lease, backoff, error and status columns of `projection_state` — never its identity
+  columns; status changes into or out of `disabled` are owner-only (guard trigger);
+- no `INSERT`, `DELETE`, `TRUNCATE`, `REFERENCES`, `TRIGGER`, `MAINTAIN` (PostgreSQL 17), no
+  sequence privileges, no `EXECUTE` on either grant function.
+
+`ledger_grant_runtime` is re-issued by 0011 with one addition, `SELECT` on
+`projection_state` (status reads); the runtime identity gains no write on projection state
+or on the outbox delivery columns, so the HTTP server can never mark projection progress.
+Verification is one parameterized routine (`IdentityModel`: table model, sequence model,
+exhaustive "no unlisted table privilege" check) used for both identities at start-up and
+readiness; `pg_projection` and `pg_least_privilege` exercise it on PostgreSQL 15 and 17,
+including drift in either direction and weakened 0011 guards, indexes, FKs and CHECKs.

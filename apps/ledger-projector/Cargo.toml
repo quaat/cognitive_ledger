@@ -21,7 +21,6 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
-ledger-api = { path = "../../crates/ledger-api" }
 reqwest.workspace = true
 sqlx.workspace = true
 

@@ -7,6 +7,8 @@ use std::fmt;
 
 /// Reserved graph holding one marker per cognitive graph in a target dataset.
 pub const MARKER_GRAPH: &str = "urn:sculpin:ledger-projection:v1:markers";
+/// Subject of the dataset's target binding in the marker graph (one dataset, one target id).
+pub const TARGET_SUBJECT: &str = "urn:sculpin:ledger-projection:v1:target";
 /// Reserved graph used only by the start-up transactional probe (always left empty).
 pub const PROBE_GRAPH: &str = "urn:sculpin:ledger-projection:v1:probe";
 

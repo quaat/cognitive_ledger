@@ -581,7 +581,7 @@ mod postgres_projection;
 #[cfg(feature = "postgres")]
 pub use postgres_projection::{
     Claim, FailureDisposition, LeaseOutcome, MAX_LEASE_OWNER_BYTES, MAX_TARGET_ID_BYTES,
-    ProjectionRepository, StreamKey, StreamStatus, WorkItem,
+    PROJECTED_REF, ProjectionRepository, StreamKey, StreamStatus, WorkItem, WorkMode,
 };
 #[cfg(feature = "postgres")]
 mod postgres_validation;

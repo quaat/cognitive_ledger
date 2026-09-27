@@ -160,13 +160,11 @@ impl FusekiClient {
     pub fn new(config: FusekiConfig) -> Result<Self, TargetConfigError> {
         check_endpoint(&config.query_endpoint, config.allow_insecure_loopback)?;
         check_endpoint(&config.update_endpoint, config.allow_insecure_loopback)?;
-        let token_ok =
-            |t: &str| !t.is_empty() && !t.chars().any(|c| c.is_control() || c.is_whitespace());
+        let token_ok = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_graphic());
         match &config.credentials {
             TargetCredentials::Bearer(t) if !token_ok(t) => {
                 return Err(TargetConfigError(
-                    "projection target bearer token must be a non-empty token without whitespace"
-                        .into(),
+                    "projection target bearer token must be non-empty visible ASCII".into(),
                 ));
             }
             TargetCredentials::Basic { username, password }
@@ -212,19 +210,35 @@ impl FusekiClient {
         }
     }
 
+    fn too_large(&self, bytes: usize) -> ProjectionError {
+        ProjectionError::permanent(
+            Code::StateTooLarge,
+            format!(
+                "the projection request (~{bytes} bytes) exceeds the configured limit of {} bytes",
+                self.max_update_bytes
+            ),
+        )
+    }
+
     /// POST a SPARQL Update; `Ok` only on 2xx.
     async fn update(&self, body: String) -> Result<(), ProjectionError> {
-        if body.len() > self.max_update_bytes {
-            return Err(ProjectionError::permanent(
-                Code::StateTooLarge,
-                format!(
-                    "the projection update ({} bytes) exceeds the configured limit of {} bytes",
-                    body.len(),
-                    self.max_update_bytes
-                ),
-            ));
+        let (status, _) = self.update_raw(body).await?;
+        if status.is_success() {
+            Ok(())
+        } else {
+            Err(classify(status))
         }
-        let response = self
+    }
+
+    /// POST a SPARQL Update and return the status with a bounded body excerpt (probe).
+    async fn update_raw(
+        &self,
+        body: String,
+    ) -> Result<(reqwest::StatusCode, String), ProjectionError> {
+        if body.len() > self.max_update_bytes {
+            return Err(self.too_large(body.len()));
+        }
+        let mut response = self
             .authorize(
                 self.http
                     .post(&self.update_endpoint)
@@ -235,15 +249,22 @@ impl FusekiClient {
             .await
             .map_err(|e| transport(&e))?;
         let status = response.status();
-        if status.is_success() {
-            Ok(())
-        } else {
-            Err(classify(status))
+        let mut excerpt = Vec::new();
+        while excerpt.len() < 4096 {
+            match response.chunk().await {
+                Ok(Some(chunk)) => excerpt.extend_from_slice(&chunk),
+                _ => break,
+            }
         }
+        excerpt.truncate(4096);
+        Ok((status, String::from_utf8_lossy(&excerpt).into_owned()))
     }
 
     /// POST a SPARQL query and return the bounded body of the expected media type.
     async fn query(&self, query: String, accept: &str) -> Result<Vec<u8>, ProjectionError> {
+        if query.len() > self.max_update_bytes {
+            return Err(self.too_large(query.len()));
+        }
         let mut response = self
             .authorize(
                 self.http
@@ -317,8 +338,62 @@ impl ProjectionClient for FusekiClient {
         marker: &ProjectionMarker,
         mode: WriteMode,
     ) -> Result<(), ProjectionError> {
+        // Refuse before formatting the request: no multi-copy of an oversized state.
+        let estimate = state.byte_len() + 16 * 1024;
+        if estimate > self.max_update_bytes {
+            return Err(self.too_large(estimate));
+        }
         self.update(sparql::write_update(graph, state, marker, mode))
             .await
+    }
+
+    async fn contains_all(
+        &self,
+        graph: &CognitiveGraph,
+        state: &ProjectedState,
+    ) -> Result<bool, ProjectionError> {
+        if state.triples().is_empty() {
+            return Ok(true);
+        }
+        let estimate = state.byte_len() + 1024;
+        if estimate > self.max_update_bytes {
+            return Err(self.too_large(estimate));
+        }
+        let body = self
+            .query(sparql::contains_all_query(graph, state), SPARQL_JSON)
+            .await?;
+        sparql::parse_ask(&body)
+    }
+
+    async fn bind_target(&self, target_id: &str) -> Result<(), ProjectionError> {
+        if target_id.is_empty()
+            || !target_id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
+        {
+            return Err(ProjectionError::permanent(
+                Code::InvalidTargetGraph,
+                "the target id must match [A-Za-z0-9._:-]+",
+            ));
+        }
+        self.update(sparql::bind_target_update(target_id)).await?;
+        let bound = sparql::parse_bound_target(
+            &self
+                .query(sparql::bound_target_query(), SPARQL_JSON)
+                .await?,
+        )?;
+        if bound == [target_id] {
+            Ok(())
+        } else {
+            Err(ProjectionError::permanent(
+                Code::TargetConflict,
+                format!(
+                    "the target dataset is bound to {} other target id(s); one dataset serves one \
+                     target id (ADR-0020)",
+                    bound.iter().filter(|b| *b != target_id).count()
+                ),
+            ))
+        }
     }
 
     async fn read_graph(&self, graph: &CognitiveGraph) -> Result<BTreeSet<Quad>, ProjectionError> {
@@ -343,25 +418,25 @@ impl ProjectionClient for FusekiClient {
     }
 
     async fn probe_transactional(&self) -> Result<(), ProjectionError> {
-        // The probe request must fail as a whole (its last operation cannot succeed).
-        match self.update(sparql::probe_update()).await {
-            Ok(()) => {
-                let _ = self.update(sparql::probe_cleanup()).await;
-                return Err(ProjectionError::permanent(
-                    Code::TargetNotTransactional,
-                    "the target accepted an update whose last operation must fail",
-                ));
-            }
-            // Only an execution failure (5xx) says the request ran and aborted; anything else
-            // (unreachable, auth, a 4xx rejection before execution) proves nothing.
-            Err(e) if e.code() == Code::TargetServerError => {}
-            Err(e) if e.is_retryable() || e.code() == Code::TargetAuth => return Err(e),
-            Err(_) => {
-                return Err(ProjectionError::permanent(
+        // The probe request must fail as a whole, and it must fail *executing* (the LOAD
+        // step): only an HTTP 500 naming the LOAD proves the request ran and aborted. A
+        // proxy's 502/503/504 or a 4xx rejection before execution proves nothing.
+        let (status, body) = self.update_raw(sparql::probe_update()).await?;
+        if status.is_success() {
+            let _ = self.update(sparql::probe_cleanup()).await;
+            return Err(ProjectionError::permanent(
+                Code::TargetNotTransactional,
+                "the target accepted an update whose last operation must fail",
+            ));
+        }
+        if status.as_u16() != 500 || !body.contains("LOAD") {
+            return Err(match classify(status) {
+                e if e.is_retryable() || e.code() == Code::TargetAuth => e,
+                _ => ProjectionError::permanent(
                     Code::TargetNotTransactional,
                     "the target rejected the transactional probe before executing it",
-                ));
-            }
+                ),
+            });
         }
         let kept = sparql::parse_ask(&self.query(sparql::probe_ask(), SPARQL_JSON).await?)?;
         if kept {

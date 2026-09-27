@@ -37,8 +37,6 @@ CREATE TABLE projection_state (
     rebuilds              BIGINT      NOT NULL DEFAULT 0,
     created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT projection_state_pk PRIMARY KEY (graph_id, branch, target_id),
-    -- No two streams of one target write the same cognitive graph (tenant isolation).
-    CONSTRAINT projection_state_graph_unique UNIQUE (target_id, cognitive_graph),
     CONSTRAINT projection_state_graph_tenant_fk FOREIGN KEY (graph_id, tenant_id)
         REFERENCES graphs (graph_id, tenant_id),
     -- Recorded progress names a real accepted state of exactly this ref.
@@ -59,6 +57,11 @@ CREATE TABLE projection_state (
     CONSTRAINT ps_counters CHECK (lease_epoch >= 0 AND consecutive_failures >= 0 AND rebuilds >= 0
         AND (projected_ref_version IS NULL OR projected_ref_version >= 1))
 );
+
+-- No two live streams of one target write the same cognitive graph (tenant isolation); a
+-- disabled stream releases it so the operator can switch which ledger graph feeds the KB.
+CREATE UNIQUE INDEX projection_state_graph_unique ON projection_state (target_id, cognitive_graph)
+    WHERE status <> 'disabled';
 
 -- ---- guards ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.projection_state_guard() RETURNS trigger
@@ -82,6 +85,14 @@ BEGIN
        OR NEW.projected_ref_version < OLD.projected_ref_version) THEN
         RAISE EXCEPTION 'projection_state progress never moves backwards'
             USING ERRCODE = 'integrity_constraint_violation';
+    END IF;
+    -- Enabling and disabling a stream are owner (operator) decisions; the projector role
+    -- can never re-activate a disabled stream or disable a live one.
+    IF (OLD.status = 'disabled') <> (NEW.status = 'disabled')
+       AND current_user::text IS DISTINCT FROM (SELECT t.tableowner::text FROM pg_catalog.pg_tables t
+                                           WHERE t.schemaname = 'public' AND t.tablename = 'projection_state') THEN
+        RAISE EXCEPTION 'only the schema owner enables or disables a projection stream'
+            USING ERRCODE = 'insufficient_privilege';
     END IF;
     RETURN NEW;
 END

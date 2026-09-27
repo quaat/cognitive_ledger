@@ -30,8 +30,10 @@ explicit. Not general event streaming: a narrow projection subsystem consuming t
    rebuild, marker read and the transactional probe.
 6. `apps/ledger-projector`: startup verification (schema, projector identity, target
    transactional probe), bounded worker concurrency, claim loop, backoff, graceful shutdown,
-   `/health`, `/ready`, `/metrics`; `rebuild`, `verify` and `status` subcommands.
-7. `ledger-admin projection enable | disable` (owner).
+   `/health`, `/ready`, `/metrics`; `rebuild` and `verify` subcommands; periodic
+   reconciliation of idle streams and a periodic transactional probe.
+7. `ledger-admin projection enable | disable | status [--json]` (owner; status is the one
+   status surface).
 8. Tests: unit (IRI vectors, marker parsing, decision table), PostgreSQL (claim race, lease
    expiry, fencing, ordering, least privilege, verifier drift), real Fuseki (genesis,
    advance, duplicate, outage and catch-up, crash before/after target commit with failpoints,
@@ -50,7 +52,9 @@ never changes ledger history and acceptance never waits for projection; (b) the 
 never moves backwards and a version is marked delivered only when the target represents it or
 a later version; (c) a stream projects only into its own cognitive graph, and no two streams
 share one; (d) nothing but accepted state at the stream's ref is written; (e) the ledger never
-reads state back from Fuseki.
+reads *state* back from Fuseki into history — the projector reads only the marker, the
+target's own triple count and containment answers, to decide what to write (ADR-0020: the
+marker is trusted as far as the target is).
 
 ## Persistent data changes
 Migration 0011 only (ADR-0021). No content migration; existing outbox rows stay pending until
@@ -92,6 +96,33 @@ projection fault suite, compose integration, upgrade 0010 → 0011; Phase-2 suit
   therefore uses its own assembler (TDB2, named `query` and `update` endpoints only).
 - `/fuseki/configuration` must be writable in the webapp build; the explicit `--config`
   file avoids it.
+- 2026-09-28, same image: TDB2 stores literals by value — `"01"^^xsd:integer` reads back as
+  `"1"` and merges with a distinct ledger triple `"1"^^xsd:integer`; `"1.50"^^xsd:decimal` →
+  `"1.5"`; `@EN` → `@en`; `"1"^^xsd:boolean` → `"true"`. A ledger-computed triple count and
+  byte-exact comparison would therefore rebuild a correct projection forever; ADR-0020 now
+  has the target compute `lp:tripleCount` in the write transaction and verifies rebuilds by
+  `ASK` containment (target term equality). Pinned by
+  `fuseki_projection::the_targets_literal_canonicalization_never_loops_or_blocks`.
+- 2026-09-28: every TDB2 update commit costs ~0.5–1.1 s on the qualification host (even a
+  one-triple `INSERT DATA`; queries take milliseconds). Twelve Fuseki tests sharing one
+  dataset in parallel queued past the 10 s client timeout (correct, retried
+  `TARGET_TIMEOUT`, but not what each test asserts); the suite runs `--test-threads=1`.
+- 2026-09-28: the upgrade workload of Phase 2 puts named-graph quads on `main`; such streams
+  block visibly (`NAMED_GRAPH_UNSUPPORTED`) in v1. The 0010 → 0011 harness therefore adds
+  default-graph-only graphs to prove the backlog projection, and asserts the blocking of
+  the others.
+- Review round 1 (seven read-only reviewers on `898b122`) found, and this round fixed: an
+  unguarded rebuild that a stalled worker could apply over a newer projection (now the
+  ceiling-guarded replace); `DependencyTimeout` classified permanent (now retryable); an idle
+  target that lost its data stayed empty until the next acceptance (now reconciliation +
+  `TARGET_LOST`); two deployments or two KB feeds sharing one dataset/graph could overwrite
+  each other (now `TARGET_CONFLICT` + dataset binding); literal canonicalization (above);
+  projector role able to enable/disable streams (now owner-only by trigger); a full UNIQUE
+  preventing re-pointing a KB after disable (now partial); non-`main` refs and bootstrap
+  heads enable-able but never projectable (now refused); `work_for` reading head and event in
+  two snapshots (now one query); language-tagged marker values accepted; probe accepting any
+  failure (now HTTP 500 naming `LOAD`); secret files not checked as regular bounded files;
+  `MAINTAIN` (PostgreSQL 17) not in the privilege model.
 
 ## Evidence
 (filled as slices land)

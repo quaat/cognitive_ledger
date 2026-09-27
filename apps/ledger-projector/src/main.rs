@@ -4,8 +4,8 @@
 //! ledger-projector [run]                         serve /health /ready /metrics and project
 //! ledger-projector rebuild --graph <id> [--ref main]
 //! ledger-projector verify  --graph <id> [--ref main]
-//! ledger-projector status  [--json]
 //! ```
+//! (Status is `ledger-admin projection status`, a database-only operator read.)
 //! Configuration (environment; secrets only through files, never logged):
 //! `LEDGER_PROJECTOR_DATABASE_URL` (the projector identity, ADR-0021), `LEDGER_PROJECTION_TARGET_ID`,
 //! `LEDGER_PROJECTION_QUERY_URL`, `LEDGER_PROJECTION_UPDATE_URL`, either
@@ -14,7 +14,9 @@
 //! `LEDGER_PROJECTOR_CONCURRENCY`, `LEDGER_PROJECTOR_LEASE_SECONDS`, `LEDGER_PROJECTOR_POLL_MS`,
 //! `LEDGER_PROJECTOR_TARGET_TIMEOUT_SECONDS`, `LEDGER_PROJECTOR_MAX_UPDATE_BYTES`,
 //! `LEDGER_PROJECTOR_MAX_RESPONSE_BYTES`, `LEDGER_PROJECTOR_MAX_QUADS`,
-//! `LEDGER_PROJECTOR_MAX_STATE_BYTES`, `LEDGER_PROJECTOR_MAX_DEPTH`.
+//! `LEDGER_PROJECTOR_MAX_STATE_BYTES`, `LEDGER_PROJECTOR_MAX_DEPTH`,
+//! `LEDGER_PROJECTOR_RECONCILE_SECONDS` (idle-stream re-check, default 300),
+//! `LEDGER_PROJECTOR_PROBE_SECONDS` (transactional probe, default 300).
 //! `LEDGER_PROJECTOR_DEVELOPMENT=allow-insecure-development-only` permits plain http to a
 //! loopback target and a target without credentials; it is refused together with https-less
 //! non-loopback endpoints in every case.
@@ -29,16 +31,19 @@ use std::{env, process::ExitCode, sync::Arc, time::Duration};
 const DEVELOPMENT_SWITCH: &str = "allow-insecure-development-only";
 const MAX_SECRET_FILE_BYTES: u64 = 64 * 1024;
 
-fn var(name: &str) -> Option<String> {
+/// Environment lookup (injectable so configuration refusals are unit-testable).
+type Env<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+fn process_env(name: &str) -> Option<String> {
     env::var(name).ok().filter(|v| !v.is_empty())
 }
 
-fn required(name: &str) -> Result<String, String> {
-    var(name).ok_or_else(|| format!("{name} is required"))
+fn required(env: Env, name: &str) -> Result<String, String> {
+    env(name).ok_or_else(|| format!("{name} is required"))
 }
 
-fn number<T: std::str::FromStr>(name: &str, default: T) -> Result<T, String> {
-    match var(name) {
+fn number<T: std::str::FromStr>(env: Env, name: &str, default: T) -> Result<T, String> {
+    match env(name) {
         None => Ok(default),
         Some(v) => v
             .parse()
@@ -46,21 +51,28 @@ fn number<T: std::str::FromStr>(name: &str, default: T) -> Result<T, String> {
     }
 }
 
-fn secret_file(name: &str) -> Result<Option<String>, String> {
-    let Some(path) = var(name) else {
+/// Read a secret from a regular file, bounded (a FIFO or device cannot bypass the cap).
+fn secret_file(env: Env, name: &str) -> Result<Option<String>, String> {
+    use std::io::Read as _;
+    let Some(path) = env(name) else {
         return Ok(None);
     };
     let unreadable = || format!("{name} cannot be read (path not shown)");
-    let size = std::fs::metadata(&path).map_err(|_| unreadable())?.len();
-    if size > MAX_SECRET_FILE_BYTES {
+    let meta = std::fs::metadata(&path).map_err(|_| unreadable())?;
+    if !meta.is_file() {
+        return Err(format!("{name} must name a regular file"));
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(&path)
+        .map_err(|_| unreadable())?
+        .take(MAX_SECRET_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| unreadable())?;
+    if bytes.len() as u64 > MAX_SECRET_FILE_BYTES {
         return Err(format!("{name} exceeds {MAX_SECRET_FILE_BYTES} bytes"));
     }
-    Ok(Some(
-        std::fs::read_to_string(&path)
-            .map_err(|_| unreadable())?
-            .trim()
-            .to_owned(),
-    ))
+    let text = String::from_utf8(bytes).map_err(|_| format!("{name} is not UTF-8"))?;
+    Ok(Some(text.trim().to_owned()))
 }
 
 struct Settings {
@@ -70,8 +82,8 @@ struct Settings {
     address: String,
 }
 
-fn settings() -> Result<Settings, String> {
-    let development = match var("LEDGER_PROJECTOR_DEVELOPMENT") {
+fn settings(env: Env) -> Result<Settings, String> {
+    let development = match env("LEDGER_PROJECTOR_DEVELOPMENT") {
         None => false,
         Some(v) if v == DEVELOPMENT_SWITCH => true,
         Some(_) => {
@@ -82,9 +94,9 @@ fn settings() -> Result<Settings, String> {
         }
     };
     let credentials = match (
-        var("LEDGER_PROJECTION_USERNAME"),
-        secret_file("LEDGER_PROJECTION_PASSWORD_FILE")?,
-        secret_file("LEDGER_PROJECTION_TOKEN_FILE")?,
+        env("LEDGER_PROJECTION_USERNAME"),
+        secret_file(env, "LEDGER_PROJECTION_PASSWORD_FILE")?,
+        secret_file(env, "LEDGER_PROJECTION_TOKEN_FILE")?,
     ) {
         (Some(username), Some(password), None) => TargetCredentials::Basic { username, password },
         (None, None, Some(token)) => TargetCredentials::Bearer(token),
@@ -104,18 +116,25 @@ fn settings() -> Result<Settings, String> {
             );
         }
     };
-    let timeout = Duration::from_secs(number("LEDGER_PROJECTOR_TARGET_TIMEOUT_SECONDS", 30u64)?);
-    let lease = Duration::from_secs(number("LEDGER_PROJECTOR_LEASE_SECONDS", 120u64)?);
-    if lease <= timeout * 2 {
+    let timeout = Duration::from_secs(number(
+        env,
+        "LEDGER_PROJECTOR_TARGET_TIMEOUT_SECONDS",
+        30u64,
+    )?);
+    let lease = Duration::from_secs(number(env, "LEDGER_PROJECTOR_LEASE_SECONDS", 180u64)?);
+    // A step makes up to four target requests (observe, write, observe, containment) plus
+    // reconstruction; the lease must cover them with margin (a write outliving its lease is
+    // harmless, ADR-0020, but wasted).
+    if lease < timeout * 4 + Duration::from_secs(30) {
         return Err(
-            "LEDGER_PROJECTOR_LEASE_SECONDS must exceed twice LEDGER_PROJECTOR_TARGET_TIMEOUT_SECONDS"
+            "LEDGER_PROJECTOR_LEASE_SECONDS must be at least 4 × LEDGER_PROJECTOR_TARGET_TIMEOUT_SECONDS + 30"
                 .into(),
         );
     }
-    let target_id = required("LEDGER_PROJECTION_TARGET_ID")?;
+    let target_id = required(env, "LEDGER_PROJECTION_TARGET_ID")?;
     let instance = format!(
         "{}:{}:{}",
-        var("HOSTNAME").unwrap_or_else(|| "projector".into()),
+        env("HOSTNAME").unwrap_or_else(|| "projector".into()),
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -123,16 +142,29 @@ fn settings() -> Result<Settings, String> {
             .unwrap_or(0)
     );
     let d = ReconstructionLimits::DEVELOPMENT;
+    let max_update_bytes: usize =
+        number(env, "LEDGER_PROJECTOR_MAX_UPDATE_BYTES", 64 * 1024 * 1024)?;
+    let max_state_bytes: usize = number(env, "LEDGER_PROJECTOR_MAX_STATE_BYTES", 48 * 1024 * 1024)?;
+    if max_state_bytes >= max_update_bytes {
+        return Err(
+            "LEDGER_PROJECTOR_MAX_STATE_BYTES must be below LEDGER_PROJECTOR_MAX_UPDATE_BYTES"
+                .into(),
+        );
+    }
     Ok(Settings {
-        database_url: required("LEDGER_PROJECTOR_DATABASE_URL")?,
+        database_url: required(env, "LEDGER_PROJECTOR_DATABASE_URL")?,
         target: FusekiConfig {
-            query_endpoint: required("LEDGER_PROJECTION_QUERY_URL")?,
-            update_endpoint: required("LEDGER_PROJECTION_UPDATE_URL")?,
+            query_endpoint: required(env, "LEDGER_PROJECTION_QUERY_URL")?,
+            update_endpoint: required(env, "LEDGER_PROJECTION_UPDATE_URL")?,
             credentials,
             connect_timeout: timeout.min(Duration::from_secs(10)),
             request_timeout: timeout,
-            max_update_bytes: number("LEDGER_PROJECTOR_MAX_UPDATE_BYTES", 64 * 1024 * 1024)?,
-            max_response_bytes: number("LEDGER_PROJECTOR_MAX_RESPONSE_BYTES", 64 * 1024 * 1024)?,
+            max_update_bytes,
+            max_response_bytes: number(
+                env,
+                "LEDGER_PROJECTOR_MAX_RESPONSE_BYTES",
+                64 * 1024 * 1024,
+            )?,
             allow_insecure_loopback: development,
         },
         projector: ProjectorConfig {
@@ -140,16 +172,26 @@ fn settings() -> Result<Settings, String> {
             owner: instance.chars().take(256).collect(),
             lease_ttl: lease,
             reconstruction: ReconstructionLimits {
-                max_depth: number("LEDGER_PROJECTOR_MAX_DEPTH", d.max_depth)?,
-                max_quads: number("LEDGER_PROJECTOR_MAX_QUADS", d.max_quads)?,
-                max_bytes: number("LEDGER_PROJECTOR_MAX_STATE_BYTES", d.max_bytes)?,
+                max_depth: number(env, "LEDGER_PROJECTOR_MAX_DEPTH", d.max_depth)?,
+                max_quads: number(env, "LEDGER_PROJECTOR_MAX_QUADS", d.max_quads)?,
+                max_bytes: max_state_bytes,
             },
             backoff_base: Duration::from_secs(1),
             backoff_max: Duration::from_secs(300),
-            poll_interval: Duration::from_millis(number("LEDGER_PROJECTOR_POLL_MS", 1000u64)?),
-            concurrency: number("LEDGER_PROJECTOR_CONCURRENCY", 2usize)?,
+            poll_interval: Duration::from_millis(number(env, "LEDGER_PROJECTOR_POLL_MS", 1000u64)?),
+            concurrency: number(env, "LEDGER_PROJECTOR_CONCURRENCY", 2usize)?,
+            reconcile_interval: Duration::from_secs(number(
+                env,
+                "LEDGER_PROJECTOR_RECONCILE_SECONDS",
+                300u64,
+            )?),
+            probe_interval: Duration::from_secs(number(
+                env,
+                "LEDGER_PROJECTOR_PROBE_SECONDS",
+                300u64,
+            )?),
         },
-        address: var("LEDGER_PROJECTOR_ADDR").unwrap_or_else(|| "127.0.0.1:9464".into()),
+        address: env("LEDGER_PROJECTOR_ADDR").unwrap_or_else(|| "127.0.0.1:9464".into()),
     })
 }
 
@@ -157,17 +199,15 @@ enum Command {
     Run,
     Rebuild(StreamKey),
     Verify(StreamKey),
-    Status { json: bool },
 }
 
 fn parse(target_id: &str, mut argv: impl Iterator<Item = String>) -> Result<Command, String> {
     let sub = argv.next();
-    let (mut graph, mut branch, mut json) = (None, "main".to_owned(), false);
+    let (mut graph, mut branch) = (None, "main".to_owned());
     while let Some(flag) = argv.next() {
         match flag.as_str() {
             "--graph" => graph = argv.next(),
             "--ref" => branch = argv.next().ok_or("--ref needs a value")?,
-            "--json" => json = true,
             _ => return Err("unknown argument (value not shown)".into()),
         }
     }
@@ -183,8 +223,7 @@ fn parse(target_id: &str, mut argv: impl Iterator<Item = String>) -> Result<Comm
         None | Some("run") => Ok(Command::Run),
         Some("rebuild") => key(graph).map(Command::Rebuild),
         Some("verify") => key(graph).map(Command::Verify),
-        Some("status") => Ok(Command::Status { json }),
-        _ => Err("usage: ledger-projector [run|rebuild|verify|status] …".into()),
+        _ => Err("usage: ledger-projector [run|rebuild|verify] …".into()),
     }
 }
 
@@ -204,6 +243,9 @@ async fn serve(
             get(move || {
                 let p = ready_projector.clone();
                 async move {
+                    if p.is_paused() {
+                        return (StatusCode::SERVICE_UNAVAILABLE, "target failed the probe");
+                    }
                     match p.repository().ready().await {
                         Ok(()) => (StatusCode::OK, "ready"),
                         Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "not ready"),
@@ -246,7 +288,7 @@ async fn serve(
 }
 
 async fn real_main() -> Result<(), String> {
-    let settings = settings()?;
+    let settings = settings(&process_env)?;
     let command = parse(&settings.projector.target_id, env::args().skip(1))?;
     let repo = ProjectionRepository::connect(
         &settings.database_url,
@@ -266,43 +308,6 @@ async fn real_main() -> Result<(), String> {
         metrics.clone(),
     ));
     match command {
-        Command::Status { json } => {
-            let streams = projector
-                .repository()
-                .status(Some(&projector.config().target_id))
-                .await
-                .map_err(|e| e.to_string())?;
-            for s in &streams {
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "graph_id": s.key.graph_id.as_str(), "ref": s.key.branch,
-                            "status": s.status, "projected_ref_version": s.projected_ref_version,
-                            "head_version": s.head_version, "lag_versions": s.lag_versions(),
-                            "pending_events": s.pending_events,
-                            "oldest_pending_seconds": s.oldest_pending_seconds,
-                            "last_error_code": s.last_error_code,
-                        })
-                    );
-                } else {
-                    println!(
-                        "{} {} [{}] projected v{} of v{} (lag {}){}",
-                        s.key.graph_id,
-                        s.key.branch,
-                        s.status,
-                        s.projected_ref_version.unwrap_or(0),
-                        s.head_version.unwrap_or(0),
-                        s.lag_versions(),
-                        s.last_error_code
-                            .as_ref()
-                            .map(|c| format!(" last error {c}"))
-                            .unwrap_or_default()
-                    );
-                }
-            }
-            return Ok(());
-        }
         Command::Verify(key) => {
             let report = projector.verify(&key).await.map_err(|e| e.to_string())?;
             println!("{}", report.detail);
@@ -315,9 +320,14 @@ async fn real_main() -> Result<(), String> {
         }
         Command::Rebuild(_) | Command::Run => {}
     }
-    // Both remaining commands write the target: prove it is transactional first.
+    // Both remaining commands write the target: prove it is transactional and bound to this
+    // target id (one dataset never answers to two target ids, ADR-0020).
     client
         .probe_transactional()
+        .await
+        .map_err(|e| format!("startup refused: {e}"))?;
+    client
+        .bind_target(&projector.config().target_id)
         .await
         .map_err(|e| format!("startup refused: {e}"))?;
     if let Command::Rebuild(key) = command {
@@ -381,5 +391,104 @@ async fn main() -> ExitCode {
             eprintln!("ledger-projector: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn with(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).into(), (*v).into()))
+            .collect();
+        move |k| map.get(k).cloned()
+    }
+
+    fn base() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("LEDGER_PROJECTOR_DATABASE_URL", "postgres://p@db/ledger"),
+            ("LEDGER_PROJECTION_TARGET_ID", "fuseki-main"),
+            ("LEDGER_PROJECTION_QUERY_URL", "https://f/ledger/query"),
+            ("LEDGER_PROJECTION_UPDATE_URL", "https://f/ledger/update"),
+        ]
+    }
+
+    #[test]
+    fn configuration_refusals_are_explicit() {
+        let dir = std::env::temp_dir().join(format!("ledger-projector-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret = dir.join("pw");
+        std::fs::write(&secret, "s3cret\n").unwrap();
+        let secret = secret.to_str().unwrap().to_owned();
+        let err = |extra: &[(&str, &str)]| {
+            let mut pairs = base();
+            pairs.extend_from_slice(extra);
+            settings(&with(&pairs)).err()
+        };
+        // Credentials are required outside development…
+        assert!(err(&[]).unwrap().contains("credentials are required"));
+        // …never mixed…
+        assert!(
+            err(&[
+                ("LEDGER_PROJECTION_USERNAME", "p"),
+                ("LEDGER_PROJECTION_PASSWORD_FILE", &secret),
+                ("LEDGER_PROJECTION_TOKEN_FILE", &secret),
+            ])
+            .unwrap()
+            .contains("not a mix")
+        );
+        // …and read from regular files only.
+        assert!(
+            err(&[
+                ("LEDGER_PROJECTION_USERNAME", "p"),
+                ("LEDGER_PROJECTION_PASSWORD_FILE", dir.to_str().unwrap()),
+            ])
+            .unwrap()
+            .contains("regular file")
+        );
+        // The development switch needs its exact value.
+        assert!(
+            err(&[("LEDGER_PROJECTOR_DEVELOPMENT", "yes")])
+                .unwrap()
+                .contains("unrecognised")
+        );
+        // The lease must cover a step.
+        assert!(
+            err(&[
+                ("LEDGER_PROJECTION_TOKEN_FILE", &secret),
+                ("LEDGER_PROJECTOR_LEASE_SECONDS", "60"),
+            ])
+            .unwrap()
+            .contains("LEASE_SECONDS")
+        );
+        // State limit below the request limit.
+        assert!(
+            err(&[
+                ("LEDGER_PROJECTION_TOKEN_FILE", &secret),
+                ("LEDGER_PROJECTOR_MAX_STATE_BYTES", "999999999"),
+            ])
+            .unwrap()
+            .contains("MAX_STATE_BYTES")
+        );
+        // A complete production configuration is accepted, credentials from the file.
+        let mut pairs = base();
+        pairs.push(("LEDGER_PROJECTION_USERNAME", "projector"));
+        pairs.push(("LEDGER_PROJECTION_PASSWORD_FILE", &secret));
+        let ok = settings(&with(&pairs)).unwrap();
+        assert!(
+            matches!(ok.target.credentials, TargetCredentials::Basic { ref password, .. } if password == "s3cret")
+        );
+        assert!(!ok.target.allow_insecure_loopback);
+        // Development allows no credentials.
+        let mut pairs = base();
+        pairs.push(("LEDGER_PROJECTOR_DEVELOPMENT", DEVELOPMENT_SWITCH));
+        assert!(matches!(
+            settings(&with(&pairs)).unwrap().target.credentials,
+            TargetCredentials::None
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

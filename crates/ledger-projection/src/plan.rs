@@ -17,25 +17,29 @@ pub struct LedgerView {
     /// The ref's head commit at the marker's version, when a well-formed marker for this
     /// stream names a version `<= head_version` (looked up by the caller).
     pub commit_at_marker_version: Option<CommitId>,
+    /// The version the ledger records as projected for this stream, if any.
+    pub recorded_version: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RebuildReason {
     MarkerMalformed,
-    MarkerForAnotherStream,
     MarkerCommitMismatch,
     TripleCountMismatch,
     UnmarkedContent,
+    /// Marker and graph are gone although the ledger recorded a projection (the target lost
+    /// its data).
+    TargetLost,
 }
 
 impl RebuildReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::MarkerMalformed => "marker_malformed",
-            Self::MarkerForAnotherStream => "marker_for_another_stream",
             Self::MarkerCommitMismatch => "marker_commit_mismatch",
             Self::TripleCountMismatch => "triple_count_mismatch",
             Self::UnmarkedContent => "unmarked_content",
+            Self::TargetLost => "target_lost",
         }
     }
 }
@@ -47,26 +51,23 @@ pub enum Plan {
     /// The target represents a later accepted version of this ref (a previous worker got
     /// there first): acknowledge up to that version, write nothing.
     AcknowledgeBeyond { commit: CommitId, version: i64 },
-    /// Write the target event's state. `Conditional` for the normal path (first projection
-    /// or a predecessor marker); `Replace` with a reason for recovery.
-    Write {
-        mode: WriteMode,
-        rebuild: Option<RebuildReason>,
-    },
+    /// Write the target event's state: conditionally (first projection or a predecessor
+    /// marker), or as a guarded replacement with a reason (recovery).
+    Write { rebuild: Option<RebuildReason> },
     /// Never regress automatically: an operator rebuild decides.
     RecoveryRequired(ProjectionError),
 }
 
 pub fn plan(view: &LedgerView, observation: &Observation) -> Plan {
     let rebuild = |reason| Plan::Write {
-        mode: WriteMode::Replace,
         rebuild: Some(reason),
     };
     let marker = match &observation.marker {
         MarkerRead::Absent if observation.triple_count == 0 => {
-            return Plan::Write {
-                mode: WriteMode::Conditional,
-                rebuild: None,
+            // An empty target where the ledger recorded a projection lost its data.
+            return match view.recorded_version {
+                Some(_) => rebuild(RebuildReason::TargetLost),
+                None => Plan::Write { rebuild: None },
             };
         }
         MarkerRead::Absent => return rebuild(RebuildReason::UnmarkedContent),
@@ -74,7 +75,13 @@ pub fn plan(view: &LedgerView, observation: &Observation) -> Plan {
         MarkerRead::Present(marker) => marker,
     };
     if marker.graph_id != view.graph_id || marker.branch != view.branch {
-        return rebuild(RebuildReason::MarkerForAnotherStream);
+        // Another stream's projection lives in this cognitive graph (two deployments sharing
+        // a dataset, or a switched feed graph): never overwrite it automatically.
+        return Plan::RecoveryRequired(ProjectionError::permanent(
+            ProjectionErrorCode::TargetConflict,
+            "the cognitive graph holds another stream's projection; an operator rebuild must \
+             decide (ADR-0020)",
+        ));
     }
     if marker.ref_version > view.head_version {
         return Plan::RecoveryRequired(ProjectionError::permanent(
@@ -87,28 +94,40 @@ pub fn plan(view: &LedgerView, observation: &Observation) -> Plan {
         ));
     }
     // A marker for this stream within the ledger's history must name the ledger's commit
-    // at that version.
+    // at that version (otherwise the target is not a state of this ref: rebuild from the
+    // ledger, which is authoritative).
     if view.commit_at_marker_version.as_ref() != Some(&marker.commit) {
         return rebuild(RebuildReason::MarkerCommitMismatch);
     }
-    let counts_agree = marker.triple_count == observation.triple_count;
-    if marker.ref_version < view.target_version {
-        // Predecessor: the conditional write replaces the whole graph whatever it holds.
-        return Plan::Write {
-            mode: WriteMode::Conditional,
-            rebuild: None,
-        };
-    }
-    if !counts_agree {
+    // The marker's count is the target's own count at write time; a difference means the
+    // graph was edited out of band.
+    if marker.triple_count != observation.triple_count {
         return rebuild(RebuildReason::TripleCountMismatch);
     }
-    if marker.ref_version == view.target_version {
+    if marker.ref_version < view.target_version {
+        Plan::Write { rebuild: None }
+    } else if marker.ref_version == view.target_version {
         Plan::AlreadyProjected
     } else {
         Plan::AcknowledgeBeyond {
             commit: marker.commit.clone(),
             version: marker.ref_version,
         }
+    }
+}
+
+/// The write mode for a plan's write (ADR-0020): conditional for the normal path, a
+/// replacement guarded by the highest version observed for recovery.
+pub fn write_mode(
+    rebuild: Option<RebuildReason>,
+    target_version: i64,
+    observation: &Observation,
+) -> WriteMode {
+    match rebuild {
+        None => WriteMode::Conditional,
+        Some(_) => WriteMode::Replace {
+            ceiling: target_version.max(observation.max_ref_version.unwrap_or(0)),
+        },
     }
 }
 
@@ -130,6 +149,7 @@ mod tests {
             target_version: target,
             head_version: head,
             commit_at_marker_version: at_marker.map(commit),
+            recorded_version: None,
         }
     }
 
@@ -145,20 +165,21 @@ mod tests {
     }
 
     fn obs(marker: MarkerRead, count: u64) -> Observation {
+        let max_ref_version = match &marker {
+            MarkerRead::Present(m) => Some(m.ref_version),
+            _ => None,
+        };
         Observation {
             marker,
             triple_count: count,
+            max_ref_version,
         }
     }
 
-    const CONDITIONAL: Plan = Plan::Write {
-        mode: WriteMode::Conditional,
-        rebuild: None,
-    };
+    const CONDITIONAL: Plan = Plan::Write { rebuild: None };
 
     fn rebuild(reason: RebuildReason) -> Plan {
         Plan::Write {
-            mode: WriteMode::Replace,
             rebuild: Some(reason),
         }
     }
@@ -169,6 +190,13 @@ mod tests {
         assert_eq!(
             plan(&view(1, 1, None), &obs(MarkerRead::Absent, 0)),
             CONDITIONAL
+        );
+        // the target lost everything although the ledger recorded a projection → rebuild
+        let mut recorded = view(3, 3, None);
+        recorded.recorded_version = Some(2);
+        assert_eq!(
+            plan(&recorded, &obs(MarkerRead::Absent, 0)),
+            rebuild(RebuildReason::TargetLost)
         );
         // unmarked content → rebuild
         assert_eq!(
@@ -198,9 +226,10 @@ mod tests {
             plan(&view(5, 5, Some(1)), &obs(marker(1, 9), 9)),
             CONDITIONAL
         );
+        // predecessor whose graph was edited → counted rebuild (same full write, logged)
         assert_eq!(
             plan(&view(5, 5, Some(4)), &obs(marker(4, 9), 2)),
-            CONDITIONAL
+            rebuild(RebuildReason::TripleCountMismatch)
         );
         // target beyond the event but within history → acknowledge beyond
         assert_eq!(
@@ -220,12 +249,36 @@ mod tests {
             plan(&view(3, 3, Some(99)), &obs(marker(2, 1), 1)),
             rebuild(RebuildReason::MarkerCommitMismatch)
         );
-        // marker for another stream → rebuild
+        // marker for another stream → recovery (never overwrite another stream)
         let mut other = view(3, 3, Some(2));
         other.branch = "dev".into();
+        match plan(&other, &obs(marker(2, 1), 1)) {
+            Plan::RecoveryRequired(e) => {
+                assert_eq!(e.code(), ProjectionErrorCode::TargetConflict)
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn replacements_are_guarded_by_the_highest_version_observed() {
         assert_eq!(
-            plan(&other, &obs(marker(2, 1), 1)),
-            rebuild(RebuildReason::MarkerForAnotherStream)
+            write_mode(None, 5, &obs(marker(4, 1), 1)),
+            WriteMode::Conditional
+        );
+        assert_eq!(
+            write_mode(
+                Some(RebuildReason::MarkerMalformed),
+                5,
+                &obs(MarkerRead::Absent, 0)
+            ),
+            WriteMode::Replace { ceiling: 5 }
+        );
+        let mut observed = obs(MarkerRead::Malformed("two versions".into()), 3);
+        observed.max_ref_version = Some(9);
+        assert_eq!(
+            write_mode(Some(RebuildReason::MarkerMalformed), 5, &observed),
+            WriteMode::Replace { ceiling: 9 }
         );
     }
 }

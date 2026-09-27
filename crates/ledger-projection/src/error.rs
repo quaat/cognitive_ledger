@@ -28,6 +28,9 @@ pub enum ProjectionErrorCode {
     InvalidTargetGraph,
     LedgerUnavailable,
     LedgerState,
+    /// The target holds another stream's projection in this stream's cognitive graph, or
+    /// the dataset is bound to another target id.
+    TargetConflict,
 }
 
 impl ProjectionErrorCode {
@@ -48,10 +51,11 @@ impl ProjectionErrorCode {
             Self::InvalidTargetGraph => "INVALID_TARGET_GRAPH",
             Self::LedgerUnavailable => "LEDGER_UNAVAILABLE",
             Self::LedgerState => "LEDGER_STATE",
+            Self::TargetConflict => "TARGET_CONFLICT",
         }
     }
 
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::TargetUnavailable,
         Self::TargetTimeout,
         Self::TargetThrottled,
@@ -66,6 +70,7 @@ impl ProjectionErrorCode {
         Self::InvalidTargetGraph,
         Self::LedgerUnavailable,
         Self::LedgerState,
+        Self::TargetConflict,
     ];
 }
 

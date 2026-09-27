@@ -2807,3 +2807,181 @@ async fn drifted_phase2_identity_constraints_and_checks_are_refused_at_startup_a
         .expect("start-up after every restoration");
     fx.teardown().await;
 }
+
+/// The owner-side definition of a named constraint, index or function (for restoration).
+async fn catalog_def(fx: &Fixture, sql: &str) -> String {
+    sqlx::query_scalar(sql)
+        .fetch_one(&fx.owner)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"))
+}
+
+/// Migration 0011's controls (ADR-0021): guard triggers and their function bodies, the
+/// partial one-stream-per-cognitive-graph index, the progress and tenant FKs and the
+/// projection CHECKs are each refused at start-up and readiness when weakened, and the
+/// database is healthy again after restoration.
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn weakened_projection_controls_are_refused_at_startup_and_readiness() {
+    let fx = fixture("lp_proj_drift").await;
+    fx.migrate_and_grant().await;
+    let running = PostgresLedgerStore::connect(&fx.runtime_db_url, V1Binding::Reject)
+        .await
+        .expect("healthy database serves");
+    assert_healthy(&fx, "fresh migration").await;
+
+    // Guard triggers disabled.
+    for (trigger, table) in [
+        ("projection_state_guard", "projection_state"),
+        ("outbox_delivery_monotonic", "projection_outbox"),
+    ] {
+        owner_exec(
+            &fx,
+            &format!("ALTER TABLE {table} DISABLE TRIGGER {trigger}"),
+        )
+        .await;
+        let m = assert_refused_by_schema(&fx, &running, &format!("{trigger} disabled")).await;
+        assert!(m.contains(trigger), "{m}");
+        owner_exec(
+            &fx,
+            &format!("ALTER TABLE {table} ENABLE TRIGGER {trigger}"),
+        )
+        .await;
+        assert_healthy(&fx, &format!("{trigger} enabled")).await;
+    }
+
+    // Guard function bodies replaced by a pass-through.
+    for function in ["projection_state_guard", "outbox_delivery_is_monotonic"] {
+        let real = catalog_def(
+            &fx,
+            &format!("SELECT pg_get_functiondef('public.{function}()'::regprocedure)"),
+        )
+        .await;
+        owner_exec(
+            &fx,
+            &format!(
+                "CREATE OR REPLACE FUNCTION public.{function}() RETURNS trigger \
+                 LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$"
+            ),
+        )
+        .await;
+        let m = assert_refused_by_schema(&fx, &running, &format!("{function} replaced")).await;
+        assert!(m.contains(function), "{m}");
+        owner_exec(&fx, &real).await;
+        assert_healthy(&fx, &format!("{function} restored")).await;
+    }
+
+    // The partial unique index: dropped, or recreated without its predicate.
+    let index = catalog_def(
+        &fx,
+        "SELECT pg_get_indexdef('public.projection_state_graph_unique'::regclass)",
+    )
+    .await;
+    owner_exec(&fx, "DROP INDEX projection_state_graph_unique").await;
+    let m = assert_refused_by_schema(&fx, &running, "graph-unique index dropped").await;
+    assert!(m.contains("projection_state_graph_unique"), "{m}");
+    owner_exec(
+        &fx,
+        "CREATE UNIQUE INDEX projection_state_graph_unique ON projection_state (target_id, cognitive_graph) WHERE status = 'active'",
+    )
+    .await;
+    // Same catalog shape, narrower predicate (two blocked streams could then share a graph):
+    // refused by deparse at start-up and by fingerprint on readiness.
+    match PostgresLedgerStore::connect(&fx.runtime_db_url, V1Binding::Reject).await {
+        Err(LedgerError::SchemaIncompatible(m)) => {
+            assert!(
+                m.contains("projection_state_graph_unique") && m.contains("predicate"),
+                "{m}"
+            )
+        }
+        other => panic!("narrowed graph-unique predicate must refuse start-up: {other:?}"),
+    }
+    match running.ready().await {
+        Err(LedgerError::SchemaIncompatible(m)) => {
+            assert!(m.contains("projection_state_graph_unique"), "{m}")
+        }
+        other => panic!("narrowed graph-unique predicate must refuse readiness: {other:?}"),
+    }
+    owner_exec(&fx, "DROP INDEX projection_state_graph_unique").await;
+    owner_exec(&fx, &index).await;
+    assert_healthy(&fx, "graph-unique index restored").await;
+
+    // The progress and tenant FKs.
+    for fk in [
+        "projection_state_progress_fk",
+        "projection_state_graph_tenant_fk",
+    ] {
+        let def = catalog_def(
+            &fx,
+            &format!("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = '{fk}'"),
+        )
+        .await;
+        owner_exec(
+            &fx,
+            &format!("ALTER TABLE projection_state DROP CONSTRAINT {fk}"),
+        )
+        .await;
+        let m = assert_refused_by_schema(&fx, &running, &format!("{fk} dropped")).await;
+        assert!(m.contains("projection_state FOREIGN KEY"), "{m}");
+        owner_exec(
+            &fx,
+            &format!("ALTER TABLE projection_state ADD CONSTRAINT {fk} {def}"),
+        )
+        .await;
+        assert_healthy(&fx, &format!("{fk} restored")).await;
+    }
+
+    // Projection CHECKs dropped, or replaced by vacuous ones under the same name.
+    for check in [
+        "ps_status",
+        "ps_progress_shape",
+        "ps_lease_shape",
+        "ps_error_code_format",
+        "ps_counters",
+    ] {
+        let def = catalog_def(
+            &fx,
+            &format!(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = '{check}'"
+            ),
+        )
+        .await;
+        owner_exec(
+            &fx,
+            &format!("ALTER TABLE projection_state DROP CONSTRAINT {check}"),
+        )
+        .await;
+        let m = assert_refused_by_schema(&fx, &running, &format!("{check} dropped")).await;
+        assert!(m.contains(check), "{m}");
+        owner_exec(
+            &fx,
+            &format!("ALTER TABLE projection_state ADD CONSTRAINT {check} CHECK (true)"),
+        )
+        .await;
+        match PostgresLedgerStore::connect(&fx.runtime_db_url, V1Binding::Reject).await {
+            Err(LedgerError::SchemaIncompatible(m)) => assert!(m.contains(check), "{m}"),
+            other => panic!("vacuous {check} must refuse start-up: {other:?}"),
+        }
+        assert!(
+            matches!(
+                running.ready().await,
+                Err(LedgerError::SchemaIncompatible(_))
+            ),
+            "vacuous {check} must refuse readiness"
+        );
+        owner_exec(
+            &fx,
+            &format!("ALTER TABLE projection_state DROP CONSTRAINT {check}"),
+        )
+        .await;
+        owner_exec(
+            &fx,
+            &format!("ALTER TABLE projection_state ADD CONSTRAINT {check} {def}"),
+        )
+        .await;
+        assert_healthy(&fx, &format!("{check} restored")).await;
+    }
+    running.ready().await.expect("readiness after restore");
+    drop(running);
+    fx.teardown().await;
+}

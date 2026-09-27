@@ -13,10 +13,19 @@ use ledger_rdf::{Operation, OperationKind, Patch};
 use ledger_store::{
     AcceptRequest, FailureDisposition, GraphStatus, LeaseOutcome, NewGraph, PostgresLedgerStore,
     PrepareRequest, ProjectionRepository, RequestScope, StreamKey, V1Binding, ValidationPolicy,
-    schema,
+    WorkMode, schema,
 };
 use sqlx::{Connection, PgPool, postgres::PgPoolOptions};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// The SQLSTATE a statement failed with (panics if it succeeded).
+fn sqlstate(result: Result<sqlx::postgres::PgQueryResult, sqlx::Error>) -> String {
+    match result {
+        Err(sqlx::Error::Database(d)) => d.code().unwrap_or_default().into_owned(),
+        Err(other) => panic!("expected a database error, got {other}"),
+        Ok(_) => panic!("the statement must be refused"),
+    }
+}
 
 fn database_url() -> String {
     std::env::var("LEDGER_TEST_DATABASE_URL").expect("LEDGER_TEST_DATABASE_URL must be set")
@@ -37,6 +46,15 @@ async fn store() -> PostgresLedgerStore {
 }
 
 async fn graph(store: &PostgresLedgerStore, tenant: &str, kb: Option<&str>) -> GraphId {
+    graph_with_status(store, tenant, kb, GraphStatus::Active).await
+}
+
+async fn graph_with_status(
+    store: &PostgresLedgerStore,
+    tenant: &str,
+    kb: Option<&str>,
+    status: GraphStatus,
+) -> GraphId {
     let id = GraphId::new(unique("proj")).unwrap();
     store
         .graphs()
@@ -45,7 +63,7 @@ async fn graph(store: &PostgresLedgerStore, tenant: &str, kb: Option<&str>) -> G
             tenant_id: TenantId::new(tenant).unwrap(),
             knowledge_base_id: kb.map(str::to_owned),
             purpose: None,
-            status: GraphStatus::Active,
+            status,
         })
         .await
         .unwrap();
@@ -142,6 +160,18 @@ async fn enabling_needs_a_knowledge_base_and_cognitive_graphs_are_never_shared()
         .await
         .unwrap_err();
     assert!(error.to_string().contains("knowledge_base_id"), "{error}");
+    // v1 projects `main` only (ADR-0020).
+    let with_kb = graph(&store, "tenant-a", Some(&unique("kb"))).await;
+    let mut draft = key(&with_kb, &target);
+    draft.branch = "draft".into();
+    let error = repo.enable(&draft, derive).await.unwrap_err();
+    assert!(error.to_string().contains("`main` ref only"), "{error}");
+    // Only active graphs are projected.
+    for status in [GraphStatus::Importing, GraphStatus::Archived] {
+        let g = graph_with_status(&store, "tenant-a", Some(&unique("kb")), status).await;
+        let error = repo.enable(&key(&g, &target), derive).await.unwrap_err();
+        assert!(error.to_string().contains("only active graphs"), "{error}");
+    }
     let kb = unique("kb");
     let a = graph(&store, "tenant-a", Some(&kb)).await;
     let b = graph(&store, "tenant-b", Some(&kb)).await;
@@ -162,9 +192,10 @@ async fn enabling_needs_a_knowledge_base_and_cognitive_graphs_are_never_shared()
     .bind(&iri)
     .execute(store.pool())
     .await;
-    assert!(
-        raced.is_err(),
-        "UNIQUE (target_id, cognitive_graph) must refuse"
+    assert_eq!(
+        sqlstate(raced),
+        "23505",
+        "the partial UNIQUE (target_id, cognitive_graph) index must refuse"
     );
     // The tenant is the graph's, enforced by FK.
     let forged = sqlx::query(
@@ -175,7 +206,11 @@ async fn enabling_needs_a_knowledge_base_and_cognitive_graphs_are_never_shared()
     .bind(unique("t2"))
     .execute(store.pool())
     .await;
-    assert!(forged.is_err(), "(graph_id, tenant_id) must match graphs");
+    assert_eq!(
+        sqlstate(forged),
+        "23503",
+        "(graph_id, tenant_id) must match graphs"
+    );
     // Another target may project the same KB.
     repo.enable(&key(&b, &unique("t3")), derive).await.unwrap();
     // Disable, then re-enable reactivates the same row.
@@ -190,6 +225,12 @@ async fn enabling_needs_a_knowledge_base_and_cognitive_graphs_are_never_shared()
     .unwrap();
     assert_eq!(status, "disabled");
     repo.enable(&key(&a, &target), derive).await.unwrap();
+    // A disabled stream frees its cognitive graph (the index is partial): another graph may
+    // then take it over, and the disabled one cannot come back while it is taken.
+    assert!(repo.disable(&key(&a, &target)).await.unwrap());
+    assert_eq!(repo.enable(&key(&b, &target), derive).await.unwrap(), iri);
+    let error = repo.enable(&key(&a, &target), derive).await.unwrap_err();
+    assert!(error.to_string().contains("already projects"), "{error}");
 }
 
 #[tokio::test]
@@ -203,7 +244,7 @@ async fn leases_are_exclusive_expire_and_fence_stale_holders() {
     let c2 = accept(&store, "tenant-a", &g, Some(c1.clone()), "two").await;
     repo.enable(&key(&g, &target), derive).await.unwrap();
     // Two concurrent claimers: exactly one wins, the other is not blocked (SKIP LOCKED).
-    let ttl = Duration::from_secs(1);
+    let ttl = Duration::from_secs(30);
     let (first, second) = tokio::join!(
         repo.claim(&target, "worker-a", ttl),
         repo.claim(&target, "worker-b", ttl)
@@ -218,16 +259,31 @@ async fn leases_are_exclusive_expire_and_fence_stale_holders() {
             .is_none()
     );
     // The work is the latest accepted event, not the oldest.
-    let work = repo.work_for(&stale, false).await.unwrap().unwrap();
+    let work = repo
+        .work_for(&stale, WorkMode::Pending)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!((work.ref_version, work.head_version), (2, 2));
     assert_eq!(work.commit, c2);
-    // The lease expires; another worker takes the stream with a higher epoch.
-    tokio::time::sleep(Duration::from_millis(1300)).await;
+    // The lease expires (owner-side, deterministic: as if the holder stalled past its TTL);
+    // the *same* owner name re-claims with a higher epoch, so fencing never relies on the
+    // owner string alone.
+    sqlx::query(
+        "UPDATE projection_state SET lease_until = now() - interval '1 second' \
+         WHERE graph_id = $1 AND target_id = $2",
+    )
+    .bind(g.as_str())
+    .bind(&target)
+    .execute(store.pool())
+    .await
+    .unwrap();
     let fresh = repo
-        .claim(&target, "worker-c", Duration::from_secs(30))
+        .claim(&target, &stale.owner, ttl)
         .await
         .unwrap()
         .expect("an expired lease is claimable");
+    assert_eq!(fresh.owner, stale.owner);
     assert_eq!(fresh.epoch, stale.epoch + 1);
     // The stale holder can neither acknowledge nor fail nor release.
     assert_eq!(
@@ -271,7 +327,7 @@ async fn leases_are_exclusive_expire_and_fence_stale_holders() {
     let next = repo.claim(&target, "worker-c", ttl).await.unwrap().unwrap();
     assert_eq!(next.projected.as_ref().map(|(_, v)| *v), Some(2));
     assert_eq!(
-        repo.work_for(&next, false)
+        repo.work_for(&next, WorkMode::Pending)
             .await
             .unwrap()
             .unwrap()
@@ -321,17 +377,35 @@ async fn progress_and_delivery_are_monotonic_and_rows_are_never_deleted() {
         .await;
     refused("UPDATE projection_outbox SET attempts = -1 WHERE graph_id = $1 AND $2 <> ''").await;
     refused("DELETE FROM projection_outbox WHERE graph_id = $1 AND $2 <> ''").await;
-    // Recorded progress must name a real accepted state of this ref (FK).
-    let forged = sqlx::query(
-        "UPDATE projection_state SET projected_ref_version = 3, projected_commit = $3 \
+    // Recorded progress must name a real accepted state of this ref (FK): a version that
+    // exists paired with the wrong commit, and a version that does not exist.
+    for (version, commit) in [(2, &c1), (3, &c2)] {
+        let forged = sqlx::query(
+            "UPDATE projection_state SET projected_ref_version = $3, projected_commit = $4 \
+             WHERE graph_id = $1 AND target_id = $2",
+        )
+        .bind(g.as_str())
+        .bind(&target)
+        .bind(version)
+        .bind(commit.to_string())
+        .execute(store.pool())
+        .await;
+        assert_eq!(
+            sqlstate(forged),
+            "23503",
+            "({version}, {commit}) must reference ref_events"
+        );
+    }
+    // Error codes are bounded upper-case tokens (CHECK).
+    let bad_code = sqlx::query(
+        "UPDATE projection_state SET last_error_code = 'free text: secret' \
          WHERE graph_id = $1 AND target_id = $2",
     )
     .bind(g.as_str())
     .bind(&target)
-    .bind(c1.to_string())
     .execute(store.pool())
     .await;
-    assert!(forged.is_err(), "progress must reference ref_events");
+    assert_eq!(sqlstate(bad_code), "23514");
 }
 
 #[tokio::test]
@@ -394,7 +468,6 @@ async fn failures_back_off_block_and_rebuild_claims_are_explicit() {
             .unwrap()
             .is_some()
     );
-    // Error codes are bounded tokens (CHECK).
     let bad = repo.claim_stream(&k, "operator2", ttl).await.unwrap();
     assert!(bad.is_none(), "the operator lease is live");
     repo.disable(&k).await.unwrap();
@@ -453,6 +526,32 @@ async fn the_projector_identity_holds_exactly_its_model() {
     ] {
         assert!(sqlx::query(sql).execute(&projector).await.is_err(), "{sql}");
     }
+    // Enabling and disabling are the owner's (ADR-0021): the projector may update `status`
+    // among active/blocked/rebuild_required, but never into or out of `disabled`.
+    let owner = owner_repo(&store).await;
+    let target = unique("t");
+    let g = graph(&store, "tenant-a", Some(&unique("kb"))).await;
+    accept(&store, "tenant-a", &g, None, "one").await;
+    owner.enable(&key(&g, &target), derive).await.unwrap();
+    let set_status = |status: &'static str| {
+        let (projector, g, target) = (projector.clone(), g.clone(), target.clone());
+        async move {
+            sqlx::query(
+                "UPDATE projection_state SET status = $3 WHERE graph_id = $1 AND target_id = $2",
+            )
+            .bind(g.as_str())
+            .bind(&target)
+            .bind(status)
+            .execute(&projector)
+            .await
+        }
+    };
+    assert_eq!(sqlstate(set_status("disabled").await), "42501");
+    set_status("blocked")
+        .await
+        .expect("the projector may block");
+    assert!(owner.disable(&key(&g, &target)).await.unwrap());
+    assert_eq!(sqlstate(set_status("active").await), "42501");
     projector.close().await;
     // Drift in either direction is refused at start-up.
     let refused = |grant: String, revoke: String| {

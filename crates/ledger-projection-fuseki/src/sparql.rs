@@ -3,24 +3,38 @@
 
 use ledger_projection::{
     CognitiveGraph, LP_NAMESPACE, MARKER_GRAPH, MarkerTerm, Observation, PROBE_GRAPH,
-    ProjectedState, ProjectionError, ProjectionErrorCode, ProjectionMarker, WriteMode,
+    ProjectedState, ProjectionError, ProjectionErrorCode, ProjectionMarker, TARGET_SUBJECT,
+    WriteMode,
 };
 use serde::Deserialize;
 
 /// A deliberately unloadable IRI: `LOAD` of it fails without any network access.
 const UNLOADABLE: &str = "urn:sculpin:ledger-projection:v1:unloadable";
 
-fn guard(graph: &CognitiveGraph, version: i64) -> String {
+/// Conditional guard: no `refVersion` of this graph's marker is `>= version` (a non-numeric
+/// value counts as blocking).
+fn conditional_guard(graph: &CognitiveGraph, version: i64) -> String {
     format!(
-        "OPTIONAL {{ GRAPH <{MARKER_GRAPH}> {{ <{g}> <{LP_NAMESPACE}refVersion> ?v }} }} \
-         FILTER (!BOUND(?v) || ?v < {version})",
+        "FILTER NOT EXISTS {{ GRAPH <{MARKER_GRAPH}> {{ <{g}> <{LP_NAMESPACE}refVersion> ?v }} \
+         FILTER (COALESCE(?v >= {version}, true)) }}",
+        g = graph.as_iri()
+    )
+}
+
+/// Replacement guard: no `refVersion` of this graph's marker is `> ceiling` (non-numeric
+/// garbage does not block a recovery).
+fn replace_guard(graph: &CognitiveGraph, ceiling: i64) -> String {
+    format!(
+        "FILTER NOT EXISTS {{ GRAPH <{MARKER_GRAPH}> {{ <{g}> <{LP_NAMESPACE}refVersion> ?v }} \
+         FILTER (COALESCE(?v > {ceiling}, false)) }}",
         g = graph.as_iri()
     )
 }
 
 /// One SPARQL Update request writing `state` and `marker` into `graph` (one transaction on a
-/// transactional dataset). `Conditional` applies only while the target's marker is absent or
-/// older than the marker being written.
+/// transactional dataset). Every operation carries the same guard, so either all apply or
+/// none does; the last operation adds `lp:tripleCount` from the target's own count of the
+/// graph it just wrote.
 pub fn write_update(
     graph: &CognitiveGraph,
     state: &ProjectedState,
@@ -28,42 +42,62 @@ pub fn write_update(
     mode: WriteMode,
 ) -> String {
     let g = graph.as_iri();
+    let guard = match mode {
+        WriteMode::Conditional => conditional_guard(graph, marker.ref_version),
+        WriteMode::Replace { ceiling } => replace_guard(graph, ceiling),
+    };
     let body = state.triples().join("\n");
     let marker_triples = marker.triples(graph).join("\n");
-    match mode {
-        WriteMode::Conditional => {
-            let guard = guard(graph, marker.ref_version);
-            let mut ops = vec![format!(
-                "DELETE {{ GRAPH <{g}> {{ ?s ?p ?o }} }} WHERE {{ {guard} GRAPH <{g}> {{ ?s ?p ?o }} }}"
-            )];
-            if !state.triples().is_empty() {
-                ops.push(format!(
-                    "INSERT {{ GRAPH <{g}> {{\n{body}\n}} }} WHERE {{ {guard} }}"
-                ));
-            }
-            ops.push(format!(
-                "DELETE {{ GRAPH <{MARKER_GRAPH}> {{ <{g}> ?mp ?mo }} }} WHERE {{ {guard} \
-                 GRAPH <{MARKER_GRAPH}> {{ <{g}> ?mp ?mo }} }}"
-            ));
-            ops.push(format!(
-                "INSERT {{ GRAPH <{MARKER_GRAPH}> {{\n{marker_triples}\n}} }} WHERE {{ {guard} }}"
-            ));
-            ops.join(" ;\n")
-        }
-        WriteMode::Replace => {
-            let mut ops = vec![format!("DROP SILENT GRAPH <{g}>")];
-            if !state.triples().is_empty() {
-                ops.push(format!("INSERT DATA {{ GRAPH <{g}> {{\n{body}\n}} }}"));
-            }
-            ops.push(format!(
-                "DELETE WHERE {{ GRAPH <{MARKER_GRAPH}> {{ <{g}> ?mp ?mo }} }}"
-            ));
-            ops.push(format!(
-                "INSERT DATA {{ GRAPH <{MARKER_GRAPH}> {{\n{marker_triples}\n}} }}"
-            ));
-            ops.join(" ;\n")
-        }
+    let mut ops = vec![format!(
+        "DELETE {{ GRAPH <{g}> {{ ?s ?p ?o }} }} WHERE {{ {guard} GRAPH <{g}> {{ ?s ?p ?o }} }}"
+    )];
+    if !state.triples().is_empty() {
+        ops.push(format!(
+            "INSERT {{ GRAPH <{g}> {{\n{body}\n}} }} WHERE {{ {guard} }}"
+        ));
     }
+    ops.push(format!(
+        "DELETE {{ GRAPH <{MARKER_GRAPH}> {{ <{g}> ?mp ?mo }} }} WHERE {{ {guard} \
+         GRAPH <{MARKER_GRAPH}> {{ <{g}> ?mp ?mo }} }}"
+    ));
+    ops.push(format!(
+        "INSERT {{ GRAPH <{MARKER_GRAPH}> {{\n{marker_triples}\n}} }} WHERE {{ {guard} }}"
+    ));
+    // Only our own, count-less marker (just inserted) receives the count.
+    ops.push(format!(
+        "INSERT {{ GRAPH <{MARKER_GRAPH}> {{ <{g}> <{LP_NAMESPACE}tripleCount> ?n }} }} WHERE {{ \
+         GRAPH <{MARKER_GRAPH}> {{ <{g}> <{LP_NAMESPACE}refVersion> {version} ; \
+         <{LP_NAMESPACE}commitId> \"{commit}\" }} \
+         FILTER NOT EXISTS {{ GRAPH <{MARKER_GRAPH}> {{ <{g}> <{LP_NAMESPACE}tripleCount> ?x }} }} \
+         {{ SELECT (COUNT(*) AS ?n) WHERE {{ GRAPH <{g}> {{ ?s ?p ?o }} }} }} }}",
+        version = marker.ref_version,
+        commit = marker.commit
+    ));
+    ops.join(" ;\n")
+}
+
+/// Whether every triple of `state` is in `graph`, by the target's own term equality.
+pub fn contains_all_query(graph: &CognitiveGraph, state: &ProjectedState) -> String {
+    format!(
+        "ASK {{ GRAPH <{}> {{\n{}\n}} }}",
+        graph.as_iri(),
+        state.triples().join("\n")
+    )
+}
+
+/// Bind the dataset to a target id if it is not bound yet.
+pub fn bind_target_update(target_id: &str) -> String {
+    format!(
+        "INSERT {{ GRAPH <{MARKER_GRAPH}> {{ <{TARGET_SUBJECT}> <{LP_NAMESPACE}targetId> \"{target_id}\" }} }} \
+         WHERE {{ FILTER NOT EXISTS {{ GRAPH <{MARKER_GRAPH}> {{ <{TARGET_SUBJECT}> <{LP_NAMESPACE}targetId> ?any }} }} }}"
+    )
+}
+
+pub fn bound_target_query() -> String {
+    format!(
+        "SELECT ?p ?o ?n WHERE {{ {{ GRAPH <{MARKER_GRAPH}> {{ <{TARGET_SUBJECT}> ?p ?o }} }} UNION \
+         {{ SELECT (COUNT(*) AS ?n) WHERE {{ GRAPH <{MARKER_GRAPH}> {{ <{TARGET_SUBJECT}> ?pp ?oo }} }} }} }}"
+    )
 }
 
 /// One query returning the marker's predicate/object pairs and the graph's triple count, so
@@ -119,6 +153,8 @@ struct Term {
     kind: String,
     value: String,
     datatype: Option<String>,
+    #[serde(rename = "xml:lang")]
+    lang: Option<String>,
 }
 
 fn protocol(message: &str) -> ProjectionError {
@@ -154,15 +190,38 @@ pub fn parse_observation(body: &[u8]) -> Result<Observation, ProjectionError> {
                     value: o.value.clone(),
                     datatype: o.datatype.clone(),
                     is_literal: o.kind == "literal" || o.kind == "typed-literal",
+                    language: o.lang.clone(),
                 },
             )),
             _ => return Err(protocol("unexpected binding in the observation result")),
         }
     }
+    let version_predicate = format!("{LP_NAMESPACE}refVersion");
+    let max_ref_version = pairs
+        .iter()
+        .filter(|(p, _)| *p == version_predicate)
+        .filter_map(|(_, o)| o.value.parse::<i64>().ok())
+        .max();
     Ok(Observation {
         marker: ProjectionMarker::from_terms(&pairs),
         triple_count: count.ok_or_else(|| protocol("the triple count is missing"))?,
+        max_ref_version,
     })
+}
+
+/// The target ids a dataset is bound to (the bind query's pairs).
+pub fn parse_bound_target(body: &[u8]) -> Result<Vec<String>, ProjectionError> {
+    let results: Results = serde_json::from_slice(body)
+        .map_err(|_| protocol("the target's query result is not SPARQL JSON results"))?;
+    let id_predicate = format!("{LP_NAMESPACE}targetId");
+    Ok(results
+        .results
+        .ok_or_else(|| protocol("the target's query result has no bindings"))?
+        .bindings
+        .into_iter()
+        .filter(|row| row.get("p").is_some_and(|p| p.value == id_predicate))
+        .filter_map(|row| row.get("o").map(|o| o.value.clone()))
+        .collect())
 }
 
 pub fn parse_ask(body: &[u8]) -> Result<bool, ProjectionError> {
@@ -203,31 +262,54 @@ mod tests {
         let (graph, state, marker) = fixture();
         let update = write_update(&graph, &state, &marker, WriteMode::Conditional);
         let ops: Vec<&str> = update.split(" ;\n").collect();
-        assert_eq!(ops.len(), 4);
-        for op in &ops {
-            assert!(op.contains("FILTER (!BOUND(?v) || ?v < 3)"), "{op}");
+        assert_eq!(ops.len(), 5);
+        for op in &ops[..4] {
+            assert!(op.contains("FILTER (COALESCE(?v >= 3, true))"), "{op}");
         }
         assert!(ops[1].contains("<urn:a> <urn:p> \"1\" ."));
-        assert!(!update.contains("DROP"));
+        assert!(
+            ops[4].contains("COUNT(*)") && ops[4].contains("refVersion> 3"),
+            "{}",
+            ops[4]
+        );
+        assert!(!update.contains("DROP") && !update.contains("INSERT DATA"));
+        assert!(
+            !update.contains("tripleCount> \""),
+            "the ledger never writes the count"
+        );
         // an empty state writes no INSERT for the graph, still guards the rest
         let empty = ProjectedState::from_state(&BTreeSet::new()).unwrap();
         let update = write_update(&graph, &empty, &marker, WriteMode::Conditional);
-        assert_eq!(update.split(" ;\n").count(), 3);
+        assert_eq!(update.split(" ;\n").count(), 4);
     }
 
     #[test]
-    fn replacement_is_unconditional_and_touches_only_the_two_graphs() {
+    fn replacements_are_guarded_by_their_ceiling_and_touch_only_the_two_graphs() {
         let (graph, state, marker) = fixture();
-        let update = write_update(&graph, &state, &marker, WriteMode::Replace);
-        assert!(update.starts_with("DROP SILENT GRAPH <urn:sculpin:kb:kb:cognitive>"));
-        assert!(!update.contains("FILTER"));
+        let update = write_update(&graph, &state, &marker, WriteMode::Replace { ceiling: 9 });
+        let ops: Vec<&str> = update.split(" ;\n").collect();
+        assert_eq!(ops.len(), 5);
+        for op in &ops[..4] {
+            assert!(op.contains("FILTER (COALESCE(?v > 9, false))"), "{op}");
+        }
         for iri in [
             "<urn:sculpin:kb:kb:cognitive>",
             &format!("<{MARKER_GRAPH}>"),
         ] {
             assert!(update.contains(iri));
         }
-        assert!(!update.contains("DEFAULT") && !update.contains("DROP ALL"));
+        assert!(!update.contains("DEFAULT") && !update.contains("DROP"));
+    }
+
+    #[test]
+    fn containment_and_binding_queries_are_well_formed() {
+        let (graph, state, _) = fixture();
+        let ask = contains_all_query(&graph, &state);
+        assert!(ask.starts_with("ASK { GRAPH <urn:sculpin:kb:kb:cognitive>"));
+        assert!(ask.contains("<urn:a> <urn:p> \"1\" ."));
+        let bind = bind_target_update("fuseki-main");
+        assert!(bind.contains(TARGET_SUBJECT) && bind.contains("\"fuseki-main\""));
+        assert!(bind.contains("FILTER NOT EXISTS"));
     }
 
     #[test]
