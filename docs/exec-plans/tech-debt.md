@@ -56,6 +56,9 @@
   invocation id each need an ADR (and, for the id, new vectors) — security review, P2/P3.
 - `AppState::with_validation*` panic on a mismatching or malformed configuration
   (construction time only; `main` validates first); return `Result` if embedders appear.
+- The released P1.5 server refuses a database restored from a logical dump (strict CHECK
+  deparse vs PostgreSQL's re-parse flattening; fixed in Phase 2, ADR-0017 amendment). A P1.5
+  rollback must use a physical base backup.
 - A P1.5 `ledger-admin verify` does not check the schema level and prints `VERIFY OK` against
   a 0010 database; always run the verifier from the same build as the servers.
 - Validation calls are synchronous inside the request (bounded by the validator timeout and a

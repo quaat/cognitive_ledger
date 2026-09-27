@@ -2509,6 +2509,86 @@ async fn assert_vacuous_check_refused(
         .unwrap_or_else(|e| panic!("{name} restored: readiness again: {e}"));
 }
 
+/// ADR-0017: a logical restore recreates every CHECK from its deparsed text. Recreating each
+/// one exactly that way (what `pg_restore` does) keeps the database servable — PostgreSQL
+/// flattens the nested `AND` of `BETWEEN`-style bounds, which the verifier accepts as the
+/// restored form — while a same-named constraint with a changed bound is still refused.
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn checks_recreated_as_a_logical_restore_does_are_accepted_and_changes_still_refused() {
+    let fx = fixture("lp_restore_checks").await;
+    fx.migrate_and_grant().await;
+    let running = PostgresLedgerStore::connect(&fx.runtime_db_url, V1Binding::Reject)
+        .await
+        .expect("healthy database serves");
+    let checks: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT c.relname::text, con.conname::text, pg_get_constraintdef(con.oid) FROM pg_constraint con \
+         JOIN pg_class c ON c.oid = con.conrelid WHERE con.contype = 'c' \
+           AND c.relnamespace = 'public'::regnamespace ORDER BY 1, 2",
+    )
+    .fetch_all(&fx.owner)
+    .await
+    .unwrap();
+    assert!(checks.len() >= 56, "{}", checks.len());
+    let mut changed = 0;
+    for (table, name, def) in &checks {
+        owner_exec(
+            &fx,
+            &format!("ALTER TABLE {table} DROP CONSTRAINT {name}, ADD CONSTRAINT {name} {def}"),
+        )
+        .await;
+        let again: String = sqlx::query_scalar(
+            "SELECT pg_get_constraintdef(con.oid) FROM pg_constraint con JOIN pg_class c \
+             ON c.oid = con.conrelid WHERE c.relname = $1 AND con.conname = $2",
+        )
+        .bind(table)
+        .bind(name)
+        .fetch_one(&fx.owner)
+        .await
+        .unwrap();
+        if &again != def {
+            changed += 1;
+        }
+    }
+    assert_eq!(
+        changed, 7,
+        "the re-parse flattens exactly the BETWEEN-style bounds"
+    );
+    // A server started before the recreation sees changed fingerprints and stops serving
+    // until verified again (drift detection); a server started on the restored database —
+    // what a restore always means — verifies the restored forms and serves.
+    assert!(
+        running.ready().await.is_err(),
+        "drift since start-up is refused"
+    );
+    assert_healthy(&fx, "every CHECK recreated from its deparsed text").await;
+    let running = PostgresLedgerStore::connect(&fx.runtime_db_url, V1Binding::Reject)
+        .await
+        .expect("a server started on the restored form serves");
+    running
+        .ready()
+        .await
+        .expect("readiness on the restored form");
+    // The restored form is accepted only as the exact flattened text: a changed bound is not.
+    owner_exec(
+        &fx,
+        "ALTER TABLE refs DROP CONSTRAINT refs_branch_bounds, ADD CONSTRAINT refs_branch_bounds \
+         CHECK (octet_length(branch) >= 1 AND octet_length(branch) <= 129 \
+         AND branch ~ '^[A-Za-z0-9._/-]+$')",
+    )
+    .await;
+    match PostgresLedgerStore::connect(&fx.runtime_db_url, V1Binding::Reject).await {
+        Err(LedgerError::SchemaIncompatible(m)) => assert!(m.contains("refs_branch_bounds"), "{m}"),
+        other => panic!("a widened branch bound must refuse start-up: {other:?}"),
+    }
+    match running.ready().await {
+        Err(LedgerError::SchemaIncompatible(m)) => {
+            assert!(m.contains("changed since start-up"), "{m}")
+        }
+        other => panic!("a widened branch bound must refuse readiness: {other:?}"),
+    }
+}
+
 /// Composite foreign keys are `MATCH SIMPLE`: a key column that became nullable lets a row
 /// skip the foreign key entirely (e.g. a `decision_validations` link with NULL graph and
 /// candidate). Nullability is therefore verified structurally, at start-up and readiness.

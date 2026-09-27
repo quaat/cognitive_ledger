@@ -64,3 +64,17 @@ versions are dense integers per ref, a restored ledger reissues the same
 - The runbook (`docs/operations/deployment.md`) carries the fencing, restore-point and
   reconciliation steps; the release gate includes the restore smoke.
 - No protocol, golden vector or migration changes; no backup platform is implemented.
+
+## Amendment: logically restored CHECK definitions (2026-09-27, Phase 2)
+The strict start-up comparison of every CHECK definition (P1.5 final round, `7842f14`) refused
+a database restored from `pg_dump`: a logical restore recreates each CHECK from its deparsed
+text, and PostgreSQL flattens the nested `AND` that `BETWEEN`-style bounds store
+(`((a AND b) AND c)` → `(a AND b AND c)`). Seven CHECKs are affected at schema level 10
+(three from the released migrations, four from 0010). The meaning is identical and the
+flattened form is a fixpoint of further dump/restore cycles, so the verifier accepts, per
+constraint, exactly that one alternative (`RESTORED_CHECKS` in `crates/ledger-store/src/schema.rs`)
+besides the migration form; every other definition is still refused. Evidence:
+`scripts/backup-restore.sh` (dump and base-backup restores serve), `pg_least_privilege::
+checks_recreated_as_a_logical_restore_does_are_accepted_and_changes_still_refused`. The
+released P1.5 binary keeps the defect: a P1.5 deployment rolls back with a physical base
+backup (or restores a dump and upgrades to Phase 2).

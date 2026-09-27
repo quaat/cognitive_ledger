@@ -1509,6 +1509,49 @@ const EXPECTED_CHECKS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// The same CHECKs as a logical restore (`pg_dump` → `pg_restore`) recreates them. A CHECK
+/// written with `BETWEEN` stores a nested `AND` that deparses as `((a AND b) AND c)`; the
+/// restore re-parses that text and PostgreSQL flattens it to `(a AND b AND c)`. The meaning is
+/// identical and the flattened form is a fixpoint of further dump/restore cycles, so exactly
+/// this alternative is accepted (ADR-0017: logical dumps are a supported recovery path).
+const RESTORED_CHECKS: &[(&str, &str, &str)] = &[
+    (
+        "proposals",
+        "proposals_branch_bounds",
+        "CHECK(((octet_length(branch)>=1)AND(octet_length(branch)<=128)AND(branch~'^[A-Za-z0-9._/-]+$')))",
+    ),
+    (
+        "ref_events",
+        "ref_events_branch_bounds",
+        "CHECK(((octet_length(branch)>=1)AND(octet_length(branch)<=128)AND(branch~'^[A-Za-z0-9._/-]+$')))",
+    ),
+    (
+        "refs",
+        "refs_branch_bounds",
+        "CHECK(((octet_length(branch)>=1)AND(octet_length(branch)<=128)AND(branch~'^[A-Za-z0-9._/-]+$')))",
+    ),
+    (
+        "semantic_execution_contexts",
+        "sec_token_bounds",
+        "CHECK(((octet_length(base_kb_id)>=1)AND(octet_length(base_kb_id)<=512)AND((octet_length(base_kb_revision)>=1)AND(octet_length(base_kb_revision)<=512))AND((ontology_idISNULL)OR((octet_length(ontology_id)>=1)AND(octet_length(ontology_id)<=512)))AND((ontology_versionISNULL)OR((octet_length(ontology_version)>=1)AND(octet_length(ontology_version)<=512)))AND((octet_length(shapes_id)>=1)AND(octet_length(shapes_id)<=512))AND((octet_length(shapes_version)>=1)AND(octet_length(shapes_version)<=512))AND((reasoning_profileISNULL)OR((octet_length(reasoning_profile)>=1)AND(octet_length(reasoning_profile)<=512)))AND((reasoning_implementationISNULL)OR((octet_length(reasoning_implementation)>=1)AND(octet_length(reasoning_implementation)<=512)))AND((reasoning_versionISNULL)OR((octet_length(reasoning_version)>=1)AND(octet_length(reasoning_version)<=512)))AND((octet_length(validator_service_id)>=1)AND(octet_length(validator_service_id)<=512))AND((octet_length(validator_service_version)>=1)AND(octet_length(validator_service_version)<=512))AND((octet_length(validator_configuration_version)>=1)AND(octet_length(validator_configuration_version)<=512))))",
+    ),
+    (
+        "semantic_virtual_contexts",
+        "svc_token_bounds",
+        "CHECK(((octet_length(dataset_id)>=1)AND(octet_length(dataset_id)<=512)AND((octet_length(source_version)>=1)AND(octet_length(source_version)<=512))))",
+    ),
+    (
+        "validation_records",
+        "vr_token_bounds",
+        "CHECK(((octet_length(validator_service_id)>=1)AND(octet_length(validator_service_id)<=512)AND((octet_length(validator_service_version)>=1)AND(octet_length(validator_service_version)<=512))AND((octet_length(validator_configuration_version)>=1)AND(octet_length(validator_configuration_version)<=512))))",
+    ),
+    (
+        "validation_violations",
+        "vv_bounds",
+        "CHECK(((octet_length(severity)>=1)AND(octet_length(severity)<=64)AND((octet_length(code)>=1)AND(octet_length(code)<=512))AND(octet_length(message)<=1024)))",
+    ),
+];
+
 fn normalize_constraint_def(def: &str) -> String {
     def.chars()
         .filter(|c| !c.is_whitespace())
@@ -1782,7 +1825,11 @@ pub async fn verify_definitions_at_startup(pool: &PgPool) -> Result<(), LedgerEr
                 "CHECK constraint {name} is missing on public.{table}; refusing to serve"
             ))
         })?;
-        if normalize_constraint_def(&def) != *expected {
+        let normalized = normalize_constraint_def(&def);
+        let restored = RESTORED_CHECKS
+            .iter()
+            .any(|(t, n, d)| t == table && n == name && normalized == *d);
+        if normalized != *expected && !restored {
             return Err(incompatible(format!(
                 "constraint {name} on public.{table} has definition {def:?} instead of the one \
                  migration-defined; refusing to serve"
@@ -2572,6 +2619,27 @@ mod tests {
         assert_eq!(normalize_constraint_def(pg17), expected);
         assert_ne!(normalize_constraint_def("CHECK (true)"), expected);
         assert_eq!(EXPECTED_CHECKS.len(), 56);
+    }
+
+    #[test]
+    fn restored_check_forms_are_the_flattened_migration_forms_only() {
+        use super::RESTORED_CHECKS;
+        assert_eq!(RESTORED_CHECKS.len(), 7);
+        for (table, name, restored) in RESTORED_CHECKS {
+            let expected = EXPECTED_CHECKS
+                .iter()
+                .find(|(t, n, _)| t == table && n == name)
+                .unwrap_or_else(|| panic!("{table}.{name} is not an expected CHECK"))
+                .2;
+            assert_ne!(expected, *restored, "{name}: no-op alternative");
+            // Only parentheses differ: the operands and operators are the migration's.
+            let strip = |d: &str| d.replace(['(', ')'], "");
+            assert_eq!(
+                strip(expected),
+                strip(restored),
+                "{name}: more than grouping differs"
+            );
+        }
     }
 
     #[test]
