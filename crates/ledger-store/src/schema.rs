@@ -178,6 +178,7 @@ pub async fn verify(pool: &PgPool) -> Result<SchemaReport, LedgerError> {
     // expects; a same-named replacement elsewhere or with weaker semantics is not compatible.
     verify_guard_triggers(pool).await?;
     verify_guard_functions(pool).await?;
+    verify_constraints_and_indexes(pool).await?;
     let content_check_fingerprint = verify_content_address_check(pool).await?;
     Ok(SchemaReport {
         version: highest,
@@ -652,6 +653,427 @@ async fn verify_guard_triggers(pool: &PgPool) -> Result<(), LedgerError> {
     Ok(())
 }
 
+/// A referential or uniqueness constraint the integrity model depends on, matched by shape
+/// (table, key columns, referenced table/columns), never by name. Every FOREIGN KEY, PRIMARY
+/// KEY and UNIQUE constraint of migrations 0001–0009 is listed: they bind audit rows to real
+/// content and real events (ADR-0013) and make the workflow's uniqueness rules facts.
+struct ExpectedConstraint {
+    table: &'static str,
+    kind: char, // 'f' | 'p' | 'u'
+    columns: &'static [&'static str],
+    references: Option<(&'static str, &'static [&'static str])>,
+}
+
+const fn fk(
+    table: &'static str,
+    columns: &'static [&'static str],
+    ref_table: &'static str,
+    ref_columns: &'static [&'static str],
+) -> ExpectedConstraint {
+    ExpectedConstraint {
+        table,
+        kind: 'f',
+        columns,
+        references: Some((ref_table, ref_columns)),
+    }
+}
+const fn pk(table: &'static str, columns: &'static [&'static str]) -> ExpectedConstraint {
+    ExpectedConstraint {
+        table,
+        kind: 'p',
+        columns,
+        references: None,
+    }
+}
+const fn uq(table: &'static str, columns: &'static [&'static str]) -> ExpectedConstraint {
+    ExpectedConstraint {
+        table,
+        kind: 'u',
+        columns,
+        references: None,
+    }
+}
+
+const EXPECTED_CONSTRAINTS: &[ExpectedConstraint] = &[
+    // 0001–0004: content, index, graphs
+    pk("refs", &["graph_id", "branch"]),
+    pk("immutable_objects", &["id"]),
+    pk("commit_index", &["id"]),
+    fk("commit_index", &["id"], "immutable_objects", &["id"]),
+    fk("commit_index", &["patch_id"], "immutable_objects", &["id"]),
+    uq("commit_index", &["graph_id", "id"]),
+    pk("commit_parents", &["commit_id", "position"]),
+    fk("commit_parents", &["commit_id"], "commit_index", &["id"]),
+    fk("commit_parents", &["parent_id"], "commit_index", &["id"]),
+    uq("commit_parents", &["commit_id", "parent_id"]),
+    pk("graphs", &["graph_id"]),
+    fk("refs", &["graph_id"], "graphs", &["graph_id"]),
+    fk("commit_index", &["graph_id"], "graphs", &["graph_id"]),
+    // 0006: workflow persistence
+    fk(
+        "refs",
+        &["graph_id", "head"],
+        "commit_index",
+        &["graph_id", "id"],
+    ),
+    pk("proposals", &["proposal_id"]),
+    fk("proposals", &["graph_id"], "graphs", &["graph_id"]),
+    fk(
+        "proposals",
+        &["requested_patch_id"],
+        "immutable_objects",
+        &["id"],
+    ),
+    fk(
+        "proposals",
+        &["effective_patch_id"],
+        "immutable_objects",
+        &["id"],
+    ),
+    fk(
+        "proposals",
+        &["graph_id", "candidate_commit"],
+        "commit_index",
+        &["graph_id", "id"],
+    ),
+    uq("proposals", &["candidate_commit"]),
+    uq(
+        "proposals",
+        &["proposal_id", "graph_id", "branch", "candidate_commit"],
+    ),
+    pk("ref_events", &["event_id"]),
+    fk(
+        "ref_events",
+        &["graph_id", "branch"],
+        "refs",
+        &["graph_id", "branch"],
+    ),
+    fk(
+        "ref_events",
+        &["graph_id", "new_head"],
+        "commit_index",
+        &["graph_id", "id"],
+    ),
+    uq("ref_events", &["graph_id", "branch", "new_version"]),
+    uq(
+        "ref_events",
+        &["event_id", "graph_id", "branch", "new_head"],
+    ),
+    uq(
+        "ref_events",
+        &["event_id", "graph_id", "branch", "new_version", "new_head"],
+    ),
+    pk("decisions", &["decision_id"]),
+    fk("decisions", &["proposal_id"], "proposals", &["proposal_id"]),
+    fk("decisions", &["ref_event_id"], "ref_events", &["event_id"]),
+    fk(
+        "decisions",
+        &["graph_id", "candidate_commit"],
+        "commit_index",
+        &["graph_id", "id"],
+    ),
+    fk(
+        "decisions",
+        &["ref_event_id", "graph_id", "branch", "candidate_commit"],
+        "ref_events",
+        &["event_id", "graph_id", "branch", "new_head"],
+    ),
+    fk(
+        "decisions",
+        &["proposal_id", "graph_id", "branch", "candidate_commit"],
+        "proposals",
+        &["proposal_id", "graph_id", "branch", "candidate_commit"],
+    ),
+    pk("projection_outbox", &["outbox_id"]),
+    fk(
+        "projection_outbox",
+        &["ref_event_id"],
+        "ref_events",
+        &["event_id"],
+    ),
+    uq("projection_outbox", &["graph_id", "branch", "ref_version"]),
+    uq("projection_outbox", &["ref_event_id"]),
+    fk(
+        "projection_outbox",
+        &["graph_id", "commit_id"],
+        "commit_index",
+        &["graph_id", "id"],
+    ),
+    fk(
+        "projection_outbox",
+        &["graph_id", "branch", "ref_version"],
+        "ref_events",
+        &["graph_id", "branch", "new_version"],
+    ),
+    fk(
+        "projection_outbox",
+        &[
+            "ref_event_id",
+            "graph_id",
+            "branch",
+            "ref_version",
+            "commit_id",
+        ],
+        "ref_events",
+        &["event_id", "graph_id", "branch", "new_version", "new_head"],
+    ),
+    fk(
+        "idempotency",
+        &["result_decision_id"],
+        "decisions",
+        &["decision_id"],
+    ),
+    fk(
+        "idempotency",
+        &["result_proposal_id"],
+        "proposals",
+        &["proposal_id"],
+    ),
+    // 0007: actor scope and tenant integrity
+    pk("idempotency", &["idempotency_id"]),
+    uq(
+        "idempotency",
+        &[
+            "tenant_id",
+            "graph_id",
+            "operation",
+            "idempotency_key",
+            "principal_id",
+            "principal_type",
+            "on_behalf_of",
+        ],
+    ),
+    uq("graphs", &["graph_id", "tenant_id"]),
+    fk(
+        "proposals",
+        &["graph_id", "tenant_id"],
+        "graphs",
+        &["graph_id", "tenant_id"],
+    ),
+    fk(
+        "ref_events",
+        &["graph_id", "tenant_id"],
+        "graphs",
+        &["graph_id", "tenant_id"],
+    ),
+    fk(
+        "decisions",
+        &["graph_id", "tenant_id"],
+        "graphs",
+        &["graph_id", "tenant_id"],
+    ),
+    fk(
+        "idempotency",
+        &["graph_id", "tenant_id"],
+        "graphs",
+        &["graph_id", "tenant_id"],
+    ),
+];
+
+/// Partial unique indexes the workflow relies on (one terminal decision per candidate /
+/// proposal / ref event): (table, columns, has a WHERE predicate).
+const EXPECTED_UNIQUE_INDEXES: &[(&str, &[&str], bool)] = &[
+    ("decisions", &["candidate_commit"], false),
+    ("decisions", &["proposal_id"], true),
+    ("decisions", &["ref_event_id"], true),
+];
+
+/// Named CHECK constraints of 0002–0009 (domain rules the Rust layer also enforces; here
+/// presence and validation are verified, the content-address one also by definition).
+const EXPECTED_CHECKS: &[(&str, &str)] = &[
+    ("immutable_objects", "immutable_objects_id_format"),
+    ("immutable_objects", "immutable_objects_content_addressed"),
+    ("commit_index", "commit_index_version_known"),
+    ("commit_index", "commit_index_parent_count"),
+    ("commit_index", "commit_index_graph_id_format"),
+    ("commit_parents", "commit_parents_position"),
+    ("graphs", "graphs_graph_id_format"),
+    ("graphs", "graphs_tenant_id_bounds"),
+    ("graphs", "graphs_kb_bounds"),
+    ("graphs", "graphs_purpose_bounds"),
+    ("graphs", "graphs_status_known"),
+    ("refs", "refs_version_positive"),
+    ("refs", "refs_branch_bounds"),
+    ("proposals", "proposals_branch_bounds"),
+    ("proposals", "proposals_principal_type"),
+    ("proposals", "proposals_correlation_bounds"),
+    ("ref_events", "ref_events_branch_bounds"),
+    ("ref_events", "ref_events_operation"),
+    ("ref_events", "ref_events_genesis_shape"),
+    ("ref_events", "ref_events_principal_type"),
+    ("ref_events", "ref_events_correlation_bounds"),
+    ("decisions", "decisions_kind"),
+    ("decisions", "decisions_accepted_has_event"),
+    ("decisions", "decisions_reason_bounds"),
+    ("decisions", "decisions_principal_type"),
+    ("decisions", "decisions_correlation_bounds"),
+    ("projection_outbox", "outbox_event_kind"),
+    ("idempotency", "idempotency_operation"),
+    ("idempotency", "idempotency_key_bounds"),
+    ("idempotency", "idempotency_digest_format"),
+    ("idempotency", "idempotency_result_kind"),
+    ("idempotency", "idempotency_principal_type"),
+];
+
+/// Every expected FOREIGN KEY / PRIMARY KEY / UNIQUE constraint exists exactly once with the
+/// expected shape and is validated and non-deferrable; every named CHECK exists and is
+/// validated; every partial unique index exists. Catalog-only (attnums resolved to names),
+/// so it is lock-free and runs on readiness.
+async fn verify_constraints_and_indexes(pool: &PgPool) -> Result<(), LedgerError> {
+    let rows = sqlx::query(
+        "SELECT c.relname::text AS table_name, con.conname::text AS name, con.contype::text AS kind, \
+                con.convalidated, con.condeferrable, \
+                (SELECT array_agg(a.attname::text ORDER BY k.ord) \
+                   FROM unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord) \
+                   JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum) AS columns, \
+                rc.relname::text AS ref_table, \
+                (SELECT array_agg(a.attname::text ORDER BY k.ord) \
+                   FROM unnest(con.confkey) WITH ORDINALITY AS k(attnum, ord) \
+                   JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = k.attnum) AS ref_columns \
+         FROM pg_constraint con \
+         JOIN pg_class c ON c.oid = con.conrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         LEFT JOIN pg_class rc ON rc.oid = con.confrelid \
+         WHERE n.nspname = 'public'",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(db_error)?;
+    struct Found {
+        table: String,
+        name: String,
+        kind: String,
+        validated: bool,
+        deferrable: bool,
+        columns: Vec<String>,
+        ref_table: Option<String>,
+        ref_columns: Vec<String>,
+    }
+    let mut found = Vec::with_capacity(rows.len());
+    for row in &rows {
+        found.push(Found {
+            table: row.try_get("table_name").map_err(db_error)?,
+            name: row.try_get("name").map_err(db_error)?,
+            kind: row.try_get("kind").map_err(db_error)?,
+            validated: row.try_get("convalidated").map_err(db_error)?,
+            deferrable: row.try_get("condeferrable").map_err(db_error)?,
+            columns: row
+                .try_get::<Option<Vec<String>>, _>("columns")
+                .map_err(db_error)?
+                .unwrap_or_default(),
+            ref_table: row.try_get("ref_table").map_err(db_error)?,
+            ref_columns: row
+                .try_get::<Option<Vec<String>>, _>("ref_columns")
+                .map_err(db_error)?
+                .unwrap_or_default(),
+        });
+    }
+    for e in EXPECTED_CONSTRAINTS {
+        let matches: Vec<&Found> = found
+            .iter()
+            .filter(|f| {
+                f.table == e.table
+                    && f.kind == e.kind.to_string()
+                    && f.columns == e.columns
+                    && match e.references {
+                        Some((rt, rcols)) => {
+                            f.ref_table.as_deref() == Some(rt) && f.ref_columns == rcols
+                        }
+                        None => true,
+                    }
+            })
+            .collect();
+        let shape = match e.references {
+            Some((rt, rcols)) => {
+                format!("{} FOREIGN KEY {:?} -> {rt} {rcols:?}", e.table, e.columns)
+            }
+            None => format!(
+                "{} {} {:?}",
+                e.table,
+                if e.kind == 'p' {
+                    "PRIMARY KEY"
+                } else {
+                    "UNIQUE"
+                },
+                e.columns
+            ),
+        };
+        match matches.as_slice() {
+            [] => {
+                return Err(incompatible(format!(
+                    "constraint {shape} is missing; refusing to serve"
+                )));
+            }
+            [one] => {
+                if !one.validated {
+                    return Err(incompatible(format!(
+                        "constraint {} ({shape}) is NOT VALID; refusing to serve",
+                        one.name
+                    )));
+                }
+                if one.deferrable {
+                    return Err(incompatible(format!(
+                        "constraint {} ({shape}) is deferrable (the migrations define none); refusing to serve",
+                        one.name
+                    )));
+                }
+            }
+            _ => {} // duplicates of an expected shape are harmless
+        }
+    }
+    for (table, name) in EXPECTED_CHECKS {
+        match found.iter().find(|f| f.table == *table && f.name == *name) {
+            Some(f) if f.kind == "c" && f.validated => {}
+            Some(f) if f.kind != "c" => {
+                return Err(incompatible(format!(
+                    "constraint {name} on public.{table} is not a CHECK constraint; refusing to serve"
+                )));
+            }
+            Some(_) => {
+                return Err(incompatible(format!(
+                    "constraint {name} on public.{table} is NOT VALID; refusing to serve"
+                )));
+            }
+            None => {
+                return Err(incompatible(format!(
+                    "CHECK constraint {name} is missing on public.{table}; refusing to serve"
+                )));
+            }
+        }
+    }
+    let indexes = sqlx::query(
+        "SELECT t.relname::text AS table_name, i.indisunique, i.indpred IS NOT NULL AS partial, \
+                (SELECT array_agg(a.attname::text ORDER BY k.ord) \
+                   FROM unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord) \
+                   JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum) AS columns \
+         FROM pg_index i JOIN pg_class t ON t.oid = i.indrelid \
+         JOIN pg_namespace n ON n.oid = t.relnamespace \
+         WHERE n.nspname = 'public' AND i.indisunique AND i.indisvalid",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(db_error)?;
+    for (table, columns, partial) in EXPECTED_UNIQUE_INDEXES {
+        let present = indexes.iter().any(|row| {
+            row.try_get::<String, _>("table_name")
+                .is_ok_and(|t| t == *table)
+                && row
+                    .try_get::<Option<Vec<String>>, _>("columns")
+                    .is_ok_and(|c| c.unwrap_or_default() == *columns)
+                && row
+                    .try_get::<bool, _>("partial")
+                    .is_ok_and(|p| p == *partial)
+        });
+        if !present {
+            return Err(incompatible(format!(
+                "unique index on {table} {columns:?}{} is missing or invalid; refusing to serve",
+                if *partial { " (partial)" } else { "" }
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Migration 0009's content-address CHECK on `immutable_objects`: the database-side
 /// guarantee that no bytes are stored under a false content id. Rust re-verifies every
 /// object's digest on read; this is defence in depth and must be present, validated and
@@ -1026,7 +1448,8 @@ async fn verify_role_attributes_and_memberships(
                 {srr} AS can_set_srr \
          FROM m JOIN pg_roles r ON r.oid = m.roleid",
         srr = if version >= 150_000 {
-            "has_parameter_privilege(r.oid, 'session_replication_role', 'SET')"
+            "(has_parameter_privilege(r.oid, 'session_replication_role', 'SET') \
+              OR has_parameter_privilege(r.oid, 'session_replication_role', 'ALTER SYSTEM'))"
         } else {
             "false"
         }
@@ -1071,7 +1494,7 @@ async fn verify_role_attributes_and_memberships(
             ),
             (
                 row.try_get::<bool, _>("can_set_srr").map_err(db_error)?,
-                "allowed to SET session_replication_role",
+                "allowed to SET or ALTER SYSTEM session_replication_role",
             ),
             (name.starts_with("pg_"), "a predefined pg_* role"),
         ];

@@ -623,6 +623,27 @@ supply-chain, upgrade, backup harnesses), `docs/` (operations runbook, security)
   unconditional (`tgqual IS NULL`). Test: `refs_movement_audited` recreated `WHEN (false)`
   is refused by `schema::verify`, start-up and readiness.
 
+### Review round 6 (fresh Codex review of `8dd0a7d`, 2026-09-27): two new P1s, fixed
+- **Referential integrity not verified.** A restore that lost `commit_index.id REFERENCES
+  immutable_objects(id)` (0003) passed with intact migration metadata, letting the runtime's
+  permitted inserts create a commit-index row without bytes and a ref pointing at it. Fix:
+  `schema::verify` verifies the complete inventory of migrations 0001–0009's FOREIGN KEY,
+  PRIMARY KEY and UNIQUE constraints by *shape* (table, key columns, referenced table and
+  columns — resolved from `conkey`/`confkey`, never by name), each validated and
+  non-deferrable; the three partial/plain unique indexes on `decisions`; and presence +
+  validation of every named CHECK constraint (their definitions remain the Rust layer's
+  domain rules, except the content-address CHECK which is checked by definition and probe).
+  Catalog-only and lock-free, so it runs on readiness. Test:
+  `pg_least_privilege::lost_referential_and_uniqueness_constraints_are_refused_at_startup_and_readiness`
+  — dropped `commit_index_id_fkey`, the same FK `NOT VALID`, a deferrable `refs_head_fk`,
+  dropped `ref_events_version_unique`, dropped `decisions_one_per_candidate`, dropped
+  `ref_events_genesis_shape` — each refused by `schema::verify`, start-up and readiness;
+  healthy after restoration.
+- **`ALTER SYSTEM` reachable through membership.** The assumable-role walk checked only the
+  SET privilege on `session_replication_role`; a settable parent with `ALTER SYSTEM` could
+  change the cluster default. Fix: both SET and ALTER SYSTEM are refused for every assumable
+  role (the direct check already covered both).
+
 ### Admission-control decision (§15, 2026-09-27)
 Measured: under 1,000 concurrent clients on two replicas the 12-slot expensive semaphore per
 replica refuses the excess prepares immediately (`503 RESOURCE_LIMIT`), successful prepare p99

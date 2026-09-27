@@ -1835,3 +1835,85 @@ async fn conditional_triggers_and_set_role_reachable_privileges_are_refused() {
     running.ready().await.expect("readiness after restore");
     fx.teardown().await;
 }
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn lost_referential_and_uniqueness_constraints_are_refused_at_startup_and_readiness() {
+    let fx = fixture("ledger_fk").await;
+    fx.migrate_and_grant().await;
+    let running = ledger_store::PostgresLedgerStore::connect(
+        &fx.runtime_db_url,
+        ledger_store::V1Binding::Reject,
+    )
+    .await
+    .unwrap();
+    // The FK that binds every indexed commit to real immutable bytes (0003).
+    owner_exec(
+        &fx,
+        "ALTER TABLE commit_index DROP CONSTRAINT commit_index_id_fkey",
+    )
+    .await;
+    let m = assert_refused_by_schema(&fx, &running, "commit_index.id FK dropped").await;
+    assert!(
+        m.contains("commit_index FOREIGN KEY [\"id\"] -> immutable_objects"),
+        "{m}"
+    );
+    // A same-shaped FK recreated NOT VALID does not count either.
+    owner_exec(&fx, "ALTER TABLE commit_index ADD CONSTRAINT commit_index_id_fkey FOREIGN KEY (id) REFERENCES immutable_objects (id) NOT VALID").await;
+    let m = assert_refused_by_schema(&fx, &running, "NOT VALID FK").await;
+    assert!(m.contains("NOT VALID"), "{m}");
+    owner_exec(
+        &fx,
+        "ALTER TABLE commit_index VALIDATE CONSTRAINT commit_index_id_fkey",
+    )
+    .await;
+    assert_healthy(&fx, "FK validated").await;
+    // A deferrable replacement of the ref head FK, a dropped uniqueness rule and a dropped
+    // partial unique index are refused too.
+    owner_exec(&fx, "ALTER TABLE refs DROP CONSTRAINT refs_head_fk").await;
+    owner_exec(&fx, "ALTER TABLE refs ADD CONSTRAINT refs_head_fk FOREIGN KEY (graph_id, head) REFERENCES commit_index (graph_id, id) DEFERRABLE").await;
+    let m = assert_refused_by_schema(&fx, &running, "deferrable ref head FK").await;
+    assert!(m.contains("deferrable"), "{m}");
+    owner_exec(&fx, "ALTER TABLE refs DROP CONSTRAINT refs_head_fk").await;
+    owner_exec(&fx, "ALTER TABLE refs ADD CONSTRAINT refs_head_fk FOREIGN KEY (graph_id, head) REFERENCES commit_index (graph_id, id)").await;
+    // (ref_events_version_unique has dependent FKs; the one-proposal-per-candidate rule has none.)
+    owner_exec(
+        &fx,
+        "ALTER TABLE proposals DROP CONSTRAINT proposals_candidate_unique",
+    )
+    .await;
+    let m = assert_refused_by_schema(
+        &fx,
+        &running,
+        "one-proposal-per-candidate uniqueness dropped",
+    )
+    .await;
+    assert!(m.contains("proposals UNIQUE"), "{m}");
+    owner_exec(
+        &fx,
+        "ALTER TABLE proposals ADD CONSTRAINT proposals_candidate_unique UNIQUE (candidate_commit)",
+    )
+    .await;
+    owner_exec(&fx, "DROP INDEX decisions_one_per_candidate").await;
+    let m =
+        assert_refused_by_schema(&fx, &running, "one-decision-per-candidate index dropped").await;
+    assert!(m.contains("unique index on decisions"), "{m}");
+    owner_exec(
+        &fx,
+        "CREATE UNIQUE INDEX decisions_one_per_candidate ON decisions (candidate_commit)",
+    )
+    .await;
+    // A named CHECK replaced by a vacuous one keeps its name: presence/validation pass here
+    // (definitions are the Rust layer's job for these); a dropped one is refused.
+    owner_exec(
+        &fx,
+        "ALTER TABLE ref_events DROP CONSTRAINT ref_events_genesis_shape",
+    )
+    .await;
+    let m = assert_refused_by_schema(&fx, &running, "genesis-shape CHECK dropped").await;
+    assert!(m.contains("ref_events_genesis_shape"), "{m}");
+    owner_exec(&fx, "ALTER TABLE ref_events ADD CONSTRAINT ref_events_genesis_shape CHECK ((operation = 'genesis' AND old_head IS NULL AND old_version IS NULL AND new_version = 1) OR (operation = 'advance' AND old_head IS NOT NULL AND old_version IS NOT NULL AND new_version = old_version + 1))").await;
+    assert_healthy(&fx, "all constraints restored").await;
+    running.ready().await.expect("readiness after restore");
+    fx.teardown().await;
+}
