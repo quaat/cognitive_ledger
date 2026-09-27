@@ -344,7 +344,7 @@ async fn verify_validation_bytes(pool: &PgPool) -> Result<Vec<CheckResult>, Ledg
                 to_char(r.recorded_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS recorded_at, \
                 r.canonical_bytes AS record_bytes, c.canonical_bytes AS context_bytes, \
                 (SELECT count(*) FROM validation_violations v WHERE v.validation_id = r.validation_id) AS summaries \
-         FROM validation_records r JOIN semantic_execution_contexts c ON c.context_id = r.context_id",
+         FROM validation_records r LEFT JOIN semantic_execution_contexts c ON c.context_id = r.context_id",
     )
     .fetch_all(&mut *tx)
     .await
@@ -354,7 +354,14 @@ async fn verify_validation_bytes(pool: &PgPool) -> Result<Vec<CheckResult>, Ledg
         let agree = (|| -> Result<bool, LedgerError> {
             let vid: ValidationId = id.parse()?;
             let record_bytes: Vec<u8> = row.try_get("record_bytes").map_err(db_error)?;
-            let context_bytes: Vec<u8> = row.try_get("context_bytes").map_err(db_error)?;
+            // A record whose context is gone (dropped FK, faulty restore) is an orphan, never
+            // silently skipped.
+            let Some(context_bytes) = row
+                .try_get::<Option<Vec<u8>>, _>("context_bytes")
+                .map_err(db_error)?
+            else {
+                return Ok(false);
+            };
             let (record, _) =
                 crate::postgres_validation::decode_stored(&vid, &record_bytes, &context_bytes)?;
             let s = |c: &str| row.try_get::<String, _>(c).map_err(db_error);

@@ -902,6 +902,32 @@ async fn each_phase2_check_detects_exactly_its_own_tampering() {
         let restored = verify::run(&pool).await.unwrap();
         assert!(restored.is_clean(), "{column}: {:?}", failing(&restored));
     }
+    // While the FK is down: a record whose context disappeared is an orphan the byte check
+    // reports (a faulty restore or owner error), not a row it silently skips.
+    committed(vec![
+        format!("CREATE TABLE saved_sec AS SELECT * FROM semantic_execution_contexts WHERE context_id = '{bad_ctx}'"),
+        format!("CREATE TABLE saved_svc AS SELECT * FROM semantic_virtual_contexts WHERE context_id = '{bad_ctx}'"),
+        "ALTER TABLE semantic_virtual_contexts DISABLE TRIGGER semantic_virtual_contexts_write_once".into(),
+        "ALTER TABLE semantic_execution_contexts DISABLE TRIGGER semantic_execution_contexts_write_once".into(),
+        format!("DELETE FROM semantic_virtual_contexts WHERE context_id = '{bad_ctx}'"),
+        format!("DELETE FROM semantic_execution_contexts WHERE context_id = '{bad_ctx}'"),
+        "ALTER TABLE semantic_execution_contexts ENABLE TRIGGER semantic_execution_contexts_write_once".into(),
+        "ALTER TABLE semantic_virtual_contexts ENABLE TRIGGER semantic_virtual_contexts_write_once".into(),
+    ])
+    .await;
+    let report = verify::run(&pool).await.unwrap();
+    assert!(
+        failing(&report).contains(&RECORD_BYTES),
+        "an orphaned record must be reported: {:?}",
+        failing(&report)
+    );
+    committed(vec![
+        "INSERT INTO semantic_execution_contexts SELECT * FROM saved_sec".into(),
+        "INSERT INTO semantic_virtual_contexts SELECT * FROM saved_svc".into(),
+        "DROP TABLE saved_sec".into(),
+        "DROP TABLE saved_svc".into(),
+    ])
+    .await;
     committed(vec![format!(
         "ALTER TABLE validation_records ADD CONSTRAINT vr_context_fk {fk}"
     )])
