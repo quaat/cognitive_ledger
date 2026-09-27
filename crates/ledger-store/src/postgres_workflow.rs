@@ -157,9 +157,9 @@ pub struct PostgresLedgerStore {
     immutable: PostgresImmutableStore,
     graphs: PgGraphs,
     workflows: WorkflowRepository,
-    /// Expression fingerprint of the content-address CHECK validated at start-up (deparse
-    /// and probe); readiness refuses if the constraint's stored expression changed since.
-    content_check_fingerprint: Option<String>,
+    /// Expression fingerprints of every CHECK and partial-index predicate validated at
+    /// start-up (deparse and probe); readiness refuses if any stored expression changed since.
+    fingerprints: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// Session limits the runtime identity sets on every connection (ADR-0016): a statement,
@@ -232,9 +232,9 @@ impl PostgresLedgerStore {
         // message for a drifted grant), then the semantic probe, which needs those grants.
         let report = crate::schema::verify(&pool).await?;
         crate::schema::verify_runtime_identity(&pool).await?;
-        crate::schema::probe_content_address_check(&pool).await?;
+        crate::schema::verify_definitions_at_startup(&pool).await?;
         let mut store = Self::from_pool_migrated(pool, v1_binding);
-        store.content_check_fingerprint = Some(report.content_check_fingerprint);
+        store.fingerprints = Some(report.fingerprints);
         Ok(store)
     }
 
@@ -261,7 +261,7 @@ impl PostgresLedgerStore {
             workflows: WorkflowRepository::new(pool.clone(), immutable.clone()),
             immutable,
             pool,
-            content_check_fingerprint: None,
+            fingerprints: None,
         }
     }
 
@@ -323,14 +323,18 @@ impl PostgresLedgerStore {
     /// build requires (ADR-0016). A drifted schema is `SchemaIncompatible`, not ready.
     pub async fn ready(&self) -> Result<(), LedgerError> {
         let report = crate::schema::verify(&self.pool).await?;
-        if let Some(expected) = &self.content_check_fingerprint
-            && *expected != report.content_check_fingerprint
+        if let Some(expected) = &self.fingerprints
+            && *expected != report.fingerprints
         {
-            return Err(LedgerError::SchemaIncompatible(
-                "the content-address CHECK on immutable_objects changed since start-up; \
-                 refusing to serve until it is verified again"
-                    .into(),
-            ));
+            let changed: Vec<&String> = expected
+                .iter()
+                .filter(|(k, v)| report.fingerprints.get(*k) != Some(v))
+                .map(|(k, _)| k)
+                .collect();
+            return Err(LedgerError::SchemaIncompatible(format!(
+                "constraint or index definitions changed since start-up ({changed:?}); \
+                 refusing to serve until they are verified again"
+            )));
         }
         Ok(())
     }

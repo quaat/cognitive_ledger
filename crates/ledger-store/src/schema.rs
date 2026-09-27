@@ -9,6 +9,7 @@ use crate::db_error;
 use ledger_core::LedgerError;
 use sqlx::{PgConnection, PgPool, Row};
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 
 fn migrator() -> sqlx::migrate::Migrator {
     sqlx::migrate!("../../migrations")
@@ -82,11 +83,11 @@ pub const REQUIRED_SCHEMA_VERSION: i64 = 9;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SchemaReport {
     pub version: i64,
-    /// Fingerprint of the content-address CHECK's stored expression tree (`conbin`, with the
-    /// statement-offset `location` fields removed so re-adding the same definition from a
-    /// differently formatted statement does not change it): readiness compares it with the
-    /// value start-up validated (deparse + probe), lock-free.
-    pub content_check_fingerprint: String,
+    /// Expression fingerprints (`md5` of the stored node tree with statement offsets removed)
+    /// of every CHECK constraint and partial-index predicate as found now, keyed
+    /// `check:<table>.<name>` / `index:<name>`: readiness compares them with the values
+    /// start-up validated by deparse, lock-free.
+    pub fingerprints: BTreeMap<String, String>,
 }
 
 /// Verify that the database is at exactly `REQUIRED_SCHEMA_VERSION` with intact migration
@@ -178,11 +179,10 @@ pub async fn verify(pool: &PgPool) -> Result<SchemaReport, LedgerError> {
     // expects; a same-named replacement elsewhere or with weaker semantics is not compatible.
     verify_guard_triggers(pool).await?;
     verify_guard_functions(pool).await?;
-    verify_constraints_and_indexes(pool).await?;
-    let content_check_fingerprint = verify_content_address_check(pool).await?;
+    let fingerprints = verify_constraints_and_indexes(pool).await?;
     Ok(SchemaReport {
         version: highest,
-        content_check_fingerprint,
+        fingerprints,
     })
 }
 
@@ -654,14 +654,17 @@ async fn verify_guard_triggers(pool: &PgPool) -> Result<(), LedgerError> {
 }
 
 /// A referential or uniqueness constraint the integrity model depends on, matched by shape
-/// (table, key columns, referenced table/columns), never by name. Every FOREIGN KEY, PRIMARY
-/// KEY and UNIQUE constraint of migrations 0001–0009 is listed: they bind audit rows to real
-/// content and real events (ADR-0013) and make the workflow's uniqueness rules facts.
+/// (table, key columns, referenced schema/table/columns), never by name. Every FOREIGN KEY,
+/// PRIMARY KEY and UNIQUE constraint of migrations 0001–0009 is listed: they bind audit rows
+/// to real content and real events (ADR-0013) and make the workflow's uniqueness rules facts.
 struct ExpectedConstraint {
     table: &'static str,
     kind: char, // 'f' | 'p' | 'u'
     columns: &'static [&'static str],
     references: Option<(&'static str, &'static [&'static str])>,
+    /// `UNIQUE NULLS NOT DISTINCT` (0007's idempotency scope): NULL `on_behalf_of` scopes
+    /// must collide too.
+    nulls_not_distinct: bool,
 }
 
 const fn fk(
@@ -675,6 +678,7 @@ const fn fk(
         kind: 'f',
         columns,
         references: Some((ref_table, ref_columns)),
+        nulls_not_distinct: false,
     }
 }
 const fn pk(table: &'static str, columns: &'static [&'static str]) -> ExpectedConstraint {
@@ -683,6 +687,7 @@ const fn pk(table: &'static str, columns: &'static [&'static str]) -> ExpectedCo
         kind: 'p',
         columns,
         references: None,
+        nulls_not_distinct: false,
     }
 }
 const fn uq(table: &'static str, columns: &'static [&'static str]) -> ExpectedConstraint {
@@ -691,6 +696,7 @@ const fn uq(table: &'static str, columns: &'static [&'static str]) -> ExpectedCo
         kind: 'u',
         columns,
         references: None,
+        nulls_not_distinct: false,
     }
 }
 
@@ -831,9 +837,10 @@ const EXPECTED_CONSTRAINTS: &[ExpectedConstraint] = &[
     ),
     // 0007: actor scope and tenant integrity
     pk("idempotency", &["idempotency_id"]),
-    uq(
-        "idempotency",
-        &[
+    ExpectedConstraint {
+        table: "idempotency",
+        kind: 'u',
+        columns: &[
             "tenant_id",
             "graph_id",
             "operation",
@@ -842,7 +849,9 @@ const EXPECTED_CONSTRAINTS: &[ExpectedConstraint] = &[
             "principal_type",
             "on_behalf_of",
         ],
-    ),
+        references: None,
+        nulls_not_distinct: true,
+    },
     uq("graphs", &["graph_id", "tenant_id"]),
     fk(
         "proposals",
@@ -870,70 +879,236 @@ const EXPECTED_CONSTRAINTS: &[ExpectedConstraint] = &[
     ),
 ];
 
-/// Partial unique indexes the workflow relies on (one terminal decision per candidate /
-/// proposal / ref event): (table, columns, has a WHERE predicate).
-const EXPECTED_UNIQUE_INDEXES: &[(&str, &[&str], bool)] = &[
-    ("decisions", &["candidate_commit"], false),
-    ("decisions", &["proposal_id"], true),
-    ("decisions", &["ref_event_id"], true),
+/// Unique indexes the workflow relies on (one terminal decision per candidate / proposal /
+/// ref event): (index name, table, columns, normalized `WHERE` predicate or "" for none).
+/// The predicate is compared by deparse at start-up and by fingerprint on readiness.
+const EXPECTED_UNIQUE_INDEXES: &[(&str, &str, &[&str], &str)] = &[
+    (
+        "decisions_one_per_candidate",
+        "decisions",
+        &["candidate_commit"],
+        "",
+    ),
+    (
+        "decisions_one_per_proposal",
+        "decisions",
+        &["proposal_id"],
+        "(proposal_idISNOTNULL)",
+    ),
+    (
+        "decisions_one_per_ref_event",
+        "decisions",
+        &["ref_event_id"],
+        "(ref_event_idISNOTNULL)",
+    ),
 ];
 
-/// Named CHECK constraints of 0002–0009 (domain rules the Rust layer also enforces; here
-/// presence and validation are verified, the content-address one also by definition).
-const EXPECTED_CHECKS: &[(&str, &str)] = &[
-    ("immutable_objects", "immutable_objects_id_format"),
-    ("immutable_objects", "immutable_objects_content_addressed"),
-    ("commit_index", "commit_index_version_known"),
-    ("commit_index", "commit_index_parent_count"),
-    ("commit_index", "commit_index_graph_id_format"),
-    ("commit_parents", "commit_parents_position"),
-    ("graphs", "graphs_graph_id_format"),
-    ("graphs", "graphs_tenant_id_bounds"),
-    ("graphs", "graphs_kb_bounds"),
-    ("graphs", "graphs_purpose_bounds"),
-    ("graphs", "graphs_status_known"),
-    ("refs", "refs_version_positive"),
-    ("refs", "refs_branch_bounds"),
-    ("proposals", "proposals_branch_bounds"),
-    ("proposals", "proposals_principal_type"),
-    ("proposals", "proposals_correlation_bounds"),
-    ("ref_events", "ref_events_branch_bounds"),
-    ("ref_events", "ref_events_operation"),
-    ("ref_events", "ref_events_genesis_shape"),
-    ("ref_events", "ref_events_principal_type"),
-    ("ref_events", "ref_events_correlation_bounds"),
-    ("decisions", "decisions_kind"),
-    ("decisions", "decisions_accepted_has_event"),
-    ("decisions", "decisions_reason_bounds"),
-    ("decisions", "decisions_principal_type"),
-    ("decisions", "decisions_correlation_bounds"),
-    ("projection_outbox", "outbox_event_kind"),
-    ("idempotency", "idempotency_operation"),
-    ("idempotency", "idempotency_key_bounds"),
-    ("idempotency", "idempotency_digest_format"),
-    ("idempotency", "idempotency_result_kind"),
-    ("idempotency", "idempotency_principal_type"),
+/// Every named CHECK constraint of 0002–0009 with its normalized `pg_get_constraintdef`
+/// (whitespace and `::text` removed; identical on PostgreSQL 15 and 17). Definitions are
+/// compared by deparse at start-up and by expression fingerprint on readiness, so a same-named
+/// vacuous replacement cannot pass; the Rust layer enforces the same domain rules independently.
+const EXPECTED_CHECKS: &[(&str, &str, &str)] = &[
+    (
+        "commit_index",
+        "commit_index_graph_id_format",
+        "CHECK((graph_id~'^[A-Za-z0-9._:-]{1,128}$'))",
+    ),
+    (
+        "commit_index",
+        "commit_index_parent_count",
+        "CHECK(((parent_count>=0)AND(parent_count<=2)))",
+    ),
+    (
+        "commit_index",
+        "commit_index_version_known",
+        "CHECK((version=ANY(ARRAY[1,2])))",
+    ),
+    (
+        "commit_parents",
+        "commit_parents_position",
+        "CHECK((\"position\"=ANY(ARRAY[0,1])))",
+    ),
+    (
+        "decisions",
+        "decisions_accepted_has_event",
+        "CHECK((((decision='accepted')AND(ref_event_idISNOTNULL))OR((decision<>'accepted')AND(ref_event_idISNULL))))",
+    ),
+    (
+        "decisions",
+        "decisions_correlation_bounds",
+        "CHECK(((correlation_idISNULL)OR((octet_length(correlation_id)>=1)AND(octet_length(correlation_id)<=128))))",
+    ),
+    (
+        "decisions",
+        "decisions_kind",
+        "CHECK((decision=ANY(ARRAY['accepted','rejected','superseded'])))",
+    ),
+    (
+        "decisions",
+        "decisions_principal_type",
+        "CHECK((principal_type=ANY(ARRAY['human','agent','service'])))",
+    ),
+    (
+        "decisions",
+        "decisions_reason_bounds",
+        "CHECK(((reasonISNULL)OR(octet_length(reason)<=4096)))",
+    ),
+    (
+        "graphs",
+        "graphs_graph_id_format",
+        "CHECK((graph_id~'^[A-Za-z0-9._:-]{1,128}$'))",
+    ),
+    (
+        "graphs",
+        "graphs_kb_bounds",
+        "CHECK(((knowledge_base_idISNULL)OR((octet_length(knowledge_base_id)>=1)AND(octet_length(knowledge_base_id)<=512))))",
+    ),
+    (
+        "graphs",
+        "graphs_purpose_bounds",
+        "CHECK(((purposeISNULL)OR(octet_length(purpose)<=512)))",
+    ),
+    (
+        "graphs",
+        "graphs_status_known",
+        "CHECK((status=ANY(ARRAY['bootstrap','active','importing','archived'])))",
+    ),
+    (
+        "graphs",
+        "graphs_tenant_id_bounds",
+        "CHECK(((octet_length(tenant_id)>=1)AND(octet_length(tenant_id)<=512)))",
+    ),
+    (
+        "idempotency",
+        "idempotency_digest_format",
+        "CHECK((request_digest~'^sha256:[0-9a-f]{64}$'))",
+    ),
+    (
+        "idempotency",
+        "idempotency_key_bounds",
+        "CHECK(((octet_length(idempotency_key)>=1)AND(octet_length(idempotency_key)<=256)))",
+    ),
+    (
+        "idempotency",
+        "idempotency_operation",
+        "CHECK((operation=ANY(ARRAY['prepare','accept','reject'])))",
+    ),
+    (
+        "idempotency",
+        "idempotency_principal_type",
+        "CHECK((principal_type=ANY(ARRAY['human','agent','service'])))",
+    ),
+    (
+        "idempotency",
+        "idempotency_result_kind",
+        "CHECK((result_kind=ANY(ARRAY['prepared','accepted','rejected'])))",
+    ),
+    (
+        "immutable_objects",
+        "immutable_objects_content_addressed",
+        "CHECK((id=('sha256:'||encode(sha256(bytes),'hex'))))",
+    ),
+    (
+        "immutable_objects",
+        "immutable_objects_id_format",
+        "CHECK((id~'^sha256:[0-9a-f]{64}$'))",
+    ),
+    (
+        "projection_outbox",
+        "outbox_event_kind",
+        "CHECK((event_kind='ref_advanced'))",
+    ),
+    (
+        "proposals",
+        "proposals_branch_bounds",
+        "CHECK((((octet_length(branch)>=1)AND(octet_length(branch)<=128))AND(branch~'^[A-Za-z0-9._/-]+$')))",
+    ),
+    (
+        "proposals",
+        "proposals_correlation_bounds",
+        "CHECK(((correlation_idISNULL)OR((octet_length(correlation_id)>=1)AND(octet_length(correlation_id)<=128))))",
+    ),
+    (
+        "proposals",
+        "proposals_principal_type",
+        "CHECK((principal_type=ANY(ARRAY['human','agent','service'])))",
+    ),
+    (
+        "ref_events",
+        "ref_events_branch_bounds",
+        "CHECK((((octet_length(branch)>=1)AND(octet_length(branch)<=128))AND(branch~'^[A-Za-z0-9._/-]+$')))",
+    ),
+    (
+        "ref_events",
+        "ref_events_correlation_bounds",
+        "CHECK(((correlation_idISNULL)OR((octet_length(correlation_id)>=1)AND(octet_length(correlation_id)<=128))))",
+    ),
+    (
+        "ref_events",
+        "ref_events_genesis_shape",
+        "CHECK((((operation='genesis')AND(old_headISNULL)AND(old_versionISNULL)AND(new_version=1))OR((operation='advance')AND(old_headISNOTNULL)AND(old_versionISNOTNULL)AND(new_version=(old_version+1)))))",
+    ),
+    (
+        "ref_events",
+        "ref_events_operation",
+        "CHECK((operation=ANY(ARRAY['genesis','advance'])))",
+    ),
+    (
+        "ref_events",
+        "ref_events_principal_type",
+        "CHECK((principal_type=ANY(ARRAY['human','agent','service'])))",
+    ),
+    (
+        "refs",
+        "refs_branch_bounds",
+        "CHECK((((octet_length(branch)>=1)AND(octet_length(branch)<=128))AND(branch~'^[A-Za-z0-9._/-]+$')))",
+    ),
+    ("refs", "refs_version_positive", "CHECK((version>=1))"),
 ];
 
-/// Every expected FOREIGN KEY / PRIMARY KEY / UNIQUE constraint exists exactly once with the
-/// expected shape and is validated and non-deferrable; every named CHECK exists and is
-/// validated; every partial unique index exists. Catalog-only (attnums resolved to names),
-/// so it is lock-free and runs on readiness.
-async fn verify_constraints_and_indexes(pool: &PgPool) -> Result<(), LedgerError> {
+fn normalize_constraint_def(def: &str) -> String {
+    def.chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .replace("::text", "")
+}
+
+/// Key of a definition fingerprint in [`SchemaReport::fingerprints`].
+fn check_key(table: &str, name: &str) -> String {
+    format!("check:{table}.{name}")
+}
+fn index_key(name: &str) -> String {
+    format!("index:{name}")
+}
+
+/// Every expected FOREIGN KEY / PRIMARY KEY / UNIQUE constraint exists (at least one validated,
+/// non-deferrable match of the expected shape, referenced tables in `public`, NULLS NOT
+/// DISTINCT where required); every named CHECK exists and is validated; every unique index
+/// exists with the expected columns and partiality. Catalog-only (attnums resolved to names,
+/// no deparse), so it is lock-free and runs on readiness. Returns the expression fingerprints
+/// of the CHECKs and partial-index predicates for readiness comparison.
+async fn verify_constraints_and_indexes(
+    pool: &PgPool,
+) -> Result<BTreeMap<String, String>, LedgerError> {
     let rows = sqlx::query(
         "SELECT c.relname::text AS table_name, con.conname::text AS name, con.contype::text AS kind, \
                 con.convalidated, con.condeferrable, \
                 (SELECT array_agg(a.attname::text ORDER BY k.ord) \
                    FROM unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord) \
                    JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum) AS columns, \
-                rc.relname::text AS ref_table, \
+                rn.nspname::text AS ref_schema, rc.relname::text AS ref_table, \
                 (SELECT array_agg(a.attname::text ORDER BY k.ord) \
                    FROM unnest(con.confkey) WITH ORDINALITY AS k(attnum, ord) \
-                   JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = k.attnum) AS ref_columns \
+                   JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = k.attnum) AS ref_columns, \
+                coalesce(i.indnullsnotdistinct, false) AS nulls_not_distinct, \
+                CASE WHEN con.contype = 'c' \
+                     THEN md5(regexp_replace(con.conbin::text, ':location -?[0-9]+', '', 'g')) END AS fingerprint \
          FROM pg_constraint con \
          JOIN pg_class c ON c.oid = con.conrelid \
          JOIN pg_namespace n ON n.oid = c.relnamespace \
          LEFT JOIN pg_class rc ON rc.oid = con.confrelid \
+         LEFT JOIN pg_namespace rn ON rn.oid = rc.relnamespace \
+         LEFT JOIN pg_index i ON i.indexrelid = con.conindid AND con.contype IN ('u', 'p') \
          WHERE n.nspname = 'public'",
     )
     .fetch_all(pool)
@@ -946,8 +1121,11 @@ async fn verify_constraints_and_indexes(pool: &PgPool) -> Result<(), LedgerError
         validated: bool,
         deferrable: bool,
         columns: Vec<String>,
+        ref_schema: Option<String>,
         ref_table: Option<String>,
         ref_columns: Vec<String>,
+        nulls_not_distinct: bool,
+        fingerprint: Option<String>,
     }
     let mut found = Vec::with_capacity(rows.len());
     for row in &rows {
@@ -961,14 +1139,38 @@ async fn verify_constraints_and_indexes(pool: &PgPool) -> Result<(), LedgerError
                 .try_get::<Option<Vec<String>>, _>("columns")
                 .map_err(db_error)?
                 .unwrap_or_default(),
+            ref_schema: row.try_get("ref_schema").map_err(db_error)?,
             ref_table: row.try_get("ref_table").map_err(db_error)?,
             ref_columns: row
                 .try_get::<Option<Vec<String>>, _>("ref_columns")
                 .map_err(db_error)?
                 .unwrap_or_default(),
+            nulls_not_distinct: row.try_get("nulls_not_distinct").map_err(db_error)?,
+            fingerprint: row.try_get("fingerprint").map_err(db_error)?,
         });
     }
     for e in EXPECTED_CONSTRAINTS {
+        let shape = match e.references {
+            Some((rt, rcols)) => format!(
+                "{} FOREIGN KEY {:?} -> public.{rt} {rcols:?}",
+                e.table, e.columns
+            ),
+            None => format!(
+                "{} {}{} {:?}",
+                e.table,
+                if e.kind == 'p' {
+                    "PRIMARY KEY"
+                } else {
+                    "UNIQUE"
+                },
+                if e.nulls_not_distinct {
+                    " NULLS NOT DISTINCT"
+                } else {
+                    ""
+                },
+                e.columns
+            ),
+        };
         let matches: Vec<&Found> = found
             .iter()
             .filter(|f| {
@@ -977,53 +1179,42 @@ async fn verify_constraints_and_indexes(pool: &PgPool) -> Result<(), LedgerError
                     && f.columns == e.columns
                     && match e.references {
                         Some((rt, rcols)) => {
-                            f.ref_table.as_deref() == Some(rt) && f.ref_columns == rcols
+                            f.ref_schema.as_deref() == Some("public")
+                                && f.ref_table.as_deref() == Some(rt)
+                                && f.ref_columns == rcols
                         }
                         None => true,
                     }
+                    && (!e.nulls_not_distinct || f.nulls_not_distinct)
             })
             .collect();
-        let shape = match e.references {
-            Some((rt, rcols)) => {
-                format!("{} FOREIGN KEY {:?} -> {rt} {rcols:?}", e.table, e.columns)
-            }
-            None => format!(
-                "{} {} {:?}",
-                e.table,
-                if e.kind == 'p' {
-                    "PRIMARY KEY"
-                } else {
-                    "UNIQUE"
-                },
-                e.columns
-            ),
-        };
-        match matches.as_slice() {
-            [] => {
-                return Err(incompatible(format!(
-                    "constraint {shape} is missing; refusing to serve"
-                )));
-            }
-            [one] => {
-                if !one.validated {
-                    return Err(incompatible(format!(
-                        "constraint {} ({shape}) is NOT VALID; refusing to serve",
-                        one.name
-                    )));
-                }
-                if one.deferrable {
-                    return Err(incompatible(format!(
-                        "constraint {} ({shape}) is deferrable (the migrations define none); refusing to serve",
-                        one.name
-                    )));
-                }
-            }
-            _ => {} // duplicates of an expected shape are harmless
+        if matches.is_empty() {
+            return Err(incompatible(format!(
+                "constraint {shape} is missing; refusing to serve"
+            )));
+        }
+        // Among same-shaped constraints at least one must be enforced now and immediately:
+        // validated and non-deferrable (two NOT VALID copies are not a constraint).
+        if !matches.iter().any(|f| f.validated && !f.deferrable) {
+            return Err(incompatible(format!(
+                "constraint {shape} exists only as NOT VALID or deferrable copies ({}); refusing to serve",
+                matches
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
         }
     }
-    for (table, name) in EXPECTED_CHECKS {
+    let mut fingerprints = BTreeMap::new();
+    for (table, name, _) in EXPECTED_CHECKS {
         match found.iter().find(|f| f.table == *table && f.name == *name) {
-            Some(f) if f.kind == "c" && f.validated => {}
+            Some(f) if f.kind == "c" && f.validated => {
+                fingerprints.insert(
+                    check_key(table, name),
+                    f.fingerprint.clone().unwrap_or_default(),
+                );
+            }
             Some(f) if f.kind != "c" => {
                 return Err(incompatible(format!(
                     "constraint {name} on public.{table} is not a CHECK constraint; refusing to serve"
@@ -1042,114 +1233,121 @@ async fn verify_constraints_and_indexes(pool: &PgPool) -> Result<(), LedgerError
         }
     }
     let indexes = sqlx::query(
-        "SELECT t.relname::text AS table_name, i.indisunique, i.indpred IS NOT NULL AS partial, \
+        "SELECT ic.relname::text AS name, t.relname::text AS table_name, i.indisunique, \
+                i.indpred IS NOT NULL AS partial, \
                 (SELECT array_agg(a.attname::text ORDER BY k.ord) \
                    FROM unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord) \
-                   JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum) AS columns \
-         FROM pg_index i JOIN pg_class t ON t.oid = i.indrelid \
+                   JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum) AS columns, \
+                CASE WHEN i.indpred IS NOT NULL \
+                     THEN md5(regexp_replace(i.indpred::text, ':location -?[0-9]+', '', 'g')) END AS fingerprint \
+         FROM pg_index i JOIN pg_class t ON t.oid = i.indrelid JOIN pg_class ic ON ic.oid = i.indexrelid \
          JOIN pg_namespace n ON n.oid = t.relnamespace \
          WHERE n.nspname = 'public' AND i.indisunique AND i.indisvalid",
     )
     .fetch_all(pool)
     .await
     .map_err(db_error)?;
-    for (table, columns, partial) in EXPECTED_UNIQUE_INDEXES {
-        let present = indexes.iter().any(|row| {
-            row.try_get::<String, _>("table_name")
-                .is_ok_and(|t| t == *table)
+    for (name, table, columns, predicate) in EXPECTED_UNIQUE_INDEXES {
+        let row = indexes.iter().find(|row| {
+            row.try_get::<String, _>("name").is_ok_and(|n| n == *name)
+                && row
+                    .try_get::<String, _>("table_name")
+                    .is_ok_and(|t| t == *table)
                 && row
                     .try_get::<Option<Vec<String>>, _>("columns")
                     .is_ok_and(|c| c.unwrap_or_default() == *columns)
                 && row
                     .try_get::<bool, _>("partial")
-                    .is_ok_and(|p| p == *partial)
+                    .is_ok_and(|p| p != predicate.is_empty())
         });
-        if !present {
+        match row {
+            Some(row) => {
+                if !predicate.is_empty() {
+                    let fp: Option<String> = row.try_get("fingerprint").map_err(db_error)?;
+                    fingerprints.insert(index_key(name), fp.unwrap_or_default());
+                }
+            }
+            None => {
+                return Err(incompatible(format!(
+                    "unique index {name} on {table} {columns:?}{} is missing or invalid; refusing to serve",
+                    if predicate.is_empty() {
+                        ""
+                    } else {
+                        " (partial)"
+                    }
+                )));
+            }
+        }
+    }
+    Ok(fingerprints)
+}
+
+/// Start-up verification of every CHECK and partial-index *definition* (deparsed and
+/// normalized against the values the migrations produce on PostgreSQL 15 and 17) plus the
+/// rolled-back semantic probe of the content-address CHECK. Deparsing opens relations with
+/// `ACCESS SHARE` and the probe takes a row lock, so this runs at start-up only; readiness
+/// compares the expression fingerprints `verify` returns with the ones validated here.
+pub async fn verify_definitions_at_startup(pool: &PgPool) -> Result<(), LedgerError> {
+    for (table, name, expected) in EXPECTED_CHECKS {
+        let def: Option<String> = sqlx::query_scalar(
+            "SELECT pg_get_constraintdef(con.oid) FROM pg_constraint con \
+             JOIN pg_class c ON c.oid = con.conrelid JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = 'public' AND c.relname = $1 AND con.conname = $2",
+        )
+        .bind(table)
+        .bind(name)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?;
+        let def = def.ok_or_else(|| {
+            incompatible(format!(
+                "CHECK constraint {name} is missing on public.{table}; refusing to serve"
+            ))
+        })?;
+        if normalize_constraint_def(&def) != *expected {
             return Err(incompatible(format!(
-                "unique index on {table} {columns:?}{} is missing or invalid; refusing to serve",
-                if *partial { " (partial)" } else { "" }
+                "constraint {name} on public.{table} has definition {def:?} instead of the one \
+                 migration-defined; refusing to serve"
             )));
         }
     }
-    Ok(())
+    for (name, table, _, predicate) in EXPECTED_UNIQUE_INDEXES {
+        if predicate.is_empty() {
+            continue;
+        }
+        let def: Option<String> = sqlx::query_scalar(
+            "SELECT pg_get_expr(i.indpred, i.indrelid) FROM pg_index i \
+             JOIN pg_class ic ON ic.oid = i.indexrelid WHERE ic.relname = $1 \
+               AND ic.relnamespace = 'public'::regnamespace",
+        )
+        .bind(name)
+        .fetch_optional(pool)
+        .await
+        .map_err(db_error)?;
+        let def = def.ok_or_else(|| {
+            incompatible(format!(
+                "unique index {name} on {table} has no WHERE predicate; refusing to serve"
+            ))
+        })?;
+        if normalize_constraint_def(&def) != *predicate {
+            return Err(incompatible(format!(
+                "unique index {name} on {table} has predicate {def:?} instead of the migration's; \
+                 refusing to serve"
+            )));
+        }
+    }
+    probe_content_address_check(pool).await
 }
 
 /// Migration 0009's content-address CHECK on `immutable_objects`: the database-side
 /// guarantee that no bytes are stored under a false content id. Rust re-verifies every
-/// object's digest on read; this is defence in depth and must be present, validated and
-/// semantically the expected condition. `verify` checks the catalog (lock-free, used by
-/// readiness); `probe_content_address_check` additionally exercises it at start-up.
+/// object's digest on read; this is defence in depth. Its definition is covered by
+/// [`verify_definitions_at_startup`] like every other CHECK; this probe additionally makes
+/// the database refuse a mislabelled object inside a rolled-back transaction, so a
+/// constraint that deparses acceptably but does not enforce the condition cannot pass.
 const CONTENT_ADDRESS_CHECK: &str = "immutable_objects_content_addressed";
-/// `pg_get_constraintdef` output with whitespace and `::text` casts removed (PostgreSQL 15
-/// and 17 deparse the expression identically otherwise).
-const CONTENT_ADDRESS_CHECK_DEF: &str = "CHECK((id=('sha256:'||encode(sha256(bytes),'hex'))))";
 
-fn normalize_constraint_def(def: &str) -> String {
-    def.chars()
-        .filter(|c| !c.is_whitespace())
-        .collect::<String>()
-        .replace("::text", "")
-}
-
-/// Catalog facts about the CHECK (lock-free: no relation is opened): present on the table,
-/// a CHECK, validated. Returns the fingerprint of its stored expression tree.
-async fn verify_content_address_check(pool: &PgPool) -> Result<String, LedgerError> {
-    let rows = sqlx::query(
-        "SELECT con.contype::text AS contype, con.convalidated, \
-                md5(regexp_replace(con.conbin::text, ':location -?[0-9]+', '', 'g')) AS fingerprint \
-         FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid \
-         JOIN pg_namespace n ON n.oid = c.relnamespace \
-         WHERE n.nspname = 'public' AND c.relname = 'immutable_objects' AND con.conname = $1",
-    )
-    .bind(CONTENT_ADDRESS_CHECK)
-    .fetch_all(pool)
-    .await
-    .map_err(db_error)?;
-    let row = match rows.as_slice() {
-        [row] => row,
-        _ => {
-            return Err(incompatible(format!(
-                "constraint {CONTENT_ADDRESS_CHECK} is missing on public.immutable_objects; refusing to serve"
-            )));
-        }
-    };
-    let contype: String = row.try_get("contype").map_err(db_error)?;
-    let validated: bool = row.try_get("convalidated").map_err(db_error)?;
-    if contype != "c" {
-        return Err(incompatible(format!(
-            "constraint {CONTENT_ADDRESS_CHECK} is not a CHECK constraint; refusing to serve"
-        )));
-    }
-    if !validated {
-        return Err(incompatible(format!(
-            "constraint {CONTENT_ADDRESS_CHECK} is NOT VALID (existing rows unverified); refusing to serve"
-        )));
-    }
-    row.try_get("fingerprint").map_err(db_error)
-}
-
-/// Start-up verification of the content-address CHECK's semantics: its deparsed definition
-/// must normalize to the content-address condition, and a mislabelled object must be refused
-/// by the database itself (rolled-back probe), so a same-named constraint with a weaker
-/// condition cannot pass. Runs at server start-up only: deparsing opens the relation with
-/// `ACCESS SHARE` and the probe takes a row lock, neither of which belongs in readiness, which
-/// instead compares the expression fingerprint `verify` returns with the one validated here.
 pub async fn probe_content_address_check(pool: &PgPool) -> Result<(), LedgerError> {
-    let def: String = sqlx::query_scalar(
-        "SELECT pg_get_constraintdef(con.oid) FROM pg_constraint con \
-         JOIN pg_class c ON c.oid = con.conrelid JOIN pg_namespace n ON n.oid = c.relnamespace \
-         WHERE n.nspname = 'public' AND c.relname = 'immutable_objects' AND con.conname = $1",
-    )
-    .bind(CONTENT_ADDRESS_CHECK)
-    .fetch_one(pool)
-    .await
-    .map_err(db_error)?;
-    if normalize_constraint_def(&def) != CONTENT_ADDRESS_CHECK_DEF {
-        return Err(incompatible(format!(
-            "constraint {CONTENT_ADDRESS_CHECK} has definition {def:?} instead of the content-address \
-             condition; refusing to serve"
-        )));
-    }
     let mut tx = pool.begin().await.map_err(db_error)?;
     let probe = sqlx::query("INSERT INTO immutable_objects (id, bytes) VALUES ($1, $2)")
         .bind(format!("sha256:{}", "0".repeat(64)))
@@ -1739,17 +1937,20 @@ async fn verify_sequence_privileges_for(
 
 #[cfg(test)]
 mod tests {
-    use super::{CONTENT_ADDRESS_CHECK_DEF, GUARD_TRIGGERS, normalize_constraint_def};
+    use super::{EXPECTED_CHECKS, GUARD_TRIGGERS, normalize_constraint_def};
 
     #[test]
     fn constraint_definition_normalization_matches_postgres_deparse() {
-        // PostgreSQL 17 deparse of migration 0009's CHECK.
+        // PostgreSQL 15/17 deparse of migration 0009's content-address CHECK.
         let pg17 = "CHECK ((id = ('sha256:'::text || encode(sha256(bytes), 'hex'::text))))";
-        assert_eq!(normalize_constraint_def(pg17), CONTENT_ADDRESS_CHECK_DEF);
-        assert_ne!(
-            normalize_constraint_def("CHECK (true)"),
-            CONTENT_ADDRESS_CHECK_DEF
-        );
+        let expected = EXPECTED_CHECKS
+            .iter()
+            .find(|(_, n, _)| *n == "immutable_objects_content_addressed")
+            .unwrap()
+            .2;
+        assert_eq!(normalize_constraint_def(pg17), expected);
+        assert_ne!(normalize_constraint_def("CHECK (true)"), expected);
+        assert_eq!(EXPECTED_CHECKS.len(), 32);
     }
 
     #[test]

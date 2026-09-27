@@ -644,6 +644,27 @@ supply-chain, upgrade, backup harnesses), `docs/` (operations runbook, security)
   change the cluster default. Fix: both SET and ALTER SYSTEM are refused for every assumable
   role (the direct check already covered both).
 
+### Review round 7 (fresh Codex review of `9fc31d7`, 2026-09-27): four new P1s, fixed
+- **Duplicates.** Two same-shaped `NOT VALID` copies of a constraint passed. Fix: among
+  same-shaped constraints at least one must be validated and non-deferrable.
+- **FK target schema.** Referenced relations were matched by name only. Fix: the referenced
+  namespace is resolved and must be `public`.
+- **`NULLS NOT DISTINCT`.** The idempotency scope uniqueness matched a plain `UNIQUE`. Fix:
+  the expected shape carries the flag and the backing index's `indnullsnotdistinct` must be
+  true.
+- **Partial-index predicates and CHECK definitions.** `WHERE false` (and a vacuous CHECK
+  body) kept the catalog shape. Fix: every named CHECK's normalized `pg_get_constraintdef`
+  and every partial predicate's `pg_get_expr` are compared at start-up against the values
+  the migrations produce (captured on PostgreSQL 15.19 and 17.2, byte-identical), and their
+  expression fingerprints (stored node tree, statement offsets removed) are compared on
+  readiness against the start-up values — the same mechanism the content-address CHECK
+  already used, now for all 32 CHECKs and both partial indexes. Tests:
+  `pg_least_privilege::duplicate_invalid_constraints_foreign_schemas_null_semantics_and_predicates_are_refused`
+  — two `NOT VALID` copies, an FK into `shadow.immutable_objects`, `UNIQUE` without
+  `NULLS NOT DISTINCT`, `decisions_one_per_proposal … WHERE false`, and
+  `decisions_accepted_has_event CHECK (true)` — each refused (start-up by definition,
+  readiness by fingerprint, structural cases by `schema::verify`); healthy after restore.
+
 ### Admission-control decision (§15, 2026-09-27)
 Measured: under 1,000 concurrent clients on two replicas the 12-slot expensive semaphore per
 replica refuses the excess prepares immediately (`503 RESOURCE_LIMIT`), successful prepare p99

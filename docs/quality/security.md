@@ -128,10 +128,12 @@ integrity rules against real PostgreSQL, including a non-superuser owner.
   allowed to SET or ALTER SYSTEM `session_replication_role`, a `pg_*` role, or any role whose own table,
   column, sequence or grant-function privileges exceed the runtime model; PostgreSQL 15
   and 16+ membership semantics both handled); every FOREIGN KEY, PRIMARY KEY and UNIQUE constraint of
-  the migrations by shape (validated, non-deferrable), the partial unique indexes and every
-  named CHECK by presence and validation; the content-address CHECK additionally by
-  deparsed definition and a rolled-back semantic probe (start-up) and by expression
-  fingerprint (readiness); the runtime role's exact per-column INSERT/UPDATE
+  the migrations by shape (key columns, referenced `public` table and columns, at least one
+  validated non-deferrable match, `NULLS NOT DISTINCT` where defined), the unique indexes
+  with their predicates, and all 32 named CHECKs — definitions compared by deparse at
+  start-up against the values the migrations produce (identical on PostgreSQL 15 and 17)
+  and by expression fingerprint on readiness; the content-address CHECK additionally by a
+  rolled-back semantic probe at start-up; the runtime role's exact per-column INSERT/UPDATE
   grants, absence of table-level writes, DELETE/TRUNCATE/TRIGGER/REFERENCES, and USAGE on
   exactly the audit sequences. ASan fuzzing passes on the hosted runner (`ci-fuzz` matrix `none`/`address`, pinned
   nightly, explicit target triple; the local host's ASan start-up crash is host-specific);

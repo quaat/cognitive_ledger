@@ -82,7 +82,7 @@ impl PostgresImmutableStore {
         .await
         .map_err(db_error)?;
         crate::schema::verify(&pool).await?;
-        crate::schema::probe_content_address_check(&pool).await?;
+        crate::schema::verify_definitions_at_startup(&pool).await?;
         Ok(Self::from_pool_migrated(pool, v1_binding))
     }
 

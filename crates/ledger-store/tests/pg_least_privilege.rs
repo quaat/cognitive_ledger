@@ -1382,11 +1382,11 @@ async fn weakened_content_address_check_is_refused_at_startup_and_readiness() {
         ledger_store::schema::verify(&rt)
             .await
             .expect("catalog facts alone still pass");
-        match ledger_store::schema::probe_content_address_check(&rt).await {
+        match ledger_store::schema::verify_definitions_at_startup(&rt).await {
             Err(ledger_core::LedgerError::SchemaIncompatible(m)) => {
                 assert!(m.contains("definition"), "{m}")
             }
-            other => panic!("CHECK (true): probe should refuse, got {other:?}"),
+            other => panic!("CHECK (true): start-up definitions should refuse, got {other:?}"),
         }
         match ledger_store::PostgresLedgerStore::connect(
             &fx.runtime_db_url,
@@ -1855,7 +1855,7 @@ async fn lost_referential_and_uniqueness_constraints_are_refused_at_startup_and_
     .await;
     let m = assert_refused_by_schema(&fx, &running, "commit_index.id FK dropped").await;
     assert!(
-        m.contains("commit_index FOREIGN KEY [\"id\"] -> immutable_objects"),
+        m.contains("commit_index FOREIGN KEY [\"id\"] -> public.immutable_objects"),
         "{m}"
     );
     // A same-shaped FK recreated NOT VALID does not count either.
@@ -1897,7 +1897,10 @@ async fn lost_referential_and_uniqueness_constraints_are_refused_at_startup_and_
     owner_exec(&fx, "DROP INDEX decisions_one_per_candidate").await;
     let m =
         assert_refused_by_schema(&fx, &running, "one-decision-per-candidate index dropped").await;
-    assert!(m.contains("unique index on decisions"), "{m}");
+    assert!(
+        m.contains("unique index decisions_one_per_candidate"),
+        "{m}"
+    );
     owner_exec(
         &fx,
         "CREATE UNIQUE INDEX decisions_one_per_candidate ON decisions (candidate_commit)",
@@ -1914,6 +1917,143 @@ async fn lost_referential_and_uniqueness_constraints_are_refused_at_startup_and_
     assert!(m.contains("ref_events_genesis_shape"), "{m}");
     owner_exec(&fx, "ALTER TABLE ref_events ADD CONSTRAINT ref_events_genesis_shape CHECK ((operation = 'genesis' AND old_head IS NULL AND old_version IS NULL AND new_version = 1) OR (operation = 'advance' AND old_head IS NOT NULL AND old_version IS NOT NULL AND new_version = old_version + 1))").await;
     assert_healthy(&fx, "all constraints restored").await;
+    running.ready().await.expect("readiness after restore");
+    fx.teardown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn duplicate_invalid_constraints_foreign_schemas_null_semantics_and_predicates_are_refused() {
+    let fx = fixture("ledger_shape").await;
+    fx.migrate_and_grant().await;
+    let running = ledger_store::PostgresLedgerStore::connect(
+        &fx.runtime_db_url,
+        ledger_store::V1Binding::Reject,
+    )
+    .await
+    .unwrap();
+    // 1. Two NOT VALID copies of the same shape are not an enforced constraint.
+    owner_exec(
+        &fx,
+        "ALTER TABLE commit_index DROP CONSTRAINT commit_index_id_fkey",
+    )
+    .await;
+    owner_exec(&fx, "ALTER TABLE commit_index ADD CONSTRAINT ci_id_fk_a FOREIGN KEY (id) REFERENCES immutable_objects (id) NOT VALID").await;
+    owner_exec(&fx, "ALTER TABLE commit_index ADD CONSTRAINT ci_id_fk_b FOREIGN KEY (id) REFERENCES immutable_objects (id) NOT VALID").await;
+    let m = assert_refused_by_schema(&fx, &running, "two NOT VALID copies").await;
+    assert!(m.contains("only as NOT VALID or deferrable copies"), "{m}");
+    owner_exec(&fx, "ALTER TABLE commit_index DROP CONSTRAINT ci_id_fk_a").await;
+    owner_exec(&fx, "ALTER TABLE commit_index DROP CONSTRAINT ci_id_fk_b").await;
+    // 2. Same-named table in another schema as the FK target.
+    owner_exec(&fx, "CREATE SCHEMA shadow").await;
+    owner_exec(
+        &fx,
+        "CREATE TABLE shadow.immutable_objects (id TEXT PRIMARY KEY)",
+    )
+    .await;
+    owner_exec(&fx, "ALTER TABLE commit_index ADD CONSTRAINT commit_index_id_fkey FOREIGN KEY (id) REFERENCES shadow.immutable_objects (id)").await;
+    let m = assert_refused_by_schema(&fx, &running, "FK into another schema").await;
+    assert!(
+        m.contains("commit_index FOREIGN KEY [\"id\"] -> public.immutable_objects")
+            && m.contains("missing"),
+        "{m}"
+    );
+    owner_exec(
+        &fx,
+        "ALTER TABLE commit_index DROP CONSTRAINT commit_index_id_fkey",
+    )
+    .await;
+    owner_exec(&fx, "DROP SCHEMA shadow CASCADE").await;
+    owner_exec(&fx, "ALTER TABLE commit_index ADD CONSTRAINT commit_index_id_fkey FOREIGN KEY (id) REFERENCES immutable_objects (id)").await;
+    assert_healthy(&fx, "FK restored").await;
+    // 3. The idempotency scope without NULLS NOT DISTINCT lets NULL on_behalf_of scopes collide.
+    owner_exec(
+        &fx,
+        "ALTER TABLE idempotency DROP CONSTRAINT idempotency_scope_unique",
+    )
+    .await;
+    owner_exec(&fx, "ALTER TABLE idempotency ADD CONSTRAINT idempotency_scope_unique UNIQUE (tenant_id, graph_id, operation, idempotency_key, principal_id, principal_type, on_behalf_of)").await;
+    let m = assert_refused_by_schema(&fx, &running, "UNIQUE without NULLS NOT DISTINCT").await;
+    assert!(
+        m.contains("NULLS NOT DISTINCT") && m.contains("missing"),
+        "{m}"
+    );
+    owner_exec(
+        &fx,
+        "ALTER TABLE idempotency DROP CONSTRAINT idempotency_scope_unique",
+    )
+    .await;
+    owner_exec(&fx, "ALTER TABLE idempotency ADD CONSTRAINT idempotency_scope_unique UNIQUE NULLS NOT DISTINCT (tenant_id, graph_id, operation, idempotency_key, principal_id, principal_type, on_behalf_of)").await;
+    assert_healthy(&fx, "NULLS NOT DISTINCT restored").await;
+    // 4. A partial unique index whose predicate never holds: catalog shape identical, so
+    //    start-up (deparse) and readiness (fingerprint) must catch it.
+    owner_exec(&fx, "DROP INDEX decisions_one_per_proposal").await;
+    owner_exec(
+        &fx,
+        "CREATE UNIQUE INDEX decisions_one_per_proposal ON decisions (proposal_id) WHERE false",
+    )
+    .await;
+    {
+        let rt = fx.runtime_pool().await;
+        match ledger_store::schema::verify_definitions_at_startup(&rt).await {
+            Err(ledger_core::LedgerError::SchemaIncompatible(m)) => {
+                assert!(m.contains("predicate"), "{m}")
+            }
+            other => panic!("WHERE false: start-up should refuse, got {other:?}"),
+        }
+        match ledger_store::PostgresLedgerStore::connect(
+            &fx.runtime_db_url,
+            ledger_store::V1Binding::Reject,
+        )
+        .await
+        {
+            Err(ledger_core::LedgerError::SchemaIncompatible(_)) => {}
+            other => panic!("WHERE false: server start-up should refuse, got {other:?}"),
+        }
+        match running.ready().await {
+            Err(ledger_core::LedgerError::SchemaIncompatible(m)) => {
+                assert!(m.contains("decisions_one_per_proposal"), "{m}")
+            }
+            other => panic!("WHERE false: readiness should refuse, got {other:?}"),
+        }
+        rt.close().await;
+    }
+    owner_exec(&fx, "DROP INDEX decisions_one_per_proposal").await;
+    owner_exec(&fx, "CREATE UNIQUE INDEX decisions_one_per_proposal ON decisions (proposal_id) WHERE proposal_id IS NOT NULL").await;
+    // 5. A vacuous replacement of any other named CHECK is caught the same way.
+    owner_exec(
+        &fx,
+        "ALTER TABLE decisions DROP CONSTRAINT decisions_accepted_has_event",
+    )
+    .await;
+    owner_exec(
+        &fx,
+        "ALTER TABLE decisions ADD CONSTRAINT decisions_accepted_has_event CHECK (true)",
+    )
+    .await;
+    {
+        let rt = fx.runtime_pool().await;
+        match ledger_store::schema::verify_definitions_at_startup(&rt).await {
+            Err(ledger_core::LedgerError::SchemaIncompatible(m)) => {
+                assert!(m.contains("decisions_accepted_has_event"), "{m}")
+            }
+            other => panic!("vacuous CHECK: start-up should refuse, got {other:?}"),
+        }
+        match running.ready().await {
+            Err(ledger_core::LedgerError::SchemaIncompatible(m)) => {
+                assert!(m.contains("decisions_accepted_has_event"), "{m}")
+            }
+            other => panic!("vacuous CHECK: readiness should refuse, got {other:?}"),
+        }
+        rt.close().await;
+    }
+    owner_exec(
+        &fx,
+        "ALTER TABLE decisions DROP CONSTRAINT decisions_accepted_has_event",
+    )
+    .await;
+    owner_exec(&fx, "ALTER TABLE decisions ADD CONSTRAINT decisions_accepted_has_event CHECK ((decision = 'accepted' AND ref_event_id IS NOT NULL) OR (decision <> 'accepted' AND ref_event_id IS NULL))").await;
+    assert_healthy(&fx, "all restored").await;
     running.ready().await.expect("readiness after restore");
     fx.teardown().await;
 }
