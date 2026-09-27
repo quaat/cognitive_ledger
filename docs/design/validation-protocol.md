@@ -1,5 +1,11 @@
 # Two-phase semantic-validation protocol and coordination contracts
 
+> **Implemented in Phase 2 (Plan 0006).** Canonical identities: ADR-0018 (context, environment,
+> record, candidate state digest). Freshness and acceptance binding: ADR-0019 (accept names a
+> validation id and a candidate-independent *semantic environment* id). Service contract:
+> [sculpin-validation-service.md](sculpin-validation-service.md). The sections below remain the
+> design rationale.
+
 This document defines the contracts by which the Cognitive Ledger coordinates semantic
 acceptance with Sculpin **without embedding any semantics**. The ledger owns immutable
 candidates, refs, decisions, and ref events; Sculpin owns SHACL, reasoning, ontology, and

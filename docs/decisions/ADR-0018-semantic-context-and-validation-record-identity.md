@@ -1,4 +1,4 @@
-# Canonical identity of `SemanticExecutionContext` v1, `ValidationRecord` v1 and the candidate state digest
+# Canonical identity of `SemanticExecutionContext` v1, `SemanticEnvironment` v1, `ValidationRecord` v1 and the candidate state digest
 
 ## Status
 Accepted (2026-09-27, Plan 0006 / Phase 2 slice P2.1). Persistent protocol: the layouts below
@@ -50,30 +50,52 @@ field  candidate_commit                 CommitId
 field  candidate_state_digest           sculpin-rdf-state/v1 digest
 field  base_kb.kb_id                    token
 field  base_kb.revision                 token (opaque: Sculpin composes it)
-u8     ontology tag  0x00 absent | 0x01 then field ontology.id, field ontology.version
+u8     ontology tag   0x00 absent | 0x01 then field ontology.id, field ontology.version
 field  shapes.id                        token
 field  shapes.version                   token
-field  reasoning.profile                token
-field  reasoning.implementation         token
-field  reasoning.version                token
+u8     reasoning tag  0x00 absent | 0x01 then field profile, field implementation, field version
 u32    virtual_context_count (<= 64)    then per element, in bytewise ascending order of the
                                         element's own encoding, unique (a set):
          field dataset_id
          field source_version
-         u32   object_ref_count (<= 64) field × n, bytewise ascending, unique (a set)
+         u32   object_ref_count (<= 64) then `field` × n, ascending by the *field encoding*
+                                        (u32 length prefix first, so shorter refs sort first),
+                                        unique (a set)
          field query_spec_digest        ContentId
          field hydration_plan_digest    ContentId
 field  validator.service_id             token (deployment-configured validator identity)
 field  validator.service_version        token
 field  validator.configuration_version  token
 ```
-Rules: the ontology is the only optional group (SHACL-only validation without an ontology is
-legitimate); everything else is required and non-empty — a validator that uses no reasoning
-names that fact as a token of its own (e.g. `none`), which the ledger does not interpret.
+Rules: the ontology and the reasoning group are optional (SHACL-only validation without an
+ontology or without reasoning is legitimate; absence is the one spelling of "none");
+everything else is required and non-empty. `ontology.version` and `shapes.version` MUST
+identify immutable content (e.g. Sculpin's shape-set version combined with its
+`shapes_hash`): two different ontologies or shape sets never share `(id, version)`.
+**Every set in every layout is ordered by the bytes of its elements' own encodings** — the
+encoder, the strict decoder and the reference implementation apply the same rule.
 Virtual contexts and object references are sets: caller order and duplicates never reach the
 identity. Two otherwise identical runs against different `source_version`s therefore have
 distinct context identities (the Virtual A-Box requirement of ADR-0014). Only identifying
 provenance of external state is recorded — never A-Box triples.
+
+### `sculpin-semantic-environment/v1` — the candidate-independent environment
+```
+"sculpin-semantic-environment-v1\0"
+field  base_kb.kb_id · field base_kb.revision
+u8     ontology tag (as in the context)
+field  shapes.id · field shapes.version
+u8     reasoning tag (as in the context)
+u32    source_pin_count (<= 64), elements (field dataset_id, field source_version),
+       ascending by their encoding, unique (a set)
+field  validator.service_version · field validator.configuration_version
+```
+The environment of a context is its projection: base KB, ontology, shapes, reasoning, the
+`(dataset_id, source_version)` pin of every virtual context, and the validator's versions.
+It omits everything that depends on the candidate (graph, commit, state digest, object
+refs, query and hydration digests) and the ledger-side `validator.service_id`, so Sculpin
+can compute and publish the id of its *current* environment before any candidate exists.
+ADR-0019 binds acceptance to it.
 
 ### `sculpin-validation-record/v1`
 ```
@@ -85,8 +107,9 @@ field  semantic_execution_context_id    ContentId of the context above
 field  validator.service_id
 field  validator.service_version
 field  validator.configuration_version
-u8     outcome                          0 conforms | 1 violations
-u32    violation_count                  0 iff conforms; >= 1 iff violations
+u8     outcome                          0 conforms | 1 violations (the validator's verdict)
+u32    violation_count                  results reported (any severity); >= 1 for violations;
+                                        a conforming verdict may report non-blocking results
 u32    summary_count (<= 64, <= violation_count)   then per entry, bytewise ascending on the
                                         entry's encoding, unique (a set):
          field severity                 token <= 64 bytes
@@ -101,14 +124,25 @@ the report's digest and an optional immutable reference. `recorded_at` is assign
 ledger when it records the response, so a `ValidationRecord` id is re-verifiable but not
 derivable from the validator's output alone (as with commit v2). The same candidate may have
 any number of records (different times, contexts, validator versions); none embeds the
-context, each references it by id, and the context's `(graph, candidate, state digest)` is
-repeated in the record so a database foreign key can enforce agreement (migration 0010).
+context, each references it by id, and the context's `(graph, candidate, state digest,
+validator)` is repeated in the record so a database foreign key can enforce agreement
+(migration 0010).
 
 ### What the ledger checks and what it does not
 The ledger checks structure: bounds, strictness, that the context's candidate and state
 digest are the ones it computed, that the record references the stored context, and that
 the identities hash correctly. It never inspects ontology, shapes, base-KB or Virtual A-Box
 identifiers beyond bounding them, and never evaluates `severity`/`code`/`message`.
+
+## Revision (review round 1, 2026-09-27, before any persisted data)
+Independent review of the first draft (commit 562f468) found that the encoder sorted object
+references by raw string while the decoder and the reference sorted by field encoding (mixed-
+length references failed to round-trip and produced another id in Sculpin), and that the
+context id could not serve as the freshness key because it hashes candidate-specific
+provenance. The layouts above supersede that draft: encoding-order sets everywhere, the
+environment layout, an optional reasoning group, conforming verdicts with non-blocking
+results, and the validator bound in the record→context foreign key. No data or release used
+the draft; its vectors were replaced.
 
 ## Alternatives considered
 - **JSON/JCS canonicalization.** Rejected for the same reasons as ADR-0009: the binary family

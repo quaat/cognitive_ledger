@@ -4,8 +4,8 @@
 Accepted (design). Implementation: Phase 2 (Plan 0006). The canonical identities of the
 contracts are frozen by ADR-0018, the acceptance binding and freshness rule by ADR-0019; the
 `ledger-validation-protocol` crate, migration 0010, `ValidationRepository`, the validator
-client and the Sculpin service contract (`docs/design/sculpin-validation-service.md`) realise
-this decision.
+client and the Sculpin service contract (`docs/design/sculpin-validation-service.md`, defined by
+the ledger; the Sculpin endpoint itself is not implemented yet) realise this decision.
 
 ## Context
 The ledger must coordinate semantic acceptance of cognitive changes but must not implement

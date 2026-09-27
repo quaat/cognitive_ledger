@@ -54,7 +54,7 @@ defining it; a client-supplied digest would let a client alias two different req
   ADR amendment and golden review.
 
 ## Amendment: `sculpin-ledger-request/v2` for validation-aware operations (2026-09-27, Plan 0006)
-Phase 2 adds request fields (`validation_id`, `semantic_context_id`, requested-context hints)
+Phase 2 adds request fields (`validation_id`, `semantic_environment_id`, requested-context hints)
 and the operation `validate`. Per this ADR that is a new version, not an extension. To keep
 every P1.x retry replaying across the upgrade, **the version is selected by the request
 shape**, deterministically:
@@ -75,7 +75,7 @@ field  candidate
 opt    reason
 field  validation_policy     "validated"
 field  validation_id         ContentId (sculpin-validation-record/v1)
-field  semantic_context_id   ContentId (sculpin-semantic-context/v1)
+field  semantic_environment_id  ContentId (sculpin-semantic-environment/v1)
 -- reject --
 field  branch
 field  candidate
@@ -87,8 +87,8 @@ u8     base_kb tag    0x00 | 0x01 field kb_id, field revision
 u8     ontology tag   0x00 | 0x01 field id, field version
 u8     shapes tag     0x00 | 0x01 field id, field version
 opt    reasoning_profile
-u32    virtual_context_count, then VirtualContextRef elements exactly as in
-       sculpin-semantic-context/v1 (bytewise ascending on the element encoding, unique)
+u32    source_pin_count, then (field dataset_id, field source_version) elements exactly as
+       in sculpin-semantic-environment/v1 (ascending by element encoding, unique)
 ```
 Vectors: `fixtures/golden/requests/request-v2-*.{input,hex,sha256}`, checked by
 `scripts/golden/request_v1_reference.py` (which now also implements v2) and

@@ -52,6 +52,34 @@ Preserve object digest verification and atomic ref updates. Never commit secrets
   require the commit to be indexed under that graph. Migration 0007's composite
   `(graph_id, tenant_id)` foreign keys make tenant/graph agreement a database invariant.
 
+## Semantic validation boundary (Phase 2, ADR-0014/0018/0019)
+- Capabilities: `validate` (`ledger.validate`) requests a validation of a prepared candidate;
+  it grants no power over refs (`review` accepts/rejects). Proposers cannot validate;
+  validators cannot accept.
+- Clients never supply validator identity, tenant, principal, `recorded_at` or record
+  fields: bodies are strict (unknown fields refused); the validator's service id is server
+  configuration; versions come from the validator's response; `recorded_at` is assigned by
+  the ledger; the requester recorded on the row is the authenticated principal.
+- A record of another tenant, graph or candidate is `VALIDATION_NOT_FOUND`, indistinguishable
+  from a nonexistent one; a foreign graph stays `NOT_FOUND`.
+- Acceptance is bound, inside the acceptance transaction, to a conforming validation of the
+  same candidate whose semantic environment is the one the reviewer names; the verdict and
+  environment are read from the hash-verified canonical bytes (`VALIDATION_REJECTED`,
+  `VALIDATION_STALE`, `LINEAGE_MISMATCH` otherwise; nothing moves).
+- The outbound client (`HttpValidationClient`) meets the JWKS-fetch standard: one configured
+  https endpoint (plain http to loopback only with development auth), no redirects, no
+  environment proxy, total timeout, streamed size cap, `application/json` only, strict
+  response shape; errors never echo the endpoint, credential or body. Outages are retryable
+  `VALIDATOR_UNAVAILABLE`; unusable answers `VALIDATOR_ERROR`; nothing is recorded in either.
+- Validation is bounded before any outbound call: hint bytes, source-pin count, candidate
+  bytes shipped, a dedicated concurrency budget and the expensive slot for reconstruction.
+- Database: the runtime role may INSERT the Phase-2 rows on exactly the columns the store
+  names (no `created_at`) and cannot UPDATE/DELETE them (write-once triggers as a second line);
+  startup verifies the 0010 objects like every other control (ADR-0016 amendment).
+- Residual (accepted, as in ADR-0016): the runtime is the trusted writer of new records; a
+  compromised runtime could fabricate a validation record for its own tenants. The report
+  digest/reference lets auditors cross-check against Sculpin's own report store.
+
 ## Mutation semantics
 - `Idempotency-Key` is required; idempotency is scoped by tenant, complete actor
   (principal id, type, on-behalf-of), graph, operation and key, and by the server-computed

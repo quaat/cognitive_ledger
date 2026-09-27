@@ -16,14 +16,16 @@ inspect ontologies or data sources would move semantic responsibility across the
 
 ## Decision
 
-### Acceptance names the validation *and* the context
+### Acceptance names the validation *and* the semantic environment
 ```
-accept(candidate, expected_head, validation_id, semantic_context_id, reason?)
+accept(candidate, expected_head, validation_id, semantic_environment_id, reason?)
 ```
 Both identifiers are required under the production policy (`validation_policy =
-"validated"`). The reviewer or orchestrator states which context it is accepting under;
-Sculpin — not the ledger — knows the currently applicable context and can compute its id
-from the frozen layout (ADR-0018). Inside the single acceptance transaction, after the
+"validated"`). The reviewer or orchestrator states which environment it is accepting
+under; Sculpin — not the ledger — knows the currently applicable environment (base KB
+revision, ontology, shapes, reasoning, external source versions, validator versions) and
+can compute its id from the frozen, candidate-independent layout
+`sculpin-semantic-environment/v1` (ADR-0018) before any candidate exists. Inside the single acceptance transaction, after the
 idempotent-replay lookup and before any write, the repository verifies:
 
 1. the validation record exists and belongs to the caller's graph and tenant
@@ -33,8 +35,11 @@ idempotent-replay lookup and before any write, the repository verifies:
    the composite foreign key `validation_records(context_id, graph_id, candidate_commit,
    candidate_state_digest) → semantic_execution_contexts(…)`; the repository re-reads it);
 4. its outcome is `conforms` (`VALIDATION_REJECTED` otherwise);
-5. its `semantic_execution_context_id` equals the `semantic_context_id` the request names
+5. the environment of its context equals the `semantic_environment_id` the request names
    (`VALIDATION_STALE` otherwise).
+
+Predicates 2–5 are evaluated on the verified canonical bytes of the record and its context
+(hash checked, strictly decoded), never on the relational projection columns.
 
 Only then do the ADR-0013 lineage predicates, the ref movement, ref event, accepted decision,
 `decision_validations` row, projection outbox row and idempotency result commit together. A
@@ -44,9 +49,9 @@ validation record remain immutable and auditable.
 ### Freshness is content identity, never time
 "Superseded" is not inferred by the ledger. A validation is applicable iff its context is
 exactly the one the accepting party names. The stale scenario (validated under ontology O1,
-acceptance required under O2) is expressed by the orchestrator naming O2's context id, which
-differs from the record's → `VALIDATION_STALE`; revalidation produces a new record under
-O2's context and acceptance with that pair succeeds if HEAD and lineage still hold. Changes
+acceptance required under O2) is expressed by the orchestrator naming O2's environment id,
+which differs from the record's → `VALIDATION_STALE`; revalidation produces a new record in
+O2's environment and acceptance with that pair succeeds if HEAD and lineage still hold. Changes
 in base-KB revision, ontology, shapes, reasoning configuration, Virtual A-Box source
 versions or validator identity/version all change the context id and are therefore all
 covered by one rule. Deployments may later add server-side pinning policies (per branch);
@@ -83,11 +88,18 @@ reads and rejection work, acceptance stays fail-closed (`VALIDATION_REQUIRED`).
 - **Accept with `validation_id` only; the ledger picks "current" context.** Requires the
   ledger to know Sculpin's current ontology/shapes/KB revision; rejected (boundary).
 - **Expiry windows on validations.** Time is not evidence of applicability; rejected.
-- **Accept passes the expected context *fields* instead of the id.** Equivalent but larger
-  and duplicates the encoder in the request; the id is sufficient because the layout is
-  frozen and independently computable.
+- **Accept names the full context id.** Rejected in review round 1: the context hashes
+  candidate-specific provenance (state digest, object references, hydration digests) that
+  only a finished run knows, so an orchestrator could only copy it from the record it cites
+  and the stale check could never fire.
+- **Accept passes the expected environment *fields* instead of the id.** Equivalent but
+  larger; the id is sufficient because the layout is frozen and independently computable.
 - **Synchronous validate-then-accept in one request.** Rejected by ADR-0014; a convenience
   orchestration may be layered above later.
+
+## Revision (review round 1, 2026-09-27)
+The first draft bound acceptance to the context id; see the rejected alternative above. The
+environment id replaces it; no data or release used the draft.
 
 ## Consequences
 - `WorkflowRepository::accept`/`reject` gain the validation fields and predicates;
