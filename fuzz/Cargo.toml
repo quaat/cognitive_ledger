@@ -15,6 +15,7 @@ serde_json = "1"
 ledger-core = { path = "../crates/ledger-core" }
 ledger-rdf = { path = "../crates/ledger-rdf" }
 ledger-api = { path = "../crates/ledger-api" }
+ledger-validation-protocol = { path = "../crates/ledger-validation-protocol" }
 
 # Fuzz targets are their own workspace so nightly-only sanitizer builds never touch the
 # release workspace (the root Cargo.toml excludes this directory).
@@ -66,6 +67,13 @@ bench = false
 [[bin]]
 name = "timestamp"
 path = "fuzz_targets/timestamp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "validation_decode"
+path = "fuzz_targets/validation_decode.rs"
 test = false
 doc = false
 bench = false

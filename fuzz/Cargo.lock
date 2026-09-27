@@ -919,6 +919,7 @@ dependencies = [
  "ledger-core",
  "ledger-rdf",
  "ledger-store",
+ "ledger-validation-protocol",
  "reqwest",
  "serde",
  "serde_json",
@@ -947,6 +948,7 @@ dependencies = [
  "ledger-api",
  "ledger-core",
  "ledger-rdf",
+ "ledger-validation-protocol",
  "libfuzzer-sys",
  "serde_json",
 ]
@@ -971,11 +973,22 @@ dependencies = [
  "hex",
  "ledger-core",
  "ledger-rdf",
+ "ledger-validation-protocol",
  "serde",
  "sha2",
  "sqlx",
  "time",
  "tokio",
+]
+
+[[package]]
+name = "ledger-validation-protocol"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ledger-core",
+ "serde",
+ "thiserror",
 ]
 
 [[package]]

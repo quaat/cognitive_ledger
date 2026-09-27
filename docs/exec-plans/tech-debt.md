@@ -8,11 +8,36 @@
 - Migration 0009 aborts on a corrupt `immutable_objects` row with a raw `23514` naming no ids (the README convention is guards that name rows); the runbook says to run `verify` first. Add a pre-check guard that lists offending ids, and document the `ACCESS EXCLUSIVE` hashing window. Also: a graph moved from `importing` to `active` after raw ref moves has no `ref_events` for them and fails the verifier's version-equals-events check permanently — activation needs an audited path (Phase 4 admin flow).
 - Fault injection (Plan 0005 slice 4): the lost-response-after-COMMIT case is deterministic only in the `FailPoint` unit test; at the HTTP level random SIGKILLs hit the sub-millisecond COMMIT-to-response window by chance (0–3 observations per run). A `fault-injection` cargo feature that aborts the process right after the workflow transaction commits — compiled only into a separate qualification image, never into the runtime image — would make it deterministic.
 
+## Phase 2 (Plan 0006) external prerequisites and residuals
+
+- **Sculpin validation endpoint — EXTERNAL PREREQUISITE.** The ledger-side contract, client and
+  every ADR-0014 scenario are implemented and tested against a deterministic fake validator;
+  no live Sculpin service exists yet. Sculpin must provide the endpoint of
+  `docs/design/sculpin-validation-service.md`, an aggregate stable `base_kb.revision`,
+  content-identifying ontology/shape versions, Virtual A-Box identification, and a way to
+  publish its current semantic environment. A live end-to-end test is external evidence,
+  never part of the workspace gate.
+- Environment freshness assumes external source versions are known before hydration (a
+  source pin). A Virtual A-Box whose version is discovered only during hydration can still
+  be validated, but an orchestrator must then accept under the environment the record
+  reports or revalidate with an explicit pin; a Sculpin "current environment" endpoint would
+  make that uniform.
+- The runtime remains the trusted writer of new validation records (ADR-0016 residual): a
+  compromised runtime could fabricate a conforming record for its own tenants. The report
+  digest/reference allows cross-checking against Sculpin's report store; signed validator
+  responses (a validator key verified by the ledger) would close it and need an ADR.
+- The 0010 upgrade path is exercised by the migration and verifier suites on fresh databases;
+  `scripts/upgrade.sh` has not yet been re-run from the P1.5 release (schema 0009) with
+  populated data. Run it before the Phase 2 release.
+- Validation calls are synchronous inside the request (bounded by the validator timeout and a
+  dedicated budget). A queued/async validation flow is a later orchestration layer above
+  these primitives, not a replacement for them.
+
 ## Later-phase work and accepted residual risk (does not block Phase 2 or the P1.5 gate)
 
 - Design a stable skolemization/import protocol and hostile-input limits around the standards N-Quads parser.
 - Run the live Fluree differential adapter; the reference image is already digest-pinned (see test/reference-images.lock), so only running the semantic-state adapter remains, blocked pending BUSL-1.1 license sign-off.
-- Add the Sculpin validation-service adapter (Phase 2, ADR-0014) and Fuseki projection retry integration (Phase 3) without coupling either to history.
+- Fuseki projection retry integration (Phase 3) without coupling it to history (the Phase 2 validation adapter is implemented; see above).
 - Graph import operator path (ADR-0010): register `status='importing'`, import, activate. Until it exists, migration 0004 fails closed on unowned graphs and `ledger-admin migrate-fs-to-pg` can only target `bootstrap`/`importing` graphs.
 - `WorkflowRepository::state_at_on` (transaction-connection, bounded reconstruction) and `Ledger::state_at_bounded` are two implementations of the same fold over `ReconstructionLimits`; unify when `Ledger` composes over `PostgresLedgerStore`.
 - `mark_superseded` is an explicit operator action without an idempotency key; a retry after a lost response reports `LINEAGE_MISMATCH` (already decided) rather than replaying. Give it a scope/key if it becomes an API operation.

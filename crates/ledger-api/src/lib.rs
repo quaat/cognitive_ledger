@@ -1409,22 +1409,44 @@ async fn validate(
         candidate: candidate.clone(),
         requested: body.requested,
     };
-    let _validation_slot = state
-        .0
-        .validations
-        .try_acquire()
-        .map_err(|_| busy(&correlation, "validations"))?;
     let store = state.0.store.validations();
-    let begun = {
-        let _expensive = state
-            .0
-            .expensive
-            .try_acquire()
-            .map_err(|_| busy(&correlation, "expensive operations"))?;
-        store
-            .begin(&request)
-            .await
-            .map_err(|e| ApiError::from_ledger(e, &correlation))?
+    // A completed identical request replays before any admission slot or validator check.
+    let replayed = store
+        .replayed(&request)
+        .await
+        .map_err(|e| ApiError::from_ledger(e, &correlation))?;
+    let begun = match replayed {
+        Some(recorded) => ValidationBegin::Replayed(Box::new(recorded)),
+        None => {
+            if state.0.validation.is_none() {
+                return Err(ApiError::from_ledger(
+                    LedgerError::ValidatorUnavailable("no validation service is configured".into()),
+                    &correlation,
+                ));
+            }
+            let _expensive = state
+                .0
+                .expensive
+                .try_acquire()
+                .map_err(|_| busy(&correlation, "expensive operations"))?;
+            // Never reconstruct more than may be shipped to the validator.
+            let mut bounds = limits.reconstruction;
+            bounds.max_bytes = bounds.max_bytes.min(limits.max_validation_state_bytes);
+            store
+                .begin_with_limits(&request, &bounds)
+                .await
+                .map_err(|e| ApiError::from_ledger(e, &correlation))?
+        }
+    };
+    let _validation_slot = match &begun {
+        ValidationBegin::Replayed(_) => None,
+        ValidationBegin::Fresh(_) => Some(
+            state
+                .0
+                .validations
+                .try_acquire()
+                .map_err(|_| busy(&correlation, "validations"))?,
+        ),
     };
     let ticket = match begun {
         ValidationBegin::Replayed(recorded) => {
@@ -1479,7 +1501,7 @@ async fn validate(
             state_href: Some(format!("/v1/graphs/{graph}/commits/{candidate}/state")),
             quads,
         },
-        request.requested.clone(),
+        request.requested.canonical(),
     );
     outbound.correlation_id = Some(correlation.clone());
     let answer =
@@ -1491,13 +1513,15 @@ async fn validate(
                 "validator call exceeded the configured timeout".into(),
             )),
         }
-        .map_err(|e| ApiError::from_ledger(e, &correlation))?;
+        .map_err(|e| ApiError::from_ledger(e, &correlation))?
+        .with_bounded_summary();
     let context = answer
         .into_context(
             &graph,
             &candidate,
             ticket.state_digest(),
             &service.service_id,
+            &request.requested,
         )
         .map_err(|e| {
             ApiError::from_ledger(LedgerError::ValidatorError(e.to_string()), &correlation)

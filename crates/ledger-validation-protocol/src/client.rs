@@ -67,6 +67,50 @@ impl RequestedContext {
         canonical_pins(&self.source_pins)
     }
 
+    /// The same hints with the source-pin set in canonical order and without duplicates:
+    /// what is forwarded to the validator (never the caller's raw list).
+    pub fn canonical(&self) -> Self {
+        let mut pins = self.source_pins.clone();
+        pins.sort_by_key(|p| p.canonical_bytes().unwrap_or_default());
+        pins.dedup();
+        Self {
+            source_pins: pins,
+            ..self.clone()
+        }
+    }
+
+    /// A present hint the validator did not honour, if any: the effective context must use
+    /// exactly the hinted base KB, ontology, shapes and reasoning profile, and every hydrated
+    /// source whose dataset is pinned must have the pinned version. Opaque comparison only.
+    pub fn unmet_by(&self, effective: &EffectiveContext) -> Option<&'static str> {
+        if self
+            .base_kb
+            .as_ref()
+            .is_some_and(|kb| kb != &effective.base_kb)
+        {
+            return Some("base_kb");
+        }
+        if self.ontology.is_some() && self.ontology != effective.ontology {
+            return Some("ontology");
+        }
+        if self.shapes.as_ref().is_some_and(|s| s != &effective.shapes) {
+            return Some("shapes");
+        }
+        if let Some(profile) = &self.reasoning_profile
+            && effective.reasoning.as_ref().map(|r| &r.profile) != Some(profile)
+        {
+            return Some("reasoning_profile");
+        }
+        for pin in &self.source_pins {
+            if effective.virtual_contexts.iter().any(|vc| {
+                vc.dataset_id == pin.dataset_id && vc.source_version != pin.source_version
+            }) {
+                return Some("source_pins");
+            }
+        }
+        None
+    }
+
     /// Append the hint encoding used by request identity v2 (ADR-0015 amendment):
     /// tagged pairs for base KB, ontology and shapes, `opt` reasoning profile, then the
     /// source-pin set exactly as in `sculpin-semantic-environment/v1`.
@@ -198,15 +242,51 @@ pub struct ValidatorResponse {
 }
 
 impl ValidatorResponse {
+    /// Bound the result summary deterministically before it becomes a record: control
+    /// characters in messages become spaces (SHACL engines emit multi-line messages), messages
+    /// are cut to the protocol cap at a character boundary, and the summary keeps the first
+    /// `MAX_VIOLATION_SUMMARY` entries in canonical order. `violation_count` (the validator's
+    /// total) is untouched. Formatting only — the ledger never evaluates the results.
+    pub fn with_bounded_summary(mut self) -> Self {
+        for v in &mut self.outcome.violations {
+            let cleaned: String = v
+                .message
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect();
+            let mut cut = cleaned.len().min(crate::MAX_VIOLATION_MESSAGE_BYTES);
+            while !cleaned.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            v.message = cleaned[..cut].to_owned();
+        }
+        let mut encoded: Vec<(Vec<u8>, crate::ViolationSummary)> = self
+            .outcome
+            .violations
+            .drain(..)
+            .map(|v| (v.canonical_bytes().unwrap_or_default(), v))
+            .collect();
+        encoded.sort_by(|a, b| a.0.cmp(&b.0));
+        encoded.dedup_by(|a, b| a.0 == b.0);
+        self.outcome.violations = encoded
+            .into_iter()
+            .take(crate::MAX_VIOLATION_SUMMARY)
+            .map(|(_, v)| v)
+            .collect();
+        self
+    }
+
     /// Turn the response into the context the ledger records, refusing a response that
-    /// names another protocol version, candidate or state than the one asked about.
-    /// `service_id` is the ledger's configured identity of the validator it called.
+    /// names another protocol version, candidate or state than the one asked about, or that
+    /// ignored a hint the requester set. `service_id` is the ledger's configured identity of
+    /// the validator it called.
     pub fn into_context(
         &self,
         graph_id: &GraphId,
         candidate: &CommitId,
         state_digest: &ContentId,
         service_id: &str,
+        requested: &RequestedContext,
     ) -> Result<SemanticExecutionContext, ProtocolError> {
         if self.protocol != VALIDATION_RESPONSE_PROTOCOL {
             return Err(ProtocolError::Invalid(format!(
@@ -223,6 +303,11 @@ impl ValidatorResponse {
             return Err(ProtocolError::Invalid(
                 "validator response names another candidate state digest".into(),
             ));
+        }
+        if let Some(hint) = requested.unmet_by(&self.context) {
+            return Err(ProtocolError::Invalid(format!(
+                "validator response did not honour the requested {hint}"
+            )));
         }
         let context = SemanticExecutionContext {
             graph_id: graph_id.clone(),
@@ -331,24 +416,108 @@ mod tests {
         let graph = GraphId::new("g").unwrap();
         let r = response();
         let context = r
-            .into_context(&graph, &CommitId(digest("c")), &digest("s"), "urn:svc")
+            .into_context(
+                &graph,
+                &CommitId(digest("c")),
+                &digest("s"),
+                "urn:svc",
+                &RequestedContext::default(),
+            )
             .unwrap();
         assert_eq!(context.validator.service_id, "urn:svc");
         assert!(
-            r.into_context(&graph, &CommitId(digest("other")), &digest("s"), "urn:svc")
-                .is_err()
+            r.into_context(
+                &graph,
+                &CommitId(digest("other")),
+                &digest("s"),
+                "urn:svc",
+                &RequestedContext::default()
+            )
+            .is_err()
         );
         assert!(
-            r.into_context(&graph, &CommitId(digest("c")), &digest("other"), "urn:svc")
-                .is_err()
+            r.into_context(
+                &graph,
+                &CommitId(digest("c")),
+                &digest("other"),
+                "urn:svc",
+                &RequestedContext::default()
+            )
+            .is_err()
         );
         let mut wrong_protocol = response();
         wrong_protocol.protocol = "sculpin-validation-response/v9".into();
         assert!(
             wrong_protocol
-                .into_context(&graph, &CommitId(digest("c")), &digest("s"), "urn:svc")
+                .into_context(
+                    &graph,
+                    &CommitId(digest("c")),
+                    &digest("s"),
+                    "urn:svc",
+                    &RequestedContext::default()
+                )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn unhonoured_hints_are_refused_and_messages_are_bounded() {
+        let graph = GraphId::new("g").unwrap();
+        let r = response();
+        let hinted = RequestedContext {
+            shapes: Some(ShapeSet {
+                id: "shapes".into(),
+                version: "2".into(),
+            }),
+            ..RequestedContext::default()
+        };
+        assert!(
+            r.into_context(
+                &graph,
+                &CommitId(digest("c")),
+                &digest("s"),
+                "urn:svc",
+                &hinted
+            )
+            .is_err()
+        );
+        let honoured = RequestedContext {
+            shapes: Some(ShapeSet {
+                id: "shapes".into(),
+                version: "1".into(),
+            }),
+            ..RequestedContext::default()
+        };
+        assert!(
+            r.into_context(
+                &graph,
+                &CommitId(digest("c")),
+                &digest("s"),
+                "urn:svc",
+                &honoured
+            )
+            .is_ok()
+        );
+        let mut noisy = response();
+        noisy.outcome = ValidationOutcome {
+            kind: crate::OutcomeKind::Violations,
+            violation_count: 100,
+            violations: (0..80)
+                .map(|i| crate::ViolationSummary {
+                    severity: "Violation".into(),
+                    code: format!("c{i:02}"),
+                    message: format!("line one\nline two {}", "é".repeat(700)),
+                })
+                .collect(),
+        };
+        let bounded = noisy.with_bounded_summary();
+        assert_eq!(
+            bounded.outcome.violations.len(),
+            crate::MAX_VIOLATION_SUMMARY
+        );
+        assert!(bounded.outcome.validate().is_ok());
+        assert!(!bounded.outcome.violations[0].message.contains('\n'));
+        assert!(bounded.outcome.violations[0].message.len() <= crate::MAX_VIOLATION_MESSAGE_BYTES);
     }
 
     #[test]

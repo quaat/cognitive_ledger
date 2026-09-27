@@ -298,6 +298,46 @@ async fn snapshot(store: &PostgresLedgerStore, graph: &GraphId) -> Vec<i64> {
     out
 }
 
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// As the owner, inside a rolled-back transaction: run `setup` (if any), then `sql` must be
+/// refused by the write-once guard of `table` — SQLSTATE 23000 (integrity_constraint_violation)
+/// with the guard's message — never by a foreign key (23503) or anything else.
+async fn assert_write_once(
+    store: &PostgresLedgerStore,
+    table: &str,
+    setup: Option<&str>,
+    sql: &str,
+) {
+    let mut tx = store.pool().begin().await.unwrap();
+    if let Some(setup) = setup {
+        let inserted = sqlx::query(setup)
+            .execute(&mut *tx)
+            .await
+            .unwrap_or_else(|e| panic!("{setup}: {e}"));
+        assert_eq!(inserted.rows_affected(), 1, "{setup}");
+    }
+    let op = if sql.starts_with("UPDATE") {
+        "UPDATE"
+    } else {
+        "DELETE"
+    };
+    match sqlx::query(sql).execute(&mut *tx).await {
+        Err(sqlx::Error::Database(e)) => {
+            assert_eq!(e.code().as_deref(), Some("23000"), "{sql}: {e}");
+            assert!(
+                e.message()
+                    .contains(&format!("{table} rows are write-once ({op} attempted)")),
+                "{sql}: {e}"
+            );
+        }
+        other => panic!("{sql} must be refused as write-once, got {other:?}"),
+    }
+    tx.rollback().await.unwrap();
+}
+
 #[tokio::test]
 #[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
 async fn contexts_and_records_are_content_addressed_write_once_and_many_per_candidate() {
@@ -392,19 +432,144 @@ async fn contexts_and_records_are_content_addressed_write_once_and_many_per_cand
     .unwrap();
     assert_eq!(vcs, 2);
 
-    // Write-once: the owner cannot update or delete a record or a context.
-    for sql in [
-        "UPDATE validation_records SET outcome = 'conforms', violation_count = 0 WHERE validation_id = $1",
-        "DELETE FROM validation_records WHERE validation_id = $1",
-        "UPDATE semantic_execution_contexts SET base_kb_revision = 'x' WHERE context_id = $1",
-    ] {
-        let id = if sql.contains("semantic_execution_contexts") {
-            b.context_id.to_string()
-        } else {
-            b.validation_id.to_string()
-        };
-        let result = sqlx::query(sql).bind(id).execute(store.pool()).await;
-        assert!(result.is_err(), "{sql} must be refused");
+    // Write-once: the owner can neither update nor delete a row of any Phase-2 table. Each
+    // statement targets a row nothing references (a leaf row, or an orphan context/record
+    // inserted in the same rolled-back transaction), so a missing guard would let it succeed
+    // (or fail with another SQLSTATE) instead of the write-once refusal asserted here.
+    let b_id = b.validation_id.to_string();
+    let b_ctx = b.context_id.to_string();
+    let orphan_context = context_for(
+        &g,
+        &c1,
+        &b.record.candidate_state_digest,
+        "O-orphan",
+        "D-orphan",
+    );
+    let orphan_ctx_id = orphan_context.id().unwrap().to_string();
+    let orphan_ctx_insert = format!(
+        "INSERT INTO semantic_execution_contexts (context_id, graph_id, tenant_id, candidate_commit, \
+         candidate_state_digest, base_kb_id, base_kb_revision, ontology_id, ontology_version, shapes_id, \
+         shapes_version, reasoning_profile, reasoning_implementation, reasoning_version, validator_service_id, \
+         validator_service_version, validator_configuration_version, virtual_context_count, canonical_bytes) \
+         SELECT '{orphan_ctx_id}', graph_id, tenant_id, candidate_commit, candidate_state_digest, base_kb_id, \
+                base_kb_revision, ontology_id, 'O-orphan', shapes_id, shapes_version, reasoning_profile, \
+                reasoning_implementation, reasoning_version, validator_service_id, validator_service_version, \
+                validator_configuration_version, 0, decode('{}', 'hex') \
+         FROM semantic_execution_contexts WHERE context_id = '{b_ctx}'",
+        hex(&orphan_context.canonical_bytes().unwrap())
+    );
+    let mut orphan_record = b.record.clone();
+    orphan_record.report_reference = Some("urn:sculpin:report:orphan".into());
+    let orphan_id = orphan_record.id().unwrap().to_string();
+    let orphan_record_insert = format!(
+        "INSERT INTO validation_records (validation_id, graph_id, tenant_id, candidate_commit, candidate_state_digest, \
+         context_id, validator_service_id, validator_service_version, validator_configuration_version, outcome, \
+         violation_count, report_digest, report_reference, recorded_at, principal_id, principal_type, on_behalf_of, \
+         correlation_id, canonical_bytes) \
+         SELECT '{orphan_id}', graph_id, tenant_id, candidate_commit, candidate_state_digest, context_id, \
+                validator_service_id, validator_service_version, validator_configuration_version, outcome, \
+                violation_count, report_digest, 'urn:sculpin:report:orphan', recorded_at, principal_id, \
+                principal_type, on_behalf_of, correlation_id, decode('{}', 'hex') \
+         FROM validation_records WHERE validation_id = '{b_id}'",
+        hex(&orphan_record.canonical_bytes().unwrap())
+    );
+    let cases: Vec<(&str, Option<&str>, String)> = vec![
+        (
+            "semantic_execution_contexts",
+            Some(&orphan_ctx_insert),
+            format!(
+                "UPDATE semantic_execution_contexts SET base_kb_revision = 'x' WHERE context_id = '{orphan_ctx_id}'"
+            ),
+        ),
+        (
+            "semantic_execution_contexts",
+            Some(&orphan_ctx_insert),
+            format!("DELETE FROM semantic_execution_contexts WHERE context_id = '{orphan_ctx_id}'"),
+        ),
+        (
+            "semantic_virtual_contexts",
+            None,
+            format!(
+                "UPDATE semantic_virtual_contexts SET source_version = 'x' WHERE context_id = '{b_ctx}' AND position = 0"
+            ),
+        ),
+        (
+            "semantic_virtual_contexts",
+            None,
+            format!(
+                "DELETE FROM semantic_virtual_contexts WHERE context_id = '{b_ctx}' AND position = 0"
+            ),
+        ),
+        (
+            "validation_records",
+            Some(&orphan_record_insert),
+            format!(
+                "UPDATE validation_records SET outcome = 'conforms', violation_count = 0 WHERE validation_id = '{orphan_id}'"
+            ),
+        ),
+        (
+            "validation_records",
+            Some(&orphan_record_insert),
+            format!("DELETE FROM validation_records WHERE validation_id = '{orphan_id}'"),
+        ),
+        (
+            "validation_violations",
+            None,
+            format!(
+                "UPDATE validation_violations SET message = 'x' WHERE validation_id = '{b_id}' AND position = 0"
+            ),
+        ),
+        (
+            "validation_violations",
+            None,
+            format!(
+                "DELETE FROM validation_violations WHERE validation_id = '{b_id}' AND position = 0"
+            ),
+        ),
+    ];
+    for (table, setup, sql) in &cases {
+        assert_write_once(&store, table, *setup, sql).await;
+    }
+    // The orphan rows were real, insertable rows (the refusal above is not a setup failure):
+    // inserted and rolled back, they leave nothing behind.
+    for setup in [&orphan_ctx_insert, &orphan_record_insert] {
+        let mut tx = store.pool().begin().await.unwrap();
+        let n = sqlx::query(setup).execute(&mut *tx).await.unwrap();
+        assert_eq!(n.rows_affected(), 1, "{setup}");
+        tx.rollback().await.unwrap();
+    }
+    let orphans: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM semantic_execution_contexts WHERE context_id = $1) \
+              + (SELECT count(*) FROM validation_records WHERE validation_id = $2)",
+    )
+    .bind(&orphan_ctx_id)
+    .bind(&orphan_id)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(orphans, 0);
+    // Content-address CHECK: a mislabelled context is refused by the database, by name.
+    let forged_context = sqlx::query(
+        "INSERT INTO semantic_execution_contexts (context_id, graph_id, tenant_id, candidate_commit, \
+         candidate_state_digest, base_kb_id, base_kb_revision, ontology_id, ontology_version, shapes_id, \
+         shapes_version, reasoning_profile, reasoning_implementation, reasoning_version, validator_service_id, \
+         validator_service_version, validator_configuration_version, virtual_context_count, canonical_bytes) \
+         SELECT $1, graph_id, tenant_id, candidate_commit, candidate_state_digest, base_kb_id, base_kb_revision, \
+                ontology_id, ontology_version, shapes_id, shapes_version, reasoning_profile, \
+                reasoning_implementation, reasoning_version, validator_service_id, validator_service_version, \
+                validator_configuration_version, virtual_context_count, canonical_bytes \
+         FROM semantic_execution_contexts WHERE context_id = $2",
+    )
+    .bind(format!("sha256:{}", "f".repeat(64)))
+    .bind(a.context_id.to_string())
+    .execute(store.pool())
+    .await;
+    match forged_context {
+        Err(sqlx::Error::Database(e)) => {
+            assert_eq!(e.code().as_deref(), Some("23514"), "{e}");
+            assert_eq!(e.constraint(), Some("sec_content_addressed"), "{e}");
+        }
+        other => panic!("forged context must be refused: {other:?}"),
     }
     // Content-address CHECK: a mislabelled record is refused by the database.
     let forged = sqlx::query(
@@ -420,7 +585,10 @@ async fn contexts_and_records_are_content_addressed_write_once_and_many_per_cand
     .execute(store.pool())
     .await;
     match forged {
-        Err(sqlx::Error::Database(e)) => assert_eq!(e.code().as_deref(), Some("23514")),
+        Err(sqlx::Error::Database(e)) => {
+            assert_eq!(e.code().as_deref(), Some("23514"));
+            assert_eq!(e.constraint(), Some("vr_content_addressed"), "{e}");
+        }
         other => panic!("forged record must be refused: {other:?}"),
     }
     let report = verify::run(store.pool()).await.unwrap();
@@ -516,6 +684,17 @@ async fn validation_is_idempotent_by_scope_key_and_digest() {
     .await
     .unwrap();
     assert_eq!(records, 1);
+    // The loser replayed under the idempotency lock before inserting anything: its context
+    // (another external version) was never persisted either.
+    let contexts: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM semantic_execution_contexts WHERE graph_id = $1 AND candidate_commit = $2",
+    )
+    .bind(g.as_str())
+    .bind(c2.to_string())
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(contexts, 1, "only the winner's context is stored");
     let idem: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM idempotency WHERE graph_id = $1 AND operation = 'validate'",
     )
@@ -576,6 +755,40 @@ async fn validation_refuses_unprepared_foreign_and_mismatching_candidates() {
             .await
             .unwrap();
     assert_eq!(records, 0);
+    let contexts: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM semantic_execution_contexts WHERE graph_id = $1")
+            .bind(g.as_str())
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(contexts, 0, "a refused response stores no context");
+    let validate_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM idempotency WHERE graph_id = $1 AND operation = 'validate'",
+    )
+    .bind(g.as_str())
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        validate_rows, 0,
+        "a refused response stores no idempotency result"
+    );
+    // The same key with a good response then succeeds (nothing was consumed by the refusal).
+    let retried = store
+        .validations()
+        .record(
+            &request,
+            &ticket,
+            conforms(context_for(&g, &c1, ticket.state_digest(), "O1", "D")),
+        )
+        .await
+        .unwrap();
+    assert!(!retried.replayed);
+    let ValidationBegin::Replayed(replayed) = store.validations().begin(&request).await.unwrap()
+    else {
+        panic!("the retried request replays");
+    };
+    assert_eq!(replayed.validation_id, retried.validation_id);
     // Reads are tenant/graph scoped: a record of graph g is invisible from another graph or
     // tenant (None, same as nonexistent).
     let recorded = validate_with(
@@ -772,6 +985,19 @@ async fn acceptance_is_bound_to_a_conforming_validation_of_the_named_context() {
     assert!(replay.replayed);
     assert_eq!(replay.decision_id, accepted.decision_id);
     assert_eq!(ref_head(&store, &g).await, Some((c1.clone(), 1)));
+    // The decision→validation link is a leaf row (nothing references it): write-once.
+    for sql in [
+        format!(
+            "UPDATE decision_validations SET validation_id = validation_id WHERE decision_id = {}",
+            accepted.decision_id
+        ),
+        format!(
+            "DELETE FROM decision_validations WHERE decision_id = {}",
+            accepted.decision_id
+        ),
+    ] {
+        assert_write_once(&store, "decision_validations", None, &sql).await;
+    }
 
     // The database refuses a decision_validations row that crosses candidates or graphs,
     // whoever writes it (owner here).
@@ -945,4 +1171,235 @@ async fn revalidation_after_rejection_and_head_race_and_rejected_decisions_cite_
     assert_eq!(records, 4, "no record was deleted");
     let report = verify::run(store.pool()).await.unwrap();
     assert!(report.is_clean(), "{:?}", report.checks);
+}
+
+/// Rows a validation of `candidate` under `key` could have left behind: contexts, virtual
+/// contexts, records, violation summaries and the idempotency result.
+async fn validation_footprint(
+    store: &PostgresLedgerStore,
+    graph: &GraphId,
+    candidate: &CommitId,
+    key: &str,
+) -> [i64; 5] {
+    let row = sqlx::query(
+        "SELECT \
+           (SELECT count(*) FROM semantic_execution_contexts WHERE graph_id = $1 AND candidate_commit = $2) AS contexts, \
+           (SELECT count(*) FROM semantic_virtual_contexts v JOIN semantic_execution_contexts c \
+              ON c.context_id = v.context_id WHERE c.graph_id = $1 AND c.candidate_commit = $2) AS virtual_contexts, \
+           (SELECT count(*) FROM validation_records WHERE graph_id = $1 AND candidate_commit = $2) AS records, \
+           (SELECT count(*) FROM validation_violations v JOIN validation_records r \
+              ON r.validation_id = v.validation_id WHERE r.graph_id = $1 AND r.candidate_commit = $2) AS violations, \
+           (SELECT count(*) FROM idempotency WHERE graph_id = $1 AND operation = 'validate' \
+              AND idempotency_key = $3) AS idempotency",
+    )
+    .bind(graph.as_str())
+    .bind(candidate.to_string())
+    .bind(key)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    [
+        row.get("contexts"),
+        row.get("virtual_contexts"),
+        row.get("records"),
+        row.get("violations"),
+        row.get("idempotency"),
+    ]
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn an_interrupted_record_persists_nothing_and_the_same_key_then_succeeds() {
+    use ledger_store::{FailPoint, ValidationRepository};
+    let store = store().await;
+    let g = graph(&store).await;
+    for (n, point) in [
+        FailPoint::AfterLineageValidation, // after the context insert
+        FailPoint::AfterDecision,          // after the record (and summary) insert
+        FailPoint::BeforeCommit,           // after the idempotency result
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let c = prepare(&store, &g, &format!("p{n}"), None, &format!("fp{n}")).await;
+        let key = format!("v-fp-{n}");
+        let request = validate_request(&g, &key, &c, RequestedContext::default());
+        let ValidationBegin::Fresh(ticket) = store.validations().begin(&request).await.unwrap()
+        else {
+            panic!("{point:?}: no result yet");
+        };
+        let faulty = ValidationRepository::new(store.pool().clone()).with_failpoint(point);
+        let error = faulty
+            .record(
+                &request,
+                &ticket,
+                violates(context_for(&g, &c, ticket.state_digest(), "O1", "D-A")),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, LedgerError::Storage(m) if m.contains("injected failure")),
+            "{point:?}: {error}"
+        );
+        assert_eq!(
+            validation_footprint(&store, &g, &c, &key).await,
+            [0; 5],
+            "{point:?}: an interrupted record left rows behind"
+        );
+        // The same key with a healthy repository is a fresh request, not a replay.
+        let ValidationBegin::Fresh(ticket) = store.validations().begin(&request).await.unwrap()
+        else {
+            panic!("{point:?}: nothing was stored, so the retry is fresh");
+        };
+        let recorded = store
+            .validations()
+            .record(
+                &request,
+                &ticket,
+                violates(context_for(&g, &c, ticket.state_digest(), "O1", "D-A")),
+            )
+            .await
+            .unwrap();
+        assert!(!recorded.replayed, "{point:?}");
+        assert_eq!(
+            validation_footprint(&store, &g, &c, &key).await,
+            [1, 1, 1, 1, 1],
+            "{point:?}: the retry persisted everything once"
+        );
+        let ValidationBegin::Replayed(replayed) =
+            store.validations().begin(&request).await.unwrap()
+        else {
+            panic!("{point:?}: the completed request replays");
+        };
+        assert!(replayed.replayed);
+        assert_eq!(replayed.validation_id, recorded.validation_id);
+    }
+    let report = verify::run(store.pool()).await.unwrap();
+    assert!(report.is_clean(), "{:?}", report.checks);
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn an_interrupted_validated_acceptance_persists_nothing_and_the_same_key_then_succeeds() {
+    use ledger_store::{FailPoint, WorkflowRepository};
+    let store = store().await;
+    let g = graph(&store).await;
+    let c1 = prepare(&store, &g, "p1", None, "a").await;
+    let good = validate_with(
+        &store,
+        &g,
+        "v-good",
+        &c1,
+        RequestedContext::default(),
+        |g, c, s| conforms(context_for(g, c, s, "O1", "D")),
+    )
+    .await
+    .unwrap();
+    let request = accept_request(
+        &g,
+        "a-fp",
+        None,
+        &c1,
+        ValidationPolicy::Validated {
+            validation_id: good.validation_id.clone(),
+            semantic_environment_id: good.environment_id.clone(),
+        },
+    );
+    let before = snapshot(&store, &g).await;
+    for point in [
+        FailPoint::AfterLineageValidation,
+        FailPoint::AfterRefUpdate,
+        FailPoint::AfterRefEvent,
+        FailPoint::AfterDecision, // right after the decision_validations insert
+        FailPoint::AfterOutbox,
+        FailPoint::BeforeCommit,
+    ] {
+        let faulty = WorkflowRepository::new(store.pool().clone(), store.immutable().clone())
+            .with_failpoint(point);
+        let error = faulty.accept(&request).await.unwrap_err();
+        assert!(
+            matches!(&error, LedgerError::Storage(m) if m.contains("injected failure")),
+            "{point:?}: {error}"
+        );
+        assert_eq!(ref_head(&store, &g).await, None, "{point:?}: ref moved");
+        assert_eq!(
+            snapshot(&store, &g).await,
+            before,
+            "{point:?}: no ref event, decision, outbox, idempotency or decision_validations row"
+        );
+    }
+    let accepted = store.workflows().accept(&request).await.unwrap();
+    assert!(!accepted.replayed);
+    assert_eq!(ref_head(&store, &g).await, Some((c1.clone(), 1)));
+    let linked: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM decision_validations WHERE decision_id = $1")
+            .bind(accepted.decision_id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(linked, 1);
+    let replay = store.workflows().accept(&request).await.unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.decision_id, accepted.decision_id);
+    assert_eq!(snapshot(&store, &g).await, vec![1, 1, 1, 1, 1, 1]);
+    let report = verify::run(store.pool()).await.unwrap();
+    assert!(report.is_clean(), "{:?}", report.checks);
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn an_indexed_commit_without_a_proposal_is_not_a_validation_candidate() {
+    use ledger_core::{
+        Actor, AnyCommit, CommitV2, ImmutableStore, LedgerTimestamp, PrincipalId, PrincipalType,
+    };
+    let store = store().await;
+    let g = graph(&store).await;
+    // Published straight through the immutable store (as an import would): indexed under g,
+    // never prepared.
+    let patch = Patch::new([add(&unique("unproposed"))]).unwrap();
+    store
+        .immutable()
+        .put_content(&patch.id().0, &patch.canonical_bytes())
+        .await
+        .unwrap();
+    let commit = store
+        .immutable()
+        .put_commit(&AnyCommit::V2(CommitV2 {
+            graph_id: g.clone(),
+            parents: vec![],
+            patch: patch.id(),
+            actor: Actor {
+                principal_id: PrincipalId::new("urn:sculpin:agent:importer").unwrap(),
+                principal_type: PrincipalType::Agent,
+                on_behalf_of: None,
+            },
+            activity: "import".into(),
+            event_time: None,
+            recorded_at: LedgerTimestamp::parse_rfc3339("2026-09-27T00:00:00Z").unwrap(),
+            evidence_refs: vec![],
+            source_system: None,
+            message: "not a workflow candidate".into(),
+        }))
+        .await
+        .unwrap();
+    let indexed: Option<String> =
+        sqlx::query_scalar("SELECT graph_id FROM commit_index WHERE id = $1")
+            .bind(commit.to_string())
+            .fetch_optional(store.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        indexed.as_deref(),
+        Some(g.as_str()),
+        "the commit is indexed under g"
+    );
+    let request = validate_request(&g, "v-unproposed", &commit, RequestedContext::default());
+    match store.validations().begin(&request).await {
+        Err(LedgerError::LineageMismatch(m)) => assert!(m.contains("no proposal"), "{m}"),
+        other => panic!("an unproposed commit must be refused: {other:?}"),
+    }
+    assert_eq!(
+        validation_footprint(&store, &g, &commit, "v-unproposed").await,
+        [0; 5]
+    );
 }

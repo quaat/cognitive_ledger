@@ -149,6 +149,32 @@ impl ValidationRepository {
     /// under the same scope/key replays (same digest) or conflicts (different digest) before
     /// any reconstruction work.
     pub async fn begin(&self, request: &ValidateRequest) -> Result<ValidationBegin, LedgerError> {
+        let limits = self.limits;
+        self.begin_with_limits(request, &limits).await
+    }
+
+    /// The idempotent-replay lookup alone (no locks held, no reconstruction): lets callers
+    /// answer a completed request before spending admission slots or calling a validator.
+    pub async fn replayed(
+        &self,
+        request: &ValidateRequest,
+    ) -> Result<Option<RecordedValidation>, LedgerError> {
+        let scope = &request.scope;
+        WorkflowRepository::validate_scope(scope)?;
+        let mut conn = self.pool.acquire().await.map_err(db_error)?;
+        match WorkflowRepository::stored_result(&mut conn, scope, Operation::Validate).await? {
+            Some(stored) => Ok(Some(Self::replay(&mut conn, stored, scope).await?)),
+            None => Ok(None),
+        }
+    }
+
+    /// `begin` under tighter reconstruction limits (the API caps the state at what it may
+    /// ship to the validator, so an oversized candidate is refused while reconstructing).
+    pub async fn begin_with_limits(
+        &self,
+        request: &ValidateRequest,
+        limits: &crate::ReconstructionLimits,
+    ) -> Result<ValidationBegin, LedgerError> {
         let scope = &request.scope;
         WorkflowRepository::validate_scope(scope)?;
         request.requested.validate()?;
@@ -173,7 +199,7 @@ impl ValidationRepository {
                 .await
                 .map_err(db_error)?;
         let reconstructed =
-            WorkflowRepository::state_at_on(&mut tx, &request.candidate, &self.limits).await?;
+            WorkflowRepository::state_at_on(&mut tx, &request.candidate, limits).await?;
         tx.rollback().await.map_err(db_error)?;
         let digest = state_digest(&reconstructed.state);
         Ok(ValidationBegin::Fresh(ValidationTicket {
