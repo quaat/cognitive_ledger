@@ -1527,3 +1527,53 @@ async fn a_delayed_operator_rebuild_never_regresses_a_newer_projection() {
     assert_projected(&cg, &g, &quads(&[Q1, Q2]), &c2, 2).await;
     assert_eq!(w.status(&g).await.projected_ref_version, Some(2));
 }
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL and Fuseki: LEDGER_TEST_DATABASE_URL, LEDGER_TEST_FUSEKI_URL"]
+async fn a_rebuild_that_observes_after_losing_its_lease_writes_nothing() {
+    let _serial = serial().await;
+    let w = World::new().await;
+    let kb = format!("urn:it:kb:{}", unique("late-observe"));
+    let healthy = w.healthy().await;
+    let (ga, cg) = w.graph_of("tenant-it", &kb).await;
+    w.accept(&ga, None, &[Q1]).await;
+    assert_eq!(healthy.step().await.unwrap(), projected(1, false));
+    // A's operator rebuild claims and stalls before it even observes the target.
+    let scripted = Scripted::new();
+    let gate = Arc::new(tokio::sync::Notify::new());
+    *scripted.hold_observe.lock().unwrap() = Some(gate.clone());
+    let slow = Arc::new(w.projector(scripted.clone(), "slow-rebuild", None).await);
+    let slow_rebuild = tokio::spawn({
+        let (slow, key) = (slow.clone(), w.key(&ga));
+        async move { slow.rebuild(&key).await.unwrap() }
+    });
+    let mut reached = false;
+    for _ in 0..500 {
+        if scripted.hold_observe.lock().unwrap().is_none() {
+            reached = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(reached, "the rebuild claimed its stream");
+    // Meanwhile its lease runs out, A is fenced and disabled, and B takes the graph.
+    w.expire_lease(&ga).await;
+    assert!(w.owner().disable(&w.key(&ga)).await.unwrap());
+    assert_eq!(healthy.step().await.unwrap(), StepOutcome::Fenced);
+    let (gb, _) = w.graph_of("tenant-it2", &kb).await;
+    let db = w.accept(&gb, None, &[Q3]).await;
+    assert_failed(
+        healthy.step().await.unwrap(),
+        ProjectionErrorCode::TargetConflict,
+        ErrorClass::Permanent,
+    );
+    assert_eq!(
+        healthy.rebuild(&w.key(&gb)).await.unwrap(),
+        Some(projected(1, true))
+    );
+    // A's rebuild observes B's current marker now; it no longer holds its lease, so it
+    // must write nothing (its compare-and-swap alone would pass).
+    gate.notify_one();
+    assert_eq!(slow_rebuild.await.unwrap(), Some(StepOutcome::LeaseLost));
+    assert_projected(&cg, &gb, &quads(&[Q3]), &db, 1).await;
+}

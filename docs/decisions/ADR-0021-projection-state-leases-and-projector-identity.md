@@ -90,7 +90,9 @@ retries with backoff. `--unfenced` sets `disabled` at once (owner) and waives th
    is `disabling` (preferred; to be fenced) or eligible and `active`, unleased (or
    lease-expired) stream of the projector's target with `FOR UPDATE SKIP LOCKED`, set
    `lease_owner`, `lease_until = now() + ttl`, `lease_epoch = lease_epoch + 1`; commit.
-2. Outside any transaction: reconstruct, read the marker, write, read back (ADR-0020).
+2. Outside any transaction: read the marker, reconstruct, **re-check the lease**
+   (`holds`, after the observation), write under the compare-and-swap, read back
+   (ADR-0020).
 3. **Acknowledge** (one short transaction): update the stream only if `lease_owner` and
    `lease_epoch` still match (fencing); advance `projected_*`, reset backoff, release the
    lease, mark the outbox rows delivered. If the lease was lost, nothing is written — the

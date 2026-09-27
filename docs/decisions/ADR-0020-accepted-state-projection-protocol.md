@@ -224,6 +224,18 @@ would pass (Codex review, P0). Two rules close it:
   as no marker. `ledger-admin projection disable --unfenced` skips the fence (escape hatch
   for a target that is gone for good), with that guarantee explicitly waived.
 
+### Authority after observation (Codex round 3)
+A compare-and-swap protects against changes *after* a worker's observation, not against a
+worker that observes *after* it lost its authority (e.g. its claim reply was delayed past
+its lease: another worker fenced its stream, another feed took the graph, and the late
+worker's observation of that feed's marker is current). Therefore every write and fence is
+preceded, after the observation it is based on, by a database check that the worker still
+holds its lease (`ProjectionRepository::holds`: owner, epoch, `lease_until > now()` on the
+database clock). If it does, nobody could have fenced or taken the graph between that
+observation and the check (both need the lease gone first), and any change after the check
+changes the marker (every write and fence stamps a fresh `lp:writeId`), so the
+compare-and-swap refuses it. If it does not, the worker writes nothing (`LeaseLost`).
+
 ### Reconciliation
 The outbox only drives work when the ledger moves. So that a target that lost its data
 (restart onto an empty volume, restore of an older target backup) or was edited out of band

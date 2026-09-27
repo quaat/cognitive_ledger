@@ -165,6 +165,12 @@ projection fault suite, compose integration, upgrade 0010 → 0011; Phase-2 suit
   a mutation removing the check turns it red); **P2** — the runtime identity model was not
   exhaustive (privileges on unlisted tables passed) → exhaustive for both identities
   (`weakened_projection_controls…` asserts the refusal for both).
+- Codex round 3 on `bffa6e0`: **P0** — a rebuild whose claim reply was delayed past its
+  lease could observe *after* its stream was fenced and another feed took the graph; its
+  compare-and-swap against that current marker would pass. Fixed by checking, after the
+  observation and before every write and fence, that the worker still holds its lease
+  (ADR-0020 "Authority after observation");
+  `a_rebuild_that_observes_after_losing_its_lease_writes_nothing` reproduces the schedule.
 
 ## Evidence
 (filled as slices land)

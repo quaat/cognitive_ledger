@@ -706,6 +706,25 @@ impl ProjectionRepository {
         Ok(LeaseOutcome::Committed)
     }
 
+    /// Whether `claim` still holds its lease now (database clock). A worker asks this after
+    /// observing the target and before writing (ADR-0020): if it holds the lease at a moment
+    /// after its observation, no other worker can have fenced or taken the stream's graph
+    /// in between (that needs the lease gone first), so its compare-and-swap is sound.
+    pub async fn holds(&self, claim: &Claim) -> Result<bool, LedgerError> {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM projection_state WHERE graph_id = $1 AND branch = $2 \
+             AND target_id = $3 AND lease_owner = $4 AND lease_epoch = $5 AND lease_until > now())",
+        )
+        .bind(claim.key.graph_id.as_str())
+        .bind(&claim.key.branch)
+        .bind(&claim.key.target_id)
+        .bind(&claim.owner)
+        .bind(claim.epoch)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_error)
+    }
+
     /// Release a lease without recording an outcome (nothing to do / shutdown).
     pub async fn release(&self, claim: &Claim) -> Result<LeaseOutcome, LedgerError> {
         let done = sqlx::query(

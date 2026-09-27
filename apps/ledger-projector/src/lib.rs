@@ -395,6 +395,12 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
         if self.crash(FailPoint::BeforeTargetRequest) {
             return Ok(StepOutcome::Crashed(FailPoint::BeforeTargetRequest));
         }
+        // Authority after observation (ADR-0020): holding the lease now — after the
+        // observation the compare-and-swap is based on — means nobody fenced or took this
+        // graph since; if it expired meanwhile (e.g. a delayed claim reply), write nothing.
+        if !self.repo.holds(claim).await.map_err(ledger_failure)? {
+            return Ok(StepOutcome::LeaseLost);
+        }
         // Compare-and-swap on exactly the observed marker (ADR-0020): if anything changed it
         // since — another version, another stream, another feed — the write is a no-op.
         self.client
@@ -515,6 +521,9 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
         let graph = CognitiveGraph::parse(&claim.cognitive_graph)?;
         let observed = self.client.observe(&graph).await?;
         let write_id = self.next_write_id(claim);
+        if !self.repo.holds(claim).await.map_err(ledger_failure)? {
+            return Ok(StepOutcome::LeaseLost);
+        }
         self.client
             .fence(&graph, &observed.terms, &write_id)
             .await?;
