@@ -31,12 +31,13 @@ export COMPOSE_PROJECT_NAME=ledger-qual-integration
 docker compose config --quiet
 # Production-shaped start (ADR-0016): PostgreSQL → owner migration (one-shot `migrate`
 # service, runtime role granted) → server with the least-privilege runtime identity.
-docker compose up --build -d --wait ledger postgres
-trap 'docker compose down --remove-orphans --volumes' EXIT
+docker compose --profile projection up --build -d --wait ledger postgres fuseki projector
+trap 'docker compose --profile projection down --remove-orphans --volumes' EXIT
 REQUIRED_SCHEMA=$(grep -oE 'REQUIRED_SCHEMA_VERSION: i64 = [0-9]+' crates/ledger-store/src/schema.rs | grep -oE '[0-9]+$')
 REQUIRED_SCHEMA=$(printf '%04d' "${REQUIRED_SCHEMA}")
 docker compose logs migrate | grep -q "schema at ${REQUIRED_SCHEMA}" || { echo "FAIL: owner migration step did not report schema ${REQUIRED_SCHEMA}" >&2; docker compose logs migrate >&2; exit 1; }
 docker compose logs migrate | grep -q "granted runtime privileges to role ledger_runtime" || { echo "FAIL: owner migration step did not grant the runtime role" >&2; exit 1; }
+docker compose logs migrate | grep -q "granted projector privileges to role ledger_projector" || { echo "FAIL: owner migration step did not grant the projector role" >&2; exit 1; }
 echo "owner migration completed; server runs as the runtime identity"
 
 # Owner identity for the host-run store suites (they create throwaway databases and run
@@ -76,6 +77,15 @@ cargo test -p ledger-store --features postgres --test pg_validation -- --ignored
 #         revalidation, idempotency, capabilities, tenant isolation, limits -----------------
 cargo test -p ledger-api --test pg_validation_api -- --ignored --nocapture
 
+# --- 1k. Projection streams: enable rules, leases, fencing, guards, projector identity (Plan 0007)
+cargo test -p ledger-store --features postgres --test pg_projection -- --ignored --nocapture
+
+# --- 1l. Projection against the real Fuseki (compose `fuseki`, own TDB2 dataset): genesis,
+#         advance, duplicate/stale writes, outage + catch-up, every crash window, lost/corrupt/
+#         ahead markers and rebuild, concurrent workers, many graphs ---------------------------
+LEDGER_TEST_FUSEKI_URL=http://127.0.0.1:53030/ledger LEDGER_TEST_FUSEKI_PASSWORD=development-only \
+  cargo test -p ledger-projector --test fuseki_projection -- --ignored --nocapture
+
 # --- 2. Containerised server: provision, authenticate, prepare/accept v2, restart, read ---
 curl --fail --silent --retry 10 --retry-delay 2 --retry-all-errors --retry-connrefused "${BASE}/health" >/dev/null
 curl --fail --silent "${BASE}/ready" >/dev/null
@@ -89,8 +99,10 @@ OBJECTS_BEFORE=$(psql_q "select count(*) from immutable_objects")
 NON_V2_BEFORE=$(psql_q "select count(*) from commit_index where version <> 2")
 # Provisioning is an owner operation: run it through the migrate service (owner URL), not
 # inside the runtime container, which holds only the runtime identity.
-docker compose run --rm migrate graph create --graph "${GRAPH}" --tenant "${TENANT}" --status active --purpose 'integration test'
+docker compose run --rm migrate graph create --graph "${GRAPH}" --tenant "${TENANT}" --status active --purpose 'integration test' --kb "urn:integration:kb:${GRAPH}"
 echo "graph provisioned by operator command under the owner identity: ${GRAPH}"
+# Enable its accepted-state projection into the compose Fuseki (owner operation, ADR-0021).
+docker compose run --rm migrate projection enable --graph "${GRAPH}" --target fuseki
 
 # Mint an HS256 token exactly as the identity provider would (stdlib only).
 mint() {
@@ -188,6 +200,31 @@ QUADS=$(echo "${R}" | body_of | python3 -c 'import sys,json; print(json.dumps(js
 EXPECTED_QUADS='["<urn:material:a> <urn:humidity> \"40\" .", "<urn:material:a> <urn:temperature> \"80\" ."]'
 [ "${QUADS}" = "${EXPECTED_QUADS}" ] || { echo "FAIL: reconstructed state is not exactly the two quads: ${QUADS}" >&2; exit 1; }
 echo "state reconstructed across restart through the authenticated, graph-scoped read"
+
+# --- Accepted-state projection (Plan 0007): the projector container converges Fuseki to ------
+#     exactly the accepted state with a marker naming C2 / version 2 ------------------------
+COGNITIVE=$(python3 -c 'import sys; kb=sys.argv[1]; print("urn:sculpin:kb:"+"".join(c if c.isalnum() or c in "-._~" else "%%%02X"%ord(c) for c in kb)+":cognitive")' "urn:integration:kb:${GRAPH}")
+sparql() { curl --silent --fail -X POST -H 'content-type: application/sparql-query' -H 'accept: application/sparql-results+json' --data-binary "$1" http://127.0.0.1:53030/ledger/query; }
+for _ in $(seq 1 120); do
+  V=$(sparql "SELECT ?v WHERE { GRAPH <urn:sculpin:ledger-projection:v1:markers> { <${COGNITIVE}> <urn:sculpin:ledger-projection:v1#refVersion> ?v } }" | python3 -c 'import sys,json; b=json.load(sys.stdin)["results"]["bindings"]; print(b[0]["v"]["value"] if b else "")')
+  [ "${V}" = "2" ] && break; sleep 0.5
+done
+[ "${V}" = "2" ] || { echo "FAIL: the projector did not project version 2 (marker: '${V}')" >&2; docker compose logs projector >&2; exit 1; }
+PROJECTED=$(sparql "SELECT ?s ?p ?o WHERE { GRAPH <${COGNITIVE}> { ?s ?p ?o } } ORDER BY ?p" | python3 -c 'import sys,json; print(json.dumps(sorted((b["s"]["value"],b["p"]["value"],b["o"]["value"]) for b in json.load(sys.stdin)["results"]["bindings"])))')
+EXPECTED_PROJECTED='[["urn:material:a", "urn:humidity", "40"], ["urn:material:a", "urn:temperature", "80"]]'
+[ "${PROJECTED}" = "${EXPECTED_PROJECTED}" ] || { echo "FAIL: projected graph is not exactly the accepted state: ${PROJECTED}" >&2; exit 1; }
+MARKER_COMMIT=$(sparql "SELECT ?c WHERE { GRAPH <urn:sculpin:ledger-projection:v1:markers> { <${COGNITIVE}> <urn:sculpin:ledger-projection:v1#commitId> ?c } }" | python3 -c 'import sys,json; print(json.load(sys.stdin)["results"]["bindings"][0]["c"]["value"])')
+[ "${MARKER_COMMIT}" = "${C2}" ] || { echo "FAIL: marker commit ${MARKER_COMMIT} != ${C2}" >&2; exit 1; }
+docker compose run --rm migrate projection status --target fuseki --json >target/integration-projection-status.json 2>/dev/null || true
+python3 - "${GRAPH}" <<'PY' <target/integration-projection-status.json || { echo "FAIL: projection status does not show the stream caught up" >&2; exit 1; }
+import json, sys
+graph = sys.argv[1]
+status = json.loads(sys.stdin.read().strip().splitlines()[-1])
+row = next(s for s in status["streams"] if s["graph_id"] == graph)
+assert row["status"] == "active" and row["projected_ref_version"] == 2 and row["lag_versions"] == 0 and row["pending_events"] == 0, row
+PY
+curl --silent --fail http://127.0.0.1:59464/metrics | grep -q "projection_lag_versions{graph=\"${GRAPH}\",ref=\"main\",target=\"fuseki\",status=\"active\"} 0" || { echo "FAIL: projector metrics do not report zero lag for ${GRAPH}" >&2; exit 1; }
+echo "projection: Fuseki cognitive graph <${COGNITIVE}> holds exactly the accepted state at C2 (marker v2), status lag 0, metrics lag 0"
 
 # Foreign tenant still cannot see the commit after it exists.
 R=$(api GET "/v1/graphs/${GRAPH}/commits/${C2}/state" "${FOREIGN}" "" "")

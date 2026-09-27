@@ -1,7 +1,11 @@
 //! Administrative entry points that must never run inside request handling.
 //!
 //! ```text
-//! LEDGER_MIGRATION_DATABASE_URL=postgres://… ledger-admin migrate [--runtime-role <name>]
+//! LEDGER_MIGRATION_DATABASE_URL=postgres://… ledger-admin migrate [--runtime-role <name>] \
+//!     [--projector-role <name>]
+//! LEDGER_MIGRATION_DATABASE_URL=postgres://… ledger-admin projection enable|disable \
+//!     --graph <id> --target <target_id> [--ref main]
+//! LEDGER_MIGRATION_DATABASE_URL=postgres://… ledger-admin projection status [--target <id>] [--json]
 //! LEDGER_MIGRATION_DATABASE_URL=postgres://… ledger-admin migrate-fs-to-pg --source <dir> \
 //!     [--graph default] [--branch main] [--json]
 //! LEDGER_MIGRATION_DATABASE_URL=postgres://… ledger-admin graph create --graph <id> --tenant <id> \
@@ -33,11 +37,29 @@ enum Command {
         database_url: String,
         json: bool,
     },
+    /// Projection stream administration (ADR-0021): owner identity, database only.
+    Projection(ProjectionArgs),
+}
+
+enum ProjectionAction {
+    Enable,
+    Disable,
+    Status,
+}
+
+struct ProjectionArgs {
+    action: ProjectionAction,
+    database_url: String,
+    graph: Option<String>,
+    target: Option<String>,
+    branch: String,
+    json: bool,
 }
 
 struct MigrateArgs {
     database_url: String,
     runtime_role: Option<String>,
+    projector_role: Option<String>,
 }
 
 struct GraphArgs {
@@ -59,7 +81,10 @@ struct Args {
 }
 
 fn usage() -> &'static str {
-    "usage: ledger-admin migrate [--runtime-role <role>] [--database-url <url>]\n\
+    "usage: ledger-admin migrate [--runtime-role <role>] [--projector-role <role>] [--database-url <url>]\n\
+     \x20      ledger-admin projection enable|disable --graph <graph_id> --target <target_id> \
+     [--ref <name>] [--database-url <url>]\n\
+     \x20      ledger-admin projection status [--target <target_id>] [--json] [--database-url <url>]\n\
      \x20      ledger-admin migrate-fs-to-pg --source <dir> [--database-url <url>] \
      [--graph <graph_id>] [--branch <name>] [--runtime-role <role>] [--json]\n\
      \x20      ledger-admin verify [--database-url <url>] [--json]\n\
@@ -123,11 +148,15 @@ fn role_name(value: String) -> Result<String, String> {
 fn parse_migrate(mut argv: impl Iterator<Item = String>) -> Result<MigrateArgs, String> {
     let mut database_url = database_url_from_env();
     let mut runtime_role = None;
+    let mut projector_role = None;
     while let Some(flag) = argv.next() {
         match flag.as_str() {
             "--database-url" => database_url = Some(value(&mut argv, "--database-url")?),
             "--runtime-role" => {
                 runtime_role = Some(role_name(value(&mut argv, "--runtime-role")?)?)
+            }
+            "--projector-role" => {
+                projector_role = Some(role_name(value(&mut argv, "--projector-role")?)?)
             }
             other if other.starts_with("--") => {
                 return Err(format!("unknown flag {other}\n{}", usage()));
@@ -140,7 +169,13 @@ fn parse_migrate(mut argv: impl Iterator<Item = String>) -> Result<MigrateArgs, 
             }
         }
     }
+    if runtime_role.is_some() && runtime_role == projector_role {
+        return Err(
+            "--runtime-role and --projector-role must name distinct roles (ADR-0021)".into(),
+        );
+    }
     Ok(MigrateArgs {
+        projector_role,
         database_url: database_url.ok_or_else(|| {
             format!(
                 "--database-url or LEDGER_MIGRATION_DATABASE_URL is required\n{}",
@@ -167,6 +202,10 @@ async fn migrate_schema(args: &MigrateArgs) -> Result<(), Box<dyn std::error::Er
             "no --runtime-role given: migrations applied, runtime grants not touched (a runtime \
              identity without grants cannot serve; see ADR-0016)"
         );
+    }
+    if let Some(role) = &args.projector_role {
+        ledger_store::schema::grant_projector_role(&mut conn, role).await?;
+        println!("granted projector privileges to role {role} (ledger_grant_projector)");
     }
     conn.close().await?;
     // Verify with a fresh pool exactly as the runtime would (owner identity here).
@@ -262,12 +301,157 @@ fn parse_command(mut argv: impl Iterator<Item = String>) -> Result<Command, Stri
             ),
         },
         Some("migrate-fs-to-pg") => parse(argv).map(Command::MigrateFs),
+        Some("projection") => parse_projection(argv).map(Command::Projection),
         Some("graph") => match argv.next().as_deref() {
             Some("create") => parse_graph_create(argv).map(Command::CreateGraph),
             _ => Err(usage().into()),
         },
         _ => Err(usage().into()),
     }
+}
+
+fn parse_projection(mut argv: impl Iterator<Item = String>) -> Result<ProjectionArgs, String> {
+    let action = match argv.next().as_deref() {
+        Some("enable") => ProjectionAction::Enable,
+        Some("disable") => ProjectionAction::Disable,
+        Some("status") => ProjectionAction::Status,
+        _ => return Err(usage().into()),
+    };
+    let mut database_url = database_url_from_env();
+    let (mut graph, mut target, mut branch, mut json) = (None, None, "main".to_owned(), false);
+    while let Some(flag) = argv.next() {
+        match flag.as_str() {
+            "--database-url" => database_url = Some(value(&mut argv, "--database-url")?),
+            "--graph" => graph = Some(value(&mut argv, "--graph")?),
+            "--target" => target = Some(value(&mut argv, "--target")?),
+            "--ref" => branch = value(&mut argv, "--ref")?,
+            "--json" => json = true,
+            other if other.starts_with("--") => {
+                return Err(format!("unknown flag {other}\n{}", usage()));
+            }
+            _ => {
+                return Err(format!(
+                    "unexpected positional argument (value not shown)\n{}",
+                    usage()
+                ));
+            }
+        }
+    }
+    if !matches!(action, ProjectionAction::Status) && (graph.is_none() || target.is_none()) {
+        return Err(format!("--graph and --target are required\n{}", usage()));
+    }
+    Ok(ProjectionArgs {
+        action,
+        database_url: database_url.ok_or_else(|| {
+            format!(
+                "--database-url or LEDGER_MIGRATION_DATABASE_URL is required\n{}",
+                usage()
+            )
+        })?,
+        graph,
+        target,
+        branch,
+        json,
+    })
+}
+
+async fn projection(args: &ProjectionArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&args.database_url)
+        .await?;
+    ledger_store::schema::verify(&pool).await?;
+    let repo = ledger_store::ProjectionRepository::new(pool);
+    let key = || -> Result<ledger_store::StreamKey, Box<dyn std::error::Error>> {
+        Ok(ledger_store::StreamKey {
+            graph_id: GraphId::new(args.graph.clone().unwrap_or_default())?,
+            branch: args.branch.clone(),
+            target_id: args.target.clone().unwrap_or_default(),
+        })
+    };
+    match args.action {
+        ProjectionAction::Enable => {
+            let key = key()?;
+            let graph = repo
+                .enable(&key, |kb| {
+                    ledger_projection::CognitiveGraph::for_knowledge_base(kb)
+                        .map(|g| g.as_iri().to_owned())
+                        .map_err(|e| e.to_string())
+                })
+                .await?;
+            println!(
+                "projection enabled: graph {} ref {} -> target {} cognitive graph <{graph}>",
+                key.graph_id, key.branch, key.target_id
+            );
+        }
+        ProjectionAction::Disable => {
+            let key = key()?;
+            if !repo.disable(&key).await? {
+                return Err("no such projection stream".into());
+            }
+            println!(
+                "projection disabled: graph {} ref {} target {}",
+                key.graph_id, key.branch, key.target_id
+            );
+        }
+        ProjectionAction::Status => {
+            let streams = repo.status(args.target.as_deref()).await?;
+            let unconfigured = repo.unconfigured_pending().await?;
+            if args.json {
+                let rows: Vec<serde_json::Value> = streams
+                    .iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "graph_id": s.key.graph_id.as_str(),
+                            "ref": s.key.branch,
+                            "target_id": s.key.target_id,
+                            "cognitive_graph": s.cognitive_graph,
+                            "status": s.status,
+                            "projected_commit": s.projected_commit,
+                            "projected_ref_version": s.projected_ref_version,
+                            "head_commit": s.head_commit,
+                            "head_version": s.head_version,
+                            "lag_versions": s.lag_versions(),
+                            "pending_events": s.pending_events,
+                            "oldest_pending_seconds": s.oldest_pending_seconds,
+                            "last_success_seconds_ago": s.last_success_seconds_ago,
+                            "last_error_code": s.last_error_code,
+                            "consecutive_failures": s.consecutive_failures,
+                            "rebuilds": s.rebuilds,
+                            "leased": s.leased,
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::json!({"streams": rows, "unconfigured_pending_events": unconfigured})
+                );
+            } else {
+                for s in &streams {
+                    println!(
+                        "{} {} -> {} [{}] projected v{} of head v{} (lag {}, {} pending{}){}",
+                        s.key.graph_id,
+                        s.key.branch,
+                        s.key.target_id,
+                        s.status,
+                        s.projected_ref_version.unwrap_or(0),
+                        s.head_version.unwrap_or(0),
+                        s.lag_versions(),
+                        s.pending_events,
+                        s.oldest_pending_seconds
+                            .map(|a| format!(", oldest {a:.0}s"))
+                            .unwrap_or_default(),
+                        s.last_error_code
+                            .as_ref()
+                            .map(|c| format!(" last error {c}"))
+                            .unwrap_or_default()
+                    );
+                }
+                println!("outbox events without an enabled stream: {unconfigured}");
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn create_graph(args: &GraphArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -467,6 +651,15 @@ async fn main() -> ExitCode {
                         "the schema was left at its previous level or at the last successfully \
                          applied migration; re-run after fixing the cause"
                     );
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        Command::Projection(args) => {
+            return match projection(&args).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("projection command failed: {e}");
                     ExitCode::FAILURE
                 }
             };

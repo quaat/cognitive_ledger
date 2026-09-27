@@ -1,25 +1,29 @@
 [package]
-name = "ledger-server"
+name = "ledger-projector"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
+description = "Accepted-state projector (ADR-0020/0021): consumes projection_outbox under stream leases and maintains the cognitive named graph in the projection target."
 
 [dependencies]
 axum.workspace = true
-ledger-api = { path = "../../crates/ledger-api" }
 ledger-core = { path = "../../crates/ledger-core" }
 ledger-projection = { path = "../../crates/ledger-projection" }
+ledger-projection-fuseki = { path = "../../crates/ledger-projection-fuseki" }
+ledger-rdf = { path = "../../crates/ledger-rdf" }
 ledger-store = { path = "../../crates/ledger-store", features = ["postgres"] }
-ledger-validation-protocol = { path = "../../crates/ledger-validation-protocol" }
-reqwest.workspace = true
-url = "2"
 serde_json.workspace = true
-sqlx.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+ledger-api = { path = "../../crates/ledger-api" }
+reqwest.workspace = true
+sqlx.workspace = true
 
 [lints]
 workspace = true

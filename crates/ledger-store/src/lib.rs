@@ -577,6 +577,13 @@ pub use postgres_workflow::{
     WorkflowRepository,
 };
 #[cfg(feature = "postgres")]
+mod postgres_projection;
+#[cfg(feature = "postgres")]
+pub use postgres_projection::{
+    Claim, FailureDisposition, LeaseOutcome, MAX_LEASE_OWNER_BYTES, MAX_TARGET_ID_BYTES,
+    ProjectionRepository, StreamKey, StreamStatus, WorkItem,
+};
+#[cfg(feature = "postgres")]
 mod postgres_validation;
 #[cfg(feature = "postgres")]
 pub use postgres_validation::{

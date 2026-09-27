@@ -1,0 +1,22 @@
+[package]
+name = "ledger-projection-fuseki"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Hardened SPARQL 1.1 Protocol adapter (Apache Jena Fuseki) implementing the ledger-projection ProjectionClient boundary (ADR-0020)."
+
+[dependencies]
+async-trait.workspace = true
+ledger-projection = { path = "../ledger-projection" }
+ledger-rdf = { path = "../ledger-rdf" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+ledger-core = { path = "../ledger-core" }
+
+[lints]
+workspace = true

@@ -591,7 +591,8 @@ async fn startup_and_readiness_refuse_any_schema_level_but_the_required_one() {
         .err()
         .unwrap();
     assert!(
-        matches!(&err, LedgerError::SchemaIncompatible(m) if m.contains("0007") && m.contains("requires 0010")),
+        matches!(&err, LedgerError::SchemaIncompatible(m) if m.contains("0007")
+            && m.contains(&format!("requires {:04}", schema::REQUIRED_SCHEMA_VERSION))),
         "{err}"
     );
     // Exactly right: connects; then readiness follows the schema level live.

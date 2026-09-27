@@ -9,7 +9,7 @@ services:
   migrate:
     build: .
     entrypoint: ["/usr/local/bin/ledger-admin"]
-    command: ["migrate", "--runtime-role", "ledger_runtime"]
+    command: ["migrate", "--runtime-role", "ledger_runtime", "--projector-role", "ledger_projector"]
     restart: "no"
     environment:
       LEDGER_MIGRATION_DATABASE_URL: postgres://ledger:ledger-development-only@postgres:5432/ledger?sslmode=disable
@@ -75,10 +75,49 @@ services:
   fuseki:
     image: stain/jena-fuseki:5.1.0@sha256:b1d0c96f19adddef417520184471ac816cf36c6e72936a88ea02b29f4305929a
     profiles: [projection]
+    # The ledger's own TDB2 dataset definition (ADR-0020): named query/update endpoints only.
+    command: ["/jena-fuseki/fuseki-server", "--config=/staging/ledger-projection.ttl"]
+    volumes:
+      - ./deploy/fuseki/ledger-projection.ttl:/staging/ledger-projection.ttl:ro
+    ports:
+      - "127.0.0.1:53030:3030"
+      # The projector shares this network namespace (below); its /health /ready /metrics.
+      - "127.0.0.1:59464:9464"
     environment:
       ADMIN_PASSWORD: development-only
     healthcheck:
       test: ["CMD-SHELL", "wget --spider -q http://127.0.0.1:3030/$/ping || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+  # Accepted-state projector (ADR-0020/0021). Development: it shares Fuseki's network
+  # namespace so the target is a loopback http endpoint; production uses https and a
+  # dedicated credential. It connects with the PROJECTOR identity (deploy/postgres-init,
+  # granted by the migrate service), never the owner or the runtime identity.
+  projector:
+    build: .
+    profiles: [projection]
+    entrypoint: ["/usr/local/bin/ledger-projector"]
+    network_mode: "service:fuseki"
+    environment:
+      LEDGER_PROJECTOR_DATABASE_URL: postgres://ledger_projector:ledger-projector-development-only@postgres:5432/ledger?sslmode=disable
+      LEDGER_PROJECTION_TARGET_ID: fuseki
+      LEDGER_PROJECTION_QUERY_URL: http://127.0.0.1:3030/ledger/query
+      LEDGER_PROJECTION_UPDATE_URL: http://127.0.0.1:3030/ledger/update
+      LEDGER_PROJECTION_USERNAME: admin
+      LEDGER_PROJECTION_PASSWORD_FILE: /run/secrets/fuseki-password
+      LEDGER_PROJECTOR_DEVELOPMENT: allow-insecure-development-only
+      LEDGER_PROJECTOR_ADDR: 0.0.0.0:9464
+      LEDGER_PROJECTOR_POLL_MS: "250"
+      RUST_LOG: info
+    volumes: ["./deploy/fuseki/development-admin-password:/run/secrets/fuseki-password:ro"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      fuseki:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/ledger-admin", "probe", "http://127.0.0.1:9464/ready"]
       interval: 5s
       timeout: 3s
       retries: 12
