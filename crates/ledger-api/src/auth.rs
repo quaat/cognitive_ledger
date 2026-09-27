@@ -31,6 +31,9 @@ pub enum Capability {
     Propose,
     /// Accept or reject proposals.
     Review,
+    /// Request semantic validation of a prepared candidate (the ledger then calls the
+    /// configured validation service). Does not allow moving refs.
+    Validate,
     /// Administrative graph/lifecycle operations (reserved).
     Admin,
 }
@@ -106,6 +109,7 @@ impl Default for ClaimsPolicy {
                 ("ledger.read", Capability::Read),
                 ("ledger.propose", Capability::Propose),
                 ("ledger.review", Capability::Review),
+                ("ledger.validate", Capability::Validate),
                 ("ledger.admin", Capability::Admin),
             ]
             .into_iter()

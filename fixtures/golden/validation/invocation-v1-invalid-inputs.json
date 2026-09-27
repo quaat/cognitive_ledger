@@ -1,0 +1,92 @@
+[
+  {
+    "why": "empty key",
+    "input": {
+      "tenant_id": "11111111-2222-4333-8444-555555555555",
+      "principal_type": "service",
+      "principal_id": "urn:sculpin:service:orchestrator",
+      "graph_id": "0b0a2a1c-2e3d-4f50-8a61-72b384c5d6e7",
+      "idempotency_key": "",
+      "request_digest": "sha256:c2345d073810e6ab8cedda85e8c3e3ced4d036d05f818ef3263ce9d1c9f39cf1"
+    }
+  },
+  {
+    "why": "257-byte key",
+    "input": {
+      "tenant_id": "11111111-2222-4333-8444-555555555555",
+      "principal_type": "service",
+      "principal_id": "urn:sculpin:service:orchestrator",
+      "graph_id": "0b0a2a1c-2e3d-4f50-8a61-72b384c5d6e7",
+      "idempotency_key": "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk",
+      "request_digest": "sha256:c2345d073810e6ab8cedda85e8c3e3ced4d036d05f818ef3263ce9d1c9f39cf1"
+    }
+  },
+  {
+    "why": "control character in key",
+    "input": {
+      "tenant_id": "11111111-2222-4333-8444-555555555555",
+      "principal_type": "service",
+      "principal_id": "urn:sculpin:service:orchestrator",
+      "graph_id": "0b0a2a1c-2e3d-4f50-8a61-72b384c5d6e7",
+      "idempotency_key": "k\n",
+      "request_digest": "sha256:c2345d073810e6ab8cedda85e8c3e3ced4d036d05f818ef3263ce9d1c9f39cf1"
+    }
+  },
+  {
+    "why": "empty delegation",
+    "input": {
+      "tenant_id": "11111111-2222-4333-8444-555555555555",
+      "principal_type": "service",
+      "principal_id": "urn:sculpin:service:orchestrator",
+      "graph_id": "0b0a2a1c-2e3d-4f50-8a61-72b384c5d6e7",
+      "idempotency_key": "validate-7f3c2a",
+      "request_digest": "sha256:c2345d073810e6ab8cedda85e8c3e3ced4d036d05f818ef3263ce9d1c9f39cf1",
+      "on_behalf_of": ""
+    }
+  },
+  {
+    "why": "invalid graph id",
+    "input": {
+      "tenant_id": "11111111-2222-4333-8444-555555555555",
+      "principal_type": "service",
+      "principal_id": "urn:sculpin:service:orchestrator",
+      "graph_id": "not a graph",
+      "idempotency_key": "validate-7f3c2a",
+      "request_digest": "sha256:c2345d073810e6ab8cedda85e8c3e3ced4d036d05f818ef3263ce9d1c9f39cf1"
+    }
+  },
+  {
+    "why": "unknown principal type",
+    "input": {
+      "tenant_id": "11111111-2222-4333-8444-555555555555",
+      "principal_type": "robot",
+      "principal_id": "urn:sculpin:service:orchestrator",
+      "graph_id": "0b0a2a1c-2e3d-4f50-8a61-72b384c5d6e7",
+      "idempotency_key": "validate-7f3c2a",
+      "request_digest": "sha256:c2345d073810e6ab8cedda85e8c3e3ced4d036d05f818ef3263ce9d1c9f39cf1"
+    }
+  },
+  {
+    "why": "non-strict request digest",
+    "input": {
+      "tenant_id": "11111111-2222-4333-8444-555555555555",
+      "principal_type": "service",
+      "principal_id": "urn:sculpin:service:orchestrator",
+      "graph_id": "0b0a2a1c-2e3d-4f50-8a61-72b384c5d6e7",
+      "idempotency_key": "validate-7f3c2a",
+      "request_digest": "sha256:ABC"
+    }
+  },
+  {
+    "why": "unknown field",
+    "input": {
+      "tenant_id": "11111111-2222-4333-8444-555555555555",
+      "principal_type": "service",
+      "principal_id": "urn:sculpin:service:orchestrator",
+      "graph_id": "0b0a2a1c-2e3d-4f50-8a61-72b384c5d6e7",
+      "idempotency_key": "validate-7f3c2a",
+      "request_digest": "sha256:c2345d073810e6ab8cedda85e8c3e3ced4d036d05f818ef3263ce9d1c9f39cf1",
+      "correlation_id": "c-1"
+    }
+  }
+]

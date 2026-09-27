@@ -1,0 +1,5 @@
+<urn:s> <urn:p> "z" <urn:g:2> .
+<urn:s> <urn:p> "a" .
+<urn:s> <urn:p> "a" <urn:g:1> .
+<urn:s> <urn:p> "a" .
+<urn:s> <urn:p> "bonjour"@fr <urn:g:1> .

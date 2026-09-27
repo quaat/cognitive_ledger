@@ -1,5 +1,11 @@
 # Two-phase semantic-validation protocol and coordination contracts
 
+> **Implemented in Phase 2 (Plan 0006).** Canonical identities: ADR-0018 (context, environment,
+> record, candidate state digest). Freshness and acceptance binding: ADR-0019 (accept names a
+> validation id and a candidate-independent *semantic environment* id). Service contract:
+> [sculpin-validation-service.md](sculpin-validation-service.md). The sections below remain the
+> design rationale.
+
 This document defines the contracts by which the Cognitive Ledger coordinates semantic
 acceptance with Sculpin **without embedding any semantics**. The ledger owns immutable
 candidates, refs, decisions, and ref events; Sculpin owns SHACL, reasoning, ontology, and
@@ -91,6 +97,27 @@ outcome (conforms | violations[])
 recorded_time
 report_reference_or_digest
 ```
+
+### Validation invocation identity (`sculpin-validation-invocation/v1`)
+Not a record and never stored: the opaque identity of one *logical* outbound validation,
+sent to the validator as `invocation_id` and as the `Idempotency-Key` header (ADR-0019
+amendment, [Sculpin contract](sculpin-validation-service.md#idempotency-at-least-once-delivery-exactly-once-logical-validation)).
+It is the same for every physical delivery of one ledger `validate` request (concurrent
+same-key duplicates, retries after a lost response or a crash between answer and record), so
+the validator can resolve them to one validation in one environment.
+```
+"sculpin-validation-invocation-v1\0"
+field tenant_id · u8 principal_type (commit-v2 wire byte: human 0, agent 1, service 2)
+field principal_id · opt on_behalf_of · field graph_id · field "validate"
+field idempotency_key (1..=256 bytes, no control characters) · field request_digest
+id = "sha256:" + hex(SHA-256(bytes))
+```
+Same `field`/`opt` encoding as commit v2 and request v1. `request_digest` is the
+`sculpin-ledger-request/v2` digest of the validate request (graph, candidate, hints).
+Excluded by construction: correlation id, wall-clock time, `recorded_at`, arrival order,
+server instance. It never enters `CommitId`, `SemanticContextId`, `SemanticEnvironmentId` or
+`ValidationId`. Vectors: `fixtures/golden/validation/invocation-v1-*`, checked by Rust
+(`crates/ledger-validation-protocol/tests/golden.rs`) and the Python reference.
 
 ### DecisionRecord
 Validation and decision are distinct: a candidate can be valid yet rejected by a reviewer.

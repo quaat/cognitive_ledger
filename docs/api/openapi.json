@@ -1,779 +1,1056 @@
 {
-  "openapi": "3.1.0",
-  "info": {
-    "title": "Sculpin Cognitive Ledger",
-    "version": "1.0.0-p1.4",
-    "description": "Authenticated, graph-scoped API over the atomic cognitive-change workflow (ADR-0013). Mutations require a bearer token, an Idempotency-Key header and the `propose` (prepare) or `review` (accept/reject) capability; reads require `read`. Ref names may contain `/` and are therefore body/query fields. A graph that does not exist or belongs to another tenant is reported as NOT_FOUND alike. Every response carries X-Correlation-Id; every error is the Error envelope. No query language is exposed. Unknown paths and methods also answer with the Error envelope."
+ "openapi": "3.1.0",
+ "info": {
+  "title": "Sculpin Cognitive Ledger",
+  "version": "1.1.0-p2",
+  "description": "Authenticated, graph-scoped API over the atomic cognitive-change workflow (ADR-0013). Mutations require a bearer token, an Idempotency-Key header and the `propose` (prepare) or `review` (accept/reject) capability; reads require `read`. Ref names may contain `/` and are therefore body/query fields. A graph that does not exist or belongs to another tenant is reported as NOT_FOUND alike. Every response carries X-Correlation-Id; every error is the Error envelope. No query language is exposed. Unknown paths and methods also answer with the Error envelope. Phase 2 (ADR-0014/0018/0019): `validate` capability requests a semantic validation of a prepared candidate (the ledger calls its configured validation service and records an immutable SemanticExecutionContext + ValidationRecord; no ref moves); accept names validation_id and semantic_environment_id and succeeds only for a conforming validation of that candidate run in that environment; reject may cite a validation."
+ },
+ "servers": [
+  {
+   "url": "/"
+  }
+ ],
+ "components": {
+  "securitySchemes": {
+   "bearer": {
+    "type": "http",
+    "scheme": "bearer",
+    "bearerFormat": "JWT"
+   }
   },
-  "servers": [
-    {
-      "url": "/"
+  "parameters": {
+   "IdempotencyKey": {
+    "name": "Idempotency-Key",
+    "in": "header",
+    "required": true,
+    "schema": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 256
+    },
+    "description": "Retries with the same key, complete actor and identical canonical request replay the original result; a different request under the same key is IDEMPOTENCY_CONFLICT."
+   },
+   "CorrelationId": {
+    "name": "X-Correlation-Id",
+    "in": "header",
+    "required": false,
+    "schema": {
+     "type": "string",
+     "minLength": 1,
+     "maxLength": 128
+    },
+    "description": "Optional client correlation id; generated when absent and echoed on every response."
+   },
+   "Graph": {
+    "name": "graph",
+    "in": "path",
+    "required": true,
+    "schema": {
+     "type": "string",
+     "pattern": "^[A-Za-z0-9._:-]{1,128}$"
     }
-  ],
-  "components": {
-    "securitySchemes": {
-      "bearer": {
-        "type": "http",
-        "scheme": "bearer",
-        "bearerFormat": "JWT"
+   },
+   "Candidate": {
+    "name": "candidate",
+    "in": "path",
+    "required": true,
+    "schema": {
+     "$ref": "#/components/schemas/ContentId"
+    }
+   },
+   "Commit": {
+    "name": "commit",
+    "in": "path",
+    "required": true,
+    "schema": {
+     "$ref": "#/components/schemas/ContentId"
+    }
+   },
+   "Validation": {
+    "name": "validation",
+    "in": "path",
+    "required": true,
+    "schema": {
+     "$ref": "#/components/schemas/ContentId"
+    }
+   }
+  },
+  "schemas": {
+   "ContentId": {
+    "type": "string",
+    "pattern": "^sha256:[0-9a-f]{64}$"
+   },
+   "RefName": {
+    "type": "string",
+    "minLength": 1,
+    "maxLength": 128,
+    "pattern": "^[A-Za-z0-9._/-]+$"
+   },
+   "Error": {
+    "type": "object",
+    "required": [
+     "code",
+     "message",
+     "correlation_id"
+    ],
+    "additionalProperties": false,
+    "properties": {
+     "code": {
+      "type": "string",
+      "enum": [
+       "INVALID_REQUEST",
+       "UNAUTHENTICATED",
+       "FORBIDDEN",
+       "NOT_FOUND",
+       "HEAD_CHANGED",
+       "IDEMPOTENCY_CONFLICT",
+       "LINEAGE_MISMATCH",
+       "BASE_MISMATCH",
+       "NO_EFFECTIVE_CHANGE",
+       "GRAPH_NOT_ACTIVE",
+       "VALIDATION_REQUIRED",
+       "VALIDATION_REJECTED",
+       "VALIDATION_STALE",
+       "VALIDATION_NOT_FOUND",
+       "VALIDATOR_UNAVAILABLE",
+       "VALIDATOR_ERROR",
+       "RESOURCE_LIMIT",
+       "DEPENDENCY_UNAVAILABLE",
+       "DEPENDENCY_TIMEOUT",
+       "INTERNAL"
+      ]
+     },
+     "message": {
+      "type": "string",
+      "description": "Safe text only; never SQL, storage paths, foreign graph or tenant identifiers."
+     },
+     "correlation_id": {
+      "type": "string"
+     }
+    }
+   },
+   "Operation": {
+    "type": "object",
+    "required": [
+     "op",
+     "quad"
+    ],
+    "additionalProperties": false,
+    "properties": {
+     "op": {
+      "type": "string",
+      "enum": [
+       "add",
+       "delete"
+      ]
+     },
+     "quad": {
+      "type": "string",
+      "description": "One canonical N-Quad; blank nodes are rejected."
+     }
+    }
+   },
+   "PrepareRequest": {
+    "type": "object",
+    "required": [
+     "ref",
+     "operations",
+     "activity",
+     "message"
+    ],
+    "additionalProperties": false,
+    "properties": {
+     "ref": {
+      "$ref": "#/components/schemas/RefName"
+     },
+     "expected_head": {
+      "oneOf": [
+       {
+        "$ref": "#/components/schemas/ContentId"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "description": "Current head of the ref (absent/null for genesis)."
+     },
+     "operations": {
+      "type": "array",
+      "items": {
+       "$ref": "#/components/schemas/Operation"
       }
-    },
-    "parameters": {
-      "IdempotencyKey": {
-        "name": "Idempotency-Key",
-        "in": "header",
-        "required": true,
-        "schema": {
+     },
+     "activity": {
+      "type": "string",
+      "maxLength": 512
+     },
+     "event_time": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC 3339; normalized to UTC microseconds."
+     },
+     "evidence_refs": {
+      "type": "array",
+      "items": {
+       "type": "string",
+       "maxLength": 512
+      },
+      "maxItems": 64,
+      "description": "A set: order and duplicates do not matter."
+     },
+     "source_system": {
+      "type": "string",
+      "maxLength": 512
+     },
+     "message": {
+      "type": "string",
+      "maxLength": 4096
+     }
+    }
+   },
+   "PrepareResponse": {
+    "type": "object",
+    "required": [
+     "proposal_id",
+     "candidate",
+     "requested_patch",
+     "effective_patch",
+     "replayed",
+     "correlation_id"
+    ],
+    "properties": {
+     "proposal_id": {
+      "type": "integer",
+      "format": "int64"
+     },
+     "candidate": {
+      "$ref": "#/components/schemas/ContentId",
+      "description": "The v2 candidate CommitId (identity-bearing; stable across retries)."
+     },
+     "requested_patch": {
+      "$ref": "#/components/schemas/ContentId"
+     },
+     "effective_patch": {
+      "$ref": "#/components/schemas/ContentId",
+      "description": "The persisted effective delta (ADR-0008)."
+     },
+     "replayed": {
+      "type": "boolean"
+     },
+     "correlation_id": {
+      "type": "string"
+     }
+    }
+   },
+   "AcceptRequest": {
+    "type": "object",
+    "required": [
+     "ref"
+    ],
+    "additionalProperties": false,
+    "properties": {
+     "ref": {
+      "$ref": "#/components/schemas/RefName"
+     },
+     "expected_head": {
+      "oneOf": [
+       {
+        "$ref": "#/components/schemas/ContentId"
+       },
+       {
+        "type": "null"
+       }
+      ]
+     },
+     "reason": {
+      "type": "string",
+      "maxLength": 4096
+     },
+     "validation_id": {
+      "$ref": "#/components/schemas/ContentId",
+      "description": "Validation record acceptance is bound to; given together with semantic_environment_id."
+     },
+     "semantic_environment_id": {
+      "$ref": "#/components/schemas/ContentId",
+      "description": "Candidate-independent semantic environment the reviewer accepts under (sculpin-semantic-environment/v1 id, as Sculpin declares it)."
+     }
+    }
+   },
+   "AcceptResponse": {
+    "type": "object",
+    "required": [
+     "decision_id",
+     "ref_event_id",
+     "outbox_id",
+     "ref_version",
+     "head",
+     "replayed",
+     "correlation_id"
+    ],
+    "properties": {
+     "decision_id": {
+      "type": "integer",
+      "format": "int64"
+     },
+     "ref_event_id": {
+      "type": "integer",
+      "format": "int64"
+     },
+     "outbox_id": {
+      "type": "integer",
+      "format": "int64"
+     },
+     "ref_version": {
+      "type": "integer",
+      "format": "int64"
+     },
+     "head": {
+      "$ref": "#/components/schemas/ContentId"
+     },
+     "replayed": {
+      "type": "boolean"
+     },
+     "correlation_id": {
+      "type": "string"
+     }
+    }
+   },
+   "RejectRequest": {
+    "type": "object",
+    "required": [
+     "ref",
+     "reason"
+    ],
+    "additionalProperties": false,
+    "properties": {
+     "ref": {
+      "$ref": "#/components/schemas/RefName"
+     },
+     "reason": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+     },
+     "validation_id": {
+      "$ref": "#/components/schemas/ContentId",
+      "description": "Validation record the rejection cites (optional)."
+     }
+    }
+   },
+   "RejectResponse": {
+    "type": "object",
+    "required": [
+     "decision_id",
+     "replayed",
+     "correlation_id"
+    ],
+    "properties": {
+     "decision_id": {
+      "type": "integer",
+      "format": "int64"
+     },
+     "replayed": {
+      "type": "boolean"
+     },
+     "correlation_id": {
+      "type": "string"
+     }
+    }
+   },
+   "RefResponse": {
+    "type": "object",
+    "required": [
+     "name",
+     "head"
+    ],
+    "properties": {
+     "name": {
+      "$ref": "#/components/schemas/RefName"
+     },
+     "head": {
+      "oneOf": [
+       {
+        "$ref": "#/components/schemas/ContentId"
+       },
+       {
+        "type": "null"
+       }
+      ]
+     },
+     "version": {
+      "type": [
+       "integer",
+       "null"
+      ],
+      "format": "int64"
+     }
+    }
+   },
+   "StateResponse": {
+    "type": "object",
+    "required": [
+     "commit",
+     "quads"
+    ],
+    "properties": {
+     "commit": {
+      "$ref": "#/components/schemas/ContentId"
+     },
+     "quads": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      },
+      "description": "Canonical N-Quads of the reconstructed state, bounded by the deployment's reconstruction and export limits."
+     }
+    }
+   },
+   "Health": {
+    "type": "object",
+    "required": [
+     "status"
+    ],
+    "properties": {
+     "status": {
+      "type": "string"
+     }
+    }
+   },
+   "ValidateRequest": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+     "requested": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Context hints for the validator (all optional; part of request identity).",
+      "properties": {
+       "base_kb": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+         "kb_id",
+         "revision"
+        ],
+        "properties": {
+         "kb_id": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 256
-        },
-        "description": "Retries with the same key, complete actor and identical canonical request replay the original result; a different request under the same key is IDEMPOTENCY_CONFLICT."
-      },
-      "CorrelationId": {
-        "name": "X-Correlation-Id",
-        "in": "header",
-        "required": false,
-        "schema": {
+          "maxLength": 512
+         },
+         "revision": {
           "type": "string",
           "minLength": 1,
-          "maxLength": 128
-        },
-        "description": "Optional client correlation id; generated when absent and echoed on every response."
-      },
-      "Graph": {
-        "name": "graph",
-        "in": "path",
-        "required": true,
-        "schema": {
+          "maxLength": 512
+         }
+        }
+       },
+       "ontology": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+         "id",
+         "version"
+        ],
+        "properties": {
+         "id": {
           "type": "string",
-          "pattern": "^[A-Za-z0-9._:-]{1,128}$"
+          "minLength": 1,
+          "maxLength": 512
+         },
+         "version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+         }
         }
-      },
-      "Candidate": {
-        "name": "candidate",
-        "in": "path",
-        "required": true,
-        "schema": {
-          "$ref": "#/components/schemas/ContentId"
+       },
+       "shapes": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+         "id",
+         "version"
+        ],
+        "properties": {
+         "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+         },
+         "version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+         }
         }
-      },
-      "Commit": {
-        "name": "commit",
-        "in": "path",
-        "required": true,
-        "schema": {
-          "$ref": "#/components/schemas/ContentId"
-        }
-      }
-    },
-    "schemas": {
-      "ContentId": {
-        "type": "string",
-        "pattern": "^sha256:[0-9a-f]{64}$"
-      },
-      "RefName": {
+       },
+       "reasoning_profile": {
         "type": "string",
         "minLength": 1,
-        "maxLength": 128,
-        "pattern": "^[A-Za-z0-9._/-]+$"
-      },
-      "Error": {
-        "type": "object",
-        "required": [
-          "code",
-          "message",
-          "correlation_id"
-        ],
-        "additionalProperties": false,
-        "properties": {
-          "code": {
-            "type": "string",
-            "enum": [
-              "INVALID_REQUEST",
-              "UNAUTHENTICATED",
-              "FORBIDDEN",
-              "NOT_FOUND",
-              "HEAD_CHANGED",
-              "IDEMPOTENCY_CONFLICT",
-              "LINEAGE_MISMATCH",
-              "BASE_MISMATCH",
-              "NO_EFFECTIVE_CHANGE",
-              "GRAPH_NOT_ACTIVE",
-              "VALIDATION_REQUIRED",
-              "RESOURCE_LIMIT",
-              "DEPENDENCY_UNAVAILABLE",
-              "DEPENDENCY_TIMEOUT",
-              "INTERNAL"
-            ]
-          },
-          "message": {
-            "type": "string",
-            "description": "Safe text only; never SQL, storage paths, foreign graph or tenant identifiers."
-          },
-          "correlation_id": {
-            "type": "string"
-          }
-        }
-      },
-      "Operation": {
-        "type": "object",
-        "required": [
-          "op",
-          "quad"
-        ],
-        "additionalProperties": false,
-        "properties": {
-          "op": {
-            "type": "string",
-            "enum": [
-              "add",
-              "delete"
-            ]
-          },
-          "quad": {
-            "type": "string",
-            "description": "One canonical N-Quad; blank nodes are rejected."
-          }
-        }
-      },
-      "PrepareRequest": {
-        "type": "object",
-        "required": [
-          "ref",
-          "operations",
-          "activity",
-          "message"
-        ],
-        "additionalProperties": false,
-        "properties": {
-          "ref": {
-            "$ref": "#/components/schemas/RefName"
-          },
-          "expected_head": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/ContentId"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "description": "Current head of the ref (absent/null for genesis)."
-          },
-          "operations": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/Operation"
-            }
-          },
-          "activity": {
-            "type": "string",
-            "maxLength": 512
-          },
-          "event_time": {
-            "type": "string",
-            "format": "date-time",
-            "description": "RFC 3339; normalized to UTC microseconds."
-          },
-          "evidence_refs": {
-            "type": "array",
-            "items": {
-              "type": "string",
-              "maxLength": 512
-            },
-            "maxItems": 64,
-            "description": "A set: order and duplicates do not matter."
-          },
-          "source_system": {
-            "type": "string",
-            "maxLength": 512
-          },
-          "message": {
-            "type": "string",
-            "maxLength": 4096
-          }
-        }
-      },
-      "PrepareResponse": {
-        "type": "object",
-        "required": [
-          "proposal_id",
-          "candidate",
-          "requested_patch",
-          "effective_patch",
-          "replayed",
-          "correlation_id"
-        ],
-        "properties": {
-          "proposal_id": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "candidate": {
-            "$ref": "#/components/schemas/ContentId",
-            "description": "The v2 candidate CommitId (identity-bearing; stable across retries)."
-          },
-          "requested_patch": {
-            "$ref": "#/components/schemas/ContentId"
-          },
-          "effective_patch": {
-            "$ref": "#/components/schemas/ContentId",
-            "description": "The persisted effective delta (ADR-0008)."
-          },
-          "replayed": {
-            "type": "boolean"
-          },
-          "correlation_id": {
-            "type": "string"
-          }
-        }
-      },
-      "AcceptRequest": {
-        "type": "object",
-        "required": [
-          "ref"
-        ],
-        "additionalProperties": false,
-        "properties": {
-          "ref": {
-            "$ref": "#/components/schemas/RefName"
-          },
-          "expected_head": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/ContentId"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "reason": {
-            "type": "string",
-            "maxLength": 4096
-          }
-        }
-      },
-      "AcceptResponse": {
-        "type": "object",
-        "required": [
-          "decision_id",
-          "ref_event_id",
-          "outbox_id",
-          "ref_version",
-          "head",
-          "replayed",
-          "correlation_id"
-        ],
-        "properties": {
-          "decision_id": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "ref_event_id": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "outbox_id": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "ref_version": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "head": {
-            "$ref": "#/components/schemas/ContentId"
-          },
-          "replayed": {
-            "type": "boolean"
-          },
-          "correlation_id": {
-            "type": "string"
-          }
-        }
-      },
-      "RejectRequest": {
-        "type": "object",
-        "required": [
-          "ref",
-          "reason"
-        ],
-        "additionalProperties": false,
-        "properties": {
-          "ref": {
-            "$ref": "#/components/schemas/RefName"
-          },
-          "reason": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 4096
-          }
-        }
-      },
-      "RejectResponse": {
-        "type": "object",
-        "required": [
-          "decision_id",
-          "replayed",
-          "correlation_id"
-        ],
-        "properties": {
-          "decision_id": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "replayed": {
-            "type": "boolean"
-          },
-          "correlation_id": {
-            "type": "string"
-          }
-        }
-      },
-      "RefResponse": {
-        "type": "object",
-        "required": [
-          "name",
-          "head"
-        ],
-        "properties": {
-          "name": {
-            "$ref": "#/components/schemas/RefName"
-          },
-          "head": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/ContentId"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "version": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64"
-          }
-        }
-      },
-      "StateResponse": {
-        "type": "object",
-        "required": [
-          "commit",
-          "quads"
-        ],
-        "properties": {
-          "commit": {
-            "$ref": "#/components/schemas/ContentId"
-          },
-          "quads": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "Canonical N-Quads of the reconstructed state, bounded by the deployment's reconstruction and export limits."
-          }
-        }
-      },
-      "Health": {
-        "type": "object",
-        "required": [
-          "status"
-        ],
-        "properties": {
-          "status": {
-            "type": "string"
-          }
-        }
+        "maxLength": 512
+       },
+       "sources_revision": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 512,
+        "description": "Sculpin external-source catalog revision the validation must run under."
+       }
       }
+     }
+    }
+   },
+   "ValidationResponse": {
+    "type": "object",
+    "required": [
+     "validation_id",
+     "semantic_context_id",
+     "semantic_environment_id",
+     "candidate",
+     "conforms",
+     "record",
+     "context",
+     "correlation_id"
+    ],
+    "properties": {
+     "validation_id": {
+      "$ref": "#/components/schemas/ContentId"
+     },
+     "semantic_context_id": {
+      "$ref": "#/components/schemas/ContentId"
+     },
+     "semantic_environment_id": {
+      "$ref": "#/components/schemas/ContentId"
+     },
+     "candidate": {
+      "$ref": "#/components/schemas/ContentId"
+     },
+     "conforms": {
+      "type": "boolean"
+     },
+     "record": {
+      "type": "object",
+      "description": "sculpin-validation-record/v1 as JSON (ADR-0018)."
+     },
+     "context": {
+      "type": "object",
+      "description": "sculpin-semantic-context/v1 as JSON (ADR-0018)."
+     },
+     "replayed": {
+      "type": "boolean"
+     },
+     "correlation_id": {
+      "type": "string"
+     }
+    }
+   }
+  },
+  "responses": {
+   "Error": {
+    "description": "Error envelope. 503 is DEPENDENCY_UNAVAILABLE (database, key source or schema not usable), DEPENDENCY_TIMEOUT (a database statement or lock wait exceeded its limit; the transaction was rolled back) or RESOURCE_LIMIT (HTTP time or concurrency limit); all three mean the outcome is unknown: retry with the same Idempotency-Key. 500 is INTERNAL with a generic message; the detail is logged under correlation_id.",
+    "content": {
+     "application/json": {
+      "schema": {
+       "$ref": "#/components/schemas/Error"
+      }
+     }
+    }
+   }
+  }
+ },
+ "security": [
+  {
+   "bearer": []
+  }
+ ],
+ "paths": {
+  "/health": {
+   "get": {
+    "security": [],
+    "summary": "Process liveness",
+    "responses": {
+     "200": {
+      "description": "alive",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Health"
+        }
+       }
+      }
+     },
+     "500": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/ready": {
+   "get": {
+    "security": [],
+    "summary": "Readiness: required dependencies for the selected mode are usable",
+    "responses": {
+     "200": {
+      "description": "ready",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Health"
+        }
+       }
+      }
+     },
+     "503": {
+      "$ref": "#/components/responses/Error"
+     },
+     "500": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/openapi.json": {
+   "get": {
+    "security": [],
+    "summary": "This document",
+    "responses": {
+     "200": {
+      "description": "OpenAPI 3.1 document",
+      "content": {
+       "application/json": {}
+      }
+     }
+    }
+   }
+  },
+  "/v1/graphs/{graph}/proposals": {
+   "post": {
+    "summary": "Prepare a candidate (propose capability)",
+    "parameters": [
+     {
+      "$ref": "#/components/parameters/Graph"
+     },
+     {
+      "$ref": "#/components/parameters/IdempotencyKey"
+     },
+     {
+      "$ref": "#/components/parameters/CorrelationId"
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/PrepareRequest"
+       }
+      }
+     }
     },
     "responses": {
-      "Error": {
-        "description": "Error envelope. 503 is DEPENDENCY_UNAVAILABLE (database, key source or schema not usable), DEPENDENCY_TIMEOUT (a database statement or lock wait exceeded its limit; the transaction was rolled back) or RESOURCE_LIMIT (HTTP time or concurrency limit); all three mean the outcome is unknown: retry with the same Idempotency-Key. 500 is INTERNAL with a generic message; the detail is logged under correlation_id.",
-        "content": {
-          "application/json": {
-            "schema": {
-              "$ref": "#/components/schemas/Error"
-            }
-          }
+     "201": {
+      "description": "candidate prepared",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/PrepareResponse"
         }
+       }
       }
+     },
+     "200": {
+      "description": "identical earlier request replayed",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/PrepareResponse"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     },
+     "409": {
+      "$ref": "#/components/responses/Error"
+     },
+     "412": {
+      "$ref": "#/components/responses/Error"
+     },
+     "413": {
+      "$ref": "#/components/responses/Error"
+     },
+     "422": {
+      "$ref": "#/components/responses/Error"
+     },
+     "503": {
+      "$ref": "#/components/responses/Error"
+     },
+     "500": {
+      "$ref": "#/components/responses/Error"
+     }
     }
+   }
   },
-  "security": [
-    {
-      "bearer": []
+  "/v1/graphs/{graph}/proposals/{candidate}/accept": {
+   "post": {
+    "summary": "Accept a prepared candidate onto a ref (review capability). With validation_id + semantic_environment_id the acceptance is bound to that conforming validation of this candidate run in that environment (VALIDATION_REJECTED, VALIDATION_STALE, VALIDATION_NOT_FOUND otherwise, nothing moves). Without them it fails with VALIDATION_REQUIRED unless the deployment explicitly allows unvalidated acceptance (development/CI only).",
+    "parameters": [
+     {
+      "$ref": "#/components/parameters/Graph"
+     },
+     {
+      "$ref": "#/components/parameters/Candidate"
+     },
+     {
+      "$ref": "#/components/parameters/IdempotencyKey"
+     },
+     {
+      "$ref": "#/components/parameters/CorrelationId"
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/AcceptRequest"
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "accepted (or identical earlier acceptance replayed)",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/AcceptResponse"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     },
+     "409": {
+      "$ref": "#/components/responses/Error"
+     },
+     "503": {
+      "$ref": "#/components/responses/Error"
+     },
+     "500": {
+      "$ref": "#/components/responses/Error"
+     },
+     "413": {
+      "$ref": "#/components/responses/Error"
+     }
     }
-  ],
-  "paths": {
-    "/health": {
-      "get": {
-        "security": [],
-        "summary": "Process liveness",
-        "responses": {
-          "200": {
-            "description": "alive",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Health"
-                }
-              }
-            }
-          },
-          "500": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
+   }
+  },
+  "/v1/graphs/{graph}/proposals/{candidate}/reject": {
+   "post": {
+    "summary": "Reject a prepared candidate (review capability)",
+    "parameters": [
+     {
+      "$ref": "#/components/parameters/Graph"
+     },
+     {
+      "$ref": "#/components/parameters/Candidate"
+     },
+     {
+      "$ref": "#/components/parameters/IdempotencyKey"
+     },
+     {
+      "$ref": "#/components/parameters/CorrelationId"
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/RejectRequest"
+       }
       }
+     }
     },
-    "/ready": {
-      "get": {
-        "security": [],
-        "summary": "Readiness: required dependencies for the selected mode are usable",
-        "responses": {
-          "200": {
-            "description": "ready",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Health"
-                }
-              }
-            }
-          },
-          "503": {
-            "$ref": "#/components/responses/Error"
-          },
-          "500": {
-            "$ref": "#/components/responses/Error"
-          }
+    "responses": {
+     "200": {
+      "description": "rejected (or replayed)",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/RejectResponse"
         }
+       }
       }
-    },
-    "/openapi.json": {
-      "get": {
-        "security": [],
-        "summary": "This document",
-        "responses": {
-          "200": {
-            "description": "OpenAPI 3.1 document",
-            "content": {
-              "application/json": {}
-            }
-          }
-        }
-      }
-    },
-    "/v1/graphs/{graph}/proposals": {
-      "post": {
-        "summary": "Prepare a candidate (propose capability)",
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/Graph"
-          },
-          {
-            "$ref": "#/components/parameters/IdempotencyKey"
-          },
-          {
-            "$ref": "#/components/parameters/CorrelationId"
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/PrepareRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "201": {
-            "description": "candidate prepared",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/PrepareResponse"
-                }
-              }
-            }
-          },
-          "200": {
-            "description": "identical earlier request replayed",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/PrepareResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "$ref": "#/components/responses/Error"
-          },
-          "401": {
-            "$ref": "#/components/responses/Error"
-          },
-          "403": {
-            "$ref": "#/components/responses/Error"
-          },
-          "404": {
-            "$ref": "#/components/responses/Error"
-          },
-          "409": {
-            "$ref": "#/components/responses/Error"
-          },
-          "412": {
-            "$ref": "#/components/responses/Error"
-          },
-          "413": {
-            "$ref": "#/components/responses/Error"
-          },
-          "422": {
-            "$ref": "#/components/responses/Error"
-          },
-          "503": {
-            "$ref": "#/components/responses/Error"
-          },
-          "500": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      }
-    },
-    "/v1/graphs/{graph}/proposals/{candidate}/accept": {
-      "post": {
-        "summary": "Accept a prepared candidate onto a ref (review capability). Fails with VALIDATION_REQUIRED unless the deployment explicitly allows unvalidated acceptance (development/CI only).",
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/Graph"
-          },
-          {
-            "$ref": "#/components/parameters/Candidate"
-          },
-          {
-            "$ref": "#/components/parameters/IdempotencyKey"
-          },
-          {
-            "$ref": "#/components/parameters/CorrelationId"
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/AcceptRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "accepted (or identical earlier acceptance replayed)",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AcceptResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "$ref": "#/components/responses/Error"
-          },
-          "401": {
-            "$ref": "#/components/responses/Error"
-          },
-          "403": {
-            "$ref": "#/components/responses/Error"
-          },
-          "404": {
-            "$ref": "#/components/responses/Error"
-          },
-          "409": {
-            "$ref": "#/components/responses/Error"
-          },
-          "503": {
-            "$ref": "#/components/responses/Error"
-          },
-          "500": {
-            "$ref": "#/components/responses/Error"
-          },
-          "413": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      }
-    },
-    "/v1/graphs/{graph}/proposals/{candidate}/reject": {
-      "post": {
-        "summary": "Reject a prepared candidate (review capability)",
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/Graph"
-          },
-          {
-            "$ref": "#/components/parameters/Candidate"
-          },
-          {
-            "$ref": "#/components/parameters/IdempotencyKey"
-          },
-          {
-            "$ref": "#/components/parameters/CorrelationId"
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/RejectRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "rejected (or replayed)",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RejectResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "$ref": "#/components/responses/Error"
-          },
-          "401": {
-            "$ref": "#/components/responses/Error"
-          },
-          "403": {
-            "$ref": "#/components/responses/Error"
-          },
-          "404": {
-            "$ref": "#/components/responses/Error"
-          },
-          "409": {
-            "$ref": "#/components/responses/Error"
-          },
-          "503": {
-            "$ref": "#/components/responses/Error"
-          },
-          "500": {
-            "$ref": "#/components/responses/Error"
-          },
-          "413": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      }
-    },
-    "/v1/graphs/{graph}/refs": {
-      "get": {
-        "summary": "Read a ref's head and version (read capability)",
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/Graph"
-          },
-          {
-            "name": "name",
-            "in": "query",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/RefName"
-            }
-          },
-          {
-            "$ref": "#/components/parameters/CorrelationId"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "ref",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/RefResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "$ref": "#/components/responses/Error"
-          },
-          "401": {
-            "$ref": "#/components/responses/Error"
-          },
-          "403": {
-            "$ref": "#/components/responses/Error"
-          },
-          "404": {
-            "$ref": "#/components/responses/Error"
-          },
-          "500": {
-            "$ref": "#/components/responses/Error"
-          },
-          "503": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      }
-    },
-    "/v1/graphs/{graph}/commits/{commit}/state": {
-      "get": {
-        "summary": "Reconstruct the state at a commit of this graph (read capability, bounded)",
-        "parameters": [
-          {
-            "$ref": "#/components/parameters/Graph"
-          },
-          {
-            "$ref": "#/components/parameters/Commit"
-          },
-          {
-            "$ref": "#/components/parameters/CorrelationId"
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "state",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/StateResponse"
-                }
-              }
-            }
-          },
-          "401": {
-            "$ref": "#/components/responses/Error"
-          },
-          "403": {
-            "$ref": "#/components/responses/Error"
-          },
-          "404": {
-            "$ref": "#/components/responses/Error"
-          },
-          "413": {
-            "$ref": "#/components/responses/Error"
-          },
-          "503": {
-            "$ref": "#/components/responses/Error"
-          },
-          "500": {
-            "$ref": "#/components/responses/Error"
-          }
-        }
-      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     },
+     "409": {
+      "$ref": "#/components/responses/Error"
+     },
+     "503": {
+      "$ref": "#/components/responses/Error"
+     },
+     "500": {
+      "$ref": "#/components/responses/Error"
+     },
+     "413": {
+      "$ref": "#/components/responses/Error"
+     }
     }
+   }
+  },
+  "/v1/graphs/{graph}/refs": {
+   "get": {
+    "summary": "Read a ref's head and version (read capability)",
+    "parameters": [
+     {
+      "$ref": "#/components/parameters/Graph"
+     },
+     {
+      "name": "name",
+      "in": "query",
+      "required": true,
+      "schema": {
+       "$ref": "#/components/schemas/RefName"
+      }
+     },
+     {
+      "$ref": "#/components/parameters/CorrelationId"
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "ref",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/RefResponse"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     },
+     "500": {
+      "$ref": "#/components/responses/Error"
+     },
+     "503": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/v1/graphs/{graph}/commits/{commit}/state": {
+   "get": {
+    "summary": "Reconstruct the state at a commit of this graph (read capability, bounded)",
+    "parameters": [
+     {
+      "$ref": "#/components/parameters/Graph"
+     },
+     {
+      "$ref": "#/components/parameters/Commit"
+     },
+     {
+      "$ref": "#/components/parameters/CorrelationId"
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "state",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/StateResponse"
+        }
+       }
+      }
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     },
+     "413": {
+      "$ref": "#/components/responses/Error"
+     },
+     "503": {
+      "$ref": "#/components/responses/Error"
+     },
+     "500": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/v1/graphs/{graph}/proposals/{candidate}/validations": {
+   "post": {
+    "summary": "Request a semantic validation of a prepared candidate (validate capability). The ledger reconstructs the candidate state, calls its configured validation service and records the immutable context and record. Never moves a ref.",
+    "parameters": [
+     {
+      "$ref": "#/components/parameters/Graph"
+     },
+     {
+      "$ref": "#/components/parameters/Candidate"
+     },
+     {
+      "$ref": "#/components/parameters/IdempotencyKey"
+     },
+     {
+      "$ref": "#/components/parameters/CorrelationId"
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/ValidateRequest"
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "validation recorded",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ValidationResponse"
+        }
+       }
+      }
+     },
+     "200": {
+      "description": "identical earlier validation replayed",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ValidationResponse"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     },
+     "409": {
+      "$ref": "#/components/responses/Error"
+     },
+     "413": {
+      "$ref": "#/components/responses/Error"
+     },
+     "500": {
+      "$ref": "#/components/responses/Error"
+     },
+     "502": {
+      "$ref": "#/components/responses/Error"
+     },
+     "503": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/v1/graphs/{graph}/proposals/{candidate}/validations/{validation}": {
+   "get": {
+    "summary": "Read one validation record of a candidate (read capability). Another graph's, tenant's or candidate's record is VALIDATION_NOT_FOUND alike.",
+    "parameters": [
+     {
+      "$ref": "#/components/parameters/Graph"
+     },
+     {
+      "$ref": "#/components/parameters/Candidate"
+     },
+     {
+      "$ref": "#/components/parameters/Validation"
+     },
+     {
+      "$ref": "#/components/parameters/CorrelationId"
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "the record and its context",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ValidationResponse"
+        }
+       }
+      }
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     },
+     "500": {
+      "$ref": "#/components/responses/Error"
+     },
+     "503": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
   }
+ }
 }

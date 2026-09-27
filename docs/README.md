@@ -6,7 +6,7 @@
 - Protocol: [canonicalization](design/canonicalization.md), [storage boundaries](design/storage-boundaries.md)
 - API contract: [`api/openapi.json`](api/openapi.json) (served at `/openapi.json`; enforced against the router in tests)
 - Operations: [deployment and operations](operations/deployment.md) (identities, migration sequence, limits, gates)
-- Coordination: [two-phase validation protocol and contracts](design/validation-protocol.md)
+- Coordination: [two-phase validation protocol and contracts](design/validation-protocol.md), [Sculpin validation service contract](design/sculpin-validation-service.md)
 - Agent setup: [agent harness](design/agent-harness.md), [Codex Cloud](design/codex-cloud.md), [Claude Code](design/claude-code.md)
 - [Architecture decisions](decisions/README.md)
 - [Execution plans](exec-plans/README.md) and [technical debt](exec-plans/tech-debt.md)

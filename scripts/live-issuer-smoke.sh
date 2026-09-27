@@ -6,6 +6,8 @@
 # and role/capability mapping. No token is ever committed, printed or logged; it is read from
 # the environment (LEDGER_LIVE_TOKEN) or a file (LEDGER_LIVE_TOKEN_FILE) and passed to curl
 # through a header file. Acceptance is never enabled: prepare is the deepest write exercised.
+# Production authentication requires a validator trust anchor (ADR-0019 amendment); the
+# smoke test names one without an endpoint (validation is not exercised here).
 #
 # Required environment:
 #   LEDGER_LIVE_ISSUER        e.g. https://login.microsoftonline.com/<tenant-id>/v2.0
@@ -42,6 +44,7 @@ trap cleanup EXIT
 # acceptance stays fail-closed (no LEDGER_UNVALIDATED_ACCEPTANCE).
 docker run -d --name "${PROJECT}-server" --network "${PROJECT}_default" -p 127.0.0.1:8080:8080 \
   -e LEDGER_ADDR=0.0.0.0:8080 -e LEDGER_DATABASE_URL='postgres://ledger_runtime:ledger-runtime-development-only@postgres:5432/ledger?sslmode=disable' \
+  -e LEDGER_VALIDATOR_SERVICE_ID="${LEDGER_LIVE_VALIDATOR_SERVICE_ID:-urn:sculpin:service:live-smoke-no-endpoint}" \
   -e LEDGER_AUTH_MODE=oidc -e LEDGER_AUTH_ISSUER="${LEDGER_LIVE_ISSUER}" -e LEDGER_AUTH_AUDIENCE="${LEDGER_LIVE_AUDIENCE}" -e LEDGER_AUTH_JWKS_URL="${LEDGER_LIVE_JWKS_URL}" \
   ${LEDGER_AUTH_TENANT_CLAIM:+-e LEDGER_AUTH_TENANT_CLAIM="${LEDGER_AUTH_TENANT_CLAIM}"} ${LEDGER_AUTH_PRINCIPAL_CLAIM:+-e LEDGER_AUTH_PRINCIPAL_CLAIM="${LEDGER_AUTH_PRINCIPAL_CLAIM}"} \
   ${LEDGER_AUTH_PRINCIPAL_TYPE_CLAIM:+-e LEDGER_AUTH_PRINCIPAL_TYPE_CLAIM="${LEDGER_AUTH_PRINCIPAL_TYPE_CLAIM}"} ${LEDGER_AUTH_ROLES_CLAIM:+-e LEDGER_AUTH_ROLES_CLAIM="${LEDGER_AUTH_ROLES_CLAIM}"} \

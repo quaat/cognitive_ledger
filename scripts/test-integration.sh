@@ -69,6 +69,13 @@ cargo test -p ledger-store --features postgres --test pg_least_privilege -- --ig
 # --- 1h. Invariant verifier (Plan 0005 §20): clean history passes, bypasses detected -----
 cargo test -p ledger-store --features postgres --test pg_verify -- --ignored --nocapture
 
+# --- 1i. Semantic validation persistence and acceptance binding (Plan 0006, ADR-0018/0019) --
+cargo test -p ledger-store --features postgres --test pg_validation -- --ignored --nocapture
+
+# --- 1j. Phase 2 over HTTP with a deterministic fake validator: every ADR-0014 scenario,
+#         revalidation, idempotency, capabilities, tenant isolation, limits -----------------
+cargo test -p ledger-api --test pg_validation_api -- --ignored --nocapture
+
 # --- 2. Containerised server: provision, authenticate, prepare/accept v2, restart, read ---
 curl --fail --silent --retry 10 --retry-delay 2 --retry-all-errors --retry-connrefused "${BASE}/health" >/dev/null
 curl --fail --silent "${BASE}/ready" >/dev/null

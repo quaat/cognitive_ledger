@@ -1,0 +1,12 @@
+{
+  "base_kb": {
+    "kb_id": "urn:exodus:kb:material-science",
+    "revision": "kbrev:sha256:9f2c-composed-by-sculpin"
+  },
+  "shapes": {
+    "id": "urn:sculpin:shapes:material",
+    "version": "12+shapes_hash:4b7e"
+  },
+  "validator_service_version": "2026.09.1",
+  "validator_configuration_version": "cfg-2026-09-27"
+}

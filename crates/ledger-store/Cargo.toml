@@ -11,6 +11,7 @@ async-trait.workspace = true
 fs2 = "0.4.3"
 ledger-core = { path = "../ledger-core" }
 ledger-rdf = { path = "../ledger-rdf" }
+ledger-validation-protocol = { path = "../ledger-validation-protocol" }
 serde.workspace = true
 sha2.workspace = true
 hex.workspace = true

@@ -15,6 +15,7 @@ for clean install and for the supported upgrade path against a real PostgreSQL
 | 0007 | actor scope, correlation, tenant integrity | `idempotency` gains `principal_type`/`on_behalf_of` (backfilled from each row's proposal; fails closed on unbindable or mismatched rows), a surrogate primary key and `UNIQUE NULLS NOT DISTINCT (tenant_id, principal_id, principal_type, on_behalf_of, graph_id, operation, idempotency_key)`; bounded `correlation_id` (1–128 bytes, nullable, audit only) on `proposals`, `ref_events`, `decisions`; `graphs UNIQUE (graph_id, tenant_id)` and composite `(graph_id, tenant_id) → graphs` FKs from `proposals`, `ref_events`, `decisions`, `idempotency`. |
 | 0008 | runtime least privilege (ADR-0016) | Installs `ledger_grant_runtime(role text)` (owner-only, pinned `search_path`, refuses superusers and roles with `CREATE` on the schema): revokes everything the role holds on the schema, then grants `USAGE` on the schema, `SELECT` on every ledger table and `_sqlx_migrations`, column-level `INSERT` matching the store's INSERT statements, `UPDATE (head, version, updated_at)` on `refs`, `USAGE` on the audit sequences. Creates no role. Applied by `ledger-admin migrate --runtime-role <name>`. |
 | 0009 | ref movement integrity (ADR-0016) | Deferred constraint trigger: a head move on an `active`/`archived` graph needs a matching `ref_events` row in the same transaction and must be a fast-forward; `graphs` status changes take the exclusive `graph-status:` advisory lock; `immutable_objects.id` must be the SHA-256 of `bytes`; `ledger_lock_key(text)` mirrors `ledger_store::lock_key`. |
+| 0010 | semantic validation (ADR-0018/0019) | `semantic_execution_contexts` and `validation_records` (content-addressed: id = SHA-256 of `canonical_bytes`, CHECK-enforced), `semantic_virtual_contexts`, `validation_violations`, `decision_validations` (composite FKs prove a decision cites validations of its own graph and candidate; the record→context FK binds graph, candidate, state digest and validator); `idempotency` gains operation `validate`, result `validated` and `result_validation_id` (composite FK to a record of the same graph and candidate, shape CHECK); `decisions_identity UNIQUE (decision_id, graph_id, candidate_commit)`; write-once triggers; `ledger_grant_runtime` re-issued with column-level INSERT on the new tables. Guard: refuses if any decision already cites validation ids. |
 | 0006 | workflow persistence | `refs.version` (monotonic, trigger-enforced) and `refs.protected`; composite FK `refs(graph_id, head) → commit_index(graph_id, id)`; append-only `proposals`, `ref_events`, `decisions`; `projection_outbox` (identity immutable, delivery columns mutable); `idempotency` results. Guard: fails with the offending `(graph, branch → head)` list if any existing ref head is not an indexed commit of its graph. |
 
 ## Upgrade semantics of 0004
@@ -52,6 +53,19 @@ recorded level is behind or ahead of `REQUIRED_SCHEMA_VERSION`, when the migrati
 absent, when a recorded migration failed, or when a recorded checksum differs from the
 embedded migration (released migrations are immutable). The runtime role cannot run DDL,
 so a misconfigured deployment cannot migrate by accident.
+
+## Upgrade semantics of 0010
+- Additive: five tables, one FK-target UNIQUE on `decisions`, two re-issued CHECKs on
+  `idempotency` (the runtime's `validate` operation), one nullable FK column on
+  `idempotency`, write-once triggers and the re-issued grant function. No content is
+  rewritten. Stop the replicas first (a pre-0010 build refuses a 0010 database as *ahead*,
+  a 0010 build refuses 0009 as *behind*), then `ledger-admin migrate --runtime-role <role>`
+  so the Phase-2 column grants are applied.
+- Content identity is a schema fact: `context_id`/`validation_id` must equal the SHA-256 of
+  the stored canonical bytes (ADR-0018), probed at start-up like the object CHECK.
+- `decisions.validation_ids` keeps its meaning and is populated identically to
+  `decision_validations`; the relation is the enforced one (`ledger-admin verify` checks
+  they agree).
 
 ## Upgrade semantics of 0008 and 0009
 - 0008 is additive: one function and a `REVOKE`. Requires the operator-created runtime role

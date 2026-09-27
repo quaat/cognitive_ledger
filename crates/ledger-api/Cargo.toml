@@ -13,6 +13,7 @@ jsonwebtoken.workspace = true
 ledger-core = { path = "../ledger-core" }
 ledger-rdf = { path = "../ledger-rdf" }
 ledger-store = { path = "../ledger-store", features = ["postgres"] }
+ledger-validation-protocol = { path = "../ledger-validation-protocol" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

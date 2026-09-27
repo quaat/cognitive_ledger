@@ -13,7 +13,8 @@ use ledger_core::{
 use ledger_rdf::{Operation, OperationKind, Patch, Quad};
 use ledger_store::{
     AcceptRequest, DbSessionLimits, GraphStatus, NewGraph, PgGraphs, PostgresLedgerStore,
-    PrepareRequest, RejectRequest, RequestScope, V1Binding, ValidationPolicy, schema,
+    PrepareRequest, RejectRequest, RequestScope, V1Binding, ValidateRequest, ValidationBegin,
+    ValidationPolicy, ValidatorOutcome, schema,
 };
 use sqlx::{Connection, PgConnection, PgPool, Row, postgres::PgPoolOptions};
 use std::{
@@ -264,6 +265,7 @@ async fn runtime_identity_serves_the_workflow_but_cannot_touch_schema_or_history
         branch: "main".into(),
         candidate: p2.candidate.clone(),
         reason: "no".into(),
+        validation_id: None,
     })
     .await
     .expect("reject under the runtime identity");
@@ -357,6 +359,11 @@ async fn runtime_identity_serves_the_workflow_but_cannot_touch_schema_or_history
             "projection_outbox",
             "idempotency",
             "_sqlx_migrations",
+            "semantic_execution_contexts",
+            "semantic_virtual_contexts",
+            "validation_records",
+            "validation_violations",
+            "decision_validations",
         ] {
             let (n,): (i64,) = sqlx::query_as(&format!("SELECT count(*) FROM {table}"))
                 .fetch_one(&pool)
@@ -408,6 +415,19 @@ async fn runtime_identity_serves_the_workflow_but_cannot_touch_schema_or_history
         "DROP FUNCTION ledger_rows_are_write_once()",
         "SELECT ledger_grant_runtime('public')",
         "CREATE ROLE smuggled_role",
+        // Phase 2 tables (0010): insert-only for the runtime, never rewrite or delete.
+        "UPDATE semantic_execution_contexts SET base_kb_revision = 'x'",
+        "DELETE FROM semantic_execution_contexts",
+        "UPDATE semantic_virtual_contexts SET source_version = 'x'",
+        "DELETE FROM semantic_virtual_contexts",
+        "UPDATE validation_records SET outcome = 'conforms', violation_count = 0",
+        "DELETE FROM validation_records",
+        "UPDATE validation_violations SET message = 'x'",
+        "DELETE FROM validation_violations",
+        "UPDATE decision_validations SET validation_id = validation_id",
+        "DELETE FROM decision_validations",
+        "ALTER TABLE validation_records DISABLE TRIGGER validation_records_write_once",
+        "DROP TABLE decision_validations",
     ] {
         assert_denied(rt, sql).await;
     }
@@ -418,6 +438,9 @@ async fn runtime_identity_serves_the_workflow_but_cannot_touch_schema_or_history
         "INSERT INTO refs (graph_id, branch, head, version, protected) VALUES ('x', 'y', 'z', 1, false)",
         "INSERT INTO projection_outbox (graph_id, branch, commit_id, ref_version, event_kind, ref_event_id, delivered_at) VALUES ('x','y','z',1,'ref_advanced',1, now())",
         "INSERT INTO decisions (proposal_id, graph_id, branch, candidate_commit, decision, tenant_id, principal_id, principal_type, reason, validation_ids, decided_at) VALUES (1,'x','y','z','rejected','t','p','agent','r','{}', now())",
+        // Back-dating the audit timestamp of a validation record or context is not granted.
+        "INSERT INTO validation_records (validation_id, graph_id, tenant_id, candidate_commit, candidate_state_digest, context_id, validator_service_id, validator_service_version, validator_configuration_version, outcome, violation_count, report_digest, recorded_at, principal_id, principal_type, canonical_bytes, created_at) VALUES ('x','y','t','z','d','c','s','v','c','conforms',0,'r',now(),'p','agent','\\x00', now())",
+        "INSERT INTO semantic_execution_contexts (context_id, graph_id, tenant_id, candidate_commit, candidate_state_digest, base_kb_id, base_kb_revision, shapes_id, shapes_version, reasoning_profile, reasoning_implementation, reasoning_version, validator_service_id, validator_service_version, validator_configuration_version, virtual_context_count, canonical_bytes, created_at) VALUES ('x','y','t','z','d','k','r','s','v','p','i','v','s','v','c',0,'\\x00', now())",
     ] {
         assert_denied(rt, sql).await;
     }
@@ -429,12 +452,12 @@ async fn runtime_identity_serves_the_workflow_but_cannot_touch_schema_or_history
     // Running the migrations as the runtime identity is refused by PostgreSQL itself, even
     // when a migration is pending: the owner removes the last migration's record so the
     // runtime would have something to apply.
-    let (checksum9,): (Vec<u8>,) =
-        sqlx::query_as("SELECT checksum FROM _sqlx_migrations WHERE version = 9")
+    let (checksum10,): (Vec<u8>,) =
+        sqlx::query_as("SELECT checksum FROM _sqlx_migrations WHERE version = 10")
             .fetch_one(&f.owner)
             .await
             .unwrap();
-    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 9")
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 10")
         .execute(&f.owner)
         .await
         .unwrap();
@@ -443,16 +466,16 @@ async fn runtime_identity_serves_the_workflow_but_cannot_touch_schema_or_history
         matches!(&err, LedgerError::Storage(m) if m.contains("permission denied") || m.contains("must be owner")),
         "{err:?}"
     );
-    let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM _sqlx_migrations WHERE version = 9")
+    let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM _sqlx_migrations WHERE version = 10")
         .fetch_one(&f.owner)
         .await
         .unwrap();
     assert_eq!(n, 0, "the runtime must not have applied anything");
     sqlx::query(
         "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
-         VALUES (9, 'ref movement integrity', true, $1, 0)",
+         VALUES (10, 'semantic validation', true, $1, 0)",
     )
-    .bind(&checksum9)
+    .bind(&checksum10)
     .execute(&f.owner)
     .await
     .unwrap();
@@ -568,7 +591,7 @@ async fn startup_and_readiness_refuse_any_schema_level_but_the_required_one() {
         .err()
         .unwrap();
     assert!(
-        matches!(&err, LedgerError::SchemaIncompatible(m) if m.contains("0007") && m.contains("requires 0009")),
+        matches!(&err, LedgerError::SchemaIncompatible(m) if m.contains("0007") && m.contains("requires 0010")),
         "{err}"
     );
     // Exactly right: connects; then readiness follows the schema level live.
@@ -719,6 +742,11 @@ async fn grant_function_is_owner_only_idempotent_and_refuses_unknown_roles() {
         "projection_outbox",
         "idempotency",
         "_sqlx_migrations",
+        "semantic_execution_contexts",
+        "semantic_virtual_contexts",
+        "validation_records",
+        "validation_violations",
+        "decision_validations",
     ];
     let insertable = [
         "refs",
@@ -730,6 +758,11 @@ async fn grant_function_is_owner_only_idempotent_and_refuses_unknown_roles() {
         "decisions",
         "projection_outbox",
         "idempotency",
+        "semantic_execution_contexts",
+        "semantic_virtual_contexts",
+        "validation_records",
+        "validation_violations",
+        "decision_validations",
     ];
     for table in tables {
         for privilege in [
@@ -800,6 +833,8 @@ async fn grant_function_is_owner_only_idempotent_and_refuses_unknown_roles() {
         "ref_events.recorded_at",
         "idempotency.idempotency_id",
         "idempotency.created_at",
+        "semantic_execution_contexts.created_at",
+        "validation_records.created_at",
     ] {
         assert!(
             !granted.contains(&absent.to_owned()),
@@ -812,6 +847,7 @@ async fn grant_function_is_owner_only_idempotent_and_refuses_unknown_roles() {
         "proposals.candidate_commit",
         "decisions.ref_event_id",
         "idempotency.request_digest",
+        "idempotency.result_validation_id",
         "immutable_objects.bytes",
     ] {
         assert!(
@@ -819,6 +855,132 @@ async fn grant_function_is_owner_only_idempotent_and_refuses_unknown_roles() {
             "{present} must be insertable"
         );
     }
+    // Phase-2 tables (0010): INSERT exactly on the columns the store's statements name.
+    let phase2_insert: [(&str, &[&str]); 5] = [
+        (
+            "semantic_execution_contexts",
+            &[
+                "context_id",
+                "graph_id",
+                "tenant_id",
+                "candidate_commit",
+                "candidate_state_digest",
+                "base_kb_id",
+                "base_kb_revision",
+                "ontology_id",
+                "ontology_version",
+                "shapes_id",
+                "shapes_version",
+                "reasoning_profile",
+                "reasoning_implementation",
+                "reasoning_version",
+                "sources_revision",
+                "validator_service_id",
+                "validator_service_version",
+                "validator_configuration_version",
+                "virtual_context_count",
+                "canonical_bytes",
+            ],
+        ),
+        (
+            "semantic_virtual_contexts",
+            &[
+                "context_id",
+                "position",
+                "dataset_id",
+                "source_version",
+                "object_refs",
+                "query_spec_digest",
+                "hydration_plan_digest",
+            ],
+        ),
+        (
+            "validation_records",
+            &[
+                "validation_id",
+                "graph_id",
+                "tenant_id",
+                "candidate_commit",
+                "candidate_state_digest",
+                "context_id",
+                "validator_service_id",
+                "validator_service_version",
+                "validator_configuration_version",
+                "outcome",
+                "violation_count",
+                "report_digest",
+                "report_reference",
+                "recorded_at",
+                "principal_id",
+                "principal_type",
+                "on_behalf_of",
+                "correlation_id",
+                "canonical_bytes",
+            ],
+        ),
+        (
+            "validation_violations",
+            &["validation_id", "position", "severity", "code", "message"],
+        ),
+        (
+            "decision_validations",
+            &[
+                "decision_id",
+                "validation_id",
+                "graph_id",
+                "candidate_commit",
+            ],
+        ),
+    ];
+    for (table, columns) in phase2_insert {
+        let mut expected: Vec<String> = columns.iter().map(|c| format!("{table}.{c}")).collect();
+        expected.sort();
+        let mut actual: Vec<String> = granted
+            .iter()
+            .filter(|c| c.starts_with(&format!("{table}.")))
+            .cloned()
+            .collect();
+        actual.sort();
+        assert_eq!(actual, expected, "{table}: INSERT column set");
+        // Per column, through the runtime identity: INSERT only where listed, never UPDATE
+        // or REFERENCES on any column (write-once, no FK targets for the runtime).
+        let all: Vec<String> = sqlx::query_scalar(
+            "SELECT column_name::text FROM information_schema.columns \
+             WHERE table_schema = 'public' AND table_name = $1 ORDER BY column_name",
+        )
+        .bind(table)
+        .fetch_all(&f.owner)
+        .await
+        .unwrap();
+        for column in columns.iter() {
+            assert!(all.iter().any(|c| c == column), "{table}.{column} exists");
+        }
+        for column in &all {
+            let (select, insert, update, references): (bool, bool, bool, bool) = sqlx::query_as(
+                "SELECT has_column_privilege($1, $2, 'SELECT'), has_column_privilege($1, $2, 'INSERT'), \
+                        has_column_privilege($1, $2, 'UPDATE'), has_column_privilege($1, $2, 'REFERENCES')",
+            )
+            .bind(table)
+            .bind(column)
+            .fetch_one(&rt)
+            .await
+            .unwrap();
+            assert_eq!(
+                (select, insert, update, references),
+                (true, columns.contains(&column.as_str()), false, false),
+                "{table}.{column}"
+            );
+        }
+    }
+    // idempotency gained exactly one insertable column in 0010; it is not updatable.
+    let (insert, update): (bool, bool) = sqlx::query_as(
+        "SELECT has_column_privilege('idempotency', 'result_validation_id', 'INSERT'), \
+                has_column_privilege('idempotency', 'result_validation_id', 'UPDATE')",
+    )
+    .fetch_one(&rt)
+    .await
+    .unwrap();
+    assert_eq!((insert, update), (true, false));
     // UPDATE on refs is column-limited to what the workflow changes.
     let cols = sqlx::query(
         "SELECT column_name FROM information_schema.column_privileges \
@@ -2055,5 +2217,592 @@ async fn duplicate_invalid_constraints_foreign_schemas_null_semantics_and_predic
     owner_exec(&fx, "ALTER TABLE decisions ADD CONSTRAINT decisions_accepted_has_event CHECK ((decision = 'accepted' AND ref_event_id IS NOT NULL) OR (decision <> 'accepted' AND ref_event_id IS NULL))").await;
     assert_healthy(&fx, "all restored").await;
     running.ready().await.expect("readiness after restore");
+    fx.teardown().await;
+}
+
+/// Phase 2 (Plan 0006): the runtime identity records validation contexts and records and
+/// accepts a candidate under a cited validation with exactly the 0010 grants; the 0010
+/// controls the acceptance binding depends on are verified at start-up and readiness.
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn validation_persistence_runs_under_the_runtime_identity_and_its_controls_are_verified() {
+    use ledger_validation_protocol::{
+        BaseKb, Reasoning, RequestedContext, SemanticExecutionContext, ShapeSet, ValidationOutcome,
+        ValidatorIdentity,
+    };
+    let fx = fixture("lp_validation").await;
+    fx.migrate_and_grant().await;
+    let g = GraphId::new(unique("g").replace('_', "-")).unwrap();
+    PgGraphs::new(fx.owner.clone())
+        .create(&NewGraph {
+            graph_id: g.clone(),
+            tenant_id: TenantId::new("tenant-lp").unwrap(),
+            knowledge_base_id: None,
+            purpose: None,
+            status: GraphStatus::Active,
+        })
+        .await
+        .unwrap();
+    let running = PostgresLedgerStore::connect(&fx.runtime_db_url, V1Binding::Reject)
+        .await
+        .unwrap()
+        .with_validation_trust(
+            ledger_store::ValidationTrustPolicy::single("urn:sculpin:service:validator").unwrap(),
+        );
+    let wf = running.workflows();
+    let prepared = wf
+        .prepare(&PrepareRequest {
+            scope: scope(&g, "k1", b"p1"),
+            branch: "main".into(),
+            expected_head: None,
+            requested: patch("<urn:s> <urn:p> \"1\" .", OperationKind::Add),
+            activity: "a".into(),
+            event_time: None,
+            evidence_refs: vec![],
+            source_system: None,
+            message: "m".into(),
+        })
+        .await
+        .unwrap();
+    let request = ValidateRequest {
+        scope: scope(&g, "k-v", b"validate"),
+        candidate: prepared.candidate.clone(),
+        requested: RequestedContext::default(),
+    };
+    let ValidationBegin::Fresh(ticket) = running.validations().begin(&request).await.unwrap()
+    else {
+        panic!("no validation yet");
+    };
+    let context = SemanticExecutionContext {
+        graph_id: g.clone(),
+        candidate_commit: prepared.candidate.clone(),
+        candidate_state_digest: ticket.state_digest().clone(),
+        base_kb: BaseKb {
+            kb_id: "kb".into(),
+            revision: "r1".into(),
+        },
+        ontology: None,
+        shapes: ShapeSet {
+            id: "shapes".into(),
+            version: "1".into(),
+        },
+        reasoning: Some(Reasoning {
+            profile: "none".into(),
+            implementation: "pyshacl".into(),
+            version: "0.26".into(),
+        }),
+        sources_revision: None,
+        virtual_contexts: vec![],
+        validator: ValidatorIdentity {
+            service_id: "urn:sculpin:service:validator".into(),
+            service_version: "1".into(),
+            configuration_version: "1".into(),
+        },
+    };
+    let recorded = running
+        .validations()
+        .record(
+            &request,
+            &ticket,
+            ValidatorOutcome {
+                context,
+                outcome: ValidationOutcome::conforms(),
+                report_digest: ledger_core::ContentId::for_bytes(b"report"),
+                report_reference: None,
+            },
+        )
+        .await
+        .expect("record a validation under the runtime identity");
+    let accepted = wf
+        .accept(&AcceptRequest {
+            scope: scope(&g, "k-a", b"accept"),
+            branch: "main".into(),
+            expected_head: None,
+            candidate: prepared.candidate.clone(),
+            reason: None,
+            validation: ValidationPolicy::Validated {
+                validation_id: recorded.validation_id.clone(),
+                semantic_environment_id: recorded.environment_id.clone(),
+            },
+        })
+        .await
+        .expect("accept under a cited validation with the runtime identity");
+    assert_eq!(accepted.ref_version, 1);
+    let (linked,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM decision_validations WHERE decision_id = $1")
+            .bind(accepted.decision_id)
+            .fetch_one(&fx.owner)
+            .await
+            .unwrap();
+    assert_eq!(linked, 1);
+
+    // Drift of the controls the binding depends on (owner statements), each refused at
+    // start-up and readiness, healthy again after restoration.
+    owner_exec(
+        &fx,
+        "ALTER TABLE decision_validations DROP CONSTRAINT dv_validation_fk",
+    )
+    .await;
+    let m = assert_refused_by_schema(&fx, &running, "decision→validation FK dropped").await;
+    assert!(m.contains("decision_validations FOREIGN KEY"), "{m}");
+    owner_exec(&fx, "ALTER TABLE decision_validations ADD CONSTRAINT dv_validation_fk FOREIGN KEY (validation_id, graph_id, candidate_commit) REFERENCES validation_records (validation_id, graph_id, candidate_commit)").await;
+    assert_healthy(&fx, "FK restored").await;
+    owner_exec(
+        &fx,
+        "ALTER TABLE validation_records DROP CONSTRAINT vr_context_fk",
+    )
+    .await;
+    let m = assert_refused_by_schema(&fx, &running, "record→context FK dropped").await;
+    assert!(m.contains("validation_records FOREIGN KEY"), "{m}");
+    owner_exec(&fx, "ALTER TABLE validation_records ADD CONSTRAINT vr_context_fk FOREIGN KEY (context_id, graph_id, candidate_commit, candidate_state_digest, validator_service_id, validator_service_version, validator_configuration_version) REFERENCES semantic_execution_contexts (context_id, graph_id, candidate_commit, candidate_state_digest, validator_service_id, validator_service_version, validator_configuration_version)").await;
+    assert_healthy(&fx, "FK restored").await;
+    owner_exec(
+        &fx,
+        "ALTER TABLE validation_records DISABLE TRIGGER validation_records_write_once",
+    )
+    .await;
+    let m = assert_refused_by_schema(&fx, &running, "record write-once guard disabled").await;
+    assert!(m.contains("validation_records_write_once"), "{m}");
+    owner_exec(
+        &fx,
+        "ALTER TABLE validation_records ENABLE TRIGGER validation_records_write_once",
+    )
+    .await;
+    assert_healthy(&fx, "guard enabled").await;
+    // A vacuous content-address CHECK keeps its name: catalog presence passes, the definition
+    // check refuses start-up, the fingerprint refuses readiness, the probe would refuse too.
+    owner_exec(
+        &fx,
+        "ALTER TABLE validation_records DROP CONSTRAINT vr_content_addressed",
+    )
+    .await;
+    owner_exec(
+        &fx,
+        "ALTER TABLE validation_records ADD CONSTRAINT vr_content_addressed CHECK (true)",
+    )
+    .await;
+    match PostgresLedgerStore::connect(&fx.runtime_db_url, V1Binding::Reject).await {
+        Err(LedgerError::SchemaIncompatible(m)) => {
+            assert!(m.contains("vr_content_addressed"), "{m}")
+        }
+        other => panic!("vacuous content-address CHECK must refuse start-up: {other:?}"),
+    }
+    assert!(matches!(
+        running.ready().await,
+        Err(LedgerError::SchemaIncompatible(_))
+    ));
+    owner_exec(
+        &fx,
+        "ALTER TABLE validation_records DROP CONSTRAINT vr_content_addressed",
+    )
+    .await;
+    owner_exec(&fx, "ALTER TABLE validation_records ADD CONSTRAINT vr_content_addressed CHECK (validation_id = 'sha256:' || encode(sha256(canonical_bytes), 'hex'))").await;
+    PostgresLedgerStore::connect(&fx.runtime_db_url, V1Binding::Reject)
+        .await
+        .expect("healthy after restoring the CHECK");
+    // The idempotency operation CHECK (which since 0010 admits `validate`) must be present;
+    // a `validate` row already exists here, so a pre-0010 definition cannot even be re-added.
+    owner_exec(
+        &fx,
+        "ALTER TABLE idempotency DROP CONSTRAINT idempotency_operation",
+    )
+    .await;
+    let m = assert_refused_by_schema(&fx, &running, "idempotency_operation CHECK dropped").await;
+    assert!(m.contains("idempotency_operation"), "{m}");
+    owner_exec(&fx, "ALTER TABLE idempotency ADD CONSTRAINT idempotency_operation CHECK (operation IN ('prepare', 'accept', 'reject', 'validate'))").await;
+    assert_healthy(&fx, "operation CHECK restored").await;
+    // A runtime that gained UPDATE on a validation column, or lost a required INSERT column,
+    // is refused as an identity drift.
+    owner_exec(
+        &fx,
+        &format!(
+            "GRANT UPDATE (outcome) ON validation_records TO {}",
+            fx.role
+        ),
+    )
+    .await;
+    let m = assert_refused_by_identity(&fx, "UPDATE (outcome) granted").await;
+    assert!(m.contains("validation_records.outcome"), "{m}");
+    owner_exec(
+        &fx,
+        &format!(
+            "REVOKE UPDATE (outcome) ON validation_records FROM {}",
+            fx.role
+        ),
+    )
+    .await;
+    owner_exec(
+        &fx,
+        &format!(
+            "REVOKE INSERT (canonical_bytes) ON semantic_execution_contexts FROM {}",
+            fx.role
+        ),
+    )
+    .await;
+    let m = assert_refused_by_identity(&fx, "INSERT (canonical_bytes) revoked").await;
+    assert!(
+        m.contains("semantic_execution_contexts.canonical_bytes"),
+        "{m}"
+    );
+    let mut conn = sqlx::postgres::PgConnection::connect(&fx.owner_db_url)
+        .await
+        .unwrap();
+    schema::grant_runtime_role(&mut conn, &fx.role)
+        .await
+        .unwrap();
+    conn.close().await.unwrap();
+    assert_healthy(&fx, "re-granted").await;
+    running
+        .ready()
+        .await
+        .expect("readiness after every restoration");
+    fx.teardown().await;
+}
+
+/// A named CHECK replaced by a vacuous `CHECK (true)` keeps its name, so the lock-free
+/// catalog check passes; start-up must refuse by definition (naming the constraint) and a
+/// running server's readiness by the changed fingerprint. Restored, both serve again.
+async fn assert_vacuous_check_refused(
+    fx: &Fixture,
+    running: &PostgresLedgerStore,
+    table: &str,
+    name: &str,
+    real: &str,
+) {
+    owner_exec(fx, &format!("ALTER TABLE {table} DROP CONSTRAINT {name}")).await;
+    let m = assert_refused_by_schema(fx, running, &format!("{name} dropped")).await;
+    assert!(m.contains(name) && m.contains("missing"), "{name}: {m}");
+    owner_exec(
+        fx,
+        &format!("ALTER TABLE {table} ADD CONSTRAINT {name} CHECK (true)"),
+    )
+    .await;
+    {
+        let rt = fx.runtime_pool().await;
+        schema::verify(&rt)
+            .await
+            .unwrap_or_else(|e| panic!("{name}: catalog facts alone still pass: {e}"));
+        rt.close().await;
+    }
+    match PostgresLedgerStore::connect(&fx.runtime_db_url, V1Binding::Reject).await {
+        Err(LedgerError::SchemaIncompatible(m)) => assert!(m.contains(name), "{name}: {m}"),
+        other => panic!("{name} CHECK (true) must refuse start-up: {other:?}"),
+    }
+    match running.ready().await {
+        Err(LedgerError::SchemaIncompatible(m)) => {
+            assert!(m.contains("changed since start-up"), "{name}: {m}")
+        }
+        other => panic!("{name} CHECK (true) must refuse readiness: {other:?}"),
+    }
+    owner_exec(fx, &format!("ALTER TABLE {table} DROP CONSTRAINT {name}")).await;
+    owner_exec(
+        fx,
+        &format!("ALTER TABLE {table} ADD CONSTRAINT {name} CHECK ({real})"),
+    )
+    .await;
+    PostgresLedgerStore::connect(&fx.runtime_db_url, V1Binding::Reject)
+        .await
+        .unwrap_or_else(|e| panic!("{name} restored: start-up serves again: {e}"));
+    running
+        .ready()
+        .await
+        .unwrap_or_else(|e| panic!("{name} restored: readiness again: {e}"));
+}
+
+/// ADR-0017: a logical restore recreates every CHECK from its deparsed text. Recreating each
+/// one exactly that way (what `pg_restore` does) keeps the database servable — PostgreSQL
+/// flattens the nested `AND` of `BETWEEN`-style bounds, which the verifier accepts as the
+/// restored form — while a same-named constraint with a changed bound is still refused.
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn checks_recreated_as_a_logical_restore_does_are_accepted_and_changes_still_refused() {
+    let fx = fixture("lp_restore_checks").await;
+    fx.migrate_and_grant().await;
+    let running = PostgresLedgerStore::connect(&fx.runtime_db_url, V1Binding::Reject)
+        .await
+        .expect("healthy database serves");
+    let checks: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT c.relname::text, con.conname::text, pg_get_constraintdef(con.oid) FROM pg_constraint con \
+         JOIN pg_class c ON c.oid = con.conrelid WHERE con.contype = 'c' \
+           AND c.relnamespace = 'public'::regnamespace ORDER BY 1, 2",
+    )
+    .fetch_all(&fx.owner)
+    .await
+    .unwrap();
+    assert!(checks.len() >= 56, "{}", checks.len());
+    let mut changed = 0;
+    for (table, name, def) in &checks {
+        owner_exec(
+            &fx,
+            &format!("ALTER TABLE {table} DROP CONSTRAINT {name}, ADD CONSTRAINT {name} {def}"),
+        )
+        .await;
+        let again: String = sqlx::query_scalar(
+            "SELECT pg_get_constraintdef(con.oid) FROM pg_constraint con JOIN pg_class c \
+             ON c.oid = con.conrelid WHERE c.relname = $1 AND con.conname = $2",
+        )
+        .bind(table)
+        .bind(name)
+        .fetch_one(&fx.owner)
+        .await
+        .unwrap();
+        if &again != def {
+            changed += 1;
+        }
+    }
+    assert_eq!(
+        changed, 7,
+        "the re-parse flattens exactly the BETWEEN-style bounds"
+    );
+    // A server started before the recreation sees changed fingerprints and stops serving
+    // until verified again (drift detection); a server started on the restored database —
+    // what a restore always means — verifies the restored forms and serves.
+    assert!(
+        running.ready().await.is_err(),
+        "drift since start-up is refused"
+    );
+    assert_healthy(&fx, "every CHECK recreated from its deparsed text").await;
+    let running = PostgresLedgerStore::connect(&fx.runtime_db_url, V1Binding::Reject)
+        .await
+        .expect("a server started on the restored form serves");
+    running
+        .ready()
+        .await
+        .expect("readiness on the restored form");
+    // The restored form is accepted only as the exact flattened text: a changed bound is not.
+    owner_exec(
+        &fx,
+        "ALTER TABLE refs DROP CONSTRAINT refs_branch_bounds, ADD CONSTRAINT refs_branch_bounds \
+         CHECK (octet_length(branch) >= 1 AND octet_length(branch) <= 129 \
+         AND branch ~ '^[A-Za-z0-9._/-]+$')",
+    )
+    .await;
+    match PostgresLedgerStore::connect(&fx.runtime_db_url, V1Binding::Reject).await {
+        Err(LedgerError::SchemaIncompatible(m)) => assert!(m.contains("refs_branch_bounds"), "{m}"),
+        other => panic!("a widened branch bound must refuse start-up: {other:?}"),
+    }
+    match running.ready().await {
+        Err(LedgerError::SchemaIncompatible(m)) => {
+            assert!(m.contains("changed since start-up"), "{m}")
+        }
+        other => panic!("a widened branch bound must refuse readiness: {other:?}"),
+    }
+    // Whitespace inside a literal is content: a space added to the branch alphabet is refused.
+    owner_exec(
+        &fx,
+        "ALTER TABLE refs DROP CONSTRAINT refs_branch_bounds, ADD CONSTRAINT refs_branch_bounds \
+         CHECK (octet_length(branch) >= 1 AND octet_length(branch) <= 128 \
+         AND branch ~ '^[A-Za-z0-9._/ -]+$')",
+    )
+    .await;
+    match PostgresLedgerStore::connect(&fx.runtime_db_url, V1Binding::Reject).await {
+        Err(LedgerError::SchemaIncompatible(m)) => assert!(m.contains("refs_branch_bounds"), "{m}"),
+        other => panic!("a widened branch alphabet must refuse start-up: {other:?}"),
+    }
+    // A quoted identifier is compared exactly: a CHECK moved to a look-alike column
+    // `"position::text"` does not pass for the one on `position`.
+    owner_exec(
+        &fx,
+        "ALTER TABLE commit_parents ADD COLUMN \"position::text\" smallint NOT NULL DEFAULT 0",
+    )
+    .await;
+    owner_exec(
+        &fx,
+        "ALTER TABLE commit_parents DROP CONSTRAINT commit_parents_position, \
+         ADD CONSTRAINT commit_parents_position CHECK (\"position::text\" IN (0, 1))",
+    )
+    .await;
+    match PostgresLedgerStore::connect(&fx.runtime_db_url, V1Binding::Reject).await {
+        Err(LedgerError::SchemaIncompatible(m)) => {
+            assert!(m.contains("commit_parents"), "{m}")
+        }
+        other => panic!("a CHECK on a look-alike column must refuse start-up: {other:?}"),
+    }
+}
+
+/// Composite foreign keys are `MATCH SIMPLE`: a key column that became nullable lets a row
+/// skip the foreign key entirely (e.g. a `decision_validations` link with NULL graph and
+/// candidate). Nullability is therefore verified structurally, at start-up and readiness.
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn nullable_key_columns_are_refused_at_startup_and_readiness() {
+    let fx = fixture("lp_not_null").await;
+    fx.migrate_and_grant().await;
+    let running = PostgresLedgerStore::connect(&fx.runtime_db_url, V1Binding::Reject)
+        .await
+        .expect("healthy database serves");
+    assert_healthy(&fx, "fresh migration").await;
+    // The inventory is exactly what the migrations declare: a NOT NULL column added by a
+    // future migration without extending the inventory fails here, not silently.
+    let declared: std::collections::BTreeSet<(String, String)> = sqlx::query_as(
+        "SELECT c.relname::text, a.attname::text FROM pg_attribute a \
+         JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = 'public' AND c.relkind = 'r' AND a.attnum > 0 AND NOT a.attisdropped \
+           AND a.attnotnull AND c.relname <> '_sqlx_migrations'",
+    )
+    .fetch_all(&fx.owner)
+    .await
+    .unwrap()
+    .into_iter()
+    .collect();
+    let expected: std::collections::BTreeSet<(String, String)> =
+        ledger_store::schema::EXPECTED_NOT_NULL
+            .iter()
+            .flat_map(|(t, cols)| cols.iter().map(|c| ((*t).to_owned(), (*c).to_owned())))
+            .collect();
+    assert_eq!(
+        declared, expected,
+        "EXPECTED_NOT_NULL drifted from the migrations"
+    );
+    for (table, column) in [
+        ("decision_validations", "graph_id"),
+        ("decision_validations", "candidate_commit"),
+        ("validation_records", "candidate_commit"),
+        ("semantic_execution_contexts", "candidate_state_digest"),
+        ("idempotency", "graph_id"),
+    ] {
+        owner_exec(
+            &fx,
+            &format!("ALTER TABLE {table} ALTER COLUMN {column} DROP NOT NULL"),
+        )
+        .await;
+        let m =
+            assert_refused_by_schema(&fx, &running, &format!("{table}.{column} nullable")).await;
+        assert!(
+            m.contains(&format!("{table}.{column} must be NOT NULL")),
+            "{m}"
+        );
+        owner_exec(
+            &fx,
+            &format!("ALTER TABLE {table} ALTER COLUMN {column} SET NOT NULL"),
+        )
+        .await;
+        assert_healthy(&fx, &format!("{table}.{column} restored")).await;
+        running.ready().await.expect("readiness after restore");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn drifted_phase2_identity_constraints_and_checks_are_refused_at_startup_and_readiness() {
+    let fx = fixture("lp_p2_drift").await;
+    fx.migrate_and_grant().await;
+    let running = PostgresLedgerStore::connect(&fx.runtime_db_url, V1Binding::Reject)
+        .await
+        .expect("healthy database serves");
+    assert_healthy(&fx, "fresh migration").await;
+
+    // Content addressing of contexts, the record's outcome shape and the idempotency shape.
+    assert_vacuous_check_refused(
+        &fx,
+        &running,
+        "semantic_execution_contexts",
+        "sec_content_addressed",
+        "context_id = 'sha256:' || encode(sha256(canonical_bytes), 'hex')",
+    )
+    .await;
+    assert_vacuous_check_refused(
+        &fx,
+        &running,
+        "validation_records",
+        "vr_outcome_shape",
+        "(outcome = 'conforms' AND violation_count >= 0) OR (outcome = 'violations' AND violation_count >= 1)",
+    )
+    .await;
+    assert_vacuous_check_refused(
+        &fx,
+        &running,
+        "idempotency",
+        "idempotency_validation_shape",
+        "((operation = 'validate') = (result_kind = 'validated')) \
+         AND ((result_kind = 'validated') = (result_validation_id IS NOT NULL)) \
+         AND (result_kind <> 'validated' OR result_commit IS NOT NULL)",
+    )
+    .await;
+
+    // The context identity the record FK targets: dropping it takes vr_context_fk along
+    // (CASCADE). Both are refused, each on its own.
+    const SEC_IDENTITY: &str = "ALTER TABLE semantic_execution_contexts ADD CONSTRAINT sec_identity \
+        UNIQUE (context_id, graph_id, candidate_commit, candidate_state_digest, validator_service_id, \
+        validator_service_version, validator_configuration_version)";
+    const VR_CONTEXT_FK: &str = "ALTER TABLE validation_records ADD CONSTRAINT vr_context_fk \
+        FOREIGN KEY (context_id, graph_id, candidate_commit, candidate_state_digest, validator_service_id, \
+        validator_service_version, validator_configuration_version) REFERENCES semantic_execution_contexts \
+        (context_id, graph_id, candidate_commit, candidate_state_digest, validator_service_id, \
+        validator_service_version, validator_configuration_version)";
+    owner_exec(
+        &fx,
+        "ALTER TABLE semantic_execution_contexts DROP CONSTRAINT sec_identity CASCADE",
+    )
+    .await;
+    let fk_left: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM pg_constraint WHERE conname = 'vr_context_fk'")
+            .fetch_one(&fx.owner)
+            .await
+            .unwrap();
+    assert_eq!(fk_left, 0, "CASCADE dropped the dependent FK");
+    let m = assert_refused_by_schema(&fx, &running, "sec_identity dropped (CASCADE)").await;
+    assert!(m.contains("semantic_execution_contexts UNIQUE"), "{m}");
+    owner_exec(&fx, SEC_IDENTITY).await;
+    let m = assert_refused_by_schema(&fx, &running, "vr_context_fk still missing").await;
+    assert!(
+        m.contains("validation_records FOREIGN KEY") && m.contains("semantic_execution_contexts"),
+        "{m}"
+    );
+    owner_exec(&fx, VR_CONTEXT_FK).await;
+    assert_healthy(&fx, "context identity and record FK restored").await;
+    running.ready().await.expect("readiness after restore");
+
+    // The decision identity the decision_validations FK targets, likewise.
+    owner_exec(
+        &fx,
+        "ALTER TABLE decisions DROP CONSTRAINT decisions_identity CASCADE",
+    )
+    .await;
+    let fk_left: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM pg_constraint WHERE conname = 'dv_decision_fk'")
+            .fetch_one(&fx.owner)
+            .await
+            .unwrap();
+    assert_eq!(fk_left, 0, "CASCADE dropped the dependent FK");
+    let m = assert_refused_by_schema(&fx, &running, "decisions_identity dropped (CASCADE)").await;
+    assert!(
+        m.contains("decisions UNIQUE [\"decision_id\", \"graph_id\", \"candidate_commit\"]"),
+        "{m}"
+    );
+    owner_exec(
+        &fx,
+        "ALTER TABLE decisions ADD CONSTRAINT decisions_identity UNIQUE (decision_id, graph_id, candidate_commit)",
+    )
+    .await;
+    let m = assert_refused_by_schema(&fx, &running, "dv_decision_fk still missing").await;
+    assert!(
+        m.contains("decision_validations FOREIGN KEY [\"decision_id\""),
+        "{m}"
+    );
+    owner_exec(&fx, "ALTER TABLE decision_validations ADD CONSTRAINT dv_decision_fk FOREIGN KEY (decision_id, graph_id, candidate_commit) REFERENCES decisions (decision_id, graph_id, candidate_commit)").await;
+    assert_healthy(&fx, "decision identity and link FK restored").await;
+    running.ready().await.expect("readiness after restore");
+
+    // The idempotency → validation record FK.
+    owner_exec(
+        &fx,
+        "ALTER TABLE idempotency DROP CONSTRAINT idempotency_validation_fk",
+    )
+    .await;
+    let m = assert_refused_by_schema(&fx, &running, "idempotency_validation_fk dropped").await;
+    assert!(
+        m.contains("idempotency FOREIGN KEY [\"result_validation_id\""),
+        "{m}"
+    );
+    owner_exec(&fx, "ALTER TABLE idempotency ADD CONSTRAINT idempotency_validation_fk FOREIGN KEY (result_validation_id, graph_id, result_commit) REFERENCES validation_records (validation_id, graph_id, candidate_commit)").await;
+    assert_healthy(&fx, "idempotency FK restored").await;
+    running
+        .ready()
+        .await
+        .expect("readiness after every restoration");
+    PostgresLedgerStore::connect(&fx.runtime_db_url, V1Binding::Reject)
+        .await
+        .expect("start-up after every restoration");
     fx.teardown().await;
 }

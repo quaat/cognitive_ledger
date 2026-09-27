@@ -3,6 +3,7 @@ members = [
   "crates/ledger-core",
   "crates/ledger-rdf",
   "crates/ledger-store",
+  "crates/ledger-validation-protocol",
   "crates/ledger-api",
   "crates/ledger-testkit",
   "apps/ledger-server",

@@ -52,6 +52,56 @@ Preserve object digest verification and atomic ref updates. Never commit secrets
   require the commit to be indexed under that graph. Migration 0007's composite
   `(graph_id, tenant_id)` foreign keys make tenant/graph agreement a database invariant.
 
+## Semantic validation boundary (Phase 2, ADR-0014/0018/0019)
+- Capabilities: `validate` (`ledger.validate`) requests a validation of a prepared candidate;
+  it grants no power over refs (`review` accepts/rejects). Proposers cannot validate;
+  validators cannot accept.
+- Clients never supply validator identity, tenant, principal, `recorded_at` or record
+  fields: bodies are strict (unknown fields refused); the validator's service id is server
+  configuration; versions come from the validator's response; `recorded_at` is assigned by
+  the ledger; the requester recorded on the row is the authenticated principal.
+- A record of another tenant, graph or candidate is `VALIDATION_NOT_FOUND`, indistinguishable
+  from a nonexistent one; a foreign graph stays `NOT_FOUND`.
+- Acceptance is bound, inside the acceptance transaction, to a conforming validation of the
+  same candidate whose semantic environment is the one the reviewer names; the verdict and
+  environment are read from the hash-verified canonical bytes (`VALIDATION_REJECTED`,
+  `VALIDATION_STALE`, `LINEAGE_MISMATCH` otherwise; nothing moves).
+- Validator trust is fail-closed and independent of reachability (ADR-0019 amendment):
+  `LEDGER_VALIDATOR_SERVICE_ID` is the one trusted service; only its records satisfy
+  acceptance. `LEDGER_VALIDATOR_URL` merely makes it callable — without it `validate` is
+  `VALIDATOR_UNAVAILABLE` while earlier trusted records remain acceptable. A URL without a
+  service id, a token file without a URL, and production authentication without a service
+  id are refused at startup; a development server without a trust anchor refuses every
+  validated acceptance. A missing or partial setting never broadens trust.
+- The trusted service id is an **operator assertion**, not a proof: the ledger writes it into
+  every context from its own configuration, and the only binding between that id and the
+  endpoint that answered is the https connection to the configured host. Repointing
+  `LEDGER_VALIDATOR_URL` under the same id makes the new endpoint's records trusted; change
+  the URL only together with the service id, or deliberately. Signed validator responses
+  (tech debt) would turn the assertion into a proof.
+- Every outbound call carries the `sculpin-validation-invocation/v1` id (body
+  `invocation_id` and `Idempotency-Key` header): an unkeyed SHA-256 of the authenticated
+  idempotency scope and request digest. It never contains the bearer credential or
+  correlation id, but it is not secret: whoever sees it (the validator, gateways, APM) and
+  knows the request can confirm a guessed tenant/principal when idempotency keys are
+  predictable, and two ledger deployments sharing one validator produce equal ids for equal
+  scopes. Sculpin therefore scopes stored results by the authenticated caller; deployments
+  must not share a validator identity across environments. A keyed (HMAC) id would close
+  both and needs an ADR plus new vectors.
+- The outbound client (`HttpValidationClient`) meets the JWKS-fetch standard: one configured
+  https endpoint (plain http to loopback only with development auth), no redirects, no
+  environment proxy, total timeout, streamed size cap, `application/json` only, strict
+  response shape; errors never echo the endpoint, credential or body. Outages are retryable
+  `VALIDATOR_UNAVAILABLE`; unusable answers `VALIDATOR_ERROR`; nothing is recorded in either.
+- Validation is bounded before any outbound call: hint bytes, source-pin count, candidate
+  bytes shipped, a dedicated concurrency budget and the expensive slot for reconstruction.
+- Database: the runtime role may INSERT the Phase-2 rows on exactly the columns the store
+  names (no `created_at`) and cannot UPDATE/DELETE them (write-once triggers as a second line);
+  startup verifies the 0010 objects like every other control (ADR-0016 amendment).
+- Residual (accepted, as in ADR-0016): the runtime is the trusted writer of new records; a
+  compromised runtime could fabricate a validation record for its own tenants. The report
+  digest/reference lets auditors cross-check against Sculpin's own report store.
+
 ## Mutation semantics
 - `Idempotency-Key` is required; idempotency is scoped by tenant, complete actor
   (principal id, type, on-behalf-of), graph, operation and key, and by the server-computed
@@ -130,10 +180,12 @@ integrity rules against real PostgreSQL, including a non-superuser owner.
   and 16+ membership semantics both handled); every FOREIGN KEY, PRIMARY KEY and UNIQUE constraint of
   the migrations by shape (key columns, referenced `public` table and columns, at least one
   validated non-deferrable match, `NULLS NOT DISTINCT` where defined), the unique indexes
-  with their predicates, and all 32 named CHECKs — definitions compared by deparse at
+  with their predicates, the NOT NULL declaration of every column the migrations make
+  NOT NULL (composite foreign keys are `MATCH SIMPLE`, so a nullable key column would let a
+  row skip them), and all 56 named CHECKs — definitions compared by deparse at
   start-up against the values the migrations produce (identical on PostgreSQL 15 and 17)
-  and by expression fingerprint on readiness; the content-address CHECK additionally by a
-  rolled-back semantic probe at start-up; the runtime role's exact per-column INSERT/UPDATE
+  and by expression fingerprint on readiness; the three content-address CHECKs (objects,
+  contexts, records) additionally by rolled-back semantic probes at start-up; the runtime role's exact per-column INSERT/UPDATE
   grants, absence of table-level writes, DELETE/TRUNCATE/TRIGGER/REFERENCES, and USAGE on
   exactly the audit sequences. ASan fuzzing passes on the hosted runner (`ci-fuzz` matrix `none`/`address`, pinned
   nightly, explicit target triple; the local host's ASan start-up crash is host-specific);

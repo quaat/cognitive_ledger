@@ -8,11 +8,77 @@
 - Migration 0009 aborts on a corrupt `immutable_objects` row with a raw `23514` naming no ids (the README convention is guards that name rows); the runbook says to run `verify` first. Add a pre-check guard that lists offending ids, and document the `ACCESS EXCLUSIVE` hashing window. Also: a graph moved from `importing` to `active` after raw ref moves has no `ref_events` for them and fails the verifier's version-equals-events check permanently — activation needs an audited path (Phase 4 admin flow).
 - Fault injection (Plan 0005 slice 4): the lost-response-after-COMMIT case is deterministic only in the `FailPoint` unit test; at the HTTP level random SIGKILLs hit the sub-millisecond COMMIT-to-response window by chance (0–3 observations per run). A `fault-injection` cargo feature that aborts the process right after the workflow transaction commits — compiled only into a separate qualification image, never into the runtime image — would make it deterministic.
 
+## Phase 2 (Plan 0006) external prerequisites and residuals
+
+- **Sculpin validation endpoint — EXTERNAL PREREQUISITE.** The ledger-side contract, client and
+  every ADR-0014 scenario are implemented and tested against a deterministic fake validator;
+  no live Sculpin service exists yet. Sculpin must provide the endpoint of
+  `docs/design/sculpin-validation-service.md`, an aggregate stable `base_kb.revision`,
+  content-identifying ontology/shape versions, Virtual A-Box identification, and a way to
+  publish its current semantic environment. A live end-to-end test is external evidence,
+  never part of the workspace gate.
+- Environment freshness for external data rests on Sculpin's `sources_revision` changing
+  whenever the source versions it would hydrate change; the ledger cannot verify that
+  discipline. A Sculpin "current environment" endpoint (publishing the environment id) would
+  make orchestration uniform.
+- The runtime remains the trusted writer of new validation records (ADR-0016 residual): a
+  compromised runtime could fabricate a conforming record for its own tenants. The report
+  digest/reference allows cross-checking against Sculpin's report store; signed validator
+  responses (a validator key verified by the ledger) would close it and need an ADR.
+- The 0009 → 0010 upgrade from the P1.5 release with populated data is qualified by
+  `scripts/upgrade-p2.sh` (Plan 0006 evidence); re-run it on the final release candidate.
+- Sculpin must honour the validation invocation identity (`invocation_id` /
+  `Idempotency-Key`, ADR-0019 amendment): repeated or concurrent calls with one id resolve to
+  one logical validation. The ledger sends it on every delivery and its tests prove its own
+  side against a fake that implements the contract; the ledger cannot verify Sculpin's
+  deduplication. Until Sculpin implements it, concurrent same-key requests (or a retry after
+  a crash between answer and record) may record a result from whichever environment was
+  current when the winning delivery ran.
+- Detail rows under sealed parents (security review, P2, accepted for this release): the
+  write-once triggers on `decision_validations`, `validation_violations` and
+  `semantic_virtual_contexts` block UPDATE/DELETE but the runtime keeps INSERT, so a
+  compromised runtime could add a citation to an already-decided decision, a summary row to a
+  recorded validation, or a virtual-context row to a context. This is the same class as the
+  accepted ADR-0016 residual (runtime is the trusted writer of new rows); acceptance never
+  reads these rows (it decides on the hashed bytes) and `ledger-admin verify` detects every
+  such row (count/array agreement plus element-by-element comparison with the decoded
+  bytes). Closing it needs insert-time guards bound to the parent's transaction (a
+  `decision_validations` INSERT trigger requiring `validation_id = ANY(decisions.validation_ids)`,
+  deferred count triggers for the detail tables) plus verifier coverage and an ADR — or the
+  `SECURITY DEFINER` write-function model below.
+- Database-level size bounds (security review, P3): `semantic_virtual_contexts.object_refs`
+  elements and the `canonical_bytes` columns have no `octet_length` CHECK (the protocol
+  bounds them; only a compromised runtime could exceed them), and `ledger-admin verify` loads
+  all records and contexts into memory. Add CHECKs in a later migration and stream in verify.
+- The trusted validator service id is an operator assertion (no response signature or key
+  binds it to the endpoint), and the invocation id is an unkeyed hash (guess-confirmable,
+  equal across deployments sharing a validator). Signed validator responses and a keyed
+  invocation id each need an ADR (and, for the id, new vectors) — security review, P2/P3.
+- `AppState::with_validation*` panic on a mismatching or malformed configuration
+  (construction time only; `main` validates first); return `Result` if embedders appear.
+- Offline-verifier hardening against owner-level FK removal (Codex on `e264950`, P2,
+  accepted for this release): `ledger-admin verify` does not yet flag orphaned
+  `decision_validations` / `validation_violations` / `semantic_virtual_contexts` rows or a
+  validate idempotency row whose `result_commit`/graph disagree with its record *after the
+  corresponding FK was dropped* (records with a missing context are flagged since
+  `e264950`). The start-up FK-shape match ignores `ON DELETE`/`ON UPDATE` actions (all
+  0001–0010 FKs are `NO ACTION`); a cascade cannot fire because DELETE is refused by the
+  structurally verified write-once triggers and by runtime privileges. Add parent-existence
+  and binding checks per detail table and include referential actions in the FK shape.
+- The released P1.5 server refuses a database restored from a logical dump (strict CHECK
+  deparse vs PostgreSQL's re-parse flattening; fixed in Phase 2, ADR-0017 amendment). A P1.5
+  rollback must use a physical base backup.
+- A P1.5 `ledger-admin verify` does not check the schema level and prints `VERIFY OK` against
+  a 0010 database; always run the verifier from the same build as the servers.
+- Validation calls are synchronous inside the request (bounded by the validator timeout and a
+  dedicated budget). A queued/async validation flow is a later orchestration layer above
+  these primitives, not a replacement for them.
+
 ## Later-phase work and accepted residual risk (does not block Phase 2 or the P1.5 gate)
 
 - Design a stable skolemization/import protocol and hostile-input limits around the standards N-Quads parser.
 - Run the live Fluree differential adapter; the reference image is already digest-pinned (see test/reference-images.lock), so only running the semantic-state adapter remains, blocked pending BUSL-1.1 license sign-off.
-- Add the Sculpin validation-service adapter (Phase 2, ADR-0014) and Fuseki projection retry integration (Phase 3) without coupling either to history.
+- Fuseki projection retry integration (Phase 3) without coupling it to history (the Phase 2 validation adapter is implemented; see above).
 - Graph import operator path (ADR-0010): register `status='importing'`, import, activate. Until it exists, migration 0004 fails closed on unowned graphs and `ledger-admin migrate-fs-to-pg` can only target `bootstrap`/`importing` graphs.
 - `WorkflowRepository::state_at_on` (transaction-connection, bounded reconstruction) and `Ledger::state_at_bounded` are two implementations of the same fold over `ReconstructionLimits`; unify when `Ledger` composes over `PostgresLedgerStore`.
 - `mark_superseded` is an explicit operator action without an idempotency key; a retry after a lost response reports `LINEAGE_MISMATCH` (already decided) rather than replaying. Give it a scope/key if it becomes an API operation.
@@ -35,3 +101,5 @@
 - Evaluate `cargo-deny`, SBOM, and container scanning with classified findings (`cargo audit` is now a blocking gate via `scripts/check-supply-chain.sh`; its single exception, RUSTSEC-2023-0071 for the lockfile-only `rsa` under `sqlx-mysql`, is re-proven on every run and must be deleted when sqlx/rsa move).
 - Third-party GitHub Actions are pinned by commit SHA (Plan 0005 slice 2); bumping them is a deliberate change with the release name in the comment. The distroless runtime base is pinned by digest and must be refreshed when the classified container findings gain fixes (`docs/quality/security.md`).
 - Establish benchmark baselines and checkpoint policy before performance gates.
+- Dedicated Rust >=1.94 / SQLx 0.9 migration and full requalification (Dependabot's
+  `sqlx 0.8.6 → 0.9.0` needs Rust 1.94 and source changes; the workspace targets Rust 1.89).

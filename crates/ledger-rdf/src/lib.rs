@@ -10,6 +10,27 @@ use std::{collections::BTreeSet, fmt, str::FromStr};
 use thiserror::Error;
 
 const PATCH_HEADER: &str = "sculpin-rdf-patch-v1\n";
+/// Header of the canonical dataset serialization whose digest identifies a reconstructed
+/// state (`sculpin-rdf-state/v1`, ADR-0018).
+pub const STATE_V1_HEADER: &str = "sculpin-rdf-state/v1\n";
+
+/// Canonical bytes of a dataset: the header, then one canonical N-Quads line per quad in
+/// bytewise ascending order (the `BTreeSet<Quad>` order), each LF-terminated. An empty
+/// dataset is the header alone. Named-graph quads carry their graph term in the line.
+pub fn canonical_state_bytes(state: &BTreeSet<Quad>) -> Vec<u8> {
+    let mut out = STATE_V1_HEADER.to_owned();
+    for quad in state {
+        out.push_str(&quad.0);
+        out.push('\n');
+    }
+    out.into_bytes()
+}
+
+/// The candidate state digest (ADR-0018): `sha256:` over [`canonical_state_bytes`]. Derived
+/// metadata — never part of `CommitId`; recomputable from immutable history.
+pub fn state_digest(state: &BTreeSet<Quad>) -> ContentId {
+    ContentId::for_bytes(&canonical_state_bytes(state))
+}
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum RdfError {
     #[error("invalid canonical N-Quad: {0}")]
@@ -211,6 +232,28 @@ mod tests {
 
         let conflict = r#"{"operations":[{"kind":"Add","quad":"<urn:s> <urn:p> <urn:o> ."},{"kind":"Delete","quad":"<urn:s> <urn:p> <urn:o> ."}]}"#;
         assert!(serde_json::from_str::<Patch>(conflict).is_err());
+    }
+    #[test]
+    fn state_digest_is_order_independent_and_distinguishes_graphs() {
+        let a: BTreeSet<Quad> = [q("<urn:s> <urn:p> \"a\" ."), q("<urn:s> <urn:p> \"b\" .")]
+            .into_iter()
+            .collect();
+        let b: BTreeSet<Quad> = [q("<urn:s> <urn:p> \"b\" ."), q("<urn:s> <urn:p> \"a\" .")]
+            .into_iter()
+            .collect();
+        assert_eq!(state_digest(&a), state_digest(&b));
+        let named: BTreeSet<Quad> = [q("<urn:s> <urn:p> \"a\" <urn:g> .")].into_iter().collect();
+        let default: BTreeSet<Quad> = [q("<urn:s> <urn:p> \"a\" .")].into_iter().collect();
+        assert_ne!(state_digest(&named), state_digest(&default));
+        assert_eq!(
+            canonical_state_bytes(&BTreeSet::new()),
+            STATE_V1_HEADER.as_bytes()
+        );
+        assert_ne!(
+            state_digest(&BTreeSet::new()),
+            ContentId::for_bytes(b""),
+            "the empty state is the header, not empty bytes"
+        );
     }
     #[test]
     fn standards_parser_canonicalizes_supported_nquads_terms() {

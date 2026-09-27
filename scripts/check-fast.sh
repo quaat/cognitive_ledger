@@ -8,6 +8,10 @@ python3 scripts/check-architecture.py
 # request identity v1); the Rust side checks the same fixtures in cargo test.
 python3 scripts/golden/commit_v2_reference.py check
 python3 scripts/golden/request_v1_reference.py check
+# Phase 2 (ADR-0018): semantic execution context / validation record vectors and the
+# candidate state digest.
+python3 scripts/golden/validation_v1_reference.py check
+python3 scripts/golden/state_v1_reference.py check
 if [[ "$mode" == sanity ]]; then
   cargo fmt --all -- --check
   exit 0

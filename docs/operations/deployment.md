@@ -17,10 +17,10 @@ roles. Never give a serving container the owner URL (the server warns if it sees
 ## Sequence
 1. PostgreSQL 15+ up; create the runtime role: `CREATE ROLE ledger_runtime LOGIN PASSWORD …`.
 2. `LEDGER_MIGRATION_DATABASE_URL=… ledger-admin migrate --runtime-role ledger_runtime`
-   — applies migrations 0001…0009 on one dedicated owner connection (60 s lock timeout,
+   — applies migrations 0001…0010 on one dedicated owner connection (60 s lock timeout,
    so a running replica or a held migration lock fails loudly instead of hanging), grants
    the role (idempotent; the role must be a plain identifier, must not be a superuser and
-   must not hold `CREATE` on the schema), then prints `schema at 0009 (required 0009)`.
+   must not hold `CREATE` on the schema), then prints `schema at 0010 (required 0010)`.
    The owner identity should itself not be a superuser in production (an ordinary database
    owner suffices; `pg_least_privilege` exercises that shape). If a database was populated
    through `ledger-admin migrate-fs-to-pg`, pass `--runtime-role` there too or run
@@ -28,7 +28,7 @@ roles. Never give a serving container the owner URL (the server warns if it sees
 3. Provision graphs: `ledger-admin graph create --graph <id> --tenant <id> --status active`.
 4. Start the servers with `LEDGER_DATABASE_URL` (runtime role), `LEDGER_AUTH_MODE=oidc`,
    issuer/audience/JWKS, limits. Startup connects, applies the session limits, **verifies**
-   the schema is exactly 0009 with contiguous, checksum-matching history and every
+   the schema is exactly 0010 with contiguous, checksum-matching history and every
    integrity trigger enabled, and refuses otherwise (behind: "run ledger-admin migrate";
    ahead: "deploy a newer build"; absent/corrupt metadata or a disabled guard: refuse), then
    verifies its own identity (not a superuser, not the owner, no `CREATE`, exactly the
@@ -36,6 +36,13 @@ roles. Never give a serving container the owner URL (the server warns if it sees
    schema verification live. Connect directly or through a session-mode pooler: the session
    limits are set per connection.
 5. Terminate TLS in front of the service; bearer tokens travel in clear otherwise.
+6. Semantic validation (Phase 2): configure `LEDGER_VALIDATOR_URL` (https),
+   `LEDGER_VALIDATOR_SERVICE_ID` and optionally `LEDGER_VALIDATOR_TOKEN_FILE`; map the
+   validator workload's role to `validate` (`LEDGER_AUTH_ROLE_MAP`, default `ledger.validate`)
+   and reviewers to `review`. Without a validator the service runs, acceptance stays
+   fail-closed. The Sculpin prerequisites (aggregate KB revision, content-identifying
+   ontology/shape versions, Virtual A-Box identification, the endpoint, publishing the current
+   environment) are listed in `docs/design/sculpin-validation-service.md`.
 
 ## Upgrades
 1. Take a backup first (below). There is no rollback: once 0008/0009 are recorded the
@@ -64,7 +71,18 @@ release's idempotency keys, new writes, `ledger-admin verify`, and a `pg_dump --
 diff between the upgraded database and a clean install plus an object-ownership comparison,
 both of which must be empty — role attributes, database-level ACLs, sequence values and seed
 rows are not covered). Run it before every release; its evidence is recorded in the active
-Plan 0005 document.
+Plan 0005 document. The Phase-2 transition from the P1.5 release (schema 0009 → 0010) is
+exercised by `scripts/upgrade-p2.sh` (additionally: `pg_dump -Fc` backup restored and
+compared, byte-identical pre-upgrade rows, runtime write probes, validation and validated
+acceptance on upgraded graphs, ahead/behind refusal of both binaries, migration 0010's
+pre-existing-validation-id guard; evidence in Plan 0006). Always run `ledger-admin verify`
+from the same build as the servers: the P1.5 verifier does not check the schema level.
+
+Phase 2 validator configuration: set `LEDGER_VALIDATOR_SERVICE_ID` (the trusted validation
+service; required with production authentication) and, to allow new validations,
+`LEDGER_VALIDATOR_URL` (+ optional `LEDGER_VALIDATOR_TOKEN_FILE`). Removing only the URL
+during a validator outage keeps earlier trusted validations acceptable (ADR-0019
+amendment).
 
 ## Runtime limits
 - HTTP: `LEDGER_LIMIT_*` (body, operations, terms, metadata, reconstruction depth/quads/

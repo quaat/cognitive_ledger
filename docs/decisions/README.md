@@ -26,3 +26,9 @@ and `product_development_plan.md`.
 - [ADR-0015: Canonical HTTP request identity](ADR-0015-canonical-request-identity.md)
 - [ADR-0016: Database identities, schema ownership and runtime least privilege](ADR-0016-database-identities-and-schema-ownership.md)
 - [ADR-0017: Backup, restore and recovery semantics](ADR-0017-backup-restore-and-recovery-semantics.md)
+
+## Phase 2 semantic validation coordination (P2)
+See [Plan 0006](../exec-plans/completed/0006-phase2-semantic-validation.md).
+
+- [ADR-0018: Canonical identity of SemanticExecutionContext v1, ValidationRecord v1 and the candidate state digest](ADR-0018-semantic-context-and-validation-record-identity.md)
+- [ADR-0019: Validation freshness and the binding of acceptance to a validation record](ADR-0019-validation-freshness-and-acceptance-binding.md)

@@ -1,0 +1,21 @@
+[package]
+name = "ledger-validation-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Versioned semantic-validation contracts (ADR-0014/0018/0019): SemanticExecutionContext, ValidationRecord, validator request/response and the ValidationClient boundary. Infrastructure-free; no SHACL, reasoning or HTTP."
+
+[dependencies]
+async-trait.workspace = true
+ledger-core = { path = "../ledger-core" }
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+hex.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

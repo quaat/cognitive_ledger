@@ -1,0 +1,22 @@
+{
+  "base_kb": {
+    "kb_id": "urn:exodus:kb:material-science",
+    "revision": "kbrev:sha256:9f2c-composed-by-sculpin"
+  },
+  "shapes": {
+    "id": "urn:sculpin:shapes:material",
+    "version": "12+shapes_hash:4b7e"
+  },
+  "ontology": {
+    "id": "urn:sculpin:ontology:core",
+    "version": "3.1.0"
+  },
+  "reasoning": {
+    "profile": "rdfs",
+    "implementation": "sculpin-python-reasoner",
+    "version": "0.9.2"
+  },
+  "sources_revision": "urn:sculpin:source-catalog:rev-41",
+  "validator_service_version": "2026.09.1",
+  "validator_configuration_version": "cfg-2026-09-27"
+}

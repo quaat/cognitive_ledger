@@ -48,7 +48,9 @@ target an indexed commit of its graph.
 | `LEDGER_ADDR` | Listen address. Default `127.0.0.1:8080`. A non-loopback bind requires production authentication (`LEDGER_AUTH_MODE=oidc`) or the conspicuous development switch `LEDGER_ALLOW_INSECURE_NON_LOOPBACK=allow-insecure-non-loopback-development-only`; filesystem-only mode is always loopback-only. |
 | `LEDGER_AUTH_MODE` | Required with a database URL: `oidc` (production; needs `LEDGER_AUTH_ISSUER`, `LEDGER_AUTH_AUDIENCE`, https `LEDGER_AUTH_JWKS_URL`) or `dev-hs256` (development/CI; needs issuer, audience and a ≥32-byte `LEDGER_AUTH_DEV_HS256_SECRET`). There is no unauthenticated or header-trusting mode. |
 | `LEDGER_AUTH_*_CLAIM`, `LEDGER_AUTH_ROLE_MAP`, `LEDGER_AUTH_AGENT_CLIENT_IDS`, `LEDGER_AUTH_SERVICE_CLIENT_IDS` | Claims policy: tenant/principal/principal-type/roles/on-behalf-of claim names, `role=capability` map (`read|propose|review|admin`), client ids that identify agents or services. See `docs/quality/security.md`. |
-| `LEDGER_UNVALIDATED_ACCEPTANCE` | Only `allow-unvalidated-acceptance-development-only` enables `accept` without semantic validation (Phase 2); any other value refuses to start; unset → `accept` returns `VALIDATION_REQUIRED`. |
+| `LEDGER_UNVALIDATED_ACCEPTANCE` | Only `allow-unvalidated-acceptance-development-only` enables `accept` without a named validation (development/CI); any other value refuses to start; unset → `accept` without `validation_id` returns `VALIDATION_REQUIRED`. An accept that names a validation is bound to it under every setting (ADR-0019). |
+| `LEDGER_VALIDATOR_URL`, `LEDGER_VALIDATOR_SERVICE_ID`, `LEDGER_VALIDATOR_TOKEN_FILE` | The Sculpin semantic validation service (Phase 2, `docs/design/sculpin-validation-service.md`): https endpoint (plain http only to loopback with development auth), the service identity recorded in every context (required with a URL; never taken from responses), optional bearer credential file (never logged). Unset URL → `validate` answers `VALIDATOR_UNAVAILABLE`; prepare, reads and rejection keep working and acceptance stays fail-closed. |
+| `LEDGER_LIMIT_CONCURRENT_VALIDATIONS`, `_VALIDATOR_SECONDS`, `_VALIDATOR_RESPONSE_BYTES`, `_VALIDATION_STATE_BYTES`, `_VALIDATION_METADATA_BYTES` | Validation budget per replica (default 4), validator call timeout (20 s; must be below the request timeout), response cap (1 MiB), candidate bytes shipped inline (8 MiB), encoded hint bytes (16 KiB). |
 | `LEDGER_LIMIT_BODY_BYTES`, `_PATCH_OPERATIONS`, `_TERM_BYTES`, `_METADATA_BYTES`, `_RECONSTRUCTION_DEPTH`, `_RECONSTRUCTION_QUADS`, `_RECONSTRUCTION_BYTES`, `_EXPORT_BYTES`, `_REQUEST_SECONDS`, `_CONCURRENT_EXPENSIVE` | Resource limits below the untrusted boundary (defaults in `ledger_api::ApiLimits`); exceeding one is `RESOURCE_LIMIT`. |
 | `LEDGER_DATA_DIR` | Filesystem root for the filesystem backend (default `./data`). |
 | `LEDGER_DATABASE_URL` | The **runtime identity** (ADR-0016). When set: PostgreSQL holds the ref head **and, by default, the immutable objects**; startup verifies the schema is exactly `REQUIRED_SCHEMA_VERSION` and never migrates. Unset: filesystem-only development mode. Set but empty, or not valid Unicode: startup error (no silent filesystem fallback). Carries credentials; never logged. |
@@ -64,7 +66,9 @@ document and the router disagree). Routes are graph-scoped and authenticated:
 `POST /v1/graphs/{graph}/proposals` (prepare; `propose`), `POST
 /v1/graphs/{graph}/proposals/{candidate}/accept|reject` (`review`), `GET
 /v1/graphs/{graph}/refs?name=<ref>` and `GET /v1/graphs/{graph}/commits/{commit}/state`
-(`read`, bounded). Ref names are body/query fields because they may contain `/`.
+(`read`, bounded), `POST /v1/graphs/{graph}/proposals/{candidate}/validations` (`validate`;
+records an immutable context + validation record, never moves a ref) and `GET
+…/validations/{validation}` (`read`). Ref names are body/query fields because they may contain `/`.
 Mutations require `Idempotency-Key`; the server computes the canonical request digest
 (`sculpin-ledger-request/v1`, golden vectors in `fixtures/golden/requests/`, reference
 encoder `scripts/golden/request_v1_reference.py`). Errors are `{code, message,
@@ -115,6 +119,17 @@ patch fails closed (`INVALID_PATCH` from the destination store, `CorruptObject` 
 verification); such sources need repair before cutover, and the server refuses to start on
 such a HEAD (`verify_head` checks the head's patch too). On startup the server runs `Ledger::verify_head` and refuses to
 serve a HEAD that does not resolve in its configured store.
+
+## Validation persistence (PostgreSQL, ADR-0018/0019, migration 0010)
+`ValidationRepository` runs two transactions around the outbound validator call so no lock is
+held while Sculpin works: `begin` (idempotency replay/conflict, tenant/graph/prepared-candidate
+binding, bounded reconstruction and `sculpin-rdf-state/v1` digest) and `record` (idempotency
+lock, re-check, content-addressed context + record + summary + result, all or nothing). Contexts
+and records are write-once rows whose ids are CHECK-enforced SHA-256s of their canonical bytes;
+the record→context FK binds graph, candidate, state digest and validator; `decision_validations`
+proves that a decision cites validations of its own graph and candidate. Acceptance and replay
+decide on the verified canonical bytes, never on projection columns; `ledger-admin verify`
+checks that the columns agree with the bytes.
 
 Schema-level guards (migration 0005): `immutable_objects`, `commit_index`, `commit_parents`
 are write-once (UPDATE/DELETE raise); `refs` identity columns are immutable and only `head`

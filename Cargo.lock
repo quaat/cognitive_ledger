@@ -960,6 +960,7 @@ dependencies = [
  "ledger-core",
  "ledger-rdf",
  "ledger-store",
+ "ledger-validation-protocol",
  "reqwest",
  "serde",
  "serde_json",
@@ -1004,6 +1005,7 @@ dependencies = [
  "ledger-api",
  "ledger-core",
  "ledger-store",
+ "ledger-validation-protocol",
  "reqwest",
  "serde_json",
  "sqlx",
@@ -1022,6 +1024,7 @@ dependencies = [
  "hex",
  "ledger-core",
  "ledger-rdf",
+ "ledger-validation-protocol",
  "serde",
  "sha2 0.11.0",
  "sqlx",
@@ -1054,6 +1057,18 @@ dependencies = [
  "ledger-store",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "ledger-validation-protocol"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "hex",
+ "ledger-core",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

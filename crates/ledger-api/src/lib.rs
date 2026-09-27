@@ -6,6 +6,7 @@
 
 pub mod auth;
 pub mod request_identity;
+pub mod validator;
 
 use auth::{AuthError, Capability, SharedAuthenticator, VerifiedIdentity};
 use axum::{
@@ -22,7 +23,13 @@ use ledger_rdf::{Operation, OperationKind, Patch, Quad};
 use ledger_store::{
     AcceptRequest, Ledger, MAX_BRANCH_BYTES, MAX_CORRELATION_BYTES, MAX_IDEMPOTENCY_KEY_BYTES,
     MAX_REASON_BYTES, PostgresLedgerStore, PrepareRequest, ReconstructionLimits, RejectRequest,
-    RequestScope, ValidationPolicy,
+    RequestScope, ValidateRequest, ValidationBegin, ValidationPolicy, ValidationTrustPolicy,
+    ValidatorOutcome,
+};
+use ledger_validation_protocol::{
+    CandidateDescriptor, RequestedContext, SemanticContextId, SemanticEnvironmentId,
+    SemanticExecutionContext, ValidationClient, ValidationId, ValidationInvocation,
+    ValidationRecord, ValidationRequest,
 };
 use request_identity::CanonicalRequest;
 use serde::{Deserialize, Serialize};
@@ -50,6 +57,17 @@ pub struct ApiLimits {
     pub max_state_export_bytes: usize,
     pub request_timeout: Duration,
     pub max_concurrent_expensive: usize,
+    /// Concurrent outbound validations (a dedicated budget beside the expensive slots: the
+    /// reconstruction before the call takes an expensive slot, the call itself one of these).
+    pub max_concurrent_validations: usize,
+    /// Total time allowed for one validator call; must be below `request_timeout`.
+    pub validator_timeout: Duration,
+    /// Maximum bytes of a validator response body (streamed and capped).
+    pub validator_response_bytes: usize,
+    /// Maximum bytes of candidate N-Quads shipped inline to the validator.
+    pub max_validation_state_bytes: usize,
+    /// Maximum bytes of the encoded context hints of a validate request.
+    pub max_validation_metadata_bytes: usize,
 }
 
 impl Default for ApiLimits {
@@ -65,8 +83,22 @@ impl Default for ApiLimits {
             // Below the store's 16-connection pool so cheap paths (auth, ref reads,
             // readiness) always find a connection while expensive work is saturated.
             max_concurrent_expensive: 12,
+            max_concurrent_validations: 4,
+            validator_timeout: Duration::from_secs(20),
+            validator_response_bytes: 1024 * 1024,
+            max_validation_state_bytes: 8 * 1024 * 1024,
+            max_validation_metadata_bytes: 16 * 1024,
         }
     }
+}
+
+/// The configured semantic validation service (ADR-0014): the client the ledger calls and
+/// the service identity recorded in every context (deployment configuration, never client
+/// input).
+#[derive(Clone)]
+pub struct ValidationService {
+    pub client: Arc<dyn ValidationClient>,
+    pub service_id: String,
 }
 
 /// Whether accepting onto protected state without semantic validation is permitted.
@@ -85,6 +117,11 @@ struct Shared {
     limits: ApiLimits,
     acceptance: AcceptancePolicy,
     expensive: tokio::sync::Semaphore,
+    validations: tokio::sync::Semaphore,
+    validation: Option<ValidationService>,
+    /// The trusted validation service (ADR-0019); independent of `validation`, which is
+    /// only the ability to call it.
+    trust: Option<ValidationTrustPolicy>,
     correlation_counter: Arc<AtomicU64>,
 }
 
@@ -107,14 +144,57 @@ impl AppState {
         // One source of truth for reconstruction bounds: the workflow's base
         // reconstruction and public state reads use the same limits.
         let store = store.with_limits(limits.reconstruction);
+        // A trust anchor already on the store is the state's: it can then only be confirmed,
+        // never silently replaced.
+        let trust = store.validation_trust().cloned();
         Self(Arc::new(Shared {
             expensive: tokio::sync::Semaphore::new(limits.max_concurrent_expensive),
+            validations: tokio::sync::Semaphore::new(limits.max_concurrent_validations),
+            validation: None,
+            trust,
             store,
             authenticator,
             limits,
             acceptance,
             correlation_counter: Arc::new(AtomicU64::new(0)),
         }))
+    }
+
+    /// Trust records of exactly this validation service for validated acceptance
+    /// (`LEDGER_VALIDATOR_SERVICE_ID`). Independent of an endpoint: with trust but no client,
+    /// `validate` answers `VALIDATOR_UNAVAILABLE` while earlier records of the trusted
+    /// service still satisfy acceptance. Without trust, validated acceptance fails closed.
+    /// Construction-time only (before the state is shared).
+    pub fn with_validation_trust(self, trust: ValidationTrustPolicy) -> Self {
+        let mut shared = Arc::try_unwrap(self.0).unwrap_or_else(|_| {
+            panic!("with_validation_trust must be called before the state is shared")
+        });
+        if shared.trust.as_ref().is_some_and(|t| t != &trust) {
+            panic!("the validation trust policy is set once");
+        }
+        shared.store = shared.store.clone().with_validation_trust(trust.clone());
+        shared.trust = Some(trust);
+        Self(Arc::new(shared))
+    }
+
+    /// Attach the client for the validation service. The service must be the trusted one:
+    /// without an explicit trust policy it becomes the trust anchor; a client for any other
+    /// service is a configuration error. Construction-time only.
+    pub fn with_validation(self, service: ValidationService) -> Self {
+        let trust = ValidationTrustPolicy::single(service.service_id.clone())
+            .unwrap_or_else(|_| panic!("validator service id must be a bounded token"));
+        let state = match &self.0.trust {
+            Some(existing) if existing != &trust => {
+                panic!("the validation client must be for the trusted validation service")
+            }
+            Some(_) => self,
+            None => self.with_validation_trust(trust),
+        };
+        let mut shared = Arc::try_unwrap(state.0).unwrap_or_else(|_| {
+            panic!("with_validation must be called before the state is shared")
+        });
+        shared.validation = Some(service);
+        Self(Arc::new(shared))
     }
 
     fn edge(&self) -> EdgeConfig {
@@ -133,6 +213,14 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("POST", "/v1/graphs/{graph}/proposals"),
     ("POST", "/v1/graphs/{graph}/proposals/{candidate}/accept"),
     ("POST", "/v1/graphs/{graph}/proposals/{candidate}/reject"),
+    (
+        "POST",
+        "/v1/graphs/{graph}/proposals/{candidate}/validations",
+    ),
+    (
+        "GET",
+        "/v1/graphs/{graph}/proposals/{candidate}/validations/{validation}",
+    ),
     ("GET", "/v1/graphs/{graph}/refs"),
     ("GET", "/v1/graphs/{graph}/commits/{commit}/state"),
 ];
@@ -154,6 +242,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/v1/graphs/{graph}/proposals/{candidate}/reject",
             post(reject),
+        )
+        .route(
+            "/v1/graphs/{graph}/proposals/{candidate}/validations",
+            post(validate),
+        )
+        .route(
+            "/v1/graphs/{graph}/proposals/{candidate}/validations/{validation}",
+            get(read_validation),
         )
         .route("/v1/graphs/{graph}/refs", get(read_ref))
         .route("/v1/graphs/{graph}/commits/{commit}/state", get(read_state))
@@ -465,7 +561,47 @@ impl ApiError {
             E::ValidationRequired => (
                 StatusCode::CONFLICT,
                 "VALIDATION_REQUIRED",
-                "acceptance requires semantic validation, which is not available yet".into(),
+                "acceptance requires a conforming validation record: name validation_id and \
+                 semantic_environment_id"
+                    .into(),
+            ),
+            E::ValidationRejected => (
+                StatusCode::CONFLICT,
+                "VALIDATION_REJECTED",
+                "the named validation reported violations; the candidate cannot be accepted on it"
+                    .into(),
+            ),
+            E::ValidationStale(_) => (
+                StatusCode::CONFLICT,
+                "VALIDATION_STALE",
+                "the named validation does not satisfy this deployment's acceptance policy: it \
+                 ran in another semantic environment than the one named, or was not produced by \
+                 the validation service this deployment trusts"
+                    .into(),
+            ),
+            E::ValidationNotFound => (
+                StatusCode::NOT_FOUND,
+                "VALIDATION_NOT_FOUND",
+                "validation record not found".into(),
+            ),
+            E::ValidatorUnavailable(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "VALIDATOR_UNAVAILABLE",
+                "the semantic validation service is not available; nothing was recorded; retry \
+                 with the same idempotency key"
+                    .into(),
+            ),
+            E::ValidatorError(_) => (
+                StatusCode::BAD_GATEWAY,
+                "VALIDATOR_ERROR",
+                "the semantic validation service returned a response the ledger cannot record; \
+                 nothing was recorded"
+                    .into(),
+            ),
+            E::InvalidValidation(_) => (
+                StatusCode::BAD_REQUEST,
+                "INVALID_REQUEST",
+                "the request does not form a valid validation request".into(),
             ),
             E::ResourceLimit(message) => (
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -997,6 +1133,14 @@ pub struct AcceptBody {
     pub ref_name: String,
     pub expected_head: Option<CommitId>,
     pub reason: Option<String>,
+    /// The validation record acceptance is bound to (ADR-0019); with
+    /// `semantic_environment_id`, both or neither.
+    #[serde(default)]
+    pub validation_id: Option<ValidationId>,
+    /// The semantic environment the reviewer accepts under (candidate-independent; the one
+    /// Sculpin declares current).
+    #[serde(default)]
+    pub semantic_environment_id: Option<SemanticEnvironmentId>,
 }
 
 #[derive(Serialize)]
@@ -1029,14 +1173,31 @@ pub fn canonical_accept(
 ) -> Result<CanonicalRequest, ApiError> {
     check_branch(&body.ref_name, correlation)?;
     check_reason(body.reason.as_deref(), correlation)?;
-    Ok(CanonicalRequest::Accept {
-        graph: graph.clone(),
-        branch: body.ref_name.clone(),
-        expected_head: body.expected_head.clone(),
-        candidate: candidate.clone(),
-        reason: body.reason.clone().filter(|r| !r.is_empty()),
-        validation_policy: "no-validation".into(),
-    })
+    match (&body.validation_id, &body.semantic_environment_id) {
+        (Some(validation_id), Some(semantic_environment_id)) => {
+            Ok(CanonicalRequest::AcceptValidated {
+                graph: graph.clone(),
+                branch: body.ref_name.clone(),
+                expected_head: body.expected_head.clone(),
+                candidate: candidate.clone(),
+                reason: body.reason.clone().filter(|r| !r.is_empty()),
+                validation_id: validation_id.clone(),
+                semantic_environment_id: semantic_environment_id.clone(),
+            })
+        }
+        (None, None) => Ok(CanonicalRequest::Accept {
+            graph: graph.clone(),
+            branch: body.ref_name.clone(),
+            expected_head: body.expected_head.clone(),
+            candidate: candidate.clone(),
+            reason: body.reason.clone().filter(|r| !r.is_empty()),
+            validation_policy: "no-validation".into(),
+        }),
+        _ => Err(ApiError::invalid(
+            "validation_id and semantic_environment_id are given together or not at all",
+            correlation,
+        )),
+    }
 }
 
 /// Validate a reject body and compute its canonical identity.
@@ -1048,11 +1209,52 @@ pub fn canonical_reject(
 ) -> Result<CanonicalRequest, ApiError> {
     check_branch(&body.ref_name, correlation)?;
     check_reason(Some(&body.reason), correlation)?;
-    Ok(CanonicalRequest::Reject {
+    Ok(match &body.validation_id {
+        Some(validation_id) => CanonicalRequest::RejectValidated {
+            graph: graph.clone(),
+            branch: body.ref_name.clone(),
+            candidate: candidate.clone(),
+            reason: body.reason.clone(),
+            validation_id: validation_id.clone(),
+        },
+        None => CanonicalRequest::Reject {
+            graph: graph.clone(),
+            branch: body.ref_name.clone(),
+            candidate: candidate.clone(),
+            reason: body.reason.clone(),
+        },
+    })
+}
+
+/// Validate a validate body (context hints) and compute its canonical identity (request
+/// v2). Bounds come before any lock, slot or reconstruction.
+pub fn canonical_validate(
+    graph: &GraphId,
+    candidate: &CommitId,
+    body: &ValidateBody,
+    limits: &ApiLimits,
+    correlation: &str,
+) -> Result<CanonicalRequest, ApiError> {
+    body.requested
+        .validate()
+        .map_err(|e| ApiError::invalid(format!("invalid context hints: {e}"), correlation))?;
+    let mut encoded = Vec::new();
+    body.requested
+        .encode_into(&mut encoded)
+        .map_err(|e| ApiError::invalid(format!("invalid context hints: {e}"), correlation))?;
+    if encoded.len() > limits.max_validation_metadata_bytes {
+        return Err(ApiError::resource_limit(
+            format!(
+                "context hints exceed {} bytes",
+                limits.max_validation_metadata_bytes
+            ),
+            correlation,
+        ));
+    }
+    Ok(CanonicalRequest::Validate {
         graph: graph.clone(),
-        branch: body.ref_name.clone(),
         candidate: candidate.clone(),
-        reason: body.reason.clone(),
+        requested: body.requested.clone(),
     })
 }
 
@@ -1070,11 +1272,19 @@ async fn accept(
     let candidate = CommitId::from_str(&candidate)
         .map_err(|_| ApiError::invalid("invalid candidate commit id", &correlation))?;
     let canonical = canonical_accept(&graph, &candidate, &body, &correlation)?;
-    // The deployment's policy travels with the request; the store enforces it after the
-    // idempotent-replay lookup, so a durable earlier acceptance still replays.
-    let validation = match state.0.acceptance {
-        AcceptancePolicy::RequireValidation => ValidationPolicy::Required,
-        AcceptancePolicy::AllowUnvalidatedDevelopmentOnly => ValidationPolicy::NoValidation,
+    // A named validation binds acceptance to that record and context (ADR-0019) under
+    // every deployment policy. Without one, the deployment's policy travels with the
+    // request; the store enforces it after the idempotent-replay lookup, so a durable
+    // earlier acceptance still replays.
+    let validation = match (&body.validation_id, &body.semantic_environment_id) {
+        (Some(validation_id), Some(semantic_environment_id)) => ValidationPolicy::Validated {
+            validation_id: validation_id.clone(),
+            semantic_environment_id: semantic_environment_id.clone(),
+        },
+        _ => match state.0.acceptance {
+            AcceptancePolicy::RequireValidation => ValidationPolicy::Required,
+            AcceptancePolicy::AllowUnvalidatedDevelopmentOnly => ValidationPolicy::NoValidation,
+        },
     };
     let request = AcceptRequest {
         scope: scope(&ctx, &graph, key, canonical.digest()),
@@ -1108,6 +1318,9 @@ pub struct RejectBody {
     #[serde(rename = "ref")]
     pub ref_name: String,
     pub reason: String,
+    /// A validation record the rejection cites (auditable; ADR-0019).
+    #[serde(default)]
+    pub validation_id: Option<ValidationId>,
 }
 
 #[derive(Serialize)]
@@ -1136,6 +1349,7 @@ async fn reject(
         branch: body.ref_name,
         candidate,
         reason: body.reason,
+        validation_id: body.validation_id,
     };
     let rejected = state
         .0
@@ -1147,6 +1361,287 @@ async fn reject(
     Ok(Json(RejectResponse {
         decision_id: rejected.decision_id,
         replayed: rejected.replayed,
+        correlation_id: correlation,
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ValidateBody {
+    /// Context hints for the validator (all optional; request identity).
+    #[serde(default)]
+    pub requested: RequestedContext,
+}
+
+#[derive(Serialize)]
+pub struct ValidationResponse {
+    pub validation_id: ValidationId,
+    pub semantic_context_id: SemanticContextId,
+    /// What an accepting party names (ADR-0019).
+    pub semantic_environment_id: SemanticEnvironmentId,
+    pub candidate: CommitId,
+    pub conforms: bool,
+    pub record: ValidationRecord,
+    pub context: SemanticExecutionContext,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replayed: Option<bool>,
+    pub correlation_id: String,
+}
+
+fn busy(correlation: &str, what: &str) -> ApiError {
+    ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "RESOURCE_LIMIT",
+        format!("too many concurrent {what}; retry later"),
+        correlation,
+    )
+}
+
+/// Request a semantic validation of a prepared candidate (ADR-0014/0019). The ledger
+/// reconstructs the candidate state (expensive slot), calls the configured validation
+/// service (validation slot, bounded time and response), and records the immutable context
+/// and record atomically with the idempotency result. It never moves a ref.
+async fn validate(
+    State(state): State<AppState>,
+    ctx: RequestContext,
+    Path((graph, candidate)): Path<(String, String)>,
+    headers: HeaderMap,
+    ValidJson(body): ValidJson<ValidateBody>,
+) -> Result<(StatusCode, Json<ValidationResponse>), ApiError> {
+    ctx.require(Capability::Validate)?;
+    let correlation = ctx.correlation_id.clone();
+    let key = idempotency_key(&headers, &correlation)?;
+    let graph = authorized_graph(&state, &ctx, &graph).await?;
+    let candidate = CommitId::from_str(&candidate)
+        .map_err(|_| ApiError::invalid("invalid candidate commit id", &correlation))?;
+    let limits = &state.0.limits;
+    let canonical = canonical_validate(&graph, &candidate, &body, limits, &correlation)?;
+    let request = ValidateRequest {
+        scope: scope(&ctx, &graph, key, canonical.digest()),
+        candidate: candidate.clone(),
+        requested: body.requested,
+    };
+    // One logical invocation per (authenticated scope, key, canonical request): concurrent
+    // duplicates and retries after a lost response or crash carry the same id, so the
+    // validator resolves them to one validation in one environment (ADR-0019 amendment).
+    let invocation_id = ValidationInvocation::for_request(
+        &request.scope.principal,
+        &request.scope.graph,
+        &request.scope.idempotency_key,
+        &request.scope.request_digest,
+    )
+    .id()
+    .map_err(|e| ApiError::from_ledger(e.into(), &correlation))?;
+    let store = state.0.store.validations();
+    // A completed identical request replays before any admission slot or validator check.
+    let replayed = store
+        .replayed(&request)
+        .await
+        .map_err(|e| ApiError::from_ledger(e, &correlation))?;
+    let begun = match replayed {
+        Some(recorded) => ValidationBegin::Replayed(Box::new(recorded)),
+        None => {
+            if state.0.validation.is_none() {
+                return Err(ApiError::from_ledger(
+                    LedgerError::ValidatorUnavailable("no validation service is configured".into()),
+                    &correlation,
+                ));
+            }
+            let _expensive = state
+                .0
+                .expensive
+                .try_acquire()
+                .map_err(|_| busy(&correlation, "expensive operations"))?;
+            // Never reconstruct more than may be shipped to the validator.
+            let mut bounds = limits.reconstruction;
+            bounds.max_bytes = bounds.max_bytes.min(limits.max_validation_state_bytes);
+            store
+                .begin_with_limits(&request, &bounds)
+                .await
+                .map_err(|e| ApiError::from_ledger(e, &correlation))?
+        }
+    };
+    let _validation_slot = match &begun {
+        ValidationBegin::Replayed(_) => None,
+        ValidationBegin::Fresh(_) => Some(
+            state
+                .0
+                .validations
+                .try_acquire()
+                .map_err(|_| busy(&correlation, "validations"))?,
+        ),
+    };
+    let ticket = match begun {
+        ValidationBegin::Replayed(recorded) => {
+            let recorded = *recorded;
+            let context =
+                load_context(&state, &ctx, &graph, &recorded.validation_id, &correlation).await?;
+            return Ok((
+                StatusCode::OK,
+                Json(ValidationResponse {
+                    validation_id: recorded.validation_id,
+                    semantic_context_id: recorded.context_id,
+                    semantic_environment_id: recorded.environment_id,
+                    candidate,
+                    conforms: recorded.record.outcome.is_conforming(),
+                    record: recorded.record,
+                    context,
+                    replayed: Some(true),
+                    correlation_id: correlation,
+                }),
+            ));
+        }
+        ValidationBegin::Fresh(ticket) => ticket,
+    };
+    let Some(service) = state.0.validation.clone() else {
+        return Err(ApiError::from_ledger(
+            LedgerError::ValidatorUnavailable("no validation service is configured".into()),
+            &correlation,
+        ));
+    };
+    let mut total = 0usize;
+    let mut quads = Vec::with_capacity(ticket.state().len());
+    for quad in ticket.state() {
+        let line = quad.to_string();
+        total += line.len() + 1;
+        if total > limits.max_validation_state_bytes {
+            return Err(ApiError::resource_limit(
+                format!(
+                    "the candidate state exceeds the {} bytes shipped to the validator",
+                    limits.max_validation_state_bytes
+                ),
+                &correlation,
+            ));
+        }
+        quads.push(line);
+    }
+    let mut outbound = ValidationRequest::new(
+        invocation_id,
+        CandidateDescriptor {
+            graph_id: graph.clone(),
+            knowledge_base_id: ticket.knowledge_base_id().map(str::to_owned),
+            commit: candidate.clone(),
+            state_digest: ticket.state_digest().clone(),
+            state_href: Some(format!("/v1/graphs/{graph}/commits/{candidate}/state")),
+            quads,
+        },
+        request.requested.clone(),
+    );
+    outbound.correlation_id = Some(correlation.clone());
+    let answer =
+        match tokio::time::timeout(limits.validator_timeout, service.client.validate(&outbound))
+            .await
+        {
+            Ok(result) => result.map_err(LedgerError::from),
+            Err(_) => Err(LedgerError::ValidatorUnavailable(
+                "validator call exceeded the configured timeout".into(),
+            )),
+        }
+        .map_err(|e| ApiError::from_ledger(e, &correlation))?
+        .with_bounded_summary();
+    let context = answer
+        .into_context(
+            &graph,
+            &candidate,
+            ticket.state_digest(),
+            &service.service_id,
+            &request.requested,
+        )
+        .map_err(|e| {
+            ApiError::from_ledger(LedgerError::ValidatorError(e.to_string()), &correlation)
+        })?;
+    let recorded = store
+        .record(
+            &request,
+            &ticket,
+            ValidatorOutcome {
+                context: context.clone(),
+                outcome: answer.outcome,
+                report_digest: answer.report.digest,
+                report_reference: answer.report.reference,
+            },
+        )
+        .await
+        .map_err(|e| ApiError::from_ledger(e, &correlation))?;
+    let context = if recorded.replayed {
+        load_context(&state, &ctx, &graph, &recorded.validation_id, &correlation).await?
+    } else {
+        context
+    };
+    Ok((
+        if recorded.replayed {
+            StatusCode::OK
+        } else {
+            StatusCode::CREATED
+        },
+        Json(ValidationResponse {
+            validation_id: recorded.validation_id,
+            semantic_context_id: recorded.context_id,
+            semantic_environment_id: recorded.environment_id,
+            candidate,
+            conforms: recorded.record.outcome.is_conforming(),
+            record: recorded.record,
+            context,
+            replayed: Some(recorded.replayed),
+            correlation_id: correlation,
+        }),
+    ))
+}
+
+async fn load_context(
+    state: &AppState,
+    ctx: &RequestContext,
+    graph: &GraphId,
+    validation_id: &ValidationId,
+    correlation: &str,
+) -> Result<SemanticExecutionContext, ApiError> {
+    state
+        .0
+        .store
+        .validations()
+        .load(&ctx.identity.principal.tenant_id, graph, validation_id)
+        .await
+        .map_err(|e| ApiError::from_ledger(e, correlation))?
+        .map(|(_, context)| context)
+        .ok_or_else(|| ApiError::from_ledger(LedgerError::ValidationNotFound, correlation))
+}
+
+/// Read one validation record of a candidate (read capability; tenant/graph scoped). A
+/// record of another graph, tenant or candidate is VALIDATION_NOT_FOUND alike.
+async fn read_validation(
+    State(state): State<AppState>,
+    ctx: RequestContext,
+    Path((graph, candidate, validation)): Path<(String, String, String)>,
+) -> Result<Json<ValidationResponse>, ApiError> {
+    ctx.require(Capability::Read)?;
+    let correlation = ctx.correlation_id.clone();
+    let graph = authorized_graph(&state, &ctx, &graph).await?;
+    let not_found = || ApiError::from_ledger(LedgerError::ValidationNotFound, &correlation);
+    let candidate = CommitId::from_str(&candidate).map_err(|_| not_found())?;
+    let validation_id = ValidationId::from_str(&validation).map_err(|_| not_found())?;
+    let (record, context) = state
+        .0
+        .store
+        .validations()
+        .load(&ctx.identity.principal.tenant_id, &graph, &validation_id)
+        .await
+        .map_err(|e| ApiError::from_ledger(e, &correlation))?
+        .ok_or_else(not_found)?;
+    if record.candidate_commit != candidate {
+        return Err(not_found());
+    }
+    let semantic_environment_id = context
+        .environment_id()
+        .map_err(|e| ApiError::from_ledger(e.into(), &correlation))?;
+    Ok(Json(ValidationResponse {
+        semantic_context_id: record.semantic_execution_context_id.clone(),
+        semantic_environment_id,
+        validation_id,
+        candidate,
+        conforms: record.outcome.is_conforming(),
+        record,
+        context,
+        replayed: None,
         correlation_id: correlation,
     }))
 }
@@ -1278,6 +1773,11 @@ mod tests {
             "NO_EFFECTIVE_CHANGE",
             "GRAPH_NOT_ACTIVE",
             "VALIDATION_REQUIRED",
+            "VALIDATION_REJECTED",
+            "VALIDATION_STALE",
+            "VALIDATION_NOT_FOUND",
+            "VALIDATOR_UNAVAILABLE",
+            "VALIDATOR_ERROR",
             "RESOURCE_LIMIT",
             "DEPENDENCY_UNAVAILABLE",
             "DEPENDENCY_TIMEOUT",
@@ -1364,6 +1864,7 @@ mod tests {
                 let concrete = path
                     .replace("{graph}", "g1")
                     .replace("{candidate}", &format!("sha256:{}", "a".repeat(64)))
+                    .replace("{validation}", &format!("sha256:{}", "b".repeat(64)))
                     .replace("{commit}", &format!("sha256:{}", "a".repeat(64)));
                 let (status, body, correlation) =
                     send(&app, &method.to_uppercase(), &concrete, None).await;

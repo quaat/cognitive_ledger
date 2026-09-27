@@ -573,7 +573,15 @@ mod postgres_workflow;
 pub use postgres_workflow::{
     AcceptRequest, Accepted, DbSessionLimits, FailPoint, MAX_BRANCH_BYTES, MAX_CORRELATION_BYTES,
     MAX_IDEMPOTENCY_KEY_BYTES, MAX_REASON_BYTES, PostgresLedgerStore, PrepareRequest, Prepared,
-    RejectRequest, Rejected, RequestScope, ValidationPolicy, WorkflowRepository,
+    RejectRequest, Rejected, RequestScope, ValidationPolicy, ValidationTrustPolicy,
+    WorkflowRepository,
+};
+#[cfg(feature = "postgres")]
+mod postgres_validation;
+#[cfg(feature = "postgres")]
+pub use postgres_validation::{
+    RecordedValidation, ValidateRequest, ValidationBegin, ValidationRepository, ValidationTicket,
+    ValidatorOutcome, validator_identity,
 };
 #[cfg(feature = "postgres")]
 mod migrate_fs_to_pg;

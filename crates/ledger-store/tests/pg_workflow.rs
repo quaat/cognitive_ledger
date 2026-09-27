@@ -926,6 +926,7 @@ async fn bad_lineage_other_graph_and_unknown_candidates_have_no_workflow_side_ef
         branch: "main".into(),
         candidate: sibling.candidate.clone(),
         reason: "stale sibling".into(),
+        validation_id: None,
     })
     .await
     .unwrap();
@@ -1168,6 +1169,7 @@ async fn every_injected_failure_before_commit_leaves_no_mutable_effect_and_retry
         branch: "main".into(),
         candidate: prepared.candidate.clone(),
         reason: "fault test".into(),
+        validation_id: None,
     };
     let before = counts(&store, &g).await;
     for point in [
@@ -1250,6 +1252,7 @@ async fn rejection_and_supersession_are_recorded_without_moving_the_ref() {
         branch: "main".into(),
         candidate: candidate.candidate.clone(),
         reason: "reviewer declined".into(),
+        validation_id: None,
     };
     let rejected = wf.reject(&request).await.unwrap();
     assert!(!rejected.replayed);
@@ -1346,6 +1349,7 @@ async fn rejection_and_supersession_are_recorded_without_moving_the_ref() {
             branch: "main".into(),
             candidate: p1_rival.candidate.clone(),
             reason: "too late".into(),
+            validation_id: None,
         })
         .await;
     assert!(
@@ -1386,6 +1390,7 @@ async fn concurrent_accept_and_reject_of_one_candidate_yield_exactly_one_decisio
         branch: "main".into(),
         candidate: p.candidate.clone(),
         reason: "declined".into(),
+        validation_id: None,
     };
     let a = tokio::spawn(async move {
         b1.wait().await;
@@ -1493,6 +1498,7 @@ async fn repository_refuses_foreign_tenants_bad_branches_and_raw_ref_movement_on
         branch: "main".into(),
         candidate: p.candidate.clone(),
         reason: "r".repeat(4097),
+        validation_id: None,
     };
     assert!(matches!(
         wf.reject(&long_reason).await,

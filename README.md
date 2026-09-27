@@ -16,7 +16,9 @@ cargo run -p ledger-server --bin ledger-admin -- migrate-fs-to-pg --source ./dat
 ```
 
 The HTTP contract is [`docs/api/openapi.json`](docs/api/openapi.json) (graph-scoped
-prepare/accept/reject, ref and bounded state reads; `Idempotency-Key` required on writes).
+prepare / validate / accept / reject, ref, state and validation reads; `Idempotency-Key`
+required on writes). Phase 2 semantic validation calls the Sculpin validation service
+described in [the service contract](docs/design/sculpin-validation-service.md).
 Runtime variables and the security boundary are documented in
 [storage boundaries](docs/design/storage-boundaries.md) and [security](docs/quality/security.md);
 migrations in [`migrations/README.md`](migrations/README.md). `docker compose up` runs a
