@@ -42,7 +42,9 @@ created_at
   imported head has no outbox event, so nothing would ever project it — accept a change
   first); and a cognitive graph already used by another non-disabled stream of the target
   (checked in the enabling transaction, and by the partial unique index against races,
-  SQLSTATE 23505). Re-enabling a disabled row reactivates it.
+  SQLSTATE 23505). Re-enabling a disabled row reactivates it with its original cognitive
+  graph; if the graph's (mutable) `knowledge_base_id` now derives another IRI, enable is
+  refused instead of reporting a graph the stream does not write.
 - The uniqueness is **partial** (`status <> 'disabled'`): disabling a stream frees its
   cognitive graph, so the KB's feed can be switched to another ledger graph (disable + enable
   + rebuild; ADR-0020 `TARGET_CONFLICT`) without deleting rows, which the guard forbids.
@@ -51,7 +53,12 @@ created_at
   `projected_ref_version`, `lease_epoch` or `rebuilds` decrease, and allows a status change
   into or out of `'disabled'` only when `current_user` owns the table (SQLSTATE 42501
   otherwise): the projector may move a stream among `active`, `blocked` and
-  `rebuild_required`, but can never enable or disable one.
+  `rebuild_required`, but can never enable or disable one. Both 0011 guard functions pin
+  `search_path = pg_catalog, public` (like 0009's), and neither identity may hold CREATE
+  anywhere (ADR-0016 amendment), so no identity can shadow what they resolve. `ledger-admin`
+  must therefore connect as the owning role itself (a member of it, or a superuser, is
+  refused: `current_user` is compared with the table owner). There is no TRUNCATE guard:
+  only the owner holds TRUNCATE, and the verifier refuses it for both identities.
 - A second guard trigger on `projection_outbox` makes delivery monotonic: `delivered_at` once
   set never changes, `attempts` never decreases (the 0006 trigger already freezes the
   identity columns and refuses DELETE).
@@ -80,10 +87,11 @@ rows pending and are reported as unconfigured.
 4. **Fail**: under the same fencing, record `last_error_*`, increment
    `consecutive_failures`, set `next_attempt_at` by bounded exponential backoff with jitter
    (retryable), or set `status = 'blocked'` (permanent); release the lease.
-5. **Reconcile claim**: the same claim for an `active`, unleased, **idle** stream (no
-   eligible event) whose `last_success_at` is older than the reconcile interval; the work
-   item is the recorded version, and a consistent target is acknowledged without a write
-   (refreshing `last_success_at`). This is how a target that lost its data is repaired
+5. **Reconcile claim**: the same claim — `active`, unleased, **due** (`next_attempt_at`,
+   so a failing reconciliation backs off like any attempt) — for an **idle** stream (no
+   eligible event) whose `last_success_at` is older than the reconcile interval, least
+   recently checked (by success or failure) first; the work item is the recorded version,
+   and a consistent target is acknowledged without a write (refreshing `last_success_at`). This is how a target that lost its data is repaired
    without a new acceptance (ADR-0020 "Reconciliation").
 6. **Operator claim** (`rebuild`): a named stream, ignoring backoff and `blocked` /
    `rebuild_required` status, never a disabled or live-leased one.
@@ -93,14 +101,19 @@ re-claim by the *same* owner name after expiry gets a new epoch, so the stale at
 still fenced. A step checks its elapsed time before the target write and gives up (releases)
 past 75 % of the TTL; the configuration refuses `LEDGER_PROJECTOR_LEASE_SECONDS < 4 ×
 LEDGER_PROJECTOR_TARGET_TIMEOUT_SECONDS + 30` (a step makes up to four target requests). If a
-write still outlives its lease, correctness holds (ADR-0020 guarded writes: the late write is
-a no-op against anything newer), only work is repeated.
+write still outlives its lease, correctness holds (ADR-0020 compare-and-swap: a write applies
+only while the target's marker is exactly what that worker observed, so a late write after
+anything changed — including a feed switch to another stream — is a no-op), only work is
+repeated. A disabled stream's lease is cleared at once for the same reason: nothing on the
+target side depends on the lease.
 
 ### Projector database identity (amends ADR-0016)
 ADR-0016 defined two database identities (owner, runtime). Phase 3 adds a third; the
-ADR-0016 rules (no ownership, no membership in privileged roles, exact and exhaustive
-privilege verification at start-up and readiness, owner-only grant functions) apply to it
-unchanged.
+ADR-0016 rules (no ownership, no membership in privileged roles, no CREATE anywhere, exact
+and exhaustive privilege verification at start-up, owner-only grant functions) apply to it
+unchanged. The projector's readiness additionally re-checks its privileges and compares the
+CHECK / partial-index fingerprints validated at start-up (the runtime server's readiness
+compares fingerprints; its privileges are checked at start-up).
 A distinct least-privilege role `ledger_projector`, granted by the owner through
 `ledger_grant_projector(role)` (`ledger-admin migrate --projector-role`):
 - SELECT on `graphs`, `refs`, `immutable_objects`, `commit_index`, `commit_parents`,

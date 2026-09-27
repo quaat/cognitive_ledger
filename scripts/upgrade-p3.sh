@@ -159,7 +159,7 @@ done <"${OUT}/graphs.txt"
 server "${OLD}" "${OLD_IMAGE}" ledger "${PORT}" -e LEDGER_UNVALIDATED_ACCEPTANCE=allow-unvalidated-acceptance-development-only
 wait_ready "${PORT}" 60 || { docker logs "${OLD}" | tail -20; fail "previous server not ready"; }
 python3 scripts/upgrade-p2/workload.py populate "${OUT}/old-writes.json" "${COMMITS}"
-python3 scripts/upgrade-p3/workload.py populate-default "${OUT}/p3.json" "${OUT}/recorded.json"
+python3 scripts/upgrade-p3/workload.py populate-default "${OUT}/p3.json" "${OUT}/recorded.json" "${COMMITS}"
 docker stop -t 30 "${OLD}" >/dev/null; docker rm -f "${OLD}" >/dev/null
 python3 scripts/upgrade-p2/fake-validator.py 127.0.0.1 "${VPORT}" "${OUT}/validator-calls.jsonl" >"${OUT}/fake-validator.log" 2>&1 &
 VAL_PID=$!
@@ -200,6 +200,7 @@ step "backup: $(du -h "${OUT}/pre-upgrade.dump" | cut -f1) dump restored into re
 
 psql_q ledger "CREATE ROLE ledger_projector LOGIN PASSWORD 'ledger-projector-development-only'" >/dev/null
 if admin "${NEW_IMAGE}" ledger migrate --runtime-role ledger_runtime --projector-role ledger_runtime >"${OUT}/same-role.log" 2>&1; then fail "migrate accepted the runtime role as the projector role"; fi
+grep -q "must name distinct roles" "${OUT}/same-role.log" || { cat "${OUT}/same-role.log"; fail "migrate refused the shared role for another reason"; }
 [ "$(schema_level ledger)" = "${PREV_SCHEMA}" ] || fail "a refused migrate changed the schema level"
 admin "${NEW_IMAGE}" ledger migrate --runtime-role ledger_runtime --projector-role ledger_projector >"${OUT}/upgrade-migrate.log" 2>&1 || { cat "${OUT}/upgrade-migrate.log"; fail "owner migrate to ${NEW_SCHEMA}"; }
 admin "${NEW_IMAGE}" ledger migrate --runtime-role ledger_runtime --projector-role ledger_projector >"${OUT}/upgrade-migrate-rerun.log" 2>&1 || { cat "${OUT}/upgrade-migrate-rerun.log"; fail "re-running migrate failed"; }
@@ -240,7 +241,7 @@ while read -r g t kb; do
 done <"${OUT}/graphs.txt"
 G_DEV=$(head -1 "${OUT}/graphs.txt" | cut -d' ' -f1)
 if admin "${NEW_IMAGE}" ledger projection enable --graph "${G_DEV}" --ref dev --target "${TARGET_ID}" >"${OUT}/enable-dev.log" 2>&1; then fail "a non-main ref was enabled"; fi
-grep -q "main" "${OUT}/enable-dev.log" || { cat "${OUT}/enable-dev.log"; fail "enable of ref dev refused for another reason"; }
+grep -q '`main` ref only' "${OUT}/enable-dev.log" || { cat "${OUT}/enable-dev.log"; fail "enable of ref dev refused for another reason"; }
 projector "${PROJ}" ledger run
 wait_ready "${MPORT}" 60 || { docker logs "${PROJ}" | tail -30; fail "projector not ready"; }
 [ "$(psql_q ledger "SELECT count(*) FROM pg_stat_activity WHERE usename = 'ledger_projector'")" -ge 1 ] || fail "the projector is not connected as the projector role"
@@ -321,15 +322,23 @@ rc2=$(timeout 90 docker wait "${NEW}-behind" || echo timeout)
 docker logs "${NEW}-behind" >"${OUT}/skew-behind.log" 2>&1
 [ "${rc2}" != timeout ] && [ "${rc2}" != 0 ] || fail "Phase-3 server did not refuse schema ${PREV_SCHEMA} (exit ${rc2})"
 grep -q "database schema is at 00${PREV_SCHEMA}; this build requires 00${NEW_SCHEMA}" "${OUT}/skew-behind.log" || { cat "${OUT}/skew-behind.log"; fail "Phase-3 server refused for another reason than 'behind'"; }
-# The projector role does not exist in the 0010 database's grants; the refusal must still be
-# the schema level (checked before identity).
+# A projector started before the owner migrated: a 0010 database has no projector grants,
+# so it cannot even read the schema level — refused with the grant instruction. With only
+# the migration metadata readable, the refusal is the schema level itself.
 projector "${PROJ}-behind" restored_0010 run
 rc3=$(timeout 90 docker wait "${PROJ}-behind" || echo timeout)
+docker logs "${PROJ}-behind" >"${OUT}/skew-projector-ungranted.log" 2>&1; docker rm -f "${PROJ}-behind" >/dev/null
+[ "${rc3}" != timeout ] && [ "${rc3}" != 0 ] || fail "the projector did not refuse an ungranted 0010 database (exit ${rc3})"
+grep -q "cannot read the migration metadata.*--projector-role" "${OUT}/skew-projector-ungranted.log" || { cat "${OUT}/skew-projector-ungranted.log"; fail "the projector refused the ungranted 0010 database without the projector grant instruction"; }
+psql_q restored_0010 "GRANT SELECT ON public._sqlx_migrations TO ledger_projector" >/dev/null
+projector "${PROJ}-behind" restored_0010 run
+rc4=$(timeout 90 docker wait "${PROJ}-behind" || echo timeout)
 docker logs "${PROJ}-behind" >"${OUT}/skew-projector-behind.log" 2>&1
-[ "${rc3}" != timeout ] && [ "${rc3}" != 0 ] || fail "the projector did not refuse schema ${PREV_SCHEMA} (exit ${rc3})"
+psql_q restored_0010 "REVOKE SELECT ON public._sqlx_migrations FROM ledger_projector" >/dev/null
+[ "${rc4}" != timeout ] && [ "${rc4}" != 0 ] || fail "the projector did not refuse schema ${PREV_SCHEMA} (exit ${rc4})"
 grep -q "database schema is at 00${PREV_SCHEMA}; this build requires 00${NEW_SCHEMA}" "${OUT}/skew-projector-behind.log" || { cat "${OUT}/skew-projector-behind.log"; fail "the projector refused schema ${PREV_SCHEMA} for another reason"; }
 [ "$(schema_level restored_0010)" = "${PREV_SCHEMA}" ] || fail "restored_0010 changed level"
-step "skew: previous server exit ${rc} (ahead); Phase-3 server exit ${rc2} and projector exit ${rc3} (behind)"
+step "skew: previous server exit ${rc} (ahead); Phase-3 server exit ${rc2} (behind); projector exit ${rc3} (ungranted 0010: grant instruction) and ${rc4} (behind)"
 
 # --- 6. Schema convergence: clean 0011 install vs upgraded 0011 ---------------------------------
 psql_q ledger "CREATE DATABASE clean_install" >/dev/null

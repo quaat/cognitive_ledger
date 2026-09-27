@@ -51,6 +51,19 @@ fn number<T: std::str::FromStr>(env: Env, name: &str, default: T) -> Result<T, S
     }
 }
 
+/// A lease owner: at most `max` bytes (never splitting a character), control characters
+/// replaced, so a hostname can never make every claim fail validation.
+fn truncate_bytes(value: &str, max: usize) -> String {
+    let mut out = String::new();
+    for c in value.chars().map(|c| if c.is_control() { '_' } else { c }) {
+        if out.len() + c.len_utf8() > max {
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Read a secret from a regular file, bounded (a FIFO or device cannot bypass the cap).
 fn secret_file(env: Env, name: &str) -> Result<Option<String>, String> {
     use std::io::Read as _;
@@ -62,10 +75,13 @@ fn secret_file(env: Env, name: &str) -> Result<Option<String>, String> {
     if !meta.is_file() {
         return Err(format!("{name} must name a regular file"));
     }
+    let file = std::fs::File::open(&path).map_err(|_| unreadable())?;
+    // Re-check what was actually opened (the path may have been swapped since).
+    if !file.metadata().map_err(|_| unreadable())?.is_file() {
+        return Err(format!("{name} must name a regular file"));
+    }
     let mut bytes = Vec::new();
-    std::fs::File::open(&path)
-        .map_err(|_| unreadable())?
-        .take(MAX_SECRET_FILE_BYTES + 1)
+    file.take(MAX_SECRET_FILE_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| unreadable())?;
     if bytes.len() as u64 > MAX_SECRET_FILE_BYTES {
@@ -125,7 +141,11 @@ fn settings(env: Env) -> Result<Settings, String> {
     // A step makes up to four target requests (observe, write, observe, containment) plus
     // reconstruction; the lease must cover them with margin (a write outliving its lease is
     // harmless, ADR-0020, but wasted).
-    if lease < timeout * 4 + Duration::from_secs(30) {
+    let minimum = timeout
+        .checked_mul(4)
+        .and_then(|t| t.checked_add(Duration::from_secs(30)))
+        .ok_or("LEDGER_PROJECTOR_TARGET_TIMEOUT_SECONDS is out of range")?;
+    if lease < minimum {
         return Err(
             "LEDGER_PROJECTOR_LEASE_SECONDS must be at least 4 × LEDGER_PROJECTOR_TARGET_TIMEOUT_SECONDS + 30"
                 .into(),
@@ -169,7 +189,7 @@ fn settings(env: Env) -> Result<Settings, String> {
         },
         projector: ProjectorConfig {
             target_id,
-            owner: instance.chars().take(256).collect(),
+            owner: truncate_bytes(&instance, 256),
             lease_ttl: lease,
             reconstruction: ReconstructionLimits {
                 max_depth: number(env, "LEDGER_PROJECTOR_MAX_DEPTH", d.max_depth)?,
@@ -299,6 +319,12 @@ async fn real_main() -> Result<(), String> {
     )
     .await
     .map_err(|e| format!("startup refused: {e}"))?;
+    if settings.target.allow_insecure_loopback {
+        tracing::warn!(
+            "LEDGER_PROJECTOR_DEVELOPMENT is set: plain http to a loopback target is allowed and \
+             target credentials are optional — development only, never in production"
+        );
+    }
     let client = Arc::new(FusekiClient::new(settings.target).map_err(|e| e.to_string())?);
     let metrics = Arc::new(Metrics::default());
     let projector = Arc::new(Projector::new(
@@ -398,6 +424,17 @@ async fn main() -> ExitCode {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn lease_owners_are_bounded_by_bytes_and_free_of_control_characters() {
+        let owner = truncate_bytes(&"é".repeat(300), 256);
+        assert_eq!((owner.len(), owner.chars().count()), (256, 128));
+        assert_eq!(truncate_bytes("host\n1:2", 256), "host_1:2");
+        assert!(
+            ledger_core::validate_token("lease_owner", &truncate_bytes(&"ü".repeat(999), 256), 256)
+                .is_ok()
+        );
+    }
 
     fn with(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let map: HashMap<String, String> = pairs

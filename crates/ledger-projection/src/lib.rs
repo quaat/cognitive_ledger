@@ -16,7 +16,8 @@ pub use error::{ErrorClass, ProjectionError, ProjectionErrorCode};
 pub use marker::{MarkerRead, MarkerTerm, ProjectionMarker, marker_predicates};
 pub use plan::{LedgerView, Plan, RebuildReason, plan, write_mode};
 pub use target::{
-    CognitiveGraph, MARKER_GRAPH, PROBE_GRAPH, TARGET_SUBJECT, pct_decode, pct_encode,
+    CognitiveGraph, MARKER_GRAPH, PROBE_GRAPH, TARGET_SUBJECT, WRITE_SUBJECT, pct_decode,
+    pct_encode,
 };
 
 use ledger_core::ContentId;
@@ -85,22 +86,25 @@ pub struct Observation {
     pub marker: MarkerRead,
     pub triple_count: u64,
     /// The highest `lp:refVersion` integer found on the marker subject, even when the
-    /// marker is malformed (the ceiling of a guarded replacement, ADR-0020).
+    /// marker is malformed (a malformed marker above the ledger head is `MARKER_AHEAD`).
     pub max_ref_version: Option<i64>,
+    /// Every (predicate, object) the marker subject holds, exactly as the target returned
+    /// them: the compare-and-swap precondition of any write planned from this observation
+    /// (ADR-0020).
+    pub terms: Vec<(String, MarkerTerm)>,
 }
 
-/// How a write treats the existing target content (ADR-0020). Both modes are guarded in
-/// the target transaction, so a stale worker can never move the marker backwards past
-/// something newer than it observed.
+/// How a write treats the existing target content (ADR-0020). Every write is a
+/// compare-and-swap in the target transaction: it applies only while the cognitive graph's
+/// marker is still **exactly** the set of terms the planner observed, so a worker whose
+/// observation is stale (another version, another stream, another feed) writes nothing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WriteMode {
-    /// Applies only while the target's marker is absent or names only older ref versions:
-    /// a duplicate or stale write is a no-op.
+    /// The normal path: additionally requires that no `lp:refVersion` of the marker is
+    /// `>=` the version written (a duplicate or stale write is a no-op).
     Conditional,
-    /// Recovery: replaces graph and marker whatever they hold, unless the marker names a
-    /// ref version above `ceiling` (the highest version the planner observed, or the
-    /// version being written, whichever is larger).
-    Replace { ceiling: i64 },
+    /// Recovery: replaces whatever the observed marker and graph held.
+    Replace,
 }
 
 /// The target boundary. Implementations are adapters (HTTP/Fuseki); they must run each
@@ -109,13 +113,17 @@ pub enum WriteMode {
 pub trait ProjectionClient: Send + Sync {
     /// Read the marker for `graph` and the graph's triple count in one read transaction.
     async fn observe(&self, graph: &CognitiveGraph) -> Result<Observation, ProjectionError>;
-    /// Write `state` and `marker` into `graph` as one target transaction.
+    /// Write `state` and `marker` into `graph` as one target transaction, only while the
+    /// marker is still exactly `expected` (the terms of the observation the write was
+    /// planned from); otherwise the request is a no-op. A marker the adapter cannot express
+    /// as an exact precondition is refused (`TARGET_PROTOCOL`).
     async fn write(
         &self,
         graph: &CognitiveGraph,
         state: &ProjectedState,
         marker: &ProjectionMarker,
         mode: WriteMode,
+        expected: &[(String, MarkerTerm)],
     ) -> Result<(), ProjectionError>;
     /// The complete content of `graph` as default-graph quads, as the target returns them
     /// (the target may canonicalize literal lexical forms; diagnostics and tests).

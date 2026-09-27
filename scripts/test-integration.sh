@@ -85,10 +85,9 @@ cargo test -p ledger-store --features postgres --test pg_projection -- --ignored
 #         every crash window at genesis and over a predecessor, lost/corrupt/ahead/foreign
 #         markers, stale replacement vs newer projection, reconciliation, literal
 #         canonicalization, concurrent workers, many graphs ----------------------------------
-# One test at a time: TDB2 has a single writer and every commit costs ~0.5-1 s on the
-# qualification host, so twelve tests sharing one dataset in parallel queue past the client
-# timeout (a correct, retried TARGET_TIMEOUT — but not the scenario each test asserts).
-# Concurrency *within* a scenario is still exercised (two workers, two loops).
+# The tests share one dataset whose single TDB2 writer commits in ~0.5-1 s on the
+# qualification host; the suite serializes itself (process-wide lock), and the flag below
+# keeps the output ordered. Concurrency *within* a scenario is still exercised.
 LEDGER_TEST_FUSEKI_URL=http://127.0.0.1:53030/ledger LEDGER_TEST_FUSEKI_PASSWORD=development-only \
   cargo test -p ledger-projector --test fuseki_projection -- --ignored --nocapture --test-threads=1
 
@@ -239,15 +238,16 @@ if OUT=$(docker compose run --rm --no-deps -e LEDGER_PROJECTION_TARGET_ID=fuseki
   echo "FAIL: a projector with another target id started against a bound dataset" >&2; exit 1
 fi
 echo "${OUT}" | grep -q "TARGET_CONFLICT" || { echo "FAIL: the second target id was not refused with TARGET_CONFLICT: ${OUT}" >&2; exit 1; }
-# Target restart: TDB2 keeps the projection (durable commit), and the projector (restarted
-# with it: it shares the target's network namespace in development) re-probes, re-binds and
-# still verifies the stream consistent.
+# Target restart: TDB2 keeps the projection (durable commit), and a projector restarted onto
+# the restarted target (it shares the target's network namespace in development) re-probes,
+# re-binds and verifies the stream consistent. A running projector riding out a target
+# outage is covered by fuseki_projection::a_target_outage_never_blocks_acceptance_….
 docker compose restart fuseki >/dev/null
 docker compose up -d --wait --force-recreate --no-deps projector >/dev/null 2>&1 || { echo "FAIL: the projector did not become ready after a target restart" >&2; docker compose logs projector >&2; exit 1; }
 V=$(sparql "SELECT ?v WHERE { GRAPH <urn:sculpin:ledger-projection:v1:markers> { <${COGNITIVE}> <urn:sculpin:ledger-projection:v1#refVersion> ?v } }" | python3 -c 'import sys,json; b=json.load(sys.stdin)["results"]["bindings"]; print(b[0]["v"]["value"] if b else "")')
 [ "${V}" = "2" ] || { echo "FAIL: the projection did not survive a target restart (marker: '${V}')" >&2; exit 1; }
 docker compose run --rm --no-deps projector verify --graph "${GRAPH}" | grep -q "PROJECTION CONSISTENT" || { echo "FAIL: projection inconsistent after a target restart" >&2; exit 1; }
-echo "projection: verify consistent; a second target id is refused; the projection survives a target restart"
+echo "projection: verify consistent; a second target id is refused; the projection survives a target restart (durability) and a projector restart onto it"
 
 # Foreign tenant still cannot see the commit after it exists.
 R=$(api GET "/v1/graphs/${GRAPH}/commits/${C2}/state" "${FOREIGN}" "" "")

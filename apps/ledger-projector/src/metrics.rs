@@ -11,6 +11,15 @@ use std::{
     time::Duration,
 };
 
+/// A Prometheus label value (escapes `\\`, `"` and newlines; the database already bounds
+/// these identifiers, this keeps the exposition format intact regardless).
+fn label(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+}
+
 const BUCKETS: [f64; 10] = [0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0];
 
 #[derive(Default)]
@@ -167,7 +176,10 @@ impl Metrics {
         for s in streams {
             let labels = format!(
                 "graph=\"{}\",ref=\"{}\",target=\"{}\",status=\"{}\"",
-                s.key.graph_id, s.key.branch, s.key.target_id, s.status
+                label(s.key.graph_id.as_str()),
+                label(&s.key.branch),
+                label(&s.key.target_id),
+                label(&s.status)
             );
             let _ = writeln!(
                 out,
@@ -185,5 +197,14 @@ impl Metrics {
              # TYPE projection_unconfigured_pending gauge\nprojection_unconfigured_pending {unconfigured_pending}"
         );
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn label_values_cannot_break_the_exposition_format() {
+        assert_eq!(super::label("a\"b\\c\nd"), "a\\\"b\\\\c\\nd");
+        assert_eq!(super::label("main"), "main");
     }
 }

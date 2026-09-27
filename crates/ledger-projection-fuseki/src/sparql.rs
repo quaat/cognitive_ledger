@@ -4,76 +4,168 @@
 use ledger_projection::{
     CognitiveGraph, LP_NAMESPACE, MARKER_GRAPH, MarkerTerm, Observation, PROBE_GRAPH,
     ProjectedState, ProjectionError, ProjectionErrorCode, ProjectionMarker, TARGET_SUBJECT,
-    WriteMode,
+    WRITE_SUBJECT, WriteMode, XSD_STRING,
 };
 use serde::Deserialize;
 
 /// A deliberately unloadable IRI: `LOAD` of it fails without any network access.
 const UNLOADABLE: &str = "urn:sculpin:ledger-projection:v1:unloadable";
 
-/// Conditional guard: no `refVersion` of this graph's marker is `>= version` (a non-numeric
-/// value counts as blocking).
-fn conditional_guard(graph: &CognitiveGraph, version: i64) -> String {
-    format!(
-        "FILTER NOT EXISTS {{ GRAPH <{MARKER_GRAPH}> {{ <{g}> <{LP_NAMESPACE}refVersion> ?v }} \
-         FILTER (COALESCE(?v >= {version}, true)) }}",
-        g = graph.as_iri()
+/// Marker terms a write precondition may name (a v1 marker has seven; more means garbage an
+/// operator must clear by hand).
+pub const MAX_EXPECTED_TERMS: usize = 64;
+
+fn unrepresentable(why: &str) -> ProjectionError {
+    ProjectionError::permanent(
+        ProjectionErrorCode::TargetProtocol,
+        format!(
+            "the target's marker cannot be named exactly in a write precondition ({why}); \
+             clear the marker subject by hand, then rebuild (ADR-0020)"
+        ),
     )
 }
 
-/// Replacement guard: no `refVersion` of this graph's marker is `> ceiling` (non-numeric
-/// garbage does not block a recovery).
-fn replace_guard(graph: &CognitiveGraph, ceiling: i64) -> String {
-    format!(
-        "FILTER NOT EXISTS {{ GRAPH <{MARKER_GRAPH}> {{ <{g}> <{LP_NAMESPACE}refVersion> ?v }} \
-         FILTER (COALESCE(?v > {ceiling}, false)) }}",
-        g = graph.as_iri()
-    )
+/// An IRI as a SPARQL constant, or `None` if it holds a character IRIREF forbids.
+fn iri_constant(iri: &str) -> Option<String> {
+    (!iri.is_empty()
+        && iri
+            .chars()
+            .all(|c| c > ' ' && !matches!(c, '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\')))
+    .then(|| format!("<{iri}>"))
+}
+
+fn language_tag_ok(tag: &str) -> bool {
+    let mut parts = tag.split('-');
+    parts
+        .next()
+        .is_some_and(|p| (1..=8).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_alphabetic()))
+        && parts.all(|p| (1..=8).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_alphanumeric()))
+}
+
+/// A string literal body: only the four characters SPARQL forbids raw are escaped, with
+/// `ECHAR`s (never `\u` escapes, which the target decodes before parsing).
+fn escape_literal(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// A marker object exactly as observed, as a SPARQL constant (`None`: not expressible).
+fn term_constant(term: &MarkerTerm) -> Option<String> {
+    if term.is_blank {
+        return None;
+    }
+    if !term.is_literal {
+        return iri_constant(&term.value);
+    }
+    let lexical = format!("\"{}\"", escape_literal(&term.value));
+    match (&term.language, &term.datatype) {
+        (Some(tag), _) => language_tag_ok(tag).then(|| format!("{lexical}@{tag}")),
+        (None, None) => Some(lexical),
+        (None, Some(datatype)) if datatype == XSD_STRING => Some(lexical),
+        (None, Some(datatype)) => iri_constant(datatype).map(|d| format!("{lexical}^^{d}")),
+    }
+}
+
+/// Compare-and-swap precondition: the marker subject holds exactly `expected` (every pair
+/// present, no other pair), compared by the target's own term identity.
+fn precondition(
+    graph: &CognitiveGraph,
+    expected: &[(String, MarkerTerm)],
+) -> Result<String, ProjectionError> {
+    let g = graph.as_iri();
+    if expected.is_empty() {
+        return Ok(format!(
+            "FILTER NOT EXISTS {{ GRAPH <{MARKER_GRAPH}> {{ <{g}> ?cp ?co }} }}"
+        ));
+    }
+    if expected.len() > MAX_EXPECTED_TERMS {
+        return Err(unrepresentable("too many values"));
+    }
+    let mut present = String::new();
+    let mut allowed = Vec::with_capacity(expected.len());
+    for (predicate, object) in expected {
+        let p = iri_constant(predicate).ok_or_else(|| unrepresentable("predicate IRI"))?;
+        let o = term_constant(object).ok_or_else(|| unrepresentable("object term"))?;
+        present.push_str(&format!("<{g}> {p} {o} . "));
+        allowed.push(format!("(?cp = {p} && sameTerm(?co, {o}))"));
+    }
+    Ok(format!(
+        "GRAPH <{MARKER_GRAPH}> {{ {present}}} FILTER NOT EXISTS {{ GRAPH <{MARKER_GRAPH}> \
+         {{ <{g}> ?cp ?co }} FILTER (!({})) }}",
+        allowed.join(" || ")
+    ))
 }
 
 /// One SPARQL Update request writing `state` and `marker` into `graph` (one transaction on a
-/// transactional dataset). Every operation carries the same guard, so either all apply or
-/// none does; the last operation adds `lp:tripleCount` from the target's own count of the
-/// graph it just wrote.
+/// transactional dataset), applied only if the marker is still exactly `expected` — and, for
+/// a conditional write, names no ref version `>=` the one written. The first operations
+/// clear any stray token and insert the transaction-local write token under that
+/// precondition; every data operation is gated on the token; the count operation adds
+/// `lp:tripleCount` from the target's own count of the graph it just wrote; the last
+/// operation deletes the token. Either every data operation applies or none does.
 pub fn write_update(
     graph: &CognitiveGraph,
     state: &ProjectedState,
     marker: &ProjectionMarker,
     mode: WriteMode,
-) -> String {
+    expected: &[(String, MarkerTerm)],
+) -> Result<String, ProjectionError> {
     let g = graph.as_iri();
-    let guard = match mode {
-        WriteMode::Conditional => conditional_guard(graph, marker.ref_version),
-        WriteMode::Replace { ceiling } => replace_guard(graph, ceiling),
-    };
+    let mut guard = precondition(graph, expected)?;
+    if mode == WriteMode::Conditional {
+        guard.push_str(&format!(
+            " FILTER NOT EXISTS {{ GRAPH <{MARKER_GRAPH}> {{ <{g}> <{LP_NAMESPACE}refVersion> ?v }} \
+             FILTER (COALESCE(?v >= {}, true)) }}",
+            marker.ref_version
+        ));
+    }
+    let token =
+        format!("GRAPH <{MARKER_GRAPH}> {{ <{WRITE_SUBJECT}> <{LP_NAMESPACE}writeFor> <{g}> }}");
+    let clear = format!(
+        "DELETE WHERE {{ GRAPH <{MARKER_GRAPH}> {{ <{WRITE_SUBJECT}> <{LP_NAMESPACE}writeFor> ?any }} }}"
+    );
     let body = state.triples().join("\n");
     let marker_triples = marker.triples(graph).join("\n");
-    let mut ops = vec![format!(
-        "DELETE {{ GRAPH <{g}> {{ ?s ?p ?o }} }} WHERE {{ {guard} GRAPH <{g}> {{ ?s ?p ?o }} }}"
-    )];
+    let mut ops = vec![
+        clear.clone(),
+        format!("INSERT {{ {token} }} WHERE {{ {guard} }}"),
+        format!(
+            "DELETE {{ GRAPH <{g}> {{ ?s ?p ?o }} }} WHERE {{ {token} GRAPH <{g}> {{ ?s ?p ?o }} }}"
+        ),
+    ];
     if !state.triples().is_empty() {
         ops.push(format!(
-            "INSERT {{ GRAPH <{g}> {{\n{body}\n}} }} WHERE {{ {guard} }}"
+            "INSERT {{ GRAPH <{g}> {{\n{body}\n}} }} WHERE {{ {token} }}"
         ));
     }
     ops.push(format!(
-        "DELETE {{ GRAPH <{MARKER_GRAPH}> {{ <{g}> ?mp ?mo }} }} WHERE {{ {guard} \
+        "DELETE {{ GRAPH <{MARKER_GRAPH}> {{ <{g}> ?mp ?mo }} }} WHERE {{ {token} \
          GRAPH <{MARKER_GRAPH}> {{ <{g}> ?mp ?mo }} }}"
     ));
     ops.push(format!(
-        "INSERT {{ GRAPH <{MARKER_GRAPH}> {{\n{marker_triples}\n}} }} WHERE {{ {guard} }}"
+        "INSERT {{ GRAPH <{MARKER_GRAPH}> {{\n{marker_triples}\n}} }} WHERE {{ {token} }}"
     ));
-    // Only our own, count-less marker (just inserted) receives the count.
     ops.push(format!(
         "INSERT {{ GRAPH <{MARKER_GRAPH}> {{ <{g}> <{LP_NAMESPACE}tripleCount> ?n }} }} WHERE {{ \
-         GRAPH <{MARKER_GRAPH}> {{ <{g}> <{LP_NAMESPACE}refVersion> {version} ; \
-         <{LP_NAMESPACE}commitId> \"{commit}\" }} \
-         FILTER NOT EXISTS {{ GRAPH <{MARKER_GRAPH}> {{ <{g}> <{LP_NAMESPACE}tripleCount> ?x }} }} \
-         {{ SELECT (COUNT(*) AS ?n) WHERE {{ GRAPH <{g}> {{ ?s ?p ?o }} }} }} }}",
-        version = marker.ref_version,
-        commit = marker.commit
+         {token} {{ SELECT (COUNT(*) AS ?n) WHERE {{ GRAPH <{g}> {{ ?s ?p ?o }} }} }} }}"
     ));
-    ops.join(" ;\n")
+    ops.push(clear);
+    Ok(ops.join(" ;\n"))
+}
+
+/// Whether the dataset's default graph shows the target binding: true only for a union
+/// default graph (or a binding written into the default graph), which the projector refuses.
+pub fn union_default_graph_ask() -> String {
+    format!("ASK {{ <{TARGET_SUBJECT}> <{LP_NAMESPACE}targetId> ?t }}")
 }
 
 /// Whether every triple of `state` is in `graph`, by the target's own term equality.
@@ -190,6 +282,7 @@ pub fn parse_observation(body: &[u8]) -> Result<Observation, ProjectionError> {
                     value: o.value.clone(),
                     datatype: o.datatype.clone(),
                     is_literal: o.kind == "literal" || o.kind == "typed-literal",
+                    is_blank: o.kind == "bnode",
                     language: o.lang.clone(),
                 },
             )),
@@ -206,6 +299,7 @@ pub fn parse_observation(body: &[u8]) -> Result<Observation, ProjectionError> {
         marker: ProjectionMarker::from_terms(&pairs),
         triple_count: count.ok_or_else(|| protocol("the triple count is missing"))?,
         max_ref_version,
+        terms: pairs,
     })
 }
 
@@ -257,48 +351,129 @@ mod tests {
         (graph, projected, marker)
     }
 
-    #[test]
-    fn conditional_writes_guard_every_operation_on_the_marker_version() {
-        let (graph, state, marker) = fixture();
-        let update = write_update(&graph, &state, &marker, WriteMode::Conditional);
-        let ops: Vec<&str> = update.split(" ;\n").collect();
-        assert_eq!(ops.len(), 5);
-        for op in &ops[..4] {
-            assert!(op.contains("FILTER (COALESCE(?v >= 3, true))"), "{op}");
+    fn term(value: &str, datatype: Option<&str>) -> MarkerTerm {
+        MarkerTerm {
+            value: value.into(),
+            datatype: datatype.map(str::to_owned),
+            is_literal: true,
+            is_blank: false,
+            language: None,
         }
-        assert!(ops[1].contains("<urn:a> <urn:p> \"1\" ."));
+    }
+
+    #[test]
+    fn writes_are_gated_on_a_token_inserted_only_under_the_exact_observed_marker() {
+        let (graph, state, marker) = fixture();
+        let observed = vec![
+            (
+                format!("{LP_NAMESPACE}refVersion"),
+                term("2", Some("http://www.w3.org/2001/XMLSchema#integer")),
+            ),
+            (format!("{LP_NAMESPACE}graphId"), term("g\"x", None)),
+        ];
+        let update =
+            write_update(&graph, &state, &marker, WriteMode::Conditional, &observed).unwrap();
+        let ops: Vec<&str> = update.split(" ;\n").collect();
+        assert_eq!(ops.len(), 8);
+        let token =
+            format!("<{WRITE_SUBJECT}> <{LP_NAMESPACE}writeFor> <urn:sculpin:kb:kb:cognitive>");
         assert!(
-            ops[4].contains("COUNT(*)") && ops[4].contains("refVersion> 3"),
-            "{}",
-            ops[4]
+            ops[0].starts_with("DELETE WHERE") && ops[7] == ops[0],
+            "stray tokens cleared first and last"
         );
-        assert!(!update.contains("DROP") && !update.contains("INSERT DATA"));
+        // the precondition: every observed pair present, nothing else, and the version rule
+        assert!(
+            ops[1].starts_with(&format!(
+                "INSERT {{ GRAPH <{MARKER_GRAPH}> {{ {token} }} }} WHERE"
+            )),
+            "{}",
+            ops[1]
+        );
+        assert!(ops[1].contains("<urn:sculpin:ledger-projection:v1#refVersion> \"2\"^^<http://www.w3.org/2001/XMLSchema#integer> ."));
+        assert!(ops[1].contains("sameTerm(?co, \"g\\\"x\")"), "{}", ops[1]);
+        assert!(ops[1].contains("FILTER (COALESCE(?v >= 3, true))"));
+        for op in &ops[2..7] {
+            assert!(
+                op.contains(&token),
+                "every data operation is gated on the token: {op}"
+            );
+            assert!(!op.contains("sameTerm"), "{op}");
+        }
+        assert!(ops[3].contains("<urn:a> <urn:p> \"1\" ."));
+        assert!(ops[6].contains("COUNT(*)"));
         assert!(
             !update.contains("tripleCount> \""),
             "the ledger never writes the count"
         );
-        // an empty state writes no INSERT for the graph, still guards the rest
+        assert!(
+            !update.contains("DROP") && !update.contains("INSERT DATA") && !update.contains("\\u")
+        );
+        // replacements carry the precondition but no version rule; an empty observation
+        // requires an absent marker; an empty state writes no graph INSERT
         let empty = ProjectedState::from_state(&BTreeSet::new()).unwrap();
-        let update = write_update(&graph, &empty, &marker, WriteMode::Conditional);
-        assert_eq!(update.split(" ;\n").count(), 4);
+        let update = write_update(&graph, &empty, &marker, WriteMode::Replace, &[]).unwrap();
+        let ops: Vec<&str> = update.split(" ;\n").collect();
+        assert_eq!(ops.len(), 7);
+        assert!(ops[1].contains("FILTER NOT EXISTS { GRAPH <urn:sculpin:ledger-projection:v1:markers> { <urn:sculpin:kb:kb:cognitive> ?cp ?co } }"));
+        assert!(!update.contains("COALESCE"));
     }
 
     #[test]
-    fn replacements_are_guarded_by_their_ceiling_and_touch_only_the_two_graphs() {
+    fn markers_that_cannot_be_named_exactly_are_refused_not_overwritten() {
         let (graph, state, marker) = fixture();
-        let update = write_update(&graph, &state, &marker, WriteMode::Replace { ceiling: 9 });
-        let ops: Vec<&str> = update.split(" ;\n").collect();
-        assert_eq!(ops.len(), 5);
-        for op in &ops[..4] {
-            assert!(op.contains("FILTER (COALESCE(?v > 9, false))"), "{op}");
+        let p = format!("{LP_NAMESPACE}graphId");
+        let blank = MarkerTerm {
+            is_literal: false,
+            is_blank: true,
+            ..term("b0", None)
+        };
+        let bad_iri = MarkerTerm {
+            is_literal: false,
+            ..term("urn:x> } ; DROP ALL ; #", None)
+        };
+        let bad_lang = MarkerTerm {
+            language: Some("en\"@".into()),
+            ..term("x", None)
+        };
+        let bad_datatype = term("1", Some("urn:t>"));
+        for object in [blank, bad_iri, bad_lang, bad_datatype] {
+            let e = write_update(
+                &graph,
+                &state,
+                &marker,
+                WriteMode::Replace,
+                &[(p.clone(), object)],
+            )
+            .unwrap_err();
+            assert_eq!(e.code(), ProjectionErrorCode::TargetProtocol);
         }
-        for iri in [
-            "<urn:sculpin:kb:kb:cognitive>",
-            &format!("<{MARKER_GRAPH}>"),
-        ] {
-            assert!(update.contains(iri));
-        }
-        assert!(!update.contains("DEFAULT") && !update.contains("DROP"));
+        let e = write_update(
+            &graph,
+            &state,
+            &marker,
+            WriteMode::Replace,
+            &[("urn:p\\".into(), term("x", None))],
+        )
+        .unwrap_err();
+        assert_eq!(e.code(), ProjectionErrorCode::TargetProtocol);
+        let many: Vec<_> = (0..=MAX_EXPECTED_TERMS)
+            .map(|i| (p.clone(), term(&i.to_string(), None)))
+            .collect();
+        assert!(write_update(&graph, &state, &marker, WriteMode::Replace, &many).is_err());
+        // language-tagged and xsd:string literals are named exactly
+        let tagged = MarkerTerm {
+            language: Some("en-GB".into()),
+            ..term("x", None)
+        };
+        let update = write_update(
+            &graph,
+            &state,
+            &marker,
+            WriteMode::Replace,
+            &[(p.clone(), tagged), (p, term("y", Some(XSD_STRING)))],
+        )
+        .unwrap();
+        assert!(update.contains("\"x\"@en-GB") && update.contains("sameTerm(?co, \"y\")"));
     }
 
     #[test]
@@ -310,6 +485,12 @@ mod tests {
         let bind = bind_target_update("fuseki-main");
         assert!(bind.contains(TARGET_SUBJECT) && bind.contains("\"fuseki-main\""));
         assert!(bind.contains("FILTER NOT EXISTS"));
+        let union = union_default_graph_ask();
+        assert!(
+            union.starts_with("ASK {")
+                && union.contains(TARGET_SUBJECT)
+                && !union.contains("GRAPH")
+        );
     }
 
     #[test]

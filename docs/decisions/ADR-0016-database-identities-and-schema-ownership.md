@@ -170,6 +170,11 @@ owner-only, idempotent `ledger_grant_projector(role)` (`ledger-admin migrate
 `projection_state` (status reads); the runtime identity gains no write on projection state
 or on the outbox delivery columns, so the HTTP server can never mark projection progress.
 Verification is one parameterized routine (`IdentityModel`: table model, sequence model,
-exhaustive "no unlisted table privilege" check) used for both identities at start-up and
-readiness; `pg_projection` and `pg_least_privilege` exercise it on PostgreSQL 15 and 17,
-including drift in either direction and weakened 0011 guards, indexes, FKs and CHECKs.
+exhaustive "no unlisted table privilege" check) used for both identities at start-up, and by
+the projector's readiness as well (the runtime server's readiness compares definition
+fingerprints). Since 0011 it also refuses CREATE on the database and on any schema, not just
+`public`, and the 0011 guard functions pin `search_path` like the 0009 ones: an identity
+that could create objects could shadow what an unpinned function resolves.
+`pg_projection` and `pg_least_privilege` exercise it on PostgreSQL 15 and 17, including
+drift in either direction, CREATE on the database or an owned schema, projector readiness
+after a grant or definition drift, and weakened 0011 guards, indexes, FKs and CHECKs.

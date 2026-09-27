@@ -135,8 +135,13 @@ it after every end-to-end scenario.
   backup); (3) `GRANT CONNECT`, `ledger-admin migrate --runtime-role <role>` on the restored
   database, `ledger-admin verify` → `VERIFY OK`; (4) record the declared restore point
   (`SELECT graph_id, branch, version, head FROM refs`) with the backup identity and reason;
-  (5) reset or rebuild every projection to that point; (6) start the replicas; (7) publish
-  the restore point to clients.
+  (5) reset or rebuild every projection to that point: `ledger-admin migrate` also takes
+  `--projector-role <role>`, then `ledger-projector rebuild --graph <id>` per stream (their
+  markers are now ahead of the restored heads: `MARKER_AHEAD` until rebuilt); a restored
+  **copy** that runs next to the original (staging, forensics) must use its own
+  `LEDGER_PROJECTION_TARGET_ID` and dataset, never the original's — the dataset binding
+  keys on the target id only (ADR-0020); (6) start the replicas; (7) publish the restore
+  point to clients.
 - **What restore does not preserve — decide before you need it:** everything acknowledged
   after the snapshot is gone, and the restored ledger will issue the same `(graph, branch,
   version)` numbers again for different commits. Before a restore: fence all writers, record
@@ -177,7 +182,12 @@ Readers' contract: [reading the projection](../design/sculpin-projection.md).
   disable` (owner only — the projector role cannot enable or disable) frees the cognitive
   graph; to switch a KB's feed graph: disable the old stream, enable the new one, then
   `ledger-projector rebuild` it (the target holds the old feed's marker until then:
-  `TARGET_CONFLICT`).
+  `TARGET_CONFLICT`); a write of the old stream still in flight cannot land afterwards
+  (ADR-0020 compare-and-swap). Re-enabling a disabled stream reactivates it with its
+  original cognitive graph; if the graph's `knowledge_base_id` changed meanwhile, enable is
+  refused (a stream's cognitive graph never changes). `ledger-admin` must connect as the
+  role that **owns** the ledger tables itself (not a member of it, not a superuser): the
+  guard compares `current_user` with the table owner for every enable/disable.
 - **Run** `ledger-projector` (one or more replicas per target; they partition work by
   stream lease) with `LEDGER_PROJECTOR_DATABASE_URL`, `LEDGER_PROJECTION_TARGET_ID`,
   `LEDGER_PROJECTION_QUERY_URL`, `LEDGER_PROJECTION_UPDATE_URL` (https) and credentials from
@@ -200,8 +210,9 @@ Readers' contract: [reading the projection](../design/sculpin-projection.md).
   `blocked`; a marker ahead of the ledger (e.g. after restoring an older ledger backup) or a
   marker of another stream (`TARGET_CONFLICT`) sets `rebuild_required`. Acceptance is never
   affected. After fixing the cause: `ledger-projector rebuild --graph <id>` (replaces the
-  cognitive graph with the accepted state at the ref head — guarded so it can never
-  overwrite a newer projection — verifies marker and containment, reactivates the stream);
+  cognitive graph with the accepted state at the ref head — a compare-and-swap on what it
+  observed, so it can never overwrite something that changed meanwhile — verifies marker and
+  containment, reactivates the stream);
   `ledger-projector verify --graph <id>` compares target and ledger content without writing
   (the only check that also finds a count-preserving out-of-band edit). A Fuseki that lost
   its data is repaired by reconciliation or the same rebuild (the ledger is authoritative;

@@ -71,6 +71,20 @@ pub fn plan(view: &LedgerView, observation: &Observation) -> Plan {
             };
         }
         MarkerRead::Absent => return rebuild(RebuildReason::UnmarkedContent),
+        // A malformed marker naming a version beyond the ledger head may be a newer
+        // protocol or a newer ledger's marker: like a well-formed one, never regress it
+        // automatically.
+        MarkerRead::Malformed(_)
+            if observation
+                .max_ref_version
+                .is_some_and(|v| v > view.head_version) =>
+        {
+            return Plan::RecoveryRequired(ProjectionError::permanent(
+                ProjectionErrorCode::MarkerAhead,
+                "the target's (malformed) marker names a ref version beyond the ledger head; \
+                 an operator rebuild must decide (ADR-0020)",
+            ));
+        }
         MarkerRead::Malformed(_) => return rebuild(RebuildReason::MarkerMalformed),
         MarkerRead::Present(marker) => marker,
     };
@@ -117,17 +131,11 @@ pub fn plan(view: &LedgerView, observation: &Observation) -> Plan {
 }
 
 /// The write mode for a plan's write (ADR-0020): conditional for the normal path, a
-/// replacement guarded by the highest version observed for recovery.
-pub fn write_mode(
-    rebuild: Option<RebuildReason>,
-    target_version: i64,
-    observation: &Observation,
-) -> WriteMode {
+/// replacement of exactly the observed marker for recovery.
+pub fn write_mode(rebuild: Option<RebuildReason>) -> WriteMode {
     match rebuild {
         None => WriteMode::Conditional,
-        Some(_) => WriteMode::Replace {
-            ceiling: target_version.max(observation.max_ref_version.unwrap_or(0)),
-        },
+        Some(_) => WriteMode::Replace,
     }
 }
 
@@ -173,6 +181,7 @@ mod tests {
             marker,
             triple_count: count,
             max_ref_version,
+            terms: Vec::new(),
         }
     }
 
@@ -261,24 +270,22 @@ mod tests {
     }
 
     #[test]
-    fn replacements_are_guarded_by_the_highest_version_observed() {
+    fn recovery_replaces_and_malformed_markers_ahead_of_the_head_are_not_regressed() {
+        assert_eq!(write_mode(None), WriteMode::Conditional);
         assert_eq!(
-            write_mode(None, 5, &obs(marker(4, 1), 1)),
-            WriteMode::Conditional
+            write_mode(Some(RebuildReason::MarkerMalformed)),
+            WriteMode::Replace
         );
+        let mut malformed = obs(MarkerRead::Malformed("two versions".into()), 3);
+        malformed.max_ref_version = Some(9);
+        match plan(&view(5, 5, None), &malformed) {
+            Plan::RecoveryRequired(e) => assert_eq!(e.code(), ProjectionErrorCode::MarkerAhead),
+            other => panic!("{other:?}"),
+        }
+        malformed.max_ref_version = Some(5);
         assert_eq!(
-            write_mode(
-                Some(RebuildReason::MarkerMalformed),
-                5,
-                &obs(MarkerRead::Absent, 0)
-            ),
-            WriteMode::Replace { ceiling: 5 }
-        );
-        let mut observed = obs(MarkerRead::Malformed("two versions".into()), 3);
-        observed.max_ref_version = Some(9);
-        assert_eq!(
-            write_mode(Some(RebuildReason::MarkerMalformed), 5, &observed),
-            WriteMode::Replace { ceiling: 9 }
+            plan(&view(5, 5, None), &malformed),
+            rebuild(RebuildReason::MarkerMalformed)
         );
     }
 }

@@ -9,6 +9,10 @@ use std::fmt;
 pub const MARKER_GRAPH: &str = "urn:sculpin:ledger-projection:v1:markers";
 /// Subject of the dataset's target binding in the marker graph (one dataset, one target id).
 pub const TARGET_SUBJECT: &str = "urn:sculpin:ledger-projection:v1:target";
+/// Subject of the transaction-local write token in the marker graph: inserted by the first
+/// operation of a write only if the compare-and-swap precondition holds, gating every later
+/// operation, and deleted by the last one (never visible outside the write transaction).
+pub const WRITE_SUBJECT: &str = "urn:sculpin:ledger-projection:v1:write";
 /// Reserved graph used only by the start-up transactional probe (always left empty).
 pub const PROBE_GRAPH: &str = "urn:sculpin:ledger-projection:v1:probe";
 
@@ -137,6 +141,18 @@ mod tests {
         ),
         ("æ検", "urn:sculpin:kb:%C3%A6%E6%A4%9C:cognitive"),
     ];
+
+    #[test]
+    fn reserved_protocol_iris_are_frozen() {
+        assert_eq!(MARKER_GRAPH, "urn:sculpin:ledger-projection:v1:markers");
+        assert_eq!(TARGET_SUBJECT, "urn:sculpin:ledger-projection:v1:target");
+        assert_eq!(WRITE_SUBJECT, "urn:sculpin:ledger-projection:v1:write");
+        assert_eq!(PROBE_GRAPH, "urn:sculpin:ledger-projection:v1:probe");
+        // No reserved IRI can be a cognitive graph.
+        for iri in [MARKER_GRAPH, TARGET_SUBJECT, WRITE_SUBJECT, PROBE_GRAPH] {
+            assert!(CognitiveGraph::parse(iri).is_err(), "{iri}");
+        }
+    }
 
     #[test]
     fn cognitive_graph_iris_are_frozen_and_round_trip() {

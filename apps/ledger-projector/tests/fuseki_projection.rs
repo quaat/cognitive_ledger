@@ -7,7 +7,8 @@
 //! graphs, unsupported state and the transactional probe.
 //!
 //! Assertions read the target with **raw SPARQL** (reqwest + the ledger's own quad parser),
-//! never through the adapter under test.
+//! never through the adapter under test. The tests share one TDB2 dataset whose single writer
+//! commits in ~0.5–1 s, so they run one at a time (a process-wide lock, [`serial`]).
 //!
 //! Requires `LEDGER_TEST_DATABASE_URL` (owner), `LEDGER_TEST_FUSEKI_URL` (dataset base URL,
 //! e.g. `http://127.0.0.1:53030/ledger`) and `LEDGER_TEST_FUSEKI_PASSWORD` (the `admin`
@@ -17,8 +18,9 @@ use ledger_core::{
     AuthenticatedPrincipal, CommitId, ContentId, GraphId, PrincipalId, PrincipalType, TenantId,
 };
 use ledger_projection::{
-    CognitiveGraph, ErrorClass, LP_NAMESPACE, MARKER_GRAPH, Observation, ProjectedState,
-    ProjectionClient, ProjectionError, ProjectionErrorCode, ProjectionMarker, WriteMode,
+    CognitiveGraph, ErrorClass, LP_NAMESPACE, MARKER_GRAPH, MarkerTerm, Observation,
+    ProjectedState, ProjectionClient, ProjectionError, ProjectionErrorCode, ProjectionMarker,
+    WriteMode,
 };
 use ledger_projection_fuseki::{FusekiClient, FusekiConfig, TargetCredentials};
 use ledger_projector::{FailPoint, Projector, ProjectorConfig, StepOutcome, metrics::Metrics};
@@ -37,6 +39,12 @@ use std::{
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+/// One test at a time against the shared dataset (see the module doc).
+async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    LOCK.lock().await
+}
 
 fn env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("{name} must be set"))
@@ -83,13 +91,17 @@ async fn projector_url() -> String {
 }
 
 fn fuseki(base: &str) -> Arc<FusekiClient> {
+    fuseki_as(base, &env("LEDGER_TEST_FUSEKI_PASSWORD"))
+}
+
+fn fuseki_as(base: &str, password: &str) -> Arc<FusekiClient> {
     Arc::new(
         FusekiClient::new(FusekiConfig {
             query_endpoint: format!("{base}/query"),
             update_endpoint: format!("{base}/update"),
             credentials: TargetCredentials::Basic {
                 username: "admin".into(),
-                password: env("LEDGER_TEST_FUSEKI_PASSWORD"),
+                password: password.into(),
             },
             connect_timeout: Duration::from_secs(2),
             request_timeout: Duration::from_secs(10),
@@ -121,6 +133,13 @@ struct Scripted {
     /// Forward the next write, then report a timeout (the target committed; the response
     /// was lost).
     lose_response: AtomicBool,
+    /// Report success for writes without forwarding them (a target that acknowledges and
+    /// loses the request).
+    swallow: AtomicBool,
+    /// Answer every containment check with `false`.
+    deny_containment: AtomicBool,
+    /// Fail the transactional probe.
+    fail_probe: AtomicBool,
 }
 
 impl Scripted {
@@ -129,6 +148,9 @@ impl Scripted {
             inner: target(),
             hold: Mutex::new(None),
             lose_response: AtomicBool::new(false),
+            swallow: AtomicBool::new(false),
+            deny_containment: AtomicBool::new(false),
+            fail_probe: AtomicBool::new(false),
         })
     }
 }
@@ -145,12 +167,18 @@ impl ProjectionClient for Scripted {
         state: &ProjectedState,
         marker: &ProjectionMarker,
         mode: WriteMode,
+        expected: &[(String, MarkerTerm)],
     ) -> Result<(), ProjectionError> {
         let gate = self.hold.lock().unwrap().take();
         if let Some(gate) = gate {
             gate.notified().await;
         }
-        self.inner.write(graph, state, marker, mode).await?;
+        if self.swallow.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.inner
+            .write(graph, state, marker, mode, expected)
+            .await?;
         if self.lose_response.swap(false, Ordering::SeqCst) {
             return Err(ProjectionError::retryable(
                 ProjectionErrorCode::TargetTimeout,
@@ -169,6 +197,9 @@ impl ProjectionClient for Scripted {
         graph: &CognitiveGraph,
         state: &ProjectedState,
     ) -> Result<bool, ProjectionError> {
+        if self.deny_containment.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
         self.inner.contains_all(graph, state).await
     }
 
@@ -177,6 +208,12 @@ impl ProjectionClient for Scripted {
     }
 
     async fn probe_transactional(&self) -> Result<(), ProjectionError> {
+        if self.fail_probe.load(Ordering::SeqCst) {
+            return Err(ProjectionError::permanent(
+                ProjectionErrorCode::TargetNotTransactional,
+                "scripted: the failed update left its insert behind",
+            ));
+        }
         self.inner.probe_transactional().await
     }
 
@@ -302,6 +339,8 @@ fn marker(
 struct World {
     store: PostgresLedgerStore,
     target_id: String,
+    /// The tenant of every graph this world created.
+    tenants: Mutex<HashMap<GraphId, TenantId>>,
 }
 
 impl World {
@@ -315,7 +354,12 @@ impl World {
             .await
             .unwrap(),
             target_id: unique("fuseki"),
+            tenants: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn owner(&self) -> ProjectionRepository {
+        ProjectionRepository::new(self.store.pool().clone())
     }
 
     async fn projector(
@@ -323,6 +367,17 @@ impl World {
         client: Arc<dyn ProjectionClient>,
         owner: &str,
         failpoint: Option<FailPoint>,
+    ) -> Projector<dyn ProjectionClient> {
+        self.projector_with(client, owner, failpoint, Arc::new(Metrics::default()))
+            .await
+    }
+
+    async fn projector_with(
+        &self,
+        client: Arc<dyn ProjectionClient>,
+        owner: &str,
+        failpoint: Option<FailPoint>,
+        metrics: Arc<Metrics>,
     ) -> Projector<dyn ProjectionClient> {
         let repo = ProjectionRepository::connect(
             &projector_url().await,
@@ -345,7 +400,7 @@ impl World {
                 reconcile_interval: Duration::from_secs(3600),
                 probe_interval: Duration::from_secs(3600),
             },
-            Arc::new(Metrics::default()),
+            metrics,
         );
         match failpoint {
             Some(point) => projector.with_failpoint(point),
@@ -359,12 +414,21 @@ impl World {
 
     /// A graph of knowledge base `kb`, projection enabled for this world's target.
     async fn graph_with_kb(&self, kb: &str) -> (GraphId, CognitiveGraph) {
+        self.graph_of("tenant-it", kb).await
+    }
+
+    async fn graph_of(&self, tenant: &str, kb: &str) -> (GraphId, CognitiveGraph) {
         let id = GraphId::new(unique("pg")).unwrap();
+        let tenant = TenantId::new(tenant).unwrap();
+        self.tenants
+            .lock()
+            .unwrap()
+            .insert(id.clone(), tenant.clone());
         self.store
             .graphs()
             .create(&NewGraph {
                 graph_id: id.clone(),
-                tenant_id: TenantId::new("tenant-it").unwrap(),
+                tenant_id: tenant,
                 knowledge_base_id: Some(kb.to_owned()),
                 purpose: None,
                 status: GraphStatus::Active,
@@ -398,11 +462,12 @@ impl World {
 
     /// Prepare + accept quads on `main`; acceptance never depends on projection.
     async fn accept(&self, graph: &GraphId, head: Option<&CommitId>, quads: &[&str]) -> CommitId {
+        let tenant = self.tenants.lock().unwrap()[graph].clone();
         let scope = |key: String| RequestScope {
             principal: AuthenticatedPrincipal {
                 principal_id: PrincipalId::new("urn:it:agent").unwrap(),
                 principal_type: PrincipalType::Agent,
-                tenant_id: TenantId::new("tenant-it").unwrap(),
+                tenant_id: tenant.clone(),
                 on_behalf_of: None,
             },
             graph: graph.clone(),
@@ -522,6 +587,7 @@ fn assert_failed(outcome: StepOutcome, code: ProjectionErrorCode, class: ErrorCl
 #[tokio::test]
 #[ignore = "requires PostgreSQL and Fuseki: LEDGER_TEST_DATABASE_URL, LEDGER_TEST_FUSEKI_URL"]
 async fn the_target_is_transactional() {
+    let _serial = serial().await;
     target()
         .probe_transactional()
         .await
@@ -531,6 +597,7 @@ async fn the_target_is_transactional() {
 #[tokio::test]
 #[ignore = "requires PostgreSQL and Fuseki: LEDGER_TEST_DATABASE_URL, LEDGER_TEST_FUSEKI_URL"]
 async fn genesis_advance_and_duplicate_stale_or_equal_version_writes() {
+    let _serial = serial().await;
     let w = World::new().await;
     let (g, cg) = w.graph().await;
     let p = w.healthy().await;
@@ -553,29 +620,72 @@ async fn genesis_advance_and_duplicate_stale_or_equal_version_writes() {
         ),
         (Some(2), 0, 0, 0)
     );
-    // A duplicate v2, a stale v1, and a v2 write carrying other content: all no-ops.
+    // A duplicate v2, a stale v1, and a v2 write carrying other content, each planned from
+    // the current observation: all no-ops.
     let client = target();
     for (state, m) in [
         (&s2, marker(&g, &c2, 2, &s2)),
         (&s1, marker(&g, &c1, 1, &s1)),
         (&s1, marker(&g, &c2, 2, &s1)),
     ] {
+        let observed = client.observe(&cg).await.unwrap();
         client
             .write(
                 &cg,
                 &ProjectedState::from_state(state).unwrap(),
                 &m,
                 WriteMode::Conditional,
+                &observed.terms,
             )
             .await
             .unwrap();
         assert_projected(&cg, &g, &s2, &c2, 2).await;
     }
+    // A replacement planned from an observation that is no longer current: a no-op.
+    let stale = client.observe(&cg).await.unwrap();
+    raw_update(&format!(
+        "INSERT DATA {{ GRAPH <{cg}> {{ <urn:x> <urn:y> \"stray\" }} }}"
+    ))
+    .await;
+    raw_update(&format!(
+        "DELETE WHERE {{ GRAPH <{MARKER_GRAPH}> {{ <{cg}> <{LP_NAMESPACE}tripleCount> ?n }} }} ; \
+         INSERT DATA {{ GRAPH <{MARKER_GRAPH}> {{ <{cg}> <{LP_NAMESPACE}tripleCount> 4 }} }}"
+    ))
+    .await;
+    client
+        .write(
+            &cg,
+            &ProjectedState::from_state(&s1).unwrap(),
+            &marker(&g, &c1, 1, &s1),
+            WriteMode::Replace,
+            &stale.terms,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        raw_graph(&cg).await.len(),
+        4,
+        "the stale replacement wrote nothing"
+    );
+    // A duplicate write never adds a second count value.
+    let current = client.observe(&cg).await.unwrap();
+    client
+        .write(
+            &cg,
+            &ProjectedState::from_state(&s2).unwrap(),
+            &marker(&g, &c2, 2, &s2),
+            WriteMode::Conditional,
+            &current.terms,
+        )
+        .await
+        .unwrap();
+    assert_eq!(raw_marker(&cg).await["tripleCount"], ["4"]);
 }
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL and Fuseki: LEDGER_TEST_DATABASE_URL, LEDGER_TEST_FUSEKI_URL"]
 async fn a_target_outage_never_blocks_acceptance_and_the_projector_catches_up() {
+    let _serial = serial().await;
     let w = World::new().await;
     let (g, cg) = w.graph().await;
     let down = w.projector(dead_target(), "down", None).await;
@@ -623,6 +733,7 @@ async fn a_target_outage_never_blocks_acceptance_and_the_projector_catches_up() 
 #[tokio::test]
 #[ignore = "requires PostgreSQL and Fuseki: LEDGER_TEST_DATABASE_URL, LEDGER_TEST_FUSEKI_URL"]
 async fn a_write_committed_behind_a_lost_response_is_acknowledged_not_repeated() {
+    let _serial = serial().await;
     let w = World::new().await;
     let (g, cg) = w.graph().await;
     let scripted = Scripted::new();
@@ -657,6 +768,7 @@ async fn a_write_committed_behind_a_lost_response_is_acknowledged_not_repeated()
 #[tokio::test]
 #[ignore = "requires PostgreSQL and Fuseki: LEDGER_TEST_DATABASE_URL, LEDGER_TEST_FUSEKI_URL"]
 async fn every_crash_window_recovers_at_genesis_and_over_a_predecessor() {
+    let _serial = serial().await;
     let w = World::new().await;
     for point in [
         FailPoint::AfterClaim,
@@ -724,6 +836,7 @@ async fn every_crash_window_recovers_at_genesis_and_over_a_predecessor() {
 #[tokio::test]
 #[ignore = "requires PostgreSQL and Fuseki: LEDGER_TEST_DATABASE_URL, LEDGER_TEST_FUSEKI_URL"]
 async fn lost_or_corrupt_markers_are_rebuilt_and_out_of_band_edits_are_reconciled() {
+    let _serial = serial().await;
     let w = World::new().await;
     let (g, cg) = w.graph().await;
     let p = w.healthy().await;
@@ -737,11 +850,11 @@ async fn lost_or_corrupt_markers_are_rebuilt_and_out_of_band_edits_are_reconcile
     let c2 = w.accept(&g, Some(&c1), &[Q2]).await;
     assert_eq!(p.step().await.unwrap(), projected(2, true));
     assert_projected(&cg, &g, &quads(&[Q1, Q2]), &c2, 2).await;
-    // Marker corrupted with a second, higher refVersion: the replacement's ceiling is the
-    // highest version observed, so recovery still applies.
+    // Marker corrupted with a second refVersion value outside i64 (a double): malformed, not
+    // provably ahead; the replacement names the observed terms exactly, so recovery applies.
     raw_update(&format!(
         "INSERT DATA {{ GRAPH <{MARKER_GRAPH}> {{ <{cg}> <{LP_NAMESPACE}refVersion> \
-         \"7\"^^<http://www.w3.org/2001/XMLSchema#integer> }} }}"
+         \"1e3\"^^<http://www.w3.org/2001/XMLSchema#double> }} }}"
     ))
     .await;
     let c3 = w.accept(&g, Some(&c2), &[Q3]).await;
@@ -769,6 +882,7 @@ async fn lost_or_corrupt_markers_are_rebuilt_and_out_of_band_edits_are_reconcile
 #[tokio::test]
 #[ignore = "requires PostgreSQL and Fuseki: LEDGER_TEST_DATABASE_URL, LEDGER_TEST_FUSEKI_URL"]
 async fn reconciliation_repairs_a_target_that_lost_its_data_without_a_new_event() {
+    let _serial = serial().await;
     let w = World::new().await;
     let (g, cg) = w.graph().await;
     let p = w.healthy().await;
@@ -800,6 +914,7 @@ async fn reconciliation_repairs_a_target_that_lost_its_data_without_a_new_event(
 #[tokio::test]
 #[ignore = "requires PostgreSQL and Fuseki: LEDGER_TEST_DATABASE_URL, LEDGER_TEST_FUSEKI_URL"]
 async fn a_stale_replacement_never_overwrites_a_newer_projection() {
+    let _serial = serial().await;
     let w = World::new().await;
     let (g, cg) = w.graph().await;
     let healthy = w.healthy().await;
@@ -848,6 +963,7 @@ async fn a_stale_replacement_never_overwrites_a_newer_projection() {
 #[tokio::test]
 #[ignore = "requires PostgreSQL and Fuseki: LEDGER_TEST_DATABASE_URL, LEDGER_TEST_FUSEKI_URL"]
 async fn markers_ahead_or_of_another_stream_are_never_overwritten_automatically() {
+    let _serial = serial().await;
     let w = World::new().await;
     let kb = format!("urn:it:kb:{}", unique("shared"));
     let (g, cg) = w.graph_with_kb(&kb).await;
@@ -855,15 +971,18 @@ async fn markers_ahead_or_of_another_stream_are_never_overwritten_automatically(
     let s1 = quads(&[Q1]);
     // The target claims version 99 (e.g. the ledger was restored from an older backup).
     let future = CommitId(ContentId::for_bytes(b"from the future"));
+    let empty = target().observe(&cg).await.unwrap();
     target()
         .write(
             &cg,
             &ProjectedState::from_state(&s1).unwrap(),
             &marker(&g, &future, 99, &s1),
-            WriteMode::Replace { ceiling: 99 },
+            WriteMode::Replace,
+            &empty.terms,
         )
         .await
         .unwrap();
+    assert_eq!(raw_marker(&cg).await["refVersion"], ["99"]);
     let p = w.healthy().await;
     assert_failed(
         p.step().await.unwrap(),
@@ -909,6 +1028,7 @@ async fn markers_ahead_or_of_another_stream_are_never_overwritten_automatically(
 #[tokio::test]
 #[ignore = "requires PostgreSQL and Fuseki: LEDGER_TEST_DATABASE_URL, LEDGER_TEST_FUSEKI_URL"]
 async fn the_targets_literal_canonicalization_never_loops_or_blocks() {
+    let _serial = serial().await;
     let w = World::new().await;
     let (g, cg) = w.graph().await;
     let p = w.healthy().await;
@@ -952,9 +1072,15 @@ async fn the_targets_literal_canonicalization_never_loops_or_blocks() {
 #[tokio::test]
 #[ignore = "requires PostgreSQL and Fuseki: LEDGER_TEST_DATABASE_URL, LEDGER_TEST_FUSEKI_URL"]
 async fn concurrent_workers_and_many_graphs_never_mix_or_repeat() {
+    let _serial = serial().await;
     let w = World::new().await;
-    let a = w.healthy().await;
-    let b = w.healthy().await;
+    let (ma, mb) = (Arc::new(Metrics::default()), Arc::new(Metrics::default()));
+    let a = w
+        .projector_with(target(), "worker-a", None, ma.clone())
+        .await;
+    let b = w
+        .projector_with(target(), "worker-b", None, mb.clone())
+        .await;
     // Two workers racing for one stream: one projects, the other finds nothing claimable.
     let (g, cg) = w.graph().await;
     let c1 = w.accept(&g, None, &[Q1]).await;
@@ -966,7 +1092,15 @@ async fn concurrent_workers_and_many_graphs_never_mix_or_repeat() {
     // Many graphs, two projector loops running concurrently.
     let mut graphs = Vec::new();
     for i in 0..6 {
-        let (gi, cgi) = w.graph().await;
+        // Graphs of two tenants, interleaved.
+        let tenant = if i % 2 == 0 {
+            "tenant-it"
+        } else {
+            "tenant-it2"
+        };
+        let (gi, cgi) = w
+            .graph_of(tenant, &format!("urn:it:kb:{}", unique("kb")))
+            .await;
         let mut head = None;
         let mut expected = Vec::new();
         for j in 0..=i % 3 {
@@ -1004,20 +1138,29 @@ async fn concurrent_workers_and_many_graphs_never_mix_or_repeat() {
             (0, 0, false),
             "{gi}"
         );
-        let attempts: i64 = sqlx::query_scalar(
-            "SELECT coalesce(sum(attempts), 0)::bigint FROM projection_outbox WHERE graph_id = $1",
-        )
-        .bind(gi.as_str())
-        .fetch_one(w.store.pool())
-        .await
-        .unwrap();
-        assert_eq!(attempts, 1, "{gi}: one projection attempt in total");
+    }
+    // Exclusive leases: no attempt of either worker lost its lease or found its write
+    // superseded, and nothing was rebuilt (a correct retry after a transient error is fine).
+    for m in [&ma, &mb] {
+        let text = m.render(&[], 0);
+        for counter in [
+            "projection_lease_lost_total",
+            "projection_superseded_total",
+            "projection_rebuilds_total",
+        ] {
+            let line = text
+                .lines()
+                .find(|l| l.starts_with(&format!("{counter} ")))
+                .unwrap_or_else(|| panic!("{counter} missing"));
+            assert_eq!(line, format!("{counter} 0"), "{text}");
+        }
     }
 }
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL and Fuseki: LEDGER_TEST_DATABASE_URL, LEDGER_TEST_FUSEKI_URL"]
 async fn named_graph_state_blocks_the_stream_visibly() {
+    let _serial = serial().await;
     let w = World::new().await;
     let (g, cg) = w.graph().await;
     w.accept(&g, None, &["<urn:s> <urn:p> <urn:o> <urn:named> ."])
@@ -1036,4 +1179,214 @@ async fn named_graph_state_blocks_the_stream_visibly() {
     );
     assert!(raw_graph(&cg).await.is_empty(), "nothing written");
     assert!(raw_marker(&cg).await.is_empty(), "no marker");
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL and Fuseki: LEDGER_TEST_DATABASE_URL, LEDGER_TEST_FUSEKI_URL"]
+async fn a_write_in_flight_across_a_feed_switch_never_lands_in_the_new_feeds_graph() {
+    let _serial = serial().await;
+    let w = World::new().await;
+    let kb = format!("urn:it:kb:{}", unique("switch"));
+    // Feed 1: tenant A's graph projects v1 into the KB's cognitive graph.
+    let (g1, cg) = w.graph_of("tenant-it", &kb).await;
+    let healthy = w.healthy().await;
+    let c1 = w.accept(&g1, None, &[Q1]).await;
+    assert_eq!(healthy.step().await.unwrap(), projected(1, false));
+    // A worker observes g1's marker, plans v2 and stalls inside its write.
+    w.accept(&g1, Some(&c1), &[Q2]).await;
+    let scripted = Scripted::new();
+    let gate = Arc::new(tokio::sync::Notify::new());
+    *scripted.hold.lock().unwrap() = Some(gate.clone());
+    let stale = Arc::new(w.projector(scripted.clone(), "stale", None).await);
+    let stale_step = tokio::spawn({
+        let stale = stale.clone();
+        async move { stale.step().await.unwrap() }
+    });
+    let mut reached = false;
+    for _ in 0..500 {
+        if scripted.hold.lock().unwrap().is_none() {
+            reached = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(reached, "the stale worker reached its target write");
+    // The operator switches the KB's feed to another tenant's graph: disable, enable, and
+    // (after the conflict is reported) rebuild.
+    assert!(w.owner().disable(&w.key(&g1)).await.unwrap());
+    let (g2, cg2) = w.graph_of("tenant-it2", &kb).await;
+    assert_eq!(cg2, cg);
+    let d1 = w.accept(&g2, None, &[Q3]).await;
+    assert_failed(
+        healthy.step().await.unwrap(),
+        ProjectionErrorCode::TargetConflict,
+        ErrorClass::Permanent,
+    );
+    assert_eq!(
+        healthy.rebuild(&w.key(&g2)).await.unwrap(),
+        Some(projected(1, true))
+    );
+    assert_projected(&cg, &g2, &quads(&[Q3]), &d1, 1).await;
+    // The stale write lands now: its precondition (g1's v1 marker) no longer holds.
+    gate.notify_one();
+    let outcome = stale_step.await.unwrap();
+    assert!(
+        matches!(outcome, StepOutcome::LeaseLost),
+        "the disabled stream's attempt is fenced: {outcome:?}"
+    );
+    assert_projected(&cg, &g2, &quads(&[Q3]), &d1, 1).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL and Fuseki: LEDGER_TEST_DATABASE_URL, LEDGER_TEST_FUSEKI_URL"]
+async fn a_marker_naming_another_commit_at_its_version_is_rebuilt_from_the_ledger() {
+    let _serial = serial().await;
+    let w = World::new().await;
+    let (g, cg) = w.graph().await;
+    let p = w.healthy().await;
+    let c1 = w.accept(&g, None, &[Q1]).await;
+    p.step().await.unwrap();
+    // A well-formed marker of this stream at v1, but naming a commit the ledger does not
+    // have at v1 (another ledger's history).
+    let foreign = CommitId(ContentId::for_bytes(b"another history"));
+    raw_update(&format!(
+        "DELETE WHERE {{ GRAPH <{MARKER_GRAPH}> {{ <{cg}> <{LP_NAMESPACE}commitId> ?c }} }} ; \
+         INSERT DATA {{ GRAPH <{MARKER_GRAPH}> {{ <{cg}> <{LP_NAMESPACE}commitId> \"{foreign}\" }} }}"
+    ))
+    .await;
+    let c2 = w.accept(&g, Some(&c1), &[Q2]).await;
+    assert_eq!(p.step().await.unwrap(), projected(2, true));
+    assert_projected(&cg, &g, &quads(&[Q1, Q2]), &c2, 2).await;
+    assert_eq!(w.status(&g).await.rebuilds, 1);
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL and Fuseki: LEDGER_TEST_DATABASE_URL, LEDGER_TEST_FUSEKI_URL"]
+async fn a_malformed_marker_ahead_of_the_ledger_waits_for_an_operator() {
+    let _serial = serial().await;
+    let w = World::new().await;
+    let (g, cg) = w.graph().await;
+    let p = w.healthy().await;
+    let c1 = w.accept(&g, None, &[Q1]).await;
+    p.step().await.unwrap();
+    // A second refVersion value beyond the head (e.g. a newer protocol's marker).
+    raw_update(&format!(
+        "INSERT DATA {{ GRAPH <{MARKER_GRAPH}> {{ <{cg}> <{LP_NAMESPACE}refVersion> 99 }} }}"
+    ))
+    .await;
+    let c2 = w.accept(&g, Some(&c1), &[Q2]).await;
+    assert_failed(
+        p.step().await.unwrap(),
+        ProjectionErrorCode::MarkerAhead,
+        ErrorClass::Permanent,
+    );
+    assert_eq!(w.status(&g).await.status, "rebuild_required");
+    assert_eq!(
+        raw_marker(&cg).await["refVersion"].len(),
+        2,
+        "left untouched"
+    );
+    assert_eq!(
+        p.rebuild(&w.key(&g)).await.unwrap(),
+        Some(projected(2, true))
+    );
+    assert_projected(&cg, &g, &quads(&[Q1, Q2]), &c2, 2).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL and Fuseki: LEDGER_TEST_DATABASE_URL, LEDGER_TEST_FUSEKI_URL"]
+async fn verification_failures_are_never_acknowledged() {
+    let _serial = serial().await;
+    let w = World::new().await;
+    let (g, cg) = w.graph().await;
+    let scripted = Scripted::new();
+    let p = w.projector(scripted.clone(), "verifying", None).await;
+    let c1 = w.accept(&g, None, &[Q1, Q2]).await;
+    // The target answers "done" but never applied the write: the read-back refuses it.
+    scripted.swallow.store(true, Ordering::SeqCst);
+    assert_failed(
+        p.step().await.unwrap(),
+        ProjectionErrorCode::VerificationFailed,
+        ErrorClass::Retryable,
+    );
+    let status = w.status(&g).await;
+    assert_eq!(
+        (status.projected_ref_version, status.pending_events),
+        (None, 1)
+    );
+    assert!(raw_marker(&cg).await.is_empty());
+    scripted.swallow.store(false, Ordering::SeqCst);
+    w.due_now(&g).await;
+    assert_eq!(p.step().await.unwrap(), projected(1, false));
+    // A rebuild whose containment check fails is permanent: the stream blocks.
+    scripted.deny_containment.store(true, Ordering::SeqCst);
+    assert_eq!(
+        p.rebuild(&w.key(&g)).await.unwrap(),
+        Some(StepOutcome::Failed {
+            code: ProjectionErrorCode::VerificationFailed,
+            class: ErrorClass::Permanent
+        })
+    );
+    let status = w.status(&g).await;
+    assert_eq!(
+        (status.status.as_str(), status.last_error_code.as_deref()),
+        ("blocked", Some("VERIFICATION_FAILED"))
+    );
+    assert_eq!(status.projected_ref_version, Some(1));
+    assert_projected(&cg, &g, &quads(&[Q1, Q2]), &c1, 1).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL and Fuseki: LEDGER_TEST_DATABASE_URL, LEDGER_TEST_FUSEKI_URL"]
+async fn a_failing_transactional_probe_pauses_claiming() {
+    let _serial = serial().await;
+    let w = World::new().await;
+    let (g, _cg) = w.graph().await;
+    let scripted = Scripted::new();
+    let p = w.projector(scripted.clone(), "probing", None).await;
+    w.accept(&g, None, &[Q1]).await;
+    scripted.fail_probe.store(true, Ordering::SeqCst);
+    assert_eq!(
+        p.probe().await.unwrap_err().code(),
+        ProjectionErrorCode::TargetNotTransactional
+    );
+    assert!(p.is_paused());
+    assert_eq!(
+        p.step().await.unwrap(),
+        StepOutcome::Idle,
+        "paused with pending work"
+    );
+    assert_eq!(w.status(&g).await.pending_events, 1);
+    scripted.fail_probe.store(false, Ordering::SeqCst);
+    p.probe().await.unwrap();
+    assert!(!p.is_paused());
+    assert_eq!(p.step().await.unwrap(), projected(1, false));
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL and Fuseki: LEDGER_TEST_DATABASE_URL, LEDGER_TEST_FUSEKI_URL"]
+async fn a_refused_target_credential_blocks_the_stream() {
+    let _serial = serial().await;
+    let w = World::new().await;
+    let (g, cg) = w.graph().await;
+    let p = w
+        .projector(
+            fuseki_as(&env("LEDGER_TEST_FUSEKI_URL"), "not-the-password"),
+            "wrong-password",
+            None,
+        )
+        .await;
+    w.accept(&g, None, &[Q1]).await;
+    // The target refuses the credential (401): permanent, never retried in a loop.
+    assert_failed(
+        p.step().await.unwrap(),
+        ProjectionErrorCode::TargetAuth,
+        ErrorClass::Permanent,
+    );
+    let status = w.status(&g).await;
+    assert_eq!(
+        (status.status.as_str(), status.last_error_code.as_deref()),
+        ("blocked", Some("TARGET_AUTH"))
+    );
+    assert!(raw_graph(&cg).await.is_empty());
 }

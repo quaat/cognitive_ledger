@@ -2,8 +2,9 @@
 
 ## Status
 Accepted (2026-09-27, Plan 0007 / Phase 3; amended before first release on 2026-09-28 by
-the Phase-3 review round: guarded replacement with a ceiling, target-computed triple count,
-stream-conflict recovery, dataset binding, reconciliation, `main`-only v1). Freezes the
+the Phase-3 review rounds: compare-and-swap writes on the exact observed marker (round 2,
+replacing round 1's version ceiling), target-computed triple count, stream-conflict
+recovery, dataset binding and union-default-graph refusal, reconciliation, `main`-only v1). Freezes the
 external projection protocol (`sculpin-ledger-projection/v1`): the cognitive graph IRI, the
 marker representation, the dataset binding and the guarded-write rules are persistent
 identity in a store the ledger does not own; changing them after release needs a
@@ -73,7 +74,13 @@ A dataset serves exactly one `target_id`. The marker graph holds
 `<urn:sculpin:ledger-projection:v1:target> lp:targetId "<target_id>"`, inserted on first use
 only if absent. Every projector process that writes (run, rebuild) binds or verifies the
 binding at start-up and refuses to start with `TARGET_CONFLICT` when the dataset is bound to
-another id or carries more than one binding. Two deployments (two ledgers, or one ledger
+another id or carries more than one binding, and with `TARGET_PROTOCOL` when the binding is
+visible in the dataset's default graph (a union default graph). The binding is keyed by the
+operator-chosen `target_id` only: two deployments configured with the **same** id (e.g. a
+staging copy restored from a production backup) both pass it, and each would see the
+other's markers as `MARKER_COMMIT_MISMATCH` or `MARKER_AHEAD`. A restored or cloned ledger
+must get its own `target_id` and dataset (runbook); the binding is not re-checked after
+start-up (residual, tech debt). Two deployments (two ledgers, or one ledger
 with two target ids) pointed at one dataset therefore cannot both write it. `target_id` is
 restricted to `[A-Za-z0-9._:-]{1,128}` (database CHECK and client validation), so it is
 interpolated into SPARQL only as a validated token.
@@ -104,42 +111,51 @@ projector's credential is the only writer of the marker graph in a correct deplo
 (`docs/operations/deployment.md`); a party that can write the target can forge a marker, and
 periodic reconciliation plus `verify` (below) are the detection controls, not prevention.
 
-### State-based projection and the guarded writes
+### State-based projection and the compare-and-swap write
 v1 always materializes the **full accepted state** at a ref version `N` (no incremental patch
 application): the projector reconstructs the state at the event's commit through the bounded
-reconstruction interface, then sends **one** SPARQL Update request of five operations, every
-data-changing one carrying the same guard:
+reconstruction interface, observes the target (marker terms and the graph's triple count in
+one query), plans (decision table below), and sends **one** SPARQL Update request whose
+precondition is the observation itself:
 ```
-DELETE { GRAPH <G> { ?s ?p ?o } }       WHERE { GUARD GRAPH <G> { ?s ?p ?o } } ;
-INSERT { GRAPH <G> { …state… } }        WHERE { GUARD } ;        # omitted for an empty state
-DELETE { GRAPH <M> { <G> ?p ?o } }      WHERE { GUARD GRAPH <M> { <G> ?p ?o } } ;
-INSERT { GRAPH <M> { …marker(N) without tripleCount… } } WHERE { GUARD } ;
-INSERT { GRAPH <M> { <G> lp:tripleCount ?n } } WHERE {
-  GRAPH <M> { <G> lp:refVersion N ; lp:commitId "C" }
-  FILTER NOT EXISTS { GRAPH <M> { <G> lp:tripleCount ?x } }
-  { SELECT (COUNT(*) AS ?n) WHERE { GRAPH <G> { ?s ?p ?o } } } }
+DELETE WHERE { GRAPH <M> { <W> lp:writeFor ?any } } ;                        # clear stray tokens
+INSERT { GRAPH <M> { <W> lp:writeFor <G> } } WHERE { CAS(observed) [VERSION(N)] } ;
+DELETE { GRAPH <G> { ?s ?p ?o } }   WHERE { TOKEN GRAPH <G> { ?s ?p ?o } } ;
+INSERT { GRAPH <G> { …state… } }    WHERE { TOKEN } ;                         # omitted if empty
+DELETE { GRAPH <M> { <G> ?p ?o } }  WHERE { TOKEN GRAPH <M> { <G> ?p ?o } } ;
+INSERT { GRAPH <M> { …marker(N) without tripleCount… } } WHERE { TOKEN } ;
+INSERT { GRAPH <M> { <G> lp:tripleCount ?n } } WHERE { TOKEN
+         { SELECT (COUNT(*) AS ?n) WHERE { GRAPH <G> { ?s ?p ?o } } } } ;
+DELETE WHERE { GRAPH <M> { <W> lp:writeFor ?any } }                           # token removed
+TOKEN      = GRAPH <M> { <W> lp:writeFor <G> }      (<W> = urn:sculpin:ledger-projection:v1:write)
+CAS(obs)   = GRAPH <M> { <G> p1 o1 . … <G> pk ok . }
+             FILTER NOT EXISTS { GRAPH <M> { <G> ?cp ?co }
+                                 FILTER (!((?cp = p1 && sameTerm(?co, o1)) || …)) }
+             (an empty observation: FILTER NOT EXISTS { GRAPH <M> { <G> ?cp ?co } })
+VERSION(N) = FILTER NOT EXISTS { GRAPH <M> { <G> lp:refVersion ?v } FILTER (COALESCE(?v >= N, true)) }
 ```
-Two guards exist:
-- **Conditional** (normal path) — `FILTER NOT EXISTS { GRAPH <M> { <G> lp:refVersion ?v }
-  FILTER (COALESCE(?v >= N, true)) }`: applies only if no `refVersion` value of the marker is
-  `≥ N` (a non-numeric value also blocks). A write for `N` is a no-op when the target already
-  represents `N` or later — duplicate delivery, an equal-version write carrying other
-  content, and a stale worker whose lease expired can never move the marker backwards or
-  overwrite newer state.
-- **Replace with ceiling** (recovery) — `FILTER NOT EXISTS { … FILTER (COALESCE(?v > K,
-  false)) }` with `K = max(N, highest refVersion the planner observed)`: overwrites whatever
-  the graph and marker hold (including garbage values), **unless** some `refVersion` is above
-  `K`. A replacement planned by a worker that then stalls is therefore itself a no-op once
-  another worker has projected a newer version (reproduced against the pinned target: a
-  held v2 replacement released after v3 was projected leaves v3 intact).
+The **compare-and-swap** (CAS) holds only while the marker subject carries exactly the
+observed (predicate, object) terms, compared by the target's own term identity, with nothing
+added or removed. A write planned from an observation that is no longer current — another
+version landed, another stream's marker arrived after a feed switch, a replacement already
+repaired a malformed marker, an operator cleaned the subject — inserts no token, so every
+data operation is a no-op. This makes any late, stalled or duplicated write harmless
+regardless of lease state, across streams and feeds (review round 2: a version-only guard let
+a disabled feed's in-flight write, or a queued stale replacement with a high ceiling, land
+over a newer projection of another stream). The normal path adds `VERSION(N)` (no
+`refVersion` ≥ `N`, a non-numeric one also blocks) as defence in depth; a recovery
+replacement has no version rule: it replaces exactly what it observed, including garbage and
+out-of-range values.
 
-The guard is evaluated within the one transaction against the pre-request marker by the
-first three operations; the fourth sees the marker removed (its guard holds by then only
-because the first three applied — if they did not, the old marker is still present and the
-guard still fails). The fifth adds the count only to the marker just inserted (it names
-`N` and `C` and has no count yet); after a no-op request the existing marker keeps its count.
-Either every operation applies or none does. Ledger state is blank-node free (ADR-0003), so
-the templates are exact.
+The token is transaction-local: the first operation clears any stray token, the last one
+deletes it, and readers never see it (one transaction). The count operation adds
+`lp:tripleCount` from the target's own count of the graph just written. Either every data
+operation applies or none does. Terms the adapter cannot write as exact SPARQL constants — a
+blank node, an IRI or datatype containing a character `IRIREF` forbids, an invalid language
+tag, or more than 64 values — make the write fail with `TARGET_PROTOCOL` (permanent: an
+operator clears the marker subject by hand); literal values are escaped with `ECHAR`s only,
+never `\u` escapes, which the target decodes before parsing. Ledger state is blank-node free
+(ADR-0003), so the state templates are exact.
 
 v1 projects the ledger dataset's **default graph**. A state containing quads in a named graph
 is refused with `NAMED_GRAPH_UNSUPPORTED` (the stream blocks visibly); mapping ledger named
@@ -154,7 +170,8 @@ projection; the recorded version on reconciliation; the ref head on an operator 
 | no marker, empty graph, nothing recorded | conditional write of `T` (first projection) |
 | no marker, empty graph, a projection was recorded | rebuild (`TARGET_LOST`) |
 | no marker, populated graph | rebuild (`UNMARKED_CONTENT`) |
-| malformed marker | rebuild (`MARKER_MALFORMED`); the ceiling covers any value it holds |
+| malformed marker whose highest parseable `refVersion` is `> H` | **recovery** `rebuild_required` (`MARKER_AHEAD`): may be a newer protocol's or ledger's marker |
+| other malformed marker (including out-of-range numeric values) | rebuild (`MARKER_MALFORMED`); the replacement names the observed terms exactly |
 | well-formed marker of **another** graph/branch | **recovery** `rebuild_required` (`TARGET_CONFLICT`): never overwritten automatically |
 | marker version `> H` | **recovery** `rebuild_required` (`MARKER_AHEAD`): never regressed automatically |
 | marker version `v ≤ H`, commit `≠ L(v)` | rebuild (`MARKER_COMMIT_MISMATCH`) |
@@ -163,11 +180,16 @@ projection; the recorded version on reconciliation; the ref head on an operator 
 | marker `v = N` | already projected: acknowledge |
 | marker `N < v ≤ H` | target already beyond: acknowledge up to `v` |
 
-A rebuild uses the replace guard and is counted, logged with its reason and exported.
+A rebuild uses the replacement write, is counted (`projection_rebuilds_total`, and
+`rebuilds` on the stream) and logged with its reason. The `N < v ≤ H` row is defensive: work
+is always the latest outbox event and enable refuses heads without one, so a marker beyond
+`N` within history can only appear through an out-of-band edit or a restore.
 `MARKER_COMMIT_MISMATCH` rebuilds automatically because the marker is this stream's and
 within the ledger's history, so the ledger (authoritative) decides; a foreign or ahead
 marker may belong to a newer or different ledger and needs an operator. An operator rebuild
-(`ledger-projector rebuild`) replaces unconditionally except for the ceiling.
+(`ledger-projector rebuild`) replaces whatever it observed (any marker, including an ahead or
+foreign one), still under CAS, so it cannot overwrite something that changed after its own
+observation.
 
 After every write the projector reads the marker and count back in one query: the marker
 must name `T`, its count must equal the observed count and be plausible (`0 < count ≤ state
@@ -193,8 +215,10 @@ write when consistent).
   probe graph followed by a failing `LOAD` of an unloadable URN), requires the request to
   fail with HTTP 500 naming the `LOAD`, and refuses to run (pauses claiming) if the probe's
   insert survived; the probe graph is emptied afterwards;
-- the dataset must **not** use a union default graph (`tdb2:unionDefaultGraph`): the marker
-  graph would then leak into default-graph queries of Sculpin;
+- the dataset must **not** use a union default graph (`tdb2:unionDefaultGraph`): every
+  cognitive graph, the markers and the binding would merge into default-graph queries. The
+  projector refuses a service whose default graph shows the binding; a separate reader
+  service over the same storage is the operator's responsibility;
 - updates go to the configured SPARQL Update endpoint with credentials; endpoint URLs are
   deployment configuration, never request data (https required outside development).
 
@@ -218,8 +242,14 @@ a rebuild that fails containment. Recovery (`rebuild_required`): `MARKER_AHEAD`,
 - **Marker triples inside the cognitive graph.** Mixes protocol data into the domain graph
   Sculpin queries and reasons over.
 - **An unguarded `DROP`/`INSERT DATA` rebuild.** Simpler, but a rebuild planned by a worker
-  that stalls past its lease would overwrite a newer projection (review finding); the
-  ceiling guard closes it.
+  that stalls past its lease would overwrite a newer projection (review round 1).
+- **Version-number guards (round 1: conditional `refVersion < N`, replacement under a
+  ceiling).** Versions are per ledger graph and ref, so they order nothing across streams or
+  feeds, and a ceiling taken from garbage or ahead values admits late regressions (review
+  round 2). Superseded by the compare-and-swap on the exact observed marker.
+- **Fencing the target by lease only** (e.g. keeping a disabled stream's lease until expiry
+  before another stream may take its graph). Helps only for workers that honour the clock;
+  the target-side precondition holds regardless of timing.
 - **A ledger-computed `lp:tripleCount` and byte-exact comparison.** Wrong on TDB2, whose
   value canonicalization makes a correct projection look edited and would rebuild forever.
 - **Timestamps for ordering or freshness.** Rejected everywhere in the ledger; `ref_version`
@@ -240,5 +270,8 @@ a rebuild that fails containment. Recovery (`rebuild_required`): `MARKER_AHEAD`,
 - Fuseki must be deployed with a transactional dataset, no union default graph and
   authenticated updates; the projector verifies the first and requires credentials for the
   last in production.
-- The protocol strings, the IRI mapping, the marker predicates and the binding subject are
-  frozen by vectors in `crates/ledger-projection` tests.
+- The protocol strings, the IRI mapping, the marker predicates, the binding and write-token
+  subjects are frozen by vectors in `crates/ledger-projection` tests; the request shape by
+  `crates/ledger-projection-fuseki` unit tests; the behaviour against the pinned target by
+  `apps/ledger-projector/tests/fuseki_projection.rs` (a mutation removing the precondition
+  turns three of those tests red).

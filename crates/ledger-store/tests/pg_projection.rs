@@ -362,9 +362,12 @@ async fn progress_and_delivery_are_monotonic_and_rows_are_never_deleted() {
                 .bind(&target)
                 .execute(&pool)
                 .await;
-            assert!(
-                result.is_err(),
-                "{sql} must be refused (even for the owner)"
+            // Refused by a guard trigger (integrity_constraint_violation), not by some
+            // unrelated error.
+            assert_eq!(
+                sqlstate(result),
+                "23000",
+                "{sql} must be refused by a guard (even for the owner)"
             );
         }
     };
@@ -376,6 +379,7 @@ async fn progress_and_delivery_are_monotonic_and_rows_are_never_deleted() {
     refused("UPDATE projection_outbox SET delivered_at = NULL WHERE graph_id = $1 AND $2 <> ''")
         .await;
     refused("UPDATE projection_outbox SET attempts = -1 WHERE graph_id = $1 AND $2 <> ''").await;
+    refused("UPDATE projection_outbox SET delivered_at = now() + interval '1 day' WHERE graph_id = $1 AND $2 <> '' AND delivered_at IS NOT NULL").await;
     refused("DELETE FROM projection_outbox WHERE graph_id = $1 AND $2 <> ''").await;
     // Recorded progress must name a real accepted state of this ref (FK): a version that
     // exists paired with the wrong commit, and a version that does not exist.
@@ -602,6 +606,24 @@ async fn the_projector_identity_holds_exactly_its_model() {
     )
     .await;
     assert!(m.contains("ledger_grant_projector"), "{m}");
+    // CREATE anywhere (database, or a schema it owns) could shadow objects: refused.
+    let db: String = sqlx::query_scalar("SELECT current_database()::text")
+        .fetch_one(&admin)
+        .await
+        .unwrap();
+    let m = refused(
+        format!("GRANT CREATE ON DATABASE {db} TO {role}"),
+        format!("REVOKE CREATE ON DATABASE {db} FROM {role}"),
+    )
+    .await;
+    assert!(m.contains("CREATE on the database"), "{m}");
+    let schema = format!("lp_shadow_{}", std::process::id());
+    let m = refused(
+        format!("CREATE SCHEMA {schema} AUTHORIZATION {role}"),
+        format!("DROP SCHEMA {schema}"),
+    )
+    .await;
+    assert!(m.contains(&schema), "{m}");
     // The runtime identity check refuses a projector role (and vice versa).
     let pool: PgPool = PgPoolOptions::new()
         .max_connections(1)
@@ -614,4 +636,147 @@ async fn the_projector_identity_holds_exactly_its_model() {
         .await
         .expect("restored");
     drop(store);
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn reconciliation_respects_backoff_and_delivery_stops_at_the_acknowledged_version() {
+    let store = store().await;
+    let repo = owner_repo(&store).await;
+    let target = unique("t");
+    let g = graph(&store, "tenant-a", Some(&unique("kb"))).await;
+    let c1 = accept(&store, "tenant-a", &g, None, "one").await;
+    let k = key(&g, &target);
+    repo.enable(&k, derive).await.unwrap();
+    let ttl = Duration::from_secs(30);
+    // Claimed at v1; v2 is accepted before the acknowledgement of v1.
+    let claim = repo.claim(&target, "w", ttl).await.unwrap().unwrap();
+    let work = repo
+        .work_for(&claim, WorkMode::Pending)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(work.ref_version, 1);
+    let c2 = accept(&store, "tenant-a", &g, Some(c1.clone()), "two").await;
+    assert_eq!(
+        repo.acknowledge(&claim, Some(work.outbox_id), &c1, 1, false)
+            .await
+            .unwrap(),
+        LeaseOutcome::Committed
+    );
+    let delivered: Vec<(i64, bool)> = sqlx::query_as(
+        "SELECT ref_version, delivered_at IS NOT NULL FROM projection_outbox \
+         WHERE graph_id = $1 ORDER BY ref_version",
+    )
+    .bind(g.as_str())
+    .fetch_all(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        delivered,
+        vec![(1, true), (2, false)],
+        "v2 is not delivered by v1's acknowledgement"
+    );
+    let claim = repo
+        .claim(&target, "w", ttl)
+        .await
+        .unwrap()
+        .expect("v2 is due");
+    let work = repo
+        .work_for(&claim, WorkMode::Pending)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((work.ref_version, &work.commit), (2, &c2));
+    repo.acknowledge(&claim, Some(work.outbox_id), &c2, 2, false)
+        .await
+        .unwrap();
+    // Idle and due for reconciliation.
+    let idle = Duration::from_secs(3600);
+    assert!(
+        repo.claim_reconcile(&target, "r", ttl, idle)
+            .await
+            .unwrap()
+            .is_none(),
+        "checked recently"
+    );
+    sqlx::query("UPDATE projection_state SET last_success_at = now() - interval '2 hours' WHERE graph_id = $1")
+        .bind(g.as_str())
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let reconcile = repo
+        .claim_reconcile(&target, "r", ttl, idle)
+        .await
+        .unwrap()
+        .expect("due");
+    assert_eq!(
+        repo.work_for(&reconcile, WorkMode::Recorded)
+            .await
+            .unwrap()
+            .unwrap()
+            .ref_version,
+        2
+    );
+    // A failed reconciliation backs off like any other attempt: no tight retry loop.
+    repo.fail(
+        &reconcile,
+        None,
+        "TARGET_UNAVAILABLE",
+        FailureDisposition::Retry(Duration::from_secs(60)),
+    )
+    .await
+    .unwrap();
+    assert!(
+        repo.claim_reconcile(&target, "r", ttl, idle)
+            .await
+            .unwrap()
+            .is_none(),
+        "backing off"
+    );
+    sqlx::query("UPDATE projection_state SET next_attempt_at = now() WHERE graph_id = $1")
+        .bind(g.as_str())
+        .execute(store.pool())
+        .await
+        .unwrap();
+    assert!(
+        repo.claim_reconcile(&target, "r", ttl, idle)
+            .await
+            .unwrap()
+            .is_some(),
+        "due again"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn a_stream_keeps_its_cognitive_graph_when_the_graphs_kb_changes() {
+    let store = store().await;
+    let repo = owner_repo(&store).await;
+    let target = unique("t");
+    let g = graph(&store, "tenant-a", Some(&unique("kb"))).await;
+    accept(&store, "tenant-a", &g, None, "one").await;
+    let k = key(&g, &target);
+    let iri = repo.enable(&k, derive).await.unwrap();
+    assert!(repo.disable(&k).await.unwrap());
+    sqlx::query("UPDATE graphs SET knowledge_base_id = $2 WHERE graph_id = $1")
+        .bind(g.as_str())
+        .bind(unique("kb2"))
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let error = repo.enable(&k, derive).await.unwrap_err();
+    assert!(
+        error.to_string().contains("knowledge_base_id changed"),
+        "{error}"
+    );
+    let (status, recorded): (String, String) = sqlx::query_as(
+        "SELECT status, cognitive_graph FROM projection_state WHERE graph_id = $1 AND target_id = $2",
+    )
+    .bind(g.as_str())
+    .bind(&target)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!((status.as_str(), recorded), ("disabled", iri));
 }

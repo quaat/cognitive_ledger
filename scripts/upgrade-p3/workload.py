@@ -8,7 +8,7 @@ through this driver is recorded (tenant, path, key, body, answer) for a verbatim
 the upgrade.
 
 Subcommands (all talk to the ledger at $BASE; tokens are minted with the dev-hs256 secret):
-  populate-default <p3.json> <rec.json>  OLD API, unvalidated-acceptance switch: history on the
+  populate-default <p3.json> <rec.json> [commits]  OLD API, unvalidated-acceptance switch: history on the
                                          projectable graphs (typed/lang literals, IRIs,
                                          deletes) and one pending proposal.
   phase2-old <p2.json> <p3.json> <rec.json> <res.json>
@@ -84,7 +84,8 @@ def dump_recorded(rec):
     json.dump(old + RECORDED, open(rec, "w"), indent=1, sort_keys=True)
 
 
-def populate_default(out, rec, commits=5):
+def populate_default(out, rec, commits="5"):
+    commits = int(commits)
     result = {"graphs": {}, "pending": []}
     for gi, g in enumerate(PGRAPHS):
         graph, tenant = g["graph"], g["tenant"]

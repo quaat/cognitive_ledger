@@ -2829,6 +2829,38 @@ async fn weakened_projection_controls_are_refused_at_startup_and_readiness() {
         .await
         .expect("healthy database serves");
     assert_healthy(&fx, "fresh migration").await;
+    // The projector identity on the same database: its readiness must refuse the same drift.
+    let projector_role = unique("lp_pj");
+    owner_exec(
+        &fx,
+        &format!("CREATE ROLE {projector_role} LOGIN PASSWORD 'pj-test-secret'"),
+    )
+    .await;
+    {
+        let mut conn = PgConnection::connect(&fx.owner_db_url).await.unwrap();
+        schema::grant_projector_role(&mut conn, &projector_role)
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+    }
+    let projector = ledger_store::ProjectionRepository::connect(
+        &with_credentials(&fx.owner_db_url, &projector_role, "pj-test-secret"),
+        DbSessionLimits::default(),
+    )
+    .await
+    .expect("the projector identity verifies");
+    projector.ready().await.expect("projector ready");
+    // A privilege granted after start-up is refused by the projector's readiness.
+    owner_exec(&fx, &format!("GRANT INSERT ON refs TO {projector_role}")).await;
+    match projector.ready().await {
+        Err(LedgerError::RuntimeIdentity(m)) => assert!(m.contains("refs"), "{m}"),
+        other => panic!("projector readiness must refuse a drifted grant: {other:?}"),
+    }
+    owner_exec(&fx, &format!("REVOKE INSERT ON refs FROM {projector_role}")).await;
+    projector
+        .ready()
+        .await
+        .expect("projector ready after revoke");
 
     // Guard triggers disabled.
     for (trigger, table) in [
@@ -2902,6 +2934,13 @@ async fn weakened_projection_controls_are_refused_at_startup_and_readiness() {
         }
         other => panic!("narrowed graph-unique predicate must refuse readiness: {other:?}"),
     }
+    assert!(
+        matches!(
+            projector.ready().await,
+            Err(LedgerError::SchemaIncompatible(_))
+        ),
+        "narrowed graph-unique predicate must refuse the projector's readiness"
+    );
     owner_exec(&fx, "DROP INDEX projection_state_graph_unique").await;
     owner_exec(&fx, &index).await;
     assert_healthy(&fx, "graph-unique index restored").await;
@@ -2969,6 +3008,13 @@ async fn weakened_projection_controls_are_refused_at_startup_and_readiness() {
             ),
             "vacuous {check} must refuse readiness"
         );
+        assert!(
+            matches!(
+                projector.ready().await,
+                Err(LedgerError::SchemaIncompatible(_))
+            ),
+            "vacuous {check} must refuse the projector's readiness"
+        );
         owner_exec(
             &fx,
             &format!("ALTER TABLE projection_state DROP CONSTRAINT {check}"),
@@ -2982,6 +3028,17 @@ async fn weakened_projection_controls_are_refused_at_startup_and_readiness() {
         assert_healthy(&fx, &format!("{check} restored")).await;
     }
     running.ready().await.expect("readiness after restore");
+    projector
+        .ready()
+        .await
+        .expect("projector readiness after restore");
     drop(running);
+    projector.pool().close().await;
+    drop(projector);
+    let admin = fx.admin.clone();
     fx.teardown().await;
+    sqlx::query(&format!("DROP ROLE {projector_role}"))
+        .execute(&admin)
+        .await
+        .unwrap();
 }

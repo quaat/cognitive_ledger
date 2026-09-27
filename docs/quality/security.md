@@ -122,18 +122,29 @@ Preserve object digest verification and atomic ref updates. Never commit secrets
   role cannot re-point a graph. A cognitive graph holding another stream's marker is never
   overwritten automatically (`TARGET_CONFLICT`), and a dataset is bound to one target id, so
   a second deployment pointed at it refuses to start rather than overwriting it.
-- Stale or concurrent writers cannot regress the target: every write, including recovery
-  replacements, is guarded in the target transaction by the marker's `refVersion`
-  (ADR-0020); leases are an efficiency measure, not the safety mechanism.
+- Stale or concurrent writers cannot regress or cross-write the target: every write,
+  including recovery replacements, is a compare-and-swap in the target transaction on the
+  exact marker terms the writer observed (ADR-0020), so a late write after a version change,
+  a repair or a feed switch to another tenant's graph is a no-op; leases are an efficiency
+  measure, not the safety mechanism. Observed terms are embedded only as validated IRIs or
+  `ECHAR`-escaped literals; anything else (blank nodes, forbidden IRI characters, invalid
+  language tags, > 64 values) refuses the write.
 - The projector runs as `ledger_projector`: SELECT on the nine tables it needs, UPDATE on
   outbox delivery columns and stream progress/lease/error columns only, no privilege on any
   other table, no sequence, no grant function; startup refuses any drift. The runtime role
   can read but never write projection progress.
 - Residual: queries on the target are whatever the deployment exposes (the compose dataset
   allows anonymous queries); the marker graph reveals ledger graph ids and commit ids of the
-  projected streams to target readers. The target itself is trusted: whoever can write it
-  can forge a marker or edit a graph; reconciliation (count) and `verify` (content) detect
-  damage, they do not prevent it — keep the projector's update account the only writer.
+  projected streams to target readers. More importantly, **anyone with query access to a
+  target dataset reads every projected tenant's accepted content**: one dataset per target
+  is shared by all tenants' streams. Deployments that must separate tenants use a dataset
+  (and target id) per tenant or query authentication in front of Fuseki; the compose
+  dataset allows anonymous queries (development only). Re-pointing a KB's cognitive graph
+  from one tenant's ledger graph to another's is an operator action (disable + enable +
+  rebuild) the ledger does not second-guess. The target itself is trusted: whoever can write
+  it can forge a marker or edit a graph; reconciliation (count) and `verify` (content)
+  detect damage, they do not prevent it — keep the projector's update account the only
+  writer.
 
 ## Mutation semantics
 - `Idempotency-Key` is required; idempotency is scoped by tenant, complete actor

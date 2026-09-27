@@ -292,14 +292,7 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
         let graph = CognitiveGraph::parse(&claim.cognitive_graph)?;
         let observation = self.client.observe(&graph).await?;
         let (mode, rebuilt) = if force {
-            (
-                WriteMode::Replace {
-                    ceiling: work
-                        .ref_version
-                        .max(observation.max_ref_version.unwrap_or(0)),
-                },
-                true,
-            )
+            (WriteMode::Replace, true)
         } else {
             let at_marker = self.commit_at_marker(claim, work, &observation).await?;
             match plan(&self.view(claim, work, at_marker), &observation) {
@@ -321,10 +314,7 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
                             reason = reason.as_str(), "projection target is ambiguous; rebuilding"
                         );
                     }
-                    (
-                        write_mode(rebuild, work.ref_version, &observation),
-                        rebuild.is_some(),
-                    )
+                    (write_mode(rebuild), rebuild.is_some())
                 }
             }
         };
@@ -355,7 +345,11 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
         if self.crash(FailPoint::BeforeTargetRequest) {
             return Ok(StepOutcome::Crashed(FailPoint::BeforeTargetRequest));
         }
-        self.client.write(&graph, &projected, &marker, mode).await?;
+        // Compare-and-swap on exactly the observed marker (ADR-0020): if anything changed it
+        // since — another version, another stream, another feed — the write is a no-op.
+        self.client
+            .write(&graph, &projected, &marker, mode, &observation.terms)
+            .await?;
         if self.crash(FailPoint::AfterTargetSuccess) {
             return Ok(StepOutcome::Crashed(FailPoint::AfterTargetSuccess));
         }
@@ -536,9 +530,21 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
                     if *stop.borrow() {
                         break;
                     }
-                    let mut busy = !matches!(me.step().await, Ok(StepOutcome::Idle) | Err(_));
+                    let mut busy = match me.step().await {
+                        Ok(outcome) => outcome != StepOutcome::Idle,
+                        Err(e) => {
+                            tracing::error!(error = %e, "claiming a projection stream failed");
+                            false
+                        }
+                    };
                     if !busy {
-                        busy = !matches!(me.reconcile_step().await, Ok(StepOutcome::Idle) | Err(_));
+                        busy = match me.reconcile_step().await {
+                            Ok(outcome) => outcome != StepOutcome::Idle,
+                            Err(e) => {
+                                tracing::error!(error = %e, "claiming a stream for reconciliation failed");
+                                false
+                            }
+                        };
                     }
                     if !busy {
                         tokio::select! {

@@ -106,7 +106,7 @@ pub struct SchemaReport {
 }
 
 /// Verify that the database is at exactly `REQUIRED_SCHEMA_VERSION` with intact migration
-/// metadata. Runs on the runtime identity (SELECT on `_sqlx_migrations`).
+/// metadata. Runs on the runtime or projector identity (SELECT on `_sqlx_migrations`).
 pub async fn verify(pool: &PgPool) -> Result<SchemaReport, LedgerError> {
     let rows = match sqlx::query(
         "SELECT version, checksum, success FROM _sqlx_migrations ORDER BY version",
@@ -118,8 +118,10 @@ pub async fn verify(pool: &PgPool) -> Result<SchemaReport, LedgerError> {
         Err(sqlx::Error::Database(d)) if d.code().as_deref() == Some("42501") => {
             return Err(LedgerError::RuntimeIdentity(
                 "the connected role cannot read the migration metadata: it has not been \
-                 granted the runtime privileges; run `ledger-admin migrate --runtime-role <role>` \
-                 with the owner identity (ADR-0016)"
+                 granted its identity's privileges on this database (or the schema predates \
+                 them); run `ledger-admin migrate --runtime-role <role>` for the server or \
+                 `--projector-role <role>` for the projector with the owner identity \
+                 (ADR-0016, ADR-0021)"
                     .into(),
             ));
         }
@@ -2478,6 +2480,11 @@ async fn verify_identity(pool: &PgPool, model: &IdentityModel) -> Result<(), Led
         "SELECT current_user::text AS who, \
                 (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) AS super, \
                 has_schema_privilege(current_user, 'public', 'CREATE') AS can_create, \
+                has_database_privilege(current_user, current_database(), 'CREATE') AS can_create_db, \
+                (SELECT string_agg(nspname::text, ', ' ORDER BY nspname) FROM pg_namespace \
+                    WHERE nspname <> 'public' AND nspname <> 'information_schema' \
+                      AND nspname NOT LIKE 'pg\\_%' \
+                      AND has_schema_privilege(current_user, oid, 'CREATE')) AS create_schemas, \
                 (SELECT count(*) FROM pg_tables WHERE schemaname = 'public' \
                     AND tableowner = current_user) AS owned",
     )
@@ -2487,6 +2494,8 @@ async fn verify_identity(pool: &PgPool, model: &IdentityModel) -> Result<(), Led
     let who: String = row.try_get("who").map_err(db_error)?;
     let is_super: Option<bool> = row.try_get("super").map_err(db_error)?;
     let can_create: bool = row.try_get("can_create").map_err(db_error)?;
+    let can_create_db: bool = row.try_get("can_create_db").map_err(db_error)?;
+    let create_schemas: Option<String> = row.try_get("create_schemas").map_err(db_error)?;
     let owned: i64 = row.try_get("owned").map_err(db_error)?;
     if is_super.unwrap_or(false) {
         return Err(identity(format!(
@@ -2503,6 +2512,18 @@ async fn verify_identity(pool: &PgPool, model: &IdentityModel) -> Result<(), Led
     if can_create {
         return Err(identity(format!(
             "role {who} holds CREATE on schema public; revoke it ({adr})"
+        )));
+    }
+    // CREATE anywhere lets the identity shadow objects through its own search_path; the
+    // guard functions pin theirs, and the identity may create nothing at all.
+    if can_create_db {
+        return Err(identity(format!(
+            "role {who} holds CREATE on the database (it could create schemas); revoke it ({adr})"
+        )));
+    }
+    if let Some(schemas) = create_schemas {
+        return Err(identity(format!(
+            "role {who} holds CREATE on schema(s) {schemas}; revoke it ({adr})"
         )));
     }
     verify_role_attributes_and_memberships(pool, &who, model).await?;

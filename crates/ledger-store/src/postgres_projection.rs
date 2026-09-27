@@ -133,11 +133,17 @@ fn validate_owner(owner: &str) -> Result<(), LedgerError> {
 #[derive(Clone, Debug)]
 pub struct ProjectionRepository {
     pool: PgPool,
+    /// CHECK and partial-index fingerprints validated at start-up (projector identity);
+    /// readiness refuses any change (as the runtime store does).
+    fingerprints: Option<std::collections::BTreeMap<String, String>>,
 }
 
 impl ProjectionRepository {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            fingerprints: None,
+        }
     }
 
     /// Connect as the **projector** identity: verify the schema level, every definition, and
@@ -152,19 +158,41 @@ impl ProjectionRepository {
             .connect(database_url)
             .await
             .map_err(db_error)?;
-        crate::schema::verify(&pool).await?;
+        let report = crate::schema::verify(&pool).await?;
         crate::schema::verify_projector_identity(&pool).await?;
         crate::schema::verify_definitions(&pool).await?;
-        Ok(Self::new(pool))
+        Ok(Self {
+            pool,
+            fingerprints: Some(report.fingerprints),
+        })
     }
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
 
-    /// Readiness: the schema is still exactly what this build requires.
+    /// Readiness: the schema is still exactly what this build requires, no CHECK or
+    /// partial-index definition changed since start-up, and the connected role still holds
+    /// exactly the projector model (catalog reads only).
     pub async fn ready(&self) -> Result<(), LedgerError> {
-        crate::schema::verify(&self.pool).await.map(|_| ())
+        let report = crate::schema::verify(&self.pool).await?;
+        if let Some(expected) = &self.fingerprints
+            && *expected != report.fingerprints
+        {
+            let changed: Vec<&String> = expected
+                .iter()
+                .filter(|(k, v)| report.fingerprints.get(*k) != Some(v))
+                .map(|(k, _)| k)
+                .collect();
+            return Err(LedgerError::SchemaIncompatible(format!(
+                "constraint or index definitions changed since start-up ({changed:?}); \
+                 refusing to project until they are verified again"
+            )));
+        }
+        if self.fingerprints.is_some() {
+            crate::schema::verify_projector_identity(&self.pool).await?;
+        }
+        Ok(())
     }
 
     // ---- operator (owner identity) ------------------------------------------------------
@@ -252,6 +280,25 @@ impl ProjectionRepository {
                     "another stream of this target already projects into this cognitive graph",
                 ));
             }
+        }
+        // A stream's cognitive graph is fixed at creation (identity column); if the graph's
+        // KB id changed since, re-enabling would report a graph the stream does not write.
+        let recorded: Option<String> = sqlx::query_scalar(
+            "SELECT cognitive_graph FROM projection_state \
+             WHERE graph_id = $1 AND branch = $2 AND target_id = $3",
+        )
+        .bind(key.graph_id.as_str())
+        .bind(&key.branch)
+        .bind(&key.target_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        if recorded.as_ref().is_some_and(|g| *g != cognitive_graph) {
+            return Err(invalid(
+                "knowledge_base_id",
+                "the graph's knowledge_base_id changed since this stream was created; a stream's \
+                 cognitive graph never changes — enable it under another target id instead",
+            ));
         }
         sqlx::query(
             "INSERT INTO projection_state (graph_id, branch, target_id, tenant_id, cognitive_graph) \
@@ -365,9 +412,10 @@ impl ProjectionRepository {
         row.map(|r| claim_from_row(&r, owner)).transpose()
     }
 
-    /// Lease an **idle** active stream (no pending events, projection recorded) whose last
-    /// successful check is older than `idle`, to re-observe its target (reconciliation:
-    /// detects a target that lost or diverged from its data without a new event).
+    /// Lease an **idle** active stream (no pending events, projection recorded), due (backoff
+    /// respected), whose last successful check is older than `idle`, to re-observe its target
+    /// (reconciliation: detects a target that lost or diverged from its data without a new
+    /// event). Streams checked least recently — by success or failure — go first.
     pub async fn claim_reconcile(
         &self,
         target_id: &str,
@@ -381,10 +429,11 @@ impl ProjectionRepository {
                  SELECT s.graph_id, s.branch, s.target_id FROM projection_state s \
                  WHERE s.target_id = $1 AND s.status = 'active' AND s.projected_ref_version IS NOT NULL \
                    AND (s.lease_until IS NULL OR s.lease_until < now()) \
+                   AND s.next_attempt_at <= now() \
                    AND (s.last_success_at IS NULL OR s.last_success_at < now() - make_interval(secs => $4)) \
                    AND NOT EXISTS (SELECT 1 FROM projection_outbox o WHERE o.graph_id = s.graph_id \
                                    AND o.branch = s.branch AND o.ref_version > s.projected_ref_version) \
-                 ORDER BY s.last_success_at NULLS FIRST, s.graph_id, s.branch \
+                 ORDER BY greatest(s.last_success_at, s.last_error_at) NULLS FIRST, s.graph_id, s.branch \
                  LIMIT 1 FOR UPDATE OF s SKIP LOCKED) \
              UPDATE projection_state s SET lease_owner = $2, \
                  lease_until = now() + make_interval(secs => $3), lease_epoch = s.lease_epoch + 1 \
@@ -494,9 +543,11 @@ impl ProjectionRepository {
                 .await
                 .map_err(db_error)?;
         if indexed.as_deref() != Some(graph.as_str()) {
-            return Err(LedgerError::Storage(
-                "the projected commit is not indexed under the stream's graph".into(),
-            ));
+            // A ledger-state fact, not a transient condition: never retried in a loop.
+            return Err(LedgerError::InvalidIdentifier {
+                field: "commit",
+                reason: "the projected commit is not indexed under the stream's graph".into(),
+            });
         }
         Ok(WorkflowRepository::state_at_on(&mut conn, commit, limits)
             .await?

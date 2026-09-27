@@ -43,6 +43,8 @@ pub struct MarkerTerm {
     /// Datatype IRI of a literal (`None` for a plain literal).
     pub datatype: Option<String>,
     pub is_literal: bool,
+    /// A blank node (never a valid marker value, and not addressable in a precondition).
+    pub is_blank: bool,
     /// Language tag of a literal (a tagged literal is never a valid marker value).
     pub language: Option<String>,
 }
@@ -200,6 +202,7 @@ mod tests {
                         value,
                         datatype,
                         is_literal: true,
+                        is_blank: false,
                         language: None,
                     },
                 )
@@ -211,6 +214,7 @@ mod tests {
                 value: m.triple_count.to_string(),
                 datatype: Some(XSD_INTEGER.into()),
                 is_literal: true,
+                is_blank: false,
                 language: None,
             },
         ));

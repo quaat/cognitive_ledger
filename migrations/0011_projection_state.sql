@@ -65,7 +65,9 @@ CREATE UNIQUE INDEX projection_state_graph_unique ON projection_state (target_id
 
 -- ---- guards ---------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.projection_state_guard() RETURNS trigger
-LANGUAGE plpgsql AS $$
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public
+AS $$
 BEGIN
     IF TG_OP = 'DELETE' THEN
         RAISE EXCEPTION 'projection_state rows are never deleted; disable the stream instead'
@@ -102,7 +104,9 @@ CREATE TRIGGER projection_state_guard BEFORE UPDATE OR DELETE ON projection_stat
     FOR EACH ROW EXECUTE FUNCTION projection_state_guard();
 
 CREATE OR REPLACE FUNCTION public.outbox_delivery_is_monotonic() RETURNS trigger
-LANGUAGE plpgsql AS $$
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public
+AS $$
 BEGIN
     IF OLD.delivered_at IS NOT NULL AND NEW.delivered_at IS DISTINCT FROM OLD.delivered_at THEN
         RAISE EXCEPTION 'projection_outbox delivered_at is set once'

@@ -8,7 +8,7 @@
 pub mod sparql;
 
 use ledger_projection::{
-    CognitiveGraph, Observation, ProjectedState, ProjectionClient, ProjectionError,
+    CognitiveGraph, MarkerTerm, Observation, ProjectedState, ProjectionClient, ProjectionError,
     ProjectionErrorCode as Code, ProjectionMarker, WriteMode,
 };
 use ledger_rdf::Quad;
@@ -32,7 +32,7 @@ impl std::fmt::Debug for TargetCredentials {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct FusekiConfig {
     /// SPARQL query endpoint (e.g. `https://fuseki.internal/ledger/query`).
     pub query_endpoint: String,
@@ -45,6 +45,22 @@ pub struct FusekiConfig {
     pub max_response_bytes: usize,
     /// Plain `http://` to a loopback host (development only).
     pub allow_insecure_loopback: bool,
+}
+
+impl std::fmt::Debug for FusekiConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Endpoints are deployment configuration and never logged (docs/quality/security.md).
+        f.debug_struct("FusekiConfig")
+            .field("query_endpoint", &"<redacted>")
+            .field("update_endpoint", &"<redacted>")
+            .field("credentials", &self.credentials)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("request_timeout", &self.request_timeout)
+            .field("max_update_bytes", &self.max_update_bytes)
+            .field("max_response_bytes", &self.max_response_bytes)
+            .field("allow_insecure_loopback", &self.allow_insecure_loopback)
+            .finish()
+    }
 }
 
 /// Why a configuration is refused (never contains the URL or a credential).
@@ -337,13 +353,14 @@ impl ProjectionClient for FusekiClient {
         state: &ProjectedState,
         marker: &ProjectionMarker,
         mode: WriteMode,
+        expected: &[(String, MarkerTerm)],
     ) -> Result<(), ProjectionError> {
         // Refuse before formatting the request: no multi-copy of an oversized state.
         let estimate = state.byte_len() + 16 * 1024;
         if estimate > self.max_update_bytes {
             return Err(self.too_large(estimate));
         }
-        self.update(sparql::write_update(graph, state, marker, mode))
+        self.update(sparql::write_update(graph, state, marker, mode, expected)?)
             .await
     }
 
@@ -382,6 +399,19 @@ impl ProjectionClient for FusekiClient {
                 .query(sparql::bound_target_query(), SPARQL_JSON)
                 .await?,
         )?;
+        // A union default graph would merge every cognitive graph and the markers into
+        // readers' default-graph queries (ADR-0020): the binding must not be visible there.
+        if sparql::parse_ask(
+            &self
+                .query(sparql::union_default_graph_ask(), SPARQL_JSON)
+                .await?,
+        )? {
+            return Err(ProjectionError::permanent(
+                Code::TargetProtocol,
+                "the target dataset exposes its named graphs in the default graph (union default \
+                 graph); refusing to project into it (ADR-0020)",
+            ));
+        }
         if bound == [target_id] {
             Ok(())
         } else {
