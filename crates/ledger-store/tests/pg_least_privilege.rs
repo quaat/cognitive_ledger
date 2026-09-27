@@ -2599,6 +2599,25 @@ async fn checks_recreated_as_a_logical_restore_does_are_accepted_and_changes_sti
         Err(LedgerError::SchemaIncompatible(m)) => assert!(m.contains("refs_branch_bounds"), "{m}"),
         other => panic!("a widened branch alphabet must refuse start-up: {other:?}"),
     }
+    // A quoted identifier is compared exactly: a CHECK moved to a look-alike column
+    // `"position::text"` does not pass for the one on `position`.
+    owner_exec(
+        &fx,
+        "ALTER TABLE commit_parents ADD COLUMN \"position::text\" smallint NOT NULL DEFAULT 0",
+    )
+    .await;
+    owner_exec(
+        &fx,
+        "ALTER TABLE commit_parents DROP CONSTRAINT commit_parents_position, \
+         ADD CONSTRAINT commit_parents_position CHECK (\"position::text\" IN (0, 1))",
+    )
+    .await;
+    match PostgresLedgerStore::connect(&fx.runtime_db_url, V1Binding::Reject).await {
+        Err(LedgerError::SchemaIncompatible(m)) => {
+            assert!(m.contains("commit_parents"), "{m}")
+        }
+        other => panic!("a CHECK on a look-alike column must refuse start-up: {other:?}"),
+    }
 }
 
 /// Composite foreign keys are `MATCH SIMPLE`: a key column that became nullable lets a row

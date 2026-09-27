@@ -1553,29 +1553,36 @@ const RESTORED_CHECKS: &[(&str, &str, &str)] = &[
 ];
 
 /// Normalize a deparsed definition for comparison: whitespace and `::text` casts are removed
-/// *outside* string literals only, so a literal (a regex, an enum value) is compared exactly —
-/// `'^[a-z]+$'` and `'^[a-z ]+$'` must never normalize alike. `''` inside a literal is an
-/// escaped quote and keeps the literal open.
+/// *outside* quoted text only. String literals (`'…'`, where `''` is an escaped quote) and
+/// quoted identifiers (`"…"`, where `""` is an escaped quote) are kept byte for byte, so
+/// `'^[a-z]+$'` never normalizes like `'^[a-z ]+$'` and `"position"` never like
+/// `"position::text"`.
 fn normalize_constraint_def(def: &str) -> String {
     let mut out = String::with_capacity(def.len());
     let mut outside = String::new();
-    let mut in_literal = false;
+    let mut quote: Option<char> = None;
     let flush = |outside: &mut String, out: &mut String| {
         out.push_str(&outside.replace("::text", ""));
         outside.clear();
     };
     for c in def.chars() {
-        if in_literal {
-            out.push(c);
-            if c == '\'' {
-                in_literal = false;
+        match quote {
+            Some(q) => {
+                out.push(c);
+                if c == q {
+                    quote = None;
+                }
             }
-        } else if c == '\'' {
-            flush(&mut outside, &mut out);
-            out.push(c);
-            in_literal = true;
-        } else if !c.is_whitespace() {
-            outside.push(c);
+            None if c == '\'' || c == '"' => {
+                flush(&mut outside, &mut out);
+                out.push(c);
+                quote = Some(c);
+            }
+            None => {
+                if !c.is_whitespace() {
+                    outside.push(c);
+                }
+            }
         }
     }
     flush(&mut outside, &mut out);
@@ -2660,6 +2667,15 @@ mod tests {
         assert_eq!(
             normalize_constraint_def("CHECK ((x = 'a::text b'::text))"),
             "CHECK((x='a::text b'))"
+        );
+        // Quoted identifiers are compared exactly too.
+        assert_ne!(
+            normalize_constraint_def("CHECK ((\"position::text\" = ANY (ARRAY[0, 1])))"),
+            normalize_constraint_def("CHECK ((\"position\" = ANY (ARRAY[0, 1])))")
+        );
+        assert_eq!(
+            normalize_constraint_def("CHECK ((\"a b\" > 0))"),
+            "CHECK((\"a b\">0))"
         );
         // An escaped quote keeps the literal open.
         assert_eq!(

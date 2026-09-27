@@ -179,14 +179,15 @@ diff -u "${OUT}/schema-source-0009.sql" "${OUT}/schema-restored-0009.sql" >"${OU
 # Exactly these replacements, and nothing else: each nested form removed, its flattened form added.
 python3 - "${OUT}/restore-schema.diff" <<'PY' || { head -40 "${OUT}/restore-schema.diff" >&2; fail "restored backup DDL/grants differ from the source beyond the re-parsed branch bounds"; }
 import sys
-lines = {l.rstrip("\n") for l in open(sys.argv[1]) if l[:1] in "+-" and not l.startswith(("+++", "---"))}
+from collections import Counter
+lines = Counter(l.rstrip("\n") for l in open(sys.argv[1]) if l[:1] in "+-" and not l.startswith(("+++", "---")))
 bounds = "(octet_length(branch) >= 1) AND (octet_length(branch) <= 128)"
 regex = "(branch ~ '^[A-Za-z0-9._/-]+$'::text)"
 tables = ("proposals", "ref_events", "refs")
 nested = {f"-    CONSTRAINT {t}_branch_bounds CHECK ((({bounds}) AND {regex}))," for t in tables}
 flat = {f"+    CONSTRAINT {t}_branch_bounds CHECK (({bounds} AND {regex}))," for t in tables}
-if lines != nested | flat:
-    print("unexpected restore DDL difference:", sorted(lines ^ (nested | flat)), file=sys.stderr)
+if lines != Counter(nested | flat):  # a multiset: each replacement exactly once
+    print("unexpected restore DDL difference:", sorted((lines - Counter(nested | flat)) + (Counter(nested | flat) - lines)), file=sys.stderr)
     sys.exit(1)
 print("restore DDL: exactly the 3 re-parsed branch-bound CHECKs differ")
 PY

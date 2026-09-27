@@ -341,6 +341,7 @@ async fn verify_validation_bytes(pool: &PgPool) -> Result<Vec<CheckResult>, Ledg
         "SELECT r.validation_id, r.graph_id, r.candidate_commit, r.candidate_state_digest, r.context_id, \
                 r.validator_service_id, r.validator_service_version, r.validator_configuration_version, \
                 r.outcome, r.violation_count, r.report_digest, r.report_reference, \
+                to_char(r.recorded_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS recorded_at, \
                 r.canonical_bytes AS record_bytes, c.canonical_bytes AS context_bytes, \
                 (SELECT count(*) FROM validation_violations v WHERE v.validation_id = r.validation_id) AS summaries \
          FROM validation_records r JOIN semantic_execution_contexts c ON c.context_id = r.context_id",
@@ -368,6 +369,7 @@ async fn verify_validation_bytes(pool: &PgPool) -> Result<Vec<CheckResult>, Ledg
                 && i64::from(record.outcome.violation_count)
                     == i64::from(row.try_get::<i32, _>("violation_count").map_err(db_error)?)
                 && record.report_digest.to_string() == s("report_digest")?
+                && ledger_core::LedgerTimestamp::parse_rfc3339(&s("recorded_at")?)? == record.recorded_at
                 && record.report_reference
                     == row
                         .try_get::<Option<String>, _>("report_reference")

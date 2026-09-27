@@ -795,6 +795,13 @@ async fn each_phase2_check_detects_exactly_its_own_tampering() {
             RECORD_BYTES,
         ),
         (
+            "validation_records",
+            "recorded_at",
+            format!("validation_id = '{bad2_id}'"),
+            "recorded_at + interval '1 second'".into(),
+            RECORD_BYTES,
+        ),
+        (
             "semantic_virtual_contexts",
             "object_refs",
             virtual_row.clone(),
