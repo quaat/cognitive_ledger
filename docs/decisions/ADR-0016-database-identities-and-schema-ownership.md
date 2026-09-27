@@ -126,3 +126,26 @@ a different schema level refuses to serve.
   cutover use the owner URL. `docs/operations/deployment.md` is the operator procedure.
 - Plan 0005 items 2–10 run under the restricted identity so their evidence reflects
   production privileges.
+
+## Amendment: Phase 2 grant set (2026-09-27, Plan 0006, migration 0010)
+Migration 0010 re-issues `ledger_grant_runtime` (same safety rules: owner-only, pinned
+`search_path`, revoke-then-grant, refuses superusers and CREATE holders) with the Phase-2
+columns derived from `ValidationRepository`'s and `WorkflowRepository`'s SQL:
+
+- `SELECT` on the new tables `semantic_execution_contexts`, `semantic_virtual_contexts`,
+  `validation_records`, `validation_violations`, `decision_validations`;
+- column-level `INSERT` naming exactly the columns the store's INSERT statements name
+  (content ids, canonical bytes, bounded provenance columns, `recorded_at` on
+  `validation_records` because it is part of the hashed record — never `created_at`);
+- `INSERT (…, result_validation_id)` added on `idempotency`;
+- no `UPDATE`/`DELETE` on any of them (write-once triggers as a second line); no new
+  sequences (content ids are text; detail rows are keyed by `(id, position)`).
+
+The runtime role therefore may record legitimate validation contexts and records but cannot
+rewrite them. A Sculpin validator never holds a database identity: it answers the ledger's
+outbound call, and the ledger's runtime identity records the result. A separate
+validation-service database identity was evaluated and not introduced: it would gain
+nothing while the ledger is the only writer, and would widen the trust surface.
+`verify_runtime_identity`'s table model, sequence model, guard-trigger, constraint and CHECK
+inventories cover the new objects; `pg_least_privilege` exercises them on PostgreSQL 15
+and 17.

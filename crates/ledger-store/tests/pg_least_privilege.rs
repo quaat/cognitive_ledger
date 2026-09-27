@@ -13,7 +13,8 @@ use ledger_core::{
 use ledger_rdf::{Operation, OperationKind, Patch, Quad};
 use ledger_store::{
     AcceptRequest, DbSessionLimits, GraphStatus, NewGraph, PgGraphs, PostgresLedgerStore,
-    PrepareRequest, RejectRequest, RequestScope, V1Binding, ValidationPolicy, schema,
+    PrepareRequest, RejectRequest, RequestScope, V1Binding, ValidateRequest, ValidationBegin,
+    ValidationPolicy, ValidatorOutcome, schema,
 };
 use sqlx::{Connection, PgConnection, PgPool, Row, postgres::PgPoolOptions};
 use std::{
@@ -264,6 +265,7 @@ async fn runtime_identity_serves_the_workflow_but_cannot_touch_schema_or_history
         branch: "main".into(),
         candidate: p2.candidate.clone(),
         reason: "no".into(),
+        validation_id: None,
     })
     .await
     .expect("reject under the runtime identity");
@@ -357,6 +359,11 @@ async fn runtime_identity_serves_the_workflow_but_cannot_touch_schema_or_history
             "projection_outbox",
             "idempotency",
             "_sqlx_migrations",
+            "semantic_execution_contexts",
+            "semantic_virtual_contexts",
+            "validation_records",
+            "validation_violations",
+            "decision_validations",
         ] {
             let (n,): (i64,) = sqlx::query_as(&format!("SELECT count(*) FROM {table}"))
                 .fetch_one(&pool)
@@ -408,6 +415,19 @@ async fn runtime_identity_serves_the_workflow_but_cannot_touch_schema_or_history
         "DROP FUNCTION ledger_rows_are_write_once()",
         "SELECT ledger_grant_runtime('public')",
         "CREATE ROLE smuggled_role",
+        // Phase 2 tables (0010): insert-only for the runtime, never rewrite or delete.
+        "UPDATE semantic_execution_contexts SET base_kb_revision = 'x'",
+        "DELETE FROM semantic_execution_contexts",
+        "UPDATE semantic_virtual_contexts SET source_version = 'x'",
+        "DELETE FROM semantic_virtual_contexts",
+        "UPDATE validation_records SET outcome = 'conforms', violation_count = 0",
+        "DELETE FROM validation_records",
+        "UPDATE validation_violations SET message = 'x'",
+        "DELETE FROM validation_violations",
+        "UPDATE decision_validations SET validation_id = validation_id",
+        "DELETE FROM decision_validations",
+        "ALTER TABLE validation_records DISABLE TRIGGER validation_records_write_once",
+        "DROP TABLE decision_validations",
     ] {
         assert_denied(rt, sql).await;
     }
@@ -418,6 +438,9 @@ async fn runtime_identity_serves_the_workflow_but_cannot_touch_schema_or_history
         "INSERT INTO refs (graph_id, branch, head, version, protected) VALUES ('x', 'y', 'z', 1, false)",
         "INSERT INTO projection_outbox (graph_id, branch, commit_id, ref_version, event_kind, ref_event_id, delivered_at) VALUES ('x','y','z',1,'ref_advanced',1, now())",
         "INSERT INTO decisions (proposal_id, graph_id, branch, candidate_commit, decision, tenant_id, principal_id, principal_type, reason, validation_ids, decided_at) VALUES (1,'x','y','z','rejected','t','p','agent','r','{}', now())",
+        // Back-dating the audit timestamp of a validation record or context is not granted.
+        "INSERT INTO validation_records (validation_id, graph_id, tenant_id, candidate_commit, candidate_state_digest, context_id, validator_service_id, validator_service_version, validator_configuration_version, outcome, violation_count, report_digest, recorded_at, principal_id, principal_type, canonical_bytes, created_at) VALUES ('x','y','t','z','d','c','s','v','c','conforms',0,'r',now(),'p','agent','\\x00', now())",
+        "INSERT INTO semantic_execution_contexts (context_id, graph_id, tenant_id, candidate_commit, candidate_state_digest, base_kb_id, base_kb_revision, shapes_id, shapes_version, reasoning_profile, reasoning_implementation, reasoning_version, validator_service_id, validator_service_version, validator_configuration_version, virtual_context_count, canonical_bytes, created_at) VALUES ('x','y','t','z','d','k','r','s','v','p','i','v','s','v','c',0,'\\x00', now())",
     ] {
         assert_denied(rt, sql).await;
     }
@@ -429,12 +452,12 @@ async fn runtime_identity_serves_the_workflow_but_cannot_touch_schema_or_history
     // Running the migrations as the runtime identity is refused by PostgreSQL itself, even
     // when a migration is pending: the owner removes the last migration's record so the
     // runtime would have something to apply.
-    let (checksum9,): (Vec<u8>,) =
-        sqlx::query_as("SELECT checksum FROM _sqlx_migrations WHERE version = 9")
+    let (checksum10,): (Vec<u8>,) =
+        sqlx::query_as("SELECT checksum FROM _sqlx_migrations WHERE version = 10")
             .fetch_one(&f.owner)
             .await
             .unwrap();
-    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 9")
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 10")
         .execute(&f.owner)
         .await
         .unwrap();
@@ -443,16 +466,16 @@ async fn runtime_identity_serves_the_workflow_but_cannot_touch_schema_or_history
         matches!(&err, LedgerError::Storage(m) if m.contains("permission denied") || m.contains("must be owner")),
         "{err:?}"
     );
-    let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM _sqlx_migrations WHERE version = 9")
+    let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM _sqlx_migrations WHERE version = 10")
         .fetch_one(&f.owner)
         .await
         .unwrap();
     assert_eq!(n, 0, "the runtime must not have applied anything");
     sqlx::query(
         "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
-         VALUES (9, 'ref movement integrity', true, $1, 0)",
+         VALUES (10, 'semantic validation', true, $1, 0)",
     )
-    .bind(&checksum9)
+    .bind(&checksum10)
     .execute(&f.owner)
     .await
     .unwrap();
@@ -568,7 +591,7 @@ async fn startup_and_readiness_refuse_any_schema_level_but_the_required_one() {
         .err()
         .unwrap();
     assert!(
-        matches!(&err, LedgerError::SchemaIncompatible(m) if m.contains("0007") && m.contains("requires 0009")),
+        matches!(&err, LedgerError::SchemaIncompatible(m) if m.contains("0007") && m.contains("requires 0010")),
         "{err}"
     );
     // Exactly right: connects; then readiness follows the schema level live.
@@ -2055,5 +2078,240 @@ async fn duplicate_invalid_constraints_foreign_schemas_null_semantics_and_predic
     owner_exec(&fx, "ALTER TABLE decisions ADD CONSTRAINT decisions_accepted_has_event CHECK ((decision = 'accepted' AND ref_event_id IS NOT NULL) OR (decision <> 'accepted' AND ref_event_id IS NULL))").await;
     assert_healthy(&fx, "all restored").await;
     running.ready().await.expect("readiness after restore");
+    fx.teardown().await;
+}
+
+/// Phase 2 (Plan 0006): the runtime identity records validation contexts and records and
+/// accepts a candidate under a cited validation with exactly the 0010 grants; the 0010
+/// controls the acceptance binding depends on are verified at start-up and readiness.
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn validation_persistence_runs_under_the_runtime_identity_and_its_controls_are_verified() {
+    use ledger_validation_protocol::{
+        BaseKb, Reasoning, RequestedContext, SemanticExecutionContext, ShapeSet, ValidationOutcome,
+        ValidatorIdentity,
+    };
+    let fx = fixture("lp_validation").await;
+    fx.migrate_and_grant().await;
+    let g = GraphId::new(unique("g").replace('_', "-")).unwrap();
+    PgGraphs::new(fx.owner.clone())
+        .create(&NewGraph {
+            graph_id: g.clone(),
+            tenant_id: TenantId::new("tenant-lp").unwrap(),
+            knowledge_base_id: None,
+            purpose: None,
+            status: GraphStatus::Active,
+        })
+        .await
+        .unwrap();
+    let running = PostgresLedgerStore::connect(&fx.runtime_db_url, V1Binding::Reject)
+        .await
+        .unwrap();
+    let wf = running.workflows();
+    let prepared = wf
+        .prepare(&PrepareRequest {
+            scope: scope(&g, "k1", b"p1"),
+            branch: "main".into(),
+            expected_head: None,
+            requested: patch("<urn:s> <urn:p> \"1\" .", OperationKind::Add),
+            activity: "a".into(),
+            event_time: None,
+            evidence_refs: vec![],
+            source_system: None,
+            message: "m".into(),
+        })
+        .await
+        .unwrap();
+    let request = ValidateRequest {
+        scope: scope(&g, "k-v", b"validate"),
+        candidate: prepared.candidate.clone(),
+        requested: RequestedContext::default(),
+    };
+    let ValidationBegin::Fresh(ticket) = running.validations().begin(&request).await.unwrap()
+    else {
+        panic!("no validation yet");
+    };
+    let context = SemanticExecutionContext {
+        graph_id: g.clone(),
+        candidate_commit: prepared.candidate.clone(),
+        candidate_state_digest: ticket.state_digest.clone(),
+        base_kb: BaseKb {
+            kb_id: "kb".into(),
+            revision: "r1".into(),
+        },
+        ontology: None,
+        shapes: ShapeSet {
+            id: "shapes".into(),
+            version: "1".into(),
+        },
+        reasoning: Reasoning {
+            profile: "none".into(),
+            implementation: "pyshacl".into(),
+            version: "0.26".into(),
+        },
+        virtual_contexts: vec![],
+        validator: ValidatorIdentity {
+            service_id: "urn:sculpin:service:validator".into(),
+            service_version: "1".into(),
+            configuration_version: "1".into(),
+        },
+    };
+    let recorded = running
+        .validations()
+        .record(
+            &request,
+            &ticket,
+            ValidatorOutcome {
+                context,
+                outcome: ValidationOutcome::conforms(),
+                report_digest: ledger_core::ContentId::for_bytes(b"report"),
+                report_reference: None,
+            },
+        )
+        .await
+        .expect("record a validation under the runtime identity");
+    let accepted = wf
+        .accept(&AcceptRequest {
+            scope: scope(&g, "k-a", b"accept"),
+            branch: "main".into(),
+            expected_head: None,
+            candidate: prepared.candidate.clone(),
+            reason: None,
+            validation: ValidationPolicy::Validated {
+                validation_id: recorded.validation_id.clone(),
+                semantic_context_id: recorded.context_id.clone(),
+            },
+        })
+        .await
+        .expect("accept under a cited validation with the runtime identity");
+    assert_eq!(accepted.ref_version, 1);
+    let (linked,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM decision_validations WHERE decision_id = $1")
+            .bind(accepted.decision_id)
+            .fetch_one(&fx.owner)
+            .await
+            .unwrap();
+    assert_eq!(linked, 1);
+
+    // Drift of the controls the binding depends on (owner statements), each refused at
+    // start-up and readiness, healthy again after restoration.
+    owner_exec(
+        &fx,
+        "ALTER TABLE decision_validations DROP CONSTRAINT dv_validation_fk",
+    )
+    .await;
+    let m = assert_refused_by_schema(&fx, &running, "decision→validation FK dropped").await;
+    assert!(m.contains("decision_validations FOREIGN KEY"), "{m}");
+    owner_exec(&fx, "ALTER TABLE decision_validations ADD CONSTRAINT dv_validation_fk FOREIGN KEY (validation_id, graph_id, candidate_commit) REFERENCES validation_records (validation_id, graph_id, candidate_commit)").await;
+    assert_healthy(&fx, "FK restored").await;
+    owner_exec(
+        &fx,
+        "ALTER TABLE validation_records DROP CONSTRAINT vr_context_fk",
+    )
+    .await;
+    let m = assert_refused_by_schema(&fx, &running, "record→context FK dropped").await;
+    assert!(m.contains("validation_records FOREIGN KEY"), "{m}");
+    owner_exec(&fx, "ALTER TABLE validation_records ADD CONSTRAINT vr_context_fk FOREIGN KEY (context_id, graph_id, candidate_commit, candidate_state_digest) REFERENCES semantic_execution_contexts (context_id, graph_id, candidate_commit, candidate_state_digest)").await;
+    assert_healthy(&fx, "FK restored").await;
+    owner_exec(
+        &fx,
+        "ALTER TABLE validation_records DISABLE TRIGGER validation_records_write_once",
+    )
+    .await;
+    let m = assert_refused_by_schema(&fx, &running, "record write-once guard disabled").await;
+    assert!(m.contains("validation_records_write_once"), "{m}");
+    owner_exec(
+        &fx,
+        "ALTER TABLE validation_records ENABLE TRIGGER validation_records_write_once",
+    )
+    .await;
+    assert_healthy(&fx, "guard enabled").await;
+    // A vacuous content-address CHECK keeps its name: catalog presence passes, the definition
+    // check refuses start-up, the fingerprint refuses readiness, the probe would refuse too.
+    owner_exec(
+        &fx,
+        "ALTER TABLE validation_records DROP CONSTRAINT vr_content_addressed",
+    )
+    .await;
+    owner_exec(
+        &fx,
+        "ALTER TABLE validation_records ADD CONSTRAINT vr_content_addressed CHECK (true)",
+    )
+    .await;
+    match PostgresLedgerStore::connect(&fx.runtime_db_url, V1Binding::Reject).await {
+        Err(LedgerError::SchemaIncompatible(m)) => {
+            assert!(m.contains("vr_content_addressed"), "{m}")
+        }
+        other => panic!("vacuous content-address CHECK must refuse start-up: {other:?}"),
+    }
+    assert!(matches!(
+        running.ready().await,
+        Err(LedgerError::SchemaIncompatible(_))
+    ));
+    owner_exec(
+        &fx,
+        "ALTER TABLE validation_records DROP CONSTRAINT vr_content_addressed",
+    )
+    .await;
+    owner_exec(&fx, "ALTER TABLE validation_records ADD CONSTRAINT vr_content_addressed CHECK (validation_id = 'sha256:' || encode(sha256(canonical_bytes), 'hex'))").await;
+    PostgresLedgerStore::connect(&fx.runtime_db_url, V1Binding::Reject)
+        .await
+        .expect("healthy after restoring the CHECK");
+    // The idempotency operation CHECK (which since 0010 admits `validate`) must be present;
+    // a `validate` row already exists here, so a pre-0010 definition cannot even be re-added.
+    owner_exec(
+        &fx,
+        "ALTER TABLE idempotency DROP CONSTRAINT idempotency_operation",
+    )
+    .await;
+    let m = assert_refused_by_schema(&fx, &running, "idempotency_operation CHECK dropped").await;
+    assert!(m.contains("idempotency_operation"), "{m}");
+    owner_exec(&fx, "ALTER TABLE idempotency ADD CONSTRAINT idempotency_operation CHECK (operation IN ('prepare', 'accept', 'reject', 'validate'))").await;
+    assert_healthy(&fx, "operation CHECK restored").await;
+    // A runtime that gained UPDATE on a validation column, or lost a required INSERT column,
+    // is refused as an identity drift.
+    owner_exec(
+        &fx,
+        &format!(
+            "GRANT UPDATE (outcome) ON validation_records TO {}",
+            fx.role
+        ),
+    )
+    .await;
+    let m = assert_refused_by_identity(&fx, "UPDATE (outcome) granted").await;
+    assert!(m.contains("validation_records.outcome"), "{m}");
+    owner_exec(
+        &fx,
+        &format!(
+            "REVOKE UPDATE (outcome) ON validation_records FROM {}",
+            fx.role
+        ),
+    )
+    .await;
+    owner_exec(
+        &fx,
+        &format!(
+            "REVOKE INSERT (canonical_bytes) ON semantic_execution_contexts FROM {}",
+            fx.role
+        ),
+    )
+    .await;
+    let m = assert_refused_by_identity(&fx, "INSERT (canonical_bytes) revoked").await;
+    assert!(
+        m.contains("semantic_execution_contexts.canonical_bytes"),
+        "{m}"
+    );
+    let mut conn = sqlx::postgres::PgConnection::connect(&fx.owner_db_url)
+        .await
+        .unwrap();
+    schema::grant_runtime_role(&mut conn, &fx.role)
+        .await
+        .unwrap();
+    conn.close().await.unwrap();
+    assert_healthy(&fx, "re-granted").await;
+    running
+        .ready()
+        .await
+        .expect("readiness after every restoration");
     fx.teardown().await;
 }

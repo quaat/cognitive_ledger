@@ -23,12 +23,13 @@
 //! atomicity is verified, production protected semantic acceptance (Phase 2) is not
 //! enabled, and no validation record is ever fabricated.
 
-use crate::{PgGraphs, PostgresImmutableStore, V1Binding, db_error};
+use crate::{PgGraphs, PostgresImmutableStore, V1Binding, ValidationRepository, db_error};
 use ledger_core::{
     AnyCommit, AuthenticatedPrincipal, CommitId, CommitV2, ContentId, GraphId, LedgerError,
     LedgerTimestamp, PatchId,
 };
 use ledger_rdf::{DeltaPolicy, Patch, effective_delta};
+use ledger_validation_protocol::{SemanticContextId, ValidationId};
 use sqlx::{PgConnection, PgPool, Row, postgres::PgPoolOptions};
 use std::collections::BTreeSet;
 use time::OffsetDateTime;
@@ -80,16 +81,21 @@ pub struct Prepared {
     pub replayed: bool,
 }
 
-/// How acceptance treats semantic validation. Phase 1 has no validation service:
-/// `Required` is the production setting and makes every non-replayed accept fail with
-/// `ValidationRequired` inside the repository (the store enforces it, not only the HTTP
-/// adapter); `NoValidation` is the explicit development/CI setting. Phase 2 adds policies
-/// that require immutable `ValidationRecord`s and fills `validation_ids`. No policy ever
-/// fabricates a validation record.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// How acceptance treats semantic validation (ADR-0019). `Validated` is the production
+/// path: the reviewer names an immutable `ValidationRecord` and the semantic execution
+/// context it accepts under, and the repository verifies both inside the acceptance
+/// transaction. `Required` is what a production deployment applies to a request that names
+/// no validation: every non-replayed accept fails with `ValidationRequired` inside the
+/// repository (the store enforces it, not only the HTTP adapter). `NoValidation` is the
+/// explicit development/CI setting. No policy ever fabricates a validation record.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ValidationPolicy {
     Required,
     NoValidation,
+    Validated {
+        validation_id: ValidationId,
+        semantic_context_id: SemanticContextId,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -118,6 +124,9 @@ pub struct RejectRequest {
     pub branch: String,
     pub candidate: CommitId,
     pub reason: String,
+    /// A validation record the rejection cites (ADR-0019): must exist for this graph and
+    /// candidate; its outcome is recorded, not judged.
+    pub validation_id: Option<ValidationId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -157,6 +166,7 @@ pub struct PostgresLedgerStore {
     immutable: PostgresImmutableStore,
     graphs: PgGraphs,
     workflows: WorkflowRepository,
+    validations: ValidationRepository,
     /// Expression fingerprints of every CHECK and partial-index predicate validated at
     /// start-up (deparse and probe); readiness refuses if any stored expression changed since.
     fingerprints: Option<std::collections::BTreeMap<String, String>>,
@@ -259,6 +269,7 @@ impl PostgresLedgerStore {
         Self {
             graphs: PgGraphs::new(pool.clone()),
             workflows: WorkflowRepository::new(pool.clone(), immutable.clone()),
+            validations: ValidationRepository::new(pool.clone()),
             immutable,
             pool,
             fingerprints: None,
@@ -269,6 +280,7 @@ impl PostgresLedgerStore {
     /// reads alike) with the deployment's limits.
     pub fn with_limits(mut self, limits: crate::ReconstructionLimits) -> Self {
         self.workflows = self.workflows.with_limits(limits);
+        self.validations = self.validations.with_limits(limits);
         self
     }
 
@@ -283,6 +295,9 @@ impl PostgresLedgerStore {
     }
     pub fn workflows(&self) -> &WorkflowRepository {
         &self.workflows
+    }
+    pub fn validations(&self) -> &ValidationRepository {
+        &self.validations
     }
 
     /// The graph an indexed commit belongs to, or `None` when the id is not an indexed
@@ -342,27 +357,29 @@ impl PostgresLedgerStore {
 
 /// A bounded reconstruction: the state plus the accounting the limits are checked against.
 #[derive(Default)]
-struct Reconstructed {
-    state: BTreeSet<ledger_rdf::Quad>,
-    bytes: usize,
-    depth: usize,
+pub(crate) struct Reconstructed {
+    pub(crate) state: BTreeSet<ledger_rdf::Quad>,
+    pub(crate) bytes: usize,
+    pub(crate) depth: usize,
 }
 
 /// What the idempotency table remembers about a completed request.
-struct StoredResult {
-    request_digest: String,
-    result_kind: String,
-    result_commit: Option<String>,
-    result_ref_version: Option<i64>,
-    result_decision_id: Option<i64>,
-    result_proposal_id: Option<i64>,
+pub(crate) struct StoredResult {
+    pub(crate) request_digest: String,
+    pub(crate) result_kind: String,
+    pub(crate) result_commit: Option<String>,
+    pub(crate) result_ref_version: Option<i64>,
+    pub(crate) result_decision_id: Option<i64>,
+    pub(crate) result_proposal_id: Option<i64>,
+    pub(crate) result_validation_id: Option<String>,
 }
 
 #[derive(Clone, Copy)]
-enum Operation {
+pub(crate) enum Operation {
     Prepare,
     Accept,
     Reject,
+    Validate,
 }
 
 impl Operation {
@@ -371,6 +388,7 @@ impl Operation {
             Self::Prepare => "prepare",
             Self::Accept => "accept",
             Self::Reject => "reject",
+            Self::Validate => "validate",
         }
     }
 }
@@ -406,7 +424,7 @@ fn validate_branch(branch: &str) -> Result<(), LedgerError> {
     Ok(())
 }
 
-fn validate_scope(scope: &RequestScope) -> Result<(), LedgerError> {
+pub(crate) fn validate_scope_fn(scope: &RequestScope) -> Result<(), LedgerError> {
     let key = &scope.idempotency_key;
     if key.is_empty() || key.len() > MAX_IDEMPOTENCY_KEY_BYTES || key.chars().any(char::is_control)
     {
@@ -501,6 +519,10 @@ impl WorkflowRepository {
         Ok(())
     }
 
+    pub(crate) fn validate_scope(scope: &RequestScope) -> Result<(), LedgerError> {
+        validate_scope_fn(scope)
+    }
+
     /// Open the workflow transaction: READ COMMITTED pinned, then the per-scope advisory
     /// lock so identical concurrent requests serialize before anything is read.
     async fn begin(
@@ -508,7 +530,15 @@ impl WorkflowRepository {
         scope: &RequestScope,
         operation: Operation,
     ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, LedgerError> {
-        let mut tx = self.pool.begin().await.map_err(db_error)?;
+        Self::begin_scoped(&self.pool, scope, operation).await
+    }
+
+    pub(crate) async fn begin_scoped(
+        pool: &PgPool,
+        scope: &RequestScope,
+        operation: Operation,
+    ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, LedgerError> {
+        let mut tx = pool.begin().await.map_err(db_error)?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
             .execute(&mut *tx)
             .await
@@ -538,14 +568,14 @@ impl WorkflowRepository {
         Ok(tx)
     }
 
-    async fn stored_result(
+    pub(crate) async fn stored_result(
         conn: &mut PgConnection,
         scope: &RequestScope,
         operation: Operation,
     ) -> Result<Option<StoredResult>, LedgerError> {
         let row = sqlx::query(
             "SELECT request_digest, result_kind, result_commit, result_ref_version, \
-             result_decision_id, result_proposal_id FROM idempotency \
+             result_decision_id, result_proposal_id, result_validation_id FROM idempotency \
              WHERE tenant_id = $1 AND principal_id = $2 AND principal_type = $3 \
              AND on_behalf_of IS NOT DISTINCT FROM $4 AND graph_id = $5 AND operation = $6 \
              AND idempotency_key = $7",
@@ -574,6 +604,7 @@ impl WorkflowRepository {
                 result_ref_version: row.try_get("result_ref_version").map_err(db_error)?,
                 result_decision_id: row.try_get("result_decision_id").map_err(db_error)?,
                 result_proposal_id: row.try_get("result_proposal_id").map_err(db_error)?,
+                result_validation_id: row.try_get("result_validation_id").map_err(db_error)?,
             })
         })
         .transpose()
@@ -582,7 +613,7 @@ impl WorkflowRepository {
     /// Insert the completed result; the advisory lock guarantees this transaction owns the
     /// key, so a conflict here is an invariant violation rather than a race.
     #[allow(clippy::too_many_arguments)]
-    async fn record_result(
+    pub(crate) async fn record_result(
         conn: &mut PgConnection,
         scope: &RequestScope,
         operation: Operation,
@@ -591,12 +622,13 @@ impl WorkflowRepository {
         result_ref_version: Option<i64>,
         result_decision_id: Option<i64>,
         result_proposal_id: Option<i64>,
+        result_validation_id: Option<&ContentId>,
     ) -> Result<(), LedgerError> {
         sqlx::query(
             "INSERT INTO idempotency (tenant_id, principal_id, principal_type, on_behalf_of, graph_id, \
              operation, idempotency_key, request_digest, result_kind, result_commit, \
-             result_ref_version, result_decision_id, result_proposal_id) \
-             VALUES ($1, $2, $12, $13, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+             result_ref_version, result_decision_id, result_proposal_id, result_validation_id) \
+             VALUES ($1, $2, $12, $13, $3, $4, $5, $6, $7, $8, $9, $10, $11, $14)",
         )
         .bind(scope.principal.tenant_id.as_str())
         .bind(scope.principal.principal_id.as_str())
@@ -617,13 +649,17 @@ impl WorkflowRepository {
                 .as_ref()
                 .map(|p| p.as_str().to_owned()),
         )
+        .bind(result_validation_id.map(ToString::to_string))
         .execute(&mut *conn)
         .await
         .map_err(db_error)?;
         Ok(())
     }
 
-    fn check_digest(stored: &StoredResult, scope: &RequestScope) -> Result<(), LedgerError> {
+    pub(crate) fn check_digest(
+        stored: &StoredResult,
+        scope: &RequestScope,
+    ) -> Result<(), LedgerError> {
         if stored.request_digest != scope.request_digest.to_string() {
             return Err(LedgerError::IdempotencyConflict);
         }
@@ -663,7 +699,7 @@ impl WorkflowRepository {
     /// The graph must exist, belong to the caller's tenant (a foreign or missing graph is
     /// reported identically as `UnknownGraph`, so nothing about other tenants leaks), and
     /// be `active` for normal workflow operations.
-    async fn graph_must_be_active(
+    pub(crate) async fn graph_must_be_active(
         conn: &mut PgConnection,
         scope: &RequestScope,
     ) -> Result<(), LedgerError> {
@@ -815,7 +851,7 @@ impl WorkflowRepository {
     /// Reconstruct the state at `head` on the caller's connection (the workflow
     /// transaction), so a prepare never holds one pool connection while waiting for
     /// another. Bytes are digest-verified exactly as `PostgresImmutableStore` does.
-    async fn state_at_on(
+    pub(crate) async fn state_at_on(
         conn: &mut PgConnection,
         head: &CommitId,
         limits: &crate::ReconstructionLimits,
@@ -888,7 +924,7 @@ impl WorkflowRepository {
     /// record the proposal — all atomically with the idempotency result.
     pub async fn prepare(&self, request: &PrepareRequest) -> Result<Prepared, LedgerError> {
         let scope = &request.scope;
-        validate_scope(scope)?;
+        validate_scope_fn(scope)?;
         validate_branch(&request.branch)?;
         let mut tx = self.begin(scope, Operation::Prepare).await?;
         if let Some(stored) = Self::stored_result(&mut tx, scope, Operation::Prepare).await? {
@@ -1024,6 +1060,7 @@ impl WorkflowRepository {
             None,
             None,
             Some(proposal_id),
+            None,
         )
         .await?;
         self.fail_at(FailPoint::BeforeCommit)?;
@@ -1080,7 +1117,7 @@ impl WorkflowRepository {
     /// and the idempotency result.
     pub async fn accept(&self, request: &AcceptRequest) -> Result<Accepted, LedgerError> {
         let scope = &request.scope;
-        validate_scope(scope)?;
+        validate_scope_fn(scope)?;
         validate_branch(&request.branch)?;
         validate_reason(request.reason.as_deref())?;
         let mut tx = self.begin(scope, Operation::Accept).await?;
@@ -1112,6 +1149,37 @@ impl WorkflowRepository {
             &request.candidate,
         )
         .await?;
+
+        // ADR-0019: the cited validation must exist for this graph and tenant, name this
+        // candidate, agree with its context's state digest, conform, and be recorded under
+        // exactly the semantic context the reviewer names. Checked before any write.
+        let cited = match &request.validation {
+            ValidationPolicy::Validated {
+                validation_id,
+                semantic_context_id,
+            } => {
+                let cited = crate::postgres_validation::cited_validation(
+                    &mut tx,
+                    scope,
+                    &request.candidate,
+                    validation_id,
+                )
+                .await?;
+                if !cited.conforms {
+                    return Err(LedgerError::ValidationRejected);
+                }
+                if &cited.context_id != semantic_context_id {
+                    return Err(LedgerError::ValidationStale(format!(
+                        "validation {validation_id} was recorded under another semantic execution context"
+                    )));
+                }
+                Some(cited)
+            }
+            ValidationPolicy::NoValidation => None,
+            ValidationPolicy::Required => unreachable!("refused above"),
+        };
+        let validation_ids: Vec<String> =
+            cited.iter().map(|c| c.validation_id.to_string()).collect();
 
         // Lineage from the verified index.
         let candidate_row = sqlx::query("SELECT parent_count FROM commit_index WHERE id = $1")
@@ -1235,7 +1303,7 @@ impl WorkflowRepository {
             "INSERT INTO decisions (proposal_id, graph_id, branch, candidate_commit, decision, \
              tenant_id, principal_id, principal_type, on_behalf_of, reason, validation_ids, ref_event_id, \
              correlation_id) \
-             VALUES ($1, $2, $3, $4, 'accepted', $5, $6, $7, $8, $9, '{}', $10, $11) RETURNING decision_id",
+             VALUES ($1, $2, $3, $4, 'accepted', $5, $6, $7, $8, $9, $12, $10, $11) RETURNING decision_id",
         )
         .bind(proposal.proposal_id)
         .bind(scope.graph.as_str())
@@ -1248,10 +1316,21 @@ impl WorkflowRepository {
         .bind(request.reason.as_deref())
         .bind(ref_event_id)
         .bind(scope.correlation_id.as_deref())
+        .bind(&validation_ids)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| map_decision_insert(e, &request.candidate))?;
         let decision_id: i64 = decision_row.try_get("decision_id").map_err(db_error)?;
+        if let Some(cited) = &cited {
+            Self::link_decision_validation(
+                &mut tx,
+                decision_id,
+                scope,
+                &request.candidate,
+                &cited.validation_id,
+            )
+            .await?;
+        }
         self.fail_at(FailPoint::AfterDecision)?;
 
         let outbox_row = sqlx::query(
@@ -1278,6 +1357,7 @@ impl WorkflowRepository {
             Some(new_version),
             Some(decision_id),
             Some(proposal.proposal_id),
+            None,
         )
         .await?;
         self.fail_at(FailPoint::BeforeCommit)?;
@@ -1338,7 +1418,7 @@ impl WorkflowRepository {
     /// decision like acceptance).
     pub async fn reject(&self, request: &RejectRequest) -> Result<Rejected, LedgerError> {
         let scope = &request.scope;
-        validate_scope(scope)?;
+        validate_scope_fn(scope)?;
         validate_branch(&request.branch)?;
         validate_reason(Some(&request.reason))?;
         let mut tx = self.begin(scope, Operation::Reject).await?;
@@ -1375,11 +1455,27 @@ impl WorkflowRepository {
             &request.candidate,
         )
         .await?;
+        // A cited validation must be a record of this graph, tenant and candidate; its
+        // outcome is recorded with the rejection, not judged (ADR-0019).
+        let cited = match &request.validation_id {
+            Some(validation_id) => Some(
+                crate::postgres_validation::cited_validation(
+                    &mut tx,
+                    scope,
+                    &request.candidate,
+                    validation_id,
+                )
+                .await?,
+            ),
+            None => None,
+        };
+        let validation_ids: Vec<String> =
+            cited.iter().map(|c| c.validation_id.to_string()).collect();
         let actor = scope.principal.actor();
         let decision_row = sqlx::query(
             "INSERT INTO decisions (proposal_id, graph_id, branch, candidate_commit, decision, \
              tenant_id, principal_id, principal_type, on_behalf_of, reason, validation_ids, correlation_id) \
-             VALUES ($1, $2, $3, $4, 'rejected', $5, $6, $7, $8, $9, '{}', $10) RETURNING decision_id",
+             VALUES ($1, $2, $3, $4, 'rejected', $5, $6, $7, $8, $9, $11, $10) RETURNING decision_id",
         )
         .bind(proposal.proposal_id)
         .bind(scope.graph.as_str())
@@ -1391,10 +1487,21 @@ impl WorkflowRepository {
         .bind(actor.on_behalf_of.as_ref().map(|p| p.as_str().to_owned()))
         .bind(&request.reason)
         .bind(scope.correlation_id.as_deref())
+        .bind(&validation_ids)
         .fetch_one(&mut *tx)
         .await
         .map_err(|e| map_decision_insert(e, &request.candidate))?;
         let decision_id: i64 = decision_row.try_get("decision_id").map_err(db_error)?;
+        if let Some(cited) = &cited {
+            Self::link_decision_validation(
+                &mut tx,
+                decision_id,
+                scope,
+                &request.candidate,
+                &cited.validation_id,
+            )
+            .await?;
+        }
         self.fail_at(FailPoint::AfterDecision)?;
         Self::record_result(
             &mut tx,
@@ -1405,6 +1512,7 @@ impl WorkflowRepository {
             None,
             Some(decision_id),
             Some(proposal.proposal_id),
+            None,
         )
         .await?;
         self.fail_at(FailPoint::BeforeCommit)?;
@@ -1413,6 +1521,29 @@ impl WorkflowRepository {
             decision_id,
             replayed: false,
         })
+    }
+
+    /// The enforced decision ↔ validation relation (ADR-0019): PostgreSQL's composite
+    /// foreign keys prove both sides name the same graph and candidate.
+    async fn link_decision_validation(
+        conn: &mut PgConnection,
+        decision_id: i64,
+        scope: &RequestScope,
+        candidate: &CommitId,
+        validation_id: &ValidationId,
+    ) -> Result<(), LedgerError> {
+        sqlx::query(
+            "INSERT INTO decision_validations (decision_id, validation_id, graph_id, candidate_commit) \
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(decision_id)
+        .bind(validation_id.to_string())
+        .bind(scope.graph.as_str())
+        .bind(candidate.to_string())
+        .execute(&mut *conn)
+        .await
+        .map_err(db_error)?;
+        Ok(())
     }
 
     fn replay_rejected(

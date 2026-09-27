@@ -1,0 +1,30 @@
+{
+  "graph_id": "0b0a2a1c-2e3d-4f50-8a61-72b384c5d6e7",
+  "candidate_commit": "sha256:e0d7367304a89f0829d1d9b142d22eff0493fe09c02da9e0d47eecdd39d58d02",
+  "candidate_state_digest": "sha256:4df1d2fb91c7aaba8d6d567034e26c17225d8b4d5b441b957ab5477cd568df67",
+  "semantic_execution_context_id": "sha256:78226b0f183bfc96f3a2cf4ce6a857aad2a65ba25c19b117379d46e790684680",
+  "validator": {
+    "service_id": "urn:sculpin:service:semantic-validator",
+    "service_version": "2026.09.1",
+    "configuration_version": "cfg-2026-09-27"
+  },
+  "outcome": {
+    "kind": "violations",
+    "violation_count": 3,
+    "violations": [
+      {
+        "severity": "Violation",
+        "code": "sh:MinCountConstraintComponent",
+        "message": "urn:material:a lacks rdfs:label"
+      },
+      {
+        "severity": "Violation",
+        "code": "reasoning:owl-disjoint",
+        "message": ""
+      }
+    ]
+  },
+  "recorded_at": "2026-09-27T16:03:07.250+02:00",
+  "report_digest": "sha256:50e337eea285fcfabe338748fb705b8ca6fd9b20d7b2d08fc5de6354732f9316",
+  "report_reference": "urn:sculpin:validation-report:0f3a"
+}

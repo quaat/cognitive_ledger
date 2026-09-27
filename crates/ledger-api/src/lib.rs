@@ -1136,6 +1136,7 @@ async fn reject(
         branch: body.ref_name,
         candidate,
         reason: body.reason,
+        validation_id: None,
     };
     let rejected = state
         .0

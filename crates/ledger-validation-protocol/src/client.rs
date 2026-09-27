@@ -1,0 +1,394 @@
+//! The validator boundary (ADR-0014): what the ledger sends a validation service, what it
+//! receives, and the `ValidationClient` trait an HTTP adapter or a deterministic test
+//! validator implements. Sculpin reconstructs the effective semantic state from references
+//! and digests; the ledger only ships the immutable candidate it owns.
+
+use crate::{
+    BaseKb, MAX_VIRTUAL_CONTEXTS, Ontology, ProtocolError, Reasoning, SemanticExecutionContext,
+    ShapeSet, ValidationOutcome, ValidatorIdentity, VirtualContextRef,
+    encoding::{TAG_ABSENT, TAG_PRESENT, canonical_set, field, opt, u32be},
+};
+use ledger_core::{CommitId, ContentId, GraphId, MAX_IDENTIFIER_BYTES, validate_token};
+use serde::{Deserialize, Serialize};
+
+pub const VALIDATION_REQUEST_PROTOCOL: &str = "sculpin-validation-request/v1";
+pub const VALIDATION_RESPONSE_PROTOCOL: &str = "sculpin-validation-response/v1";
+/// Protocol cap on candidate quads shipped inline (deployments bound bytes far lower).
+pub const MAX_CANDIDATE_QUADS_INLINE: usize = 1_000_000;
+
+fn token(field_name: &'static str, value: &str) -> Result<(), ProtocolError> {
+    validate_token(field_name, value, MAX_IDENTIFIER_BYTES).map_err(ProtocolError::from)
+}
+
+/// What the requester asks the validator to pin, if anything. Everything is optional: an
+/// absent hint lets Sculpin choose its current ontology, shapes, base KB or reasoning; a
+/// present one is a request Sculpin may honour or refuse. Hints are request identity
+/// (ADR-0015 v2), so the same key with different hints is `IDEMPOTENCY_CONFLICT`.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestedContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_kb: Option<BaseKb>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ontology: Option<Ontology>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shapes: Option<ShapeSet>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_profile: Option<String>,
+    #[serde(default)]
+    pub virtual_contexts: Vec<VirtualContextRef>,
+}
+
+impl RequestedContext {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if let Some(kb) = &self.base_kb {
+            token("base_kb.kb_id", &kb.kb_id)?;
+            token("base_kb.revision", &kb.revision)?;
+        }
+        if let Some(ontology) = &self.ontology {
+            token("ontology.id", &ontology.id)?;
+            token("ontology.version", &ontology.version)?;
+        }
+        if let Some(shapes) = &self.shapes {
+            token("shapes.id", &shapes.id)?;
+            token("shapes.version", &shapes.version)?;
+        }
+        if let Some(profile) = &self.reasoning_profile {
+            token("reasoning_profile", profile)?;
+        }
+        for context in &self.virtual_contexts {
+            context.validate()?;
+        }
+        if self.canonical_virtual_contexts()?.len() > MAX_VIRTUAL_CONTEXTS {
+            return Err(ProtocolError::Invalid(format!(
+                "more than {MAX_VIRTUAL_CONTEXTS} distinct virtual contexts"
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn canonical_virtual_contexts(&self) -> Result<Vec<Vec<u8>>, ProtocolError> {
+        let encoded = self
+            .virtual_contexts
+            .iter()
+            .map(VirtualContextRef::canonical_bytes)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(canonical_set(encoded))
+    }
+
+    /// Append the hint encoding used by request identity v2 (ADR-0015 amendment):
+    /// tagged pairs for base KB, ontology and shapes, `opt` reasoning profile, then the
+    /// virtual-context set exactly as in `sculpin-semantic-context/v1`.
+    pub fn encode_into(&self, out: &mut Vec<u8>) -> Result<(), ProtocolError> {
+        self.validate()?;
+        let pair = |a: Option<(&str, &str)>, out: &mut Vec<u8>| -> Result<(), ProtocolError> {
+            match a {
+                None => out.push(TAG_ABSENT),
+                Some((x, y)) => {
+                    out.push(TAG_PRESENT);
+                    field(out, x)?;
+                    field(out, y)?;
+                }
+            }
+            Ok(())
+        };
+        pair(
+            self.base_kb
+                .as_ref()
+                .map(|kb| (kb.kb_id.as_str(), kb.revision.as_str())),
+            out,
+        )?;
+        pair(
+            self.ontology
+                .as_ref()
+                .map(|o| (o.id.as_str(), o.version.as_str())),
+            out,
+        )?;
+        pair(
+            self.shapes
+                .as_ref()
+                .map(|s| (s.id.as_str(), s.version.as_str())),
+            out,
+        )?;
+        opt(out, self.reasoning_profile.as_deref())?;
+        let contexts = self.canonical_virtual_contexts()?;
+        u32be(out, contexts.len())?;
+        for element in &contexts {
+            out.extend_from_slice(element);
+        }
+        Ok(())
+    }
+}
+
+/// The immutable candidate the validator is asked about: references plus, bounded, the
+/// reconstructed quads themselves (the ledger already holds them for the digest; shipping
+/// them avoids a callback while `state_href` lets a validator re-fetch or verify).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateDescriptor {
+    pub graph_id: GraphId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knowledge_base_id: Option<String>,
+    pub commit: CommitId,
+    /// `sculpin-rdf-state/v1` digest of `quads`.
+    pub state_digest: ContentId,
+    /// Ledger read URL of the candidate state (graph-scoped; the validator needs `read`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_href: Option<String>,
+    /// Canonical N-Quads lines of the candidate state, bytewise sorted.
+    pub quads: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ValidationRequest {
+    pub protocol: String,
+    pub candidate: CandidateDescriptor,
+    #[serde(default)]
+    pub requested: RequestedContext,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+}
+
+impl ValidationRequest {
+    pub fn new(candidate: CandidateDescriptor, requested: RequestedContext) -> Self {
+        Self {
+            protocol: VALIDATION_REQUEST_PROTOCOL.into(),
+            candidate,
+            requested,
+            correlation_id: None,
+        }
+    }
+}
+
+/// Versions the validator declares about itself; the service identity comes from the
+/// ledger's configuration, never from the response.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ValidatorVersions {
+    pub service_version: String,
+    pub configuration_version: String,
+}
+
+/// The context the validator actually used (the effective one, which may differ from the
+/// hints the requester sent).
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectiveContext {
+    pub base_kb: BaseKb,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ontology: Option<Ontology>,
+    pub shapes: ShapeSet,
+    pub reasoning: Reasoning,
+    #[serde(default)]
+    pub virtual_contexts: Vec<VirtualContextRef>,
+    pub validator: ValidatorVersions,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReportReference {
+    pub digest: ContentId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ValidatorResponse {
+    pub protocol: String,
+    pub candidate_commit: CommitId,
+    pub candidate_state_digest: ContentId,
+    pub context: EffectiveContext,
+    pub outcome: ValidationOutcome,
+    pub report: ReportReference,
+}
+
+impl ValidatorResponse {
+    /// Turn the response into the context the ledger records, refusing a response that
+    /// names another protocol version, candidate or state than the one asked about.
+    /// `service_id` is the ledger's configured identity of the validator it called.
+    pub fn into_context(
+        &self,
+        graph_id: &GraphId,
+        candidate: &CommitId,
+        state_digest: &ContentId,
+        service_id: &str,
+    ) -> Result<SemanticExecutionContext, ProtocolError> {
+        if self.protocol != VALIDATION_RESPONSE_PROTOCOL {
+            return Err(ProtocolError::Invalid(format!(
+                "validator response protocol {:?} is not {VALIDATION_RESPONSE_PROTOCOL}",
+                bounded(&self.protocol)
+            )));
+        }
+        if &self.candidate_commit != candidate {
+            return Err(ProtocolError::Invalid(
+                "validator response names another candidate commit".into(),
+            ));
+        }
+        if &self.candidate_state_digest != state_digest {
+            return Err(ProtocolError::Invalid(
+                "validator response names another candidate state digest".into(),
+            ));
+        }
+        let context = SemanticExecutionContext {
+            graph_id: graph_id.clone(),
+            candidate_commit: candidate.clone(),
+            candidate_state_digest: state_digest.clone(),
+            base_kb: self.context.base_kb.clone(),
+            ontology: self.context.ontology.clone(),
+            shapes: self.context.shapes.clone(),
+            reasoning: self.context.reasoning.clone(),
+            virtual_contexts: self.context.virtual_contexts.clone(),
+            validator: ValidatorIdentity {
+                service_id: service_id.to_owned(),
+                service_version: self.context.validator.service_version.clone(),
+                configuration_version: self.context.validator.configuration_version.clone(),
+            },
+        };
+        context.validate()?;
+        self.outcome.validate()?;
+        if let Some(reference) = &self.report.reference {
+            validate_token(
+                "report_reference",
+                reference,
+                crate::MAX_REPORT_REFERENCE_BYTES,
+            )?;
+        }
+        Ok(context)
+    }
+}
+
+fn bounded(value: &str) -> String {
+    value.chars().filter(|c| !c.is_control()).take(64).collect()
+}
+
+/// Why a validator call produced no usable response. `Unavailable` is retryable (nothing
+/// was recorded; the client may retry with the same idempotency key); `Rejected` means the
+/// validator answered but the answer cannot become a record (refused request, malformed or
+/// oversized body, wrong content type, mismatching candidate).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidationClientError {
+    Unavailable(String),
+    Rejected(String),
+}
+
+impl From<ValidationClientError> for ledger_core::LedgerError {
+    fn from(error: ValidationClientError) -> Self {
+        match error {
+            ValidationClientError::Unavailable(reason) => Self::ValidatorUnavailable(reason),
+            ValidationClientError::Rejected(reason) => Self::ValidatorError(reason),
+        }
+    }
+}
+
+/// The boundary the ledger calls a semantic validation service through. Implementations
+/// are an HTTP adapter (production) or a deterministic fake (tests); neither interprets
+/// semantics.
+#[async_trait::async_trait]
+pub trait ValidationClient: Send + Sync {
+    async fn validate(
+        &self,
+        request: &ValidationRequest,
+    ) -> Result<ValidatorResponse, ValidationClientError>;
+    /// Human-readable description for logs (never credentials).
+    fn describe(&self) -> String;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn digest(s: &str) -> ContentId {
+        ContentId::for_bytes(s.as_bytes())
+    }
+
+    fn response() -> ValidatorResponse {
+        ValidatorResponse {
+            protocol: VALIDATION_RESPONSE_PROTOCOL.into(),
+            candidate_commit: CommitId(digest("c")),
+            candidate_state_digest: digest("s"),
+            context: EffectiveContext {
+                base_kb: BaseKb {
+                    kb_id: "kb".into(),
+                    revision: "r1".into(),
+                },
+                ontology: None,
+                shapes: ShapeSet {
+                    id: "shapes".into(),
+                    version: "1".into(),
+                },
+                reasoning: Reasoning {
+                    profile: "none".into(),
+                    implementation: "pyshacl".into(),
+                    version: "0.26".into(),
+                },
+                virtual_contexts: vec![],
+                validator: ValidatorVersions {
+                    service_version: "1".into(),
+                    configuration_version: "1".into(),
+                },
+            },
+            outcome: ValidationOutcome::conforms(),
+            report: ReportReference {
+                digest: digest("report"),
+                reference: None,
+            },
+        }
+    }
+
+    #[test]
+    fn response_must_name_the_asked_candidate_and_state() {
+        let graph = GraphId::new("g").unwrap();
+        let r = response();
+        let context = r
+            .into_context(&graph, &CommitId(digest("c")), &digest("s"), "urn:svc")
+            .unwrap();
+        assert_eq!(context.validator.service_id, "urn:svc");
+        assert!(
+            r.into_context(&graph, &CommitId(digest("other")), &digest("s"), "urn:svc")
+                .is_err()
+        );
+        assert!(
+            r.into_context(&graph, &CommitId(digest("c")), &digest("other"), "urn:svc")
+                .is_err()
+        );
+        let mut wrong_protocol = response();
+        wrong_protocol.protocol = "sculpin-validation-response/v9".into();
+        assert!(
+            wrong_protocol
+                .into_context(&graph, &CommitId(digest("c")), &digest("s"), "urn:svc")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn requested_context_hints_encode_deterministically() {
+        let mut a = RequestedContext::default();
+        let mut b = RequestedContext::default();
+        let vc = |v: &str| VirtualContextRef {
+            dataset_id: "ds".into(),
+            source_version: v.into(),
+            object_refs: vec![],
+            query_spec_digest: digest("q"),
+            hydration_plan_digest: digest("h"),
+        };
+        a.virtual_contexts = vec![vc("2"), vc("1")];
+        b.virtual_contexts = vec![vc("1"), vc("2"), vc("1")];
+        let mut ea = Vec::new();
+        let mut eb = Vec::new();
+        a.encode_into(&mut ea).unwrap();
+        b.encode_into(&mut eb).unwrap();
+        assert_eq!(ea, eb);
+        let mut c = a.clone();
+        c.reasoning_profile = Some("rdfs".into());
+        let mut ec = Vec::new();
+        c.encode_into(&mut ec).unwrap();
+        assert_ne!(ea, ec);
+        let mut empty = a.clone();
+        empty.reasoning_profile = Some(String::new());
+        assert!(empty.encode_into(&mut Vec::new()).is_err());
+        let json = serde_json::to_string(&c).unwrap();
+        assert_eq!(serde_json::from_str::<RequestedContext>(&json).unwrap(), c);
+    }
+}

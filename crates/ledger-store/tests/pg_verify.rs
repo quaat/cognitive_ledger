@@ -157,6 +157,7 @@ async fn clean_history_verifies_and_each_bypass_is_detected() {
         branch: "main".into(),
         candidate: rejected.candidate.clone(),
         reason: "no".into(),
+        validation_id: None,
     })
     .await
     .unwrap();

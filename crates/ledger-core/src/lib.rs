@@ -7,7 +7,7 @@ mod temporal;
 pub use commit_v2::{AnyCommit, COMMIT_V2_HEADER, CommitV2};
 pub use identity::{
     Actor, AuthenticatedPrincipal, GraphId, MAX_EVIDENCE_REFS, MAX_GRAPH_ID_BYTES,
-    MAX_IDENTIFIER_BYTES, MAX_MESSAGE_BYTES, PrincipalId, PrincipalType, TenantId,
+    MAX_IDENTIFIER_BYTES, MAX_MESSAGE_BYTES, PrincipalId, PrincipalType, TenantId, validate_token,
 };
 pub use temporal::LedgerTimestamp;
 
@@ -104,6 +104,29 @@ pub enum LedgerError {
         "VALIDATION_REQUIRED: acceptance onto protected state requires semantic validation, which is not available yet"
     )]
     ValidationRequired,
+    /// The named validation record reported violations; acceptance is refused (ADR-0019).
+    #[error("VALIDATION_REJECTED: the named validation reported violations")]
+    ValidationRejected,
+    /// The named validation was recorded under a semantic execution context other than the
+    /// one the accepting party names (ADR-0019).
+    #[error("VALIDATION_STALE: {0}")]
+    ValidationStale(String),
+    /// No validation record with that id exists for the caller's graph (a foreign graph's
+    /// record is reported identically).
+    #[error("VALIDATION_NOT_FOUND: the validation record does not exist for this graph")]
+    ValidationNotFound,
+    /// The validation service did not answer (unreachable, timeout, 5xx); nothing was
+    /// recorded; retry with the same idempotency key.
+    #[error("VALIDATOR_UNAVAILABLE: {0}")]
+    ValidatorUnavailable(String),
+    /// The validation service answered but its response was refused (4xx, malformed, or
+    /// naming another candidate/state); nothing was recorded.
+    #[error("VALIDATOR_ERROR: {0}")]
+    ValidatorError(String),
+    /// A semantic execution context or validation record violates the protocol's structural
+    /// rules (ADR-0018).
+    #[error("INVALID_VALIDATION: {0}")]
+    InvalidValidation(String),
     #[error("graph {0} already exists")]
     GraphAlreadyExists(String),
     #[error("graph {0} does not exist")]

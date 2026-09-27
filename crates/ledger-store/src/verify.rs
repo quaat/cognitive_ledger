@@ -151,6 +151,58 @@ const CHECKS: &[(&str, &str)] = &[
         "SELECT p.proposal_id::text FROM proposals p \
          LEFT JOIN commit_index c ON c.id = p.candidate_commit AND c.graph_id = p.graph_id WHERE c.id IS NULL",
     ),
+    // Phase 2 (ADR-0018/0019)
+    (
+        "semantic execution contexts are content-addressed",
+        "SELECT context_id FROM semantic_execution_contexts \
+         WHERE context_id <> 'sha256:' || encode(sha256(canonical_bytes), 'hex')",
+    ),
+    (
+        "validation records are content-addressed",
+        "SELECT validation_id FROM validation_records \
+         WHERE validation_id <> 'sha256:' || encode(sha256(canonical_bytes), 'hex')",
+    ),
+    (
+        "validation records agree with their context's candidate and state digest",
+        "SELECT r.validation_id FROM validation_records r JOIN semantic_execution_contexts c ON c.context_id = r.context_id \
+         WHERE c.graph_id <> r.graph_id OR c.candidate_commit <> r.candidate_commit \
+            OR c.candidate_state_digest <> r.candidate_state_digest",
+    ),
+    (
+        "virtual context rows match their context's declared count",
+        "SELECT c.context_id FROM semantic_execution_contexts c \
+         WHERE c.virtual_context_count <> (SELECT count(*) FROM semantic_virtual_contexts v WHERE v.context_id = c.context_id)",
+    ),
+    (
+        "violation summaries are bounded by the record's count and absent when conforming",
+        "SELECT r.validation_id FROM validation_records r \
+         WHERE (SELECT count(*) FROM validation_violations v WHERE v.validation_id = r.validation_id) > r.violation_count \
+            OR (r.outcome = 'conforms' AND EXISTS (SELECT 1 FROM validation_violations v WHERE v.validation_id = r.validation_id))",
+    ),
+    (
+        "accepted decisions cite only conforming validations",
+        "SELECT d.decision_id::text FROM decisions d JOIN decision_validations dv ON dv.decision_id = d.decision_id \
+         JOIN validation_records r ON r.validation_id = dv.validation_id \
+         WHERE d.decision = 'accepted' AND r.outcome <> 'conforms'",
+    ),
+    (
+        "decision validation_ids arrays equal the enforced relation",
+        "SELECT d.decision_id::text FROM decisions d \
+         WHERE (SELECT coalesce(array_agg(dv.validation_id ORDER BY dv.validation_id), '{}') \
+                  FROM decision_validations dv WHERE dv.decision_id = d.decision_id) \
+               <> (SELECT coalesce(array_agg(x ORDER BY x), '{}') FROM unnest(d.validation_ids) AS x)",
+    ),
+    (
+        "validation audit rows agree with their graph's tenant",
+        "SELECT 'validation_records:' || r.validation_id FROM validation_records r JOIN graphs g ON g.graph_id = r.graph_id WHERE g.tenant_id <> r.tenant_id \
+         UNION ALL SELECT 'semantic_execution_contexts:' || c.context_id FROM semantic_execution_contexts c JOIN graphs g ON g.graph_id = c.graph_id WHERE g.tenant_id <> c.tenant_id",
+    ),
+    (
+        "idempotency validation results reference existing records",
+        "SELECT i.idempotency_id::text FROM idempotency i \
+         WHERE i.result_validation_id IS NOT NULL \
+           AND NOT EXISTS (SELECT 1 FROM validation_records r WHERE r.validation_id = i.result_validation_id)",
+    ),
 ];
 
 const COUNTED: &[&str] = &[
@@ -164,6 +216,11 @@ const COUNTED: &[&str] = &[
     "decisions",
     "projection_outbox",
     "idempotency",
+    "semantic_execution_contexts",
+    "semantic_virtual_contexts",
+    "validation_records",
+    "validation_violations",
+    "decision_validations",
 ];
 
 /// The SQL behind a named check (tests run it inside a rolled-back tampering transaction).

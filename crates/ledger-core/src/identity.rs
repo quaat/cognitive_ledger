@@ -19,7 +19,7 @@ pub const MAX_EVIDENCE_REFS: usize = 64;
 
 /// A generic identity-bearing token: non-empty, bounded, and free of control characters
 /// (Unicode general category `Cc`).
-pub(crate) fn validate_token(
+pub fn validate_token(
     field: &'static str,
     value: &str,
     max_bytes: usize,

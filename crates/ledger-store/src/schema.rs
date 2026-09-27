@@ -77,7 +77,7 @@ pub async fn grant_runtime_role(conn: &mut PgConnection, role: &str) -> Result<(
 pub const CONTENT_SCHEMA_VERSION: i64 = 5;
 /// The exact schema level this build requires at runtime (startup and readiness refuse
 /// anything else, ADR-0016).
-pub const REQUIRED_SCHEMA_VERSION: i64 = 9;
+pub const REQUIRED_SCHEMA_VERSION: i64 = 10;
 
 /// What `verify` found.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -187,7 +187,7 @@ pub async fn verify(pool: &PgPool) -> Result<SchemaReport, LedgerError> {
 }
 
 // ---------------------------------------------------------------------------------------
-// Expected database controls (derived from migrations 0004–0009)
+// Expected database controls (derived from migrations 0004–0010)
 // ---------------------------------------------------------------------------------------
 
 /// A trigger the least-privilege model relies on, as `CREATE TRIGGER` in the migrations
@@ -370,6 +370,52 @@ const GUARD_TRIGGERS: &[ExpectedTrigger] = &[
         true,
         false,
         &["status"],
+    ),
+    // 0010: Phase 2 validation persistence is write-once too.
+    before(
+        "semantic_execution_contexts_write_once",
+        "semantic_execution_contexts",
+        "ledger_rows_are_write_once",
+        false,
+        true,
+        true,
+        &[],
+    ),
+    before(
+        "semantic_virtual_contexts_write_once",
+        "semantic_virtual_contexts",
+        "ledger_rows_are_write_once",
+        false,
+        true,
+        true,
+        &[],
+    ),
+    before(
+        "validation_records_write_once",
+        "validation_records",
+        "ledger_rows_are_write_once",
+        false,
+        true,
+        true,
+        &[],
+    ),
+    before(
+        "validation_violations_write_once",
+        "validation_violations",
+        "ledger_rows_are_write_once",
+        false,
+        true,
+        true,
+        &[],
+    ),
+    before(
+        "decision_validations_write_once",
+        "decision_validations",
+        "ledger_rows_are_write_once",
+        false,
+        true,
+        true,
+        &[],
     ),
 ];
 
@@ -655,7 +701,7 @@ async fn verify_guard_triggers(pool: &PgPool) -> Result<(), LedgerError> {
 
 /// A referential or uniqueness constraint the integrity model depends on, matched by shape
 /// (table, key columns, referenced schema/table/columns), never by name. Every FOREIGN KEY,
-/// PRIMARY KEY and UNIQUE constraint of migrations 0001–0009 is listed: they bind audit rows
+/// PRIMARY KEY and UNIQUE constraint of migrations 0001–0010 is listed: they bind audit rows
 /// to real content and real events (ADR-0013) and make the workflow's uniqueness rules facts.
 struct ExpectedConstraint {
     table: &'static str,
@@ -877,6 +923,99 @@ const EXPECTED_CONSTRAINTS: &[ExpectedConstraint] = &[
         "graphs",
         &["graph_id", "tenant_id"],
     ),
+    // 0010: semantic validation persistence (ADR-0018/0019)
+    pk("semantic_execution_contexts", &["context_id"]),
+    fk(
+        "semantic_execution_contexts",
+        &["graph_id", "candidate_commit"],
+        "commit_index",
+        &["graph_id", "id"],
+    ),
+    fk(
+        "semantic_execution_contexts",
+        &["graph_id", "tenant_id"],
+        "graphs",
+        &["graph_id", "tenant_id"],
+    ),
+    uq(
+        "semantic_execution_contexts",
+        &[
+            "context_id",
+            "graph_id",
+            "candidate_commit",
+            "candidate_state_digest",
+        ],
+    ),
+    pk("semantic_virtual_contexts", &["context_id", "position"]),
+    fk(
+        "semantic_virtual_contexts",
+        &["context_id"],
+        "semantic_execution_contexts",
+        &["context_id"],
+    ),
+    pk("validation_records", &["validation_id"]),
+    fk(
+        "validation_records",
+        &[
+            "context_id",
+            "graph_id",
+            "candidate_commit",
+            "candidate_state_digest",
+        ],
+        "semantic_execution_contexts",
+        &[
+            "context_id",
+            "graph_id",
+            "candidate_commit",
+            "candidate_state_digest",
+        ],
+    ),
+    fk(
+        "validation_records",
+        &["graph_id", "candidate_commit"],
+        "commit_index",
+        &["graph_id", "id"],
+    ),
+    fk(
+        "validation_records",
+        &["graph_id", "tenant_id"],
+        "graphs",
+        &["graph_id", "tenant_id"],
+    ),
+    uq(
+        "validation_records",
+        &["validation_id", "graph_id", "candidate_commit"],
+    ),
+    pk("validation_violations", &["validation_id", "position"]),
+    fk(
+        "validation_violations",
+        &["validation_id"],
+        "validation_records",
+        &["validation_id"],
+    ),
+    uq(
+        "decisions",
+        &["decision_id", "graph_id", "candidate_commit"],
+    ),
+    pk("decision_validations", &["decision_id", "validation_id"]),
+    fk(
+        "decision_validations",
+        &["decision_id", "graph_id", "candidate_commit"],
+        "decisions",
+        &["decision_id", "graph_id", "candidate_commit"],
+    ),
+    fk(
+        "decision_validations",
+        &["validation_id", "graph_id", "candidate_commit"],
+        "validation_records",
+        &["validation_id", "graph_id", "candidate_commit"],
+    ),
+    fk(
+        "idempotency",
+        &["result_validation_id"],
+        "validation_records",
+        &["validation_id"],
+    ),
 ];
 
 /// Unique indexes the workflow relies on (one terminal decision per candidate / proposal /
@@ -903,7 +1042,7 @@ const EXPECTED_UNIQUE_INDEXES: &[(&str, &str, &[&str], &str)] = &[
     ),
 ];
 
-/// Every named CHECK constraint of 0002–0009 with its normalized `pg_get_constraintdef`
+/// Every named CHECK constraint of 0002–0010 with its normalized `pg_get_constraintdef`
 /// (whitespace and `::text` removed; identical on PostgreSQL 15 and 17). Definitions are
 /// compared by deparse at start-up and by expression fingerprint on readiness, so a same-named
 /// vacuous replacement cannot pass; the Rust layer enforces the same domain rules independently.
@@ -991,7 +1130,7 @@ const EXPECTED_CHECKS: &[(&str, &str, &str)] = &[
     (
         "idempotency",
         "idempotency_operation",
-        "CHECK((operation=ANY(ARRAY['prepare','accept','reject'])))",
+        "CHECK((operation=ANY(ARRAY['prepare','accept','reject','validate'])))",
     ),
     (
         "idempotency",
@@ -1001,7 +1140,7 @@ const EXPECTED_CHECKS: &[(&str, &str, &str)] = &[
     (
         "idempotency",
         "idempotency_result_kind",
-        "CHECK((result_kind=ANY(ARRAY['prepared','accepted','rejected'])))",
+        "CHECK((result_kind=ANY(ARRAY['prepared','accepted','rejected','validated'])))",
     ),
     (
         "immutable_objects",
@@ -1064,6 +1203,112 @@ const EXPECTED_CHECKS: &[(&str, &str, &str)] = &[
         "CHECK((((octet_length(branch)>=1)AND(octet_length(branch)<=128))AND(branch~'^[A-Za-z0-9._/-]+$')))",
     ),
     ("refs", "refs_version_positive", "CHECK((version>=1))"),
+    // 0010 (deparse captured on PostgreSQL 15 and 17)
+    (
+        "semantic_execution_contexts",
+        "sec_content_addressed",
+        "CHECK((context_id=('sha256:'||encode(sha256(canonical_bytes),'hex'))))",
+    ),
+    (
+        "semantic_execution_contexts",
+        "sec_context_id_format",
+        "CHECK((context_id~'^sha256:[0-9a-f]{64}$'))",
+    ),
+    (
+        "semantic_execution_contexts",
+        "sec_ontology_shape",
+        "CHECK((((ontology_idISNULL)AND(ontology_versionISNULL))OR((ontology_idISNOTNULL)AND(ontology_versionISNOTNULL))))",
+    ),
+    (
+        "semantic_execution_contexts",
+        "sec_state_digest_format",
+        "CHECK((candidate_state_digest~'^sha256:[0-9a-f]{64}$'))",
+    ),
+    (
+        "semantic_execution_contexts",
+        "sec_token_bounds",
+        "CHECK((((octet_length(base_kb_id)>=1)AND(octet_length(base_kb_id)<=512))AND((octet_length(base_kb_revision)>=1)AND(octet_length(base_kb_revision)<=512))AND((ontology_idISNULL)OR((octet_length(ontology_id)>=1)AND(octet_length(ontology_id)<=512)))AND((ontology_versionISNULL)OR((octet_length(ontology_version)>=1)AND(octet_length(ontology_version)<=512)))AND((octet_length(shapes_id)>=1)AND(octet_length(shapes_id)<=512))AND((octet_length(shapes_version)>=1)AND(octet_length(shapes_version)<=512))AND((octet_length(reasoning_profile)>=1)AND(octet_length(reasoning_profile)<=512))AND((octet_length(reasoning_implementation)>=1)AND(octet_length(reasoning_implementation)<=512))AND((octet_length(reasoning_version)>=1)AND(octet_length(reasoning_version)<=512))AND((octet_length(validator_service_id)>=1)AND(octet_length(validator_service_id)<=512))AND((octet_length(validator_service_version)>=1)AND(octet_length(validator_service_version)<=512))AND((octet_length(validator_configuration_version)>=1)AND(octet_length(validator_configuration_version)<=512))))",
+    ),
+    (
+        "semantic_execution_contexts",
+        "sec_virtual_context_count",
+        "CHECK(((virtual_context_count>=0)AND(virtual_context_count<=64)))",
+    ),
+    (
+        "semantic_virtual_contexts",
+        "svc_digest_format",
+        "CHECK(((query_spec_digest~'^sha256:[0-9a-f]{64}$')AND(hydration_plan_digest~'^sha256:[0-9a-f]{64}$')))",
+    ),
+    (
+        "semantic_virtual_contexts",
+        "svc_object_refs_bound",
+        "CHECK(((cardinality(object_refs)>=0)AND(cardinality(object_refs)<=64)))",
+    ),
+    (
+        "semantic_virtual_contexts",
+        "svc_position",
+        "CHECK(((\"position\">=0)AND(\"position\"<=63)))",
+    ),
+    (
+        "semantic_virtual_contexts",
+        "svc_token_bounds",
+        "CHECK((((octet_length(dataset_id)>=1)AND(octet_length(dataset_id)<=512))AND((octet_length(source_version)>=1)AND(octet_length(source_version)<=512))))",
+    ),
+    (
+        "validation_records",
+        "vr_content_addressed",
+        "CHECK((validation_id=('sha256:'||encode(sha256(canonical_bytes),'hex'))))",
+    ),
+    (
+        "validation_records",
+        "vr_correlation_bounds",
+        "CHECK(((correlation_idISNULL)OR((octet_length(correlation_id)>=1)AND(octet_length(correlation_id)<=128))))",
+    ),
+    (
+        "validation_records",
+        "vr_outcome_kind",
+        "CHECK((outcome=ANY(ARRAY['conforms','violations'])))",
+    ),
+    (
+        "validation_records",
+        "vr_outcome_shape",
+        "CHECK((((outcome='conforms')AND(violation_count=0))OR((outcome='violations')AND(violation_count>=1))))",
+    ),
+    (
+        "validation_records",
+        "vr_principal_type",
+        "CHECK((principal_type=ANY(ARRAY['human','agent','service'])))",
+    ),
+    (
+        "validation_records",
+        "vr_report_digest_format",
+        "CHECK((report_digest~'^sha256:[0-9a-f]{64}$'))",
+    ),
+    (
+        "validation_records",
+        "vr_report_reference_bounds",
+        "CHECK(((report_referenceISNULL)OR((octet_length(report_reference)>=1)AND(octet_length(report_reference)<=2048))))",
+    ),
+    (
+        "validation_records",
+        "vr_token_bounds",
+        "CHECK((((octet_length(validator_service_id)>=1)AND(octet_length(validator_service_id)<=512))AND((octet_length(validator_service_version)>=1)AND(octet_length(validator_service_version)<=512))AND((octet_length(validator_configuration_version)>=1)AND(octet_length(validator_configuration_version)<=512))))",
+    ),
+    (
+        "validation_records",
+        "vr_validation_id_format",
+        "CHECK((validation_id~'^sha256:[0-9a-f]{64}$'))",
+    ),
+    (
+        "validation_violations",
+        "vv_bounds",
+        "CHECK((((octet_length(severity)>=1)AND(octet_length(severity)<=64))AND((octet_length(code)>=1)AND(octet_length(code)<=512))AND(octet_length(message)<=1024)))",
+    ),
+    (
+        "validation_violations",
+        "vv_position",
+        "CHECK(((\"position\">=0)AND(\"position\"<=63)))",
+    ),
 ];
 
 fn normalize_constraint_def(def: &str) -> String {
@@ -1336,7 +1581,8 @@ pub async fn verify_definitions_at_startup(pool: &PgPool) -> Result<(), LedgerEr
             )));
         }
     }
-    probe_content_address_check(pool).await
+    probe_content_address_check(pool).await?;
+    probe_validation_content_address_checks(pool).await
 }
 
 /// Migration 0009's content-address CHECK on `immutable_objects`: the database-side
@@ -1370,6 +1616,61 @@ pub async fn probe_content_address_check(pool: &PgPool) -> Result<(), LedgerErro
              guard is not enforced; refusing to serve"
         ))),
     }
+}
+
+/// Migration 0010's content-address CHECKs on `semantic_execution_contexts` and
+/// `validation_records`: the database-side guarantee that no context or record is stored
+/// under a false identity (ADR-0018). Probed like the object CHECK: a mislabelled row inside
+/// a rolled-back transaction must be refused with 23514. CHECK constraints are evaluated
+/// before the row exists, so the probe fails on the CHECK before any foreign key could.
+pub async fn probe_validation_content_address_checks(pool: &PgPool) -> Result<(), LedgerError> {
+    let zero = format!("sha256:{}", "0".repeat(64));
+    let probes: [(&str, &str, String); 2] = [
+        (
+            "sec_content_addressed",
+            "INSERT INTO semantic_execution_contexts (context_id, graph_id, tenant_id, candidate_commit, \
+             candidate_state_digest, base_kb_id, base_kb_revision, shapes_id, shapes_version, \
+             reasoning_profile, reasoning_implementation, reasoning_version, validator_service_id, \
+             validator_service_version, validator_configuration_version, virtual_context_count, canonical_bytes) \
+             VALUES ($1, 'probe', 'probe', $1, $1, 'p', 'p', 'p', 'p', 'p', 'p', 'p', 'p', 'p', 'p', 0, $2)",
+            zero.clone(),
+        ),
+        (
+            "vr_content_addressed",
+            "INSERT INTO validation_records (validation_id, graph_id, tenant_id, candidate_commit, \
+             candidate_state_digest, context_id, validator_service_id, validator_service_version, \
+             validator_configuration_version, outcome, violation_count, report_digest, recorded_at, \
+             principal_id, principal_type, canonical_bytes) \
+             VALUES ($1, 'probe', 'probe', $1, $1, $1, 'p', 'p', 'p', 'conforms', 0, $1, now(), 'p', 'service', $2)",
+            zero,
+        ),
+    ];
+    for (name, sql, id) in probes {
+        let mut tx = pool.begin().await.map_err(db_error)?;
+        let probe = sqlx::query(sql)
+            .bind(&id)
+            .bind(b"not the preimage".as_slice())
+            .execute(&mut *tx)
+            .await;
+        tx.rollback().await.map_err(db_error)?;
+        match probe {
+            Err(sqlx::Error::Database(d)) if d.code().as_deref() == Some("23514") => {}
+            Err(sqlx::Error::Database(d)) if d.code().as_deref() == Some("42501") => {
+                return Err(LedgerError::RuntimeIdentity(format!(
+                    "the connected role cannot probe {name} (no INSERT grant on the validation \
+                     tables); run `ledger-admin migrate --runtime-role <role>` (ADR-0016)"
+                )));
+            }
+            Err(e) => return Err(db_error(e)),
+            Ok(_) => {
+                return Err(incompatible(format!(
+                    "constraint {name} accepted a mislabelled row; the content-address guard is not \
+                     enforced; refusing to serve"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The runtime identity's exact table privileges (migration 0008 / `ledger_grant_runtime`):
@@ -1491,12 +1792,92 @@ const RUNTIME_TABLE_MODEL: &[TablePrivileges] = &[
             "result_ref_version",
             "result_decision_id",
             "result_proposal_id",
+            "result_validation_id",
         ],
         update_columns: &[],
     },
     TablePrivileges {
         table: "_sqlx_migrations",
         insert_columns: &[],
+        update_columns: &[],
+    },
+    // 0010 (ADR-0016 amendment): validation persistence is insert-only for the runtime.
+    TablePrivileges {
+        table: "semantic_execution_contexts",
+        insert_columns: &[
+            "context_id",
+            "graph_id",
+            "tenant_id",
+            "candidate_commit",
+            "candidate_state_digest",
+            "base_kb_id",
+            "base_kb_revision",
+            "ontology_id",
+            "ontology_version",
+            "shapes_id",
+            "shapes_version",
+            "reasoning_profile",
+            "reasoning_implementation",
+            "reasoning_version",
+            "validator_service_id",
+            "validator_service_version",
+            "validator_configuration_version",
+            "virtual_context_count",
+            "canonical_bytes",
+        ],
+        update_columns: &[],
+    },
+    TablePrivileges {
+        table: "semantic_virtual_contexts",
+        insert_columns: &[
+            "context_id",
+            "position",
+            "dataset_id",
+            "source_version",
+            "object_refs",
+            "query_spec_digest",
+            "hydration_plan_digest",
+        ],
+        update_columns: &[],
+    },
+    TablePrivileges {
+        table: "validation_records",
+        insert_columns: &[
+            "validation_id",
+            "graph_id",
+            "tenant_id",
+            "candidate_commit",
+            "candidate_state_digest",
+            "context_id",
+            "validator_service_id",
+            "validator_service_version",
+            "validator_configuration_version",
+            "outcome",
+            "violation_count",
+            "report_digest",
+            "report_reference",
+            "recorded_at",
+            "principal_id",
+            "principal_type",
+            "on_behalf_of",
+            "correlation_id",
+            "canonical_bytes",
+        ],
+        update_columns: &[],
+    },
+    TablePrivileges {
+        table: "validation_violations",
+        insert_columns: &["validation_id", "position", "severity", "code", "message"],
+        update_columns: &[],
+    },
+    TablePrivileges {
+        table: "decision_validations",
+        insert_columns: &[
+            "decision_id",
+            "validation_id",
+            "graph_id",
+            "candidate_commit",
+        ],
         update_columns: &[],
     },
 ];
@@ -1950,7 +2331,7 @@ mod tests {
             .2;
         assert_eq!(normalize_constraint_def(pg17), expected);
         assert_ne!(normalize_constraint_def("CHECK (true)"), expected);
-        assert_eq!(EXPECTED_CHECKS.len(), 32);
+        assert_eq!(EXPECTED_CHECKS.len(), 53);
     }
 
     #[test]
@@ -2001,6 +2382,6 @@ mod tests {
         assert_eq!(by_name("graphs_identity_immutable"), 19); // ROW BEFORE UPDATE
         assert_eq!(by_name("refs_version_monotonic"), 23); // ROW BEFORE INSERT UPDATE
         assert_eq!(by_name("refs_movement_audited"), 21); // ROW AFTER INSERT UPDATE
-        assert_eq!(GUARD_TRIGGERS.len(), 13);
+        assert_eq!(GUARD_TRIGGERS.len(), 18);
     }
 }

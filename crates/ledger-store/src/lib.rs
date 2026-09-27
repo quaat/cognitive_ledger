@@ -576,6 +576,13 @@ pub use postgres_workflow::{
     RejectRequest, Rejected, RequestScope, ValidationPolicy, WorkflowRepository,
 };
 #[cfg(feature = "postgres")]
+mod postgres_validation;
+#[cfg(feature = "postgres")]
+pub use postgres_validation::{
+    RecordedValidation, ValidateRequest, ValidationBegin, ValidationRepository, ValidationTicket,
+    ValidatorOutcome, validator_identity,
+};
+#[cfg(feature = "postgres")]
 mod migrate_fs_to_pg;
 #[cfg(feature = "postgres")]
 pub use migrate_fs_to_pg::{CutoverPhase, FsToPgMigration, MigrationOutcome, MigrationReport};
