@@ -399,7 +399,14 @@ Final code candidate: **`e264950`** (later commits change documentation only). E
     rows) or FK referential actions in the start-up shape match — evaluated individually and
     accepted for this release (not reachable by the runtime identity; DELETE refused by
     verified write-once triggers and privileges), recorded in `docs/exec-plans/tech-debt.md`.
-  - Last reviewed code SHA: **`e264950`**.
+  - `6cf48b4` (exact PR head after the plan move; code identical to `e264950`), narrow
+    P0/P1-only prompt (referential integrity, verify false negatives, migration 0010,
+    acceptance binding, validator trust, distributed idempotency, tenant isolation, verifier
+    drift, restore/upgrade safety, canonical identities): **NO P0/P1 FINDINGS** — the
+    Phase-2 review gate passes.
+  - Last reviewed code SHA: **`e264950`** (reviewed again as PR head `6cf48b4`). Hosted CI on
+    `6cf48b4`: ci-fast 36345153542, ci-integration 36345153632, ci-security 36345153506,
+    ci-fuzz 36345153582 — all success.
 
 ## Closure status
 - **Phase-2 ledger coordination: implemented and qualified** (all gates above, hosted CI,
