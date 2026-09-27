@@ -111,6 +111,14 @@ it after every end-to-end scenario.
   under live load with development settings and checks these properties (verifier clean,
   graph set, pre-backup watermark, exact prefixes, audit rows present in live, identical
   states, no PUBLIC execute on ledger functions); run it per release.
+- **Restore procedure (ADR-0017):** (1) stop every replica and projection consumer (no
+  writer may touch old and new database); (2) restore (PITR to the last committed transaction
+  where WAL archiving is configured — required in production; otherwise the dump or base
+  backup); (3) `GRANT CONNECT`, `ledger-admin migrate --runtime-role <role>` on the restored
+  database, `ledger-admin verify` → `VERIFY OK`; (4) record the declared restore point
+  (`SELECT graph_id, branch, version, head FROM refs`) with the backup identity and reason;
+  (5) reset or rebuild every projection to that point; (6) start the replicas; (7) publish
+  the restore point to clients.
 - **What restore does not preserve — decide before you need it:** everything acknowledged
   after the snapshot is gone, and the restored ledger will issue the same `(graph, branch,
   version)` numbers again for different commits. Before a restore: fence all writers, record
@@ -138,4 +146,4 @@ The server refuses the unvalidated-acceptance switch together with production au
 (bounded, also in CI); per release the qualification runs `scripts/stress.sh`,
 `scripts/fault.sh`, `scripts/backup-restore.sh`, `scripts/upgrade.sh` and `scripts/bench.sh`
 (baselines in `docs/quality/performance-baselines.md`), each recorded in the active plan.
-The live identity-provider smoke test is a release prerequisite as long as it is pending.
+The live identity-provider smoke test (`scripts/live-issuer-smoke.sh`, configuration in the active plan) is a release prerequisite as long as it is pending.

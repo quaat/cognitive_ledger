@@ -15,10 +15,14 @@ so sanitizer builds never touch the release build graph.
 | `request_identity` | structured (`arbitrary`) prepare bodies through `canonical_prepare` | operation order / duplicated evidence never change the identity |
 | `timestamp` | `ledger_core::LedgerTimestamp::parse_rfc3339` | canonical form satisfies the strict canonical parser |
 
-Sanitizer: `scripts/fuzz.sh` runs with `-s none` unless `FUZZ_SANITIZER=address` is set — the
-AddressSanitizer runtime crashed at start-up on the qualification host and is not validated
-on the CI runner yet (recorded as deferred in Plan 0005); the workspace forbids `unsafe`, so
-memory-safety findings could only come from dependencies.
+Toolchain and target: `scripts/fuzz.sh` uses the dated nightly `FUZZ_TOOLCHAIN`
+(default `nightly-2026-09-25`, installed with `rustup toolchain install <name> --profile minimal
+--component rust-src`) and passes `--target` explicitly, derived from that toolchain's host
+triple (`FUZZ_TARGET` overrides); the prebuilt cargo-fuzz binary must never pick the triple
+from its own build platform. Sanitizer: `FUZZ_SANITIZER=none|address` (`ci-fuzz` runs both as a
+matrix; the AddressSanitizer runtime crashed at start-up on the local qualification host, which
+is why the hosted runner is the reference for ASan). The workspace forbids `unsafe`, so
+memory-safety findings could only come from dependencies. Debug assertions are on (`-a`).
 
 Corpora under `corpus/<target>/` are seeded from the frozen golden vectors (`fixtures/golden`,
 valid and invalid commits) and small hand-written cases; libFuzzer adds what it finds.

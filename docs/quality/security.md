@@ -115,10 +115,19 @@ integrity rules against real PostgreSQL, including a non-superuser owner.
   rotation and adversarial limits (`pg_api`), bounded fuzzing of the RDF/patch/commit
   decoders, the request bodies and the request-identity encoder (`fuzz/`, `ci-fuzz`; not
   yet fuzzed: the `Idempotency-Key` header parser, the path `CommitId`, JWT/JWKS parsing,
-  which the `jsonwebtoken` crate owns), upgrade and backup/restore smoke runs, and the depth
-  baselines (`docs/quality/evidence/`, `performance-baselines.md`). ASan fuzz runs, a
-  multi-hour fuzz campaign and the **live Entra ID issuer smoke test (pending: no tenant
-  credentials available to the runs; never mark it passed)** remain. **The service is not
+  which the `jsonwebtoken` crate owns), upgrade and backup/restore smoke runs (including
+  refusal of a restore that lost a guard trigger, the content-address CHECK, a column grant or
+  a sequence grant), and the depth baselines (`docs/quality/evidence/`,
+  `performance-baselines.md`). Start-up and readiness verify the database controls the
+  privilege model depends on structurally: every guard trigger by table, function, timing,
+  event set, `UPDATE OF` columns and deferral flags; the content-address CHECK by presence,
+  validation, deparsed definition and a rolled-back semantic probe (start-up) and by
+  expression fingerprint (readiness); the runtime role's exact per-column INSERT/UPDATE
+  grants, absence of table-level writes, DELETE/TRUNCATE/TRIGGER/REFERENCES, and USAGE on
+  exactly the audit sequences. ASan and long-campaign fuzzing run on the hosted runner
+  (`ci-fuzz` matrix; results recorded in the plan) and the **live Entra ID issuer smoke test
+  (`scripts/live-issuer-smoke.sh`; pending: no tenant credentials available to the runs;
+  never mark it passed)** remain. **The service is not
   production-qualified until Plan 0005 passes in full.**
   performance baselines and the **live Entra ID issuer smoke test (pending: no tenant
   credentials available to the runs; never mark it passed)** remain. **The service is not

@@ -13,10 +13,17 @@ shift || true
 # libFuzzer's coverage guidance plus debug assertions and the properties asserted in each
 # target. Set FUZZ_SANITIZER=address on a host where ASan works.
 SANITIZER=${FUZZ_SANITIZER:-none}
-# Toolchain: CI pins a dated nightly (ci-fuzz.yml); locally `nightly` is the default.
-TOOLCHAIN=${FUZZ_TOOLCHAIN:-nightly}
+# Toolchain: the dated nightly the CI job installs; override with FUZZ_TOOLCHAIN.
+TOOLCHAIN=${FUZZ_TOOLCHAIN:-nightly-2026-09-25}
 command -v cargo-fuzz >/dev/null || { echo "cargo-fuzz is required (cargo +nightly install cargo-fuzz)" >&2; exit 69; }
-cargo "+${TOOLCHAIN}" --version >/dev/null 2>&1 || { echo "toolchain ${TOOLCHAIN} is required" >&2; exit 69; }
+cargo "+${TOOLCHAIN}" --version >/dev/null 2>&1 || { echo "toolchain ${TOOLCHAIN} is required (rustup toolchain install ${TOOLCHAIN} --profile minimal --component rust-src)" >&2; exit 69; }
+# Fuzz target triple: the selected toolchain's host, never cargo-fuzz's own build platform
+# (the prebuilt binary may be a musl build). FUZZ_TARGET overrides for another architecture.
+HOST_TRIPLE=$(rustc "+${TOOLCHAIN}" -vV | sed -n 's/^host: //p')
+TARGET=${FUZZ_TARGET:-${HOST_TRIPLE}}
+rustup target list --installed --toolchain "${TOOLCHAIN}" | grep -qx "${TARGET}" || { echo "target ${TARGET} is not installed for ${TOOLCHAIN}" >&2; exit 69; }
+if [ "${SANITIZER}" != none ] && [[ "${TARGET}" == *musl* ]]; then echo "sanitizer ${SANITIZER} is not supported on ${TARGET}" >&2; exit 69; fi
+RUSTC_VERSION=$(rustc "+${TOOLCHAIN}" -V)
 TARGETS=("$@")
 if [ ${#TARGETS[@]} -eq 0 ]; then
   LISTED=$(cd fuzz && cargo "+${TOOLCHAIN}" fuzz list) || { echo "FAIL: cargo fuzz list failed" >&2; exit 1; }
@@ -38,7 +45,7 @@ for t in "${TARGETS[@]}"; do
   # with `cargo fuzz cmin` and copy back deliberately before committing). Crash artefacts
   # land under fuzz/artifacts/<target>/ and fail the run through cargo-fuzz's exit code.
   mkdir -p "target/fuzz/corpus/${t}"
-  if (cd fuzz && cargo "+${TOOLCHAIN}" fuzz run -a -s "${SANITIZER}" "${t}" "../target/fuzz/corpus/${t}" "corpus/${t}" -- \
+  if (cd fuzz && cargo "+${TOOLCHAIN}" fuzz run -a -s "${SANITIZER}" --target "${TARGET}" "${t}" "../target/fuzz/corpus/${t}" "corpus/${t}" -- \
         -max_total_time="${SECONDS_PER_TARGET}" -timeout=10 -rss_limit_mb=2048 -print_final_stats=1) \
         >"${OUT}/${t}.log" 2>&1; then
     execs=$(grep -oE 'stat::number_of_executed_units: *[0-9]+' "${OUT}/${t}.log" | grep -oE '[0-9]+$' || echo '?')
@@ -50,7 +57,7 @@ for t in "${TARGETS[@]}"; do
     STATUS=1
   fi
 done
-echo "sanitizer: ${SANITIZER}; toolchain: ${TOOLCHAIN}; debug assertions: on" | tee -a "${OUT}/summary.txt"
+echo "toolchain: ${TOOLCHAIN} (${RUSTC_VERSION}); target: ${TARGET}; sanitizer: ${SANITIZER}; debug assertions: on; seconds per target: ${SECONDS_PER_TARGET}" | tee -a "${OUT}/summary.txt"
 echo "summary: ${OUT}/summary.txt"
 [ "${STATUS}" -eq 0 ] && echo "FUZZ OK" || echo "FUZZ FAILED"
 exit "${STATUS}"

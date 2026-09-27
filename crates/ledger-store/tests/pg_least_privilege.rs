@@ -1147,3 +1147,405 @@ async fn ref_movement_and_status_changes_are_database_facts() {
     assert_eq!(sql_key, ledger_store::lock_key("graph-status:demo"));
     f.teardown().await;
 }
+
+// =========================================================================================
+// Weakened database controls and drifted privileges are refused at start-up (PR #2 review)
+// =========================================================================================
+
+/// The three gates a drifted database must fail: the schema verifier, a fresh server start
+/// and the readiness of an already-running server. Returns the schema error text.
+async fn assert_refused_by_schema(
+    fx: &Fixture,
+    running: &ledger_store::PostgresLedgerStore,
+    why: &str,
+) -> String {
+    let rt = fx.runtime_pool().await;
+    let verify = ledger_store::schema::verify(&rt).await;
+    let message = match verify {
+        Err(ledger_core::LedgerError::SchemaIncompatible(m)) => m,
+        other => panic!("{why}: schema::verify should be SchemaIncompatible, got {other:?}"),
+    };
+    match ledger_store::PostgresLedgerStore::connect(
+        &fx.runtime_db_url,
+        ledger_store::V1Binding::Reject,
+    )
+    .await
+    {
+        Err(ledger_core::LedgerError::SchemaIncompatible(_)) => {}
+        other => {
+            panic!("{why}: server start-up should refuse with SchemaIncompatible, got {other:?}")
+        }
+    }
+    match running.ready().await {
+        Err(ledger_core::LedgerError::SchemaIncompatible(_)) => {}
+        other => panic!("{why}: readiness should refuse with SchemaIncompatible, got {other:?}"),
+    }
+    rt.close().await;
+    message
+}
+
+async fn assert_refused_by_identity(fx: &Fixture, why: &str) -> String {
+    let rt = fx.runtime_pool().await;
+    ledger_store::schema::verify(&rt)
+        .await
+        .unwrap_or_else(|e| panic!("{why}: the schema itself must still verify: {e}"));
+    let message = match ledger_store::schema::verify_runtime_identity(&rt).await {
+        Err(ledger_core::LedgerError::RuntimeIdentity(m)) => m,
+        other => panic!("{why}: verify_runtime_identity should be RuntimeIdentity, got {other:?}"),
+    };
+    match ledger_store::PostgresLedgerStore::connect(
+        &fx.runtime_db_url,
+        ledger_store::V1Binding::Reject,
+    )
+    .await
+    {
+        Err(ledger_core::LedgerError::RuntimeIdentity(_)) => {}
+        other => panic!("{why}: server start-up should refuse with RuntimeIdentity, got {other:?}"),
+    }
+    rt.close().await;
+    message
+}
+
+async fn assert_healthy(fx: &Fixture, why: &str) {
+    let rt = fx.runtime_pool().await;
+    ledger_store::schema::verify(&rt)
+        .await
+        .unwrap_or_else(|e| panic!("{why}: {e}"));
+    ledger_store::schema::verify_runtime_identity(&rt)
+        .await
+        .unwrap_or_else(|e| panic!("{why}: {e}"));
+    rt.close().await;
+}
+
+async fn owner_exec(fx: &Fixture, sql: &str) {
+    sqlx::query(sql)
+        .execute(&fx.owner)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"));
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn weakened_integrity_triggers_are_refused_at_startup_and_readiness() {
+    let fx = fixture("ledger_trig").await;
+    fx.migrate_and_grant().await;
+    let running = ledger_store::PostgresLedgerStore::connect(
+        &fx.runtime_db_url,
+        ledger_store::V1Binding::Reject,
+    )
+    .await
+    .expect("healthy database serves");
+    assert_healthy(&fx, "fresh migration").await;
+    const REAL: &str = "CREATE CONSTRAINT TRIGGER refs_movement_audited \
+        AFTER INSERT OR UPDATE OF head, version ON refs DEFERRABLE INITIALLY DEFERRED \
+        FOR EACH ROW EXECUTE FUNCTION public.refs_movement_is_audited()";
+
+    // 1. Same-named enabled trigger on another table while the real one is gone.
+    owner_exec(&fx, "DROP TRIGGER refs_movement_audited ON refs").await;
+    owner_exec(&fx, "CREATE CONSTRAINT TRIGGER refs_movement_audited AFTER INSERT ON proposals \
+        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.refs_movement_is_audited()").await;
+    let m = assert_refused_by_schema(&fx, &running, "trigger moved to another table").await;
+    assert!(
+        m.contains("refs_movement_audited") && m.contains("missing on public.refs"),
+        "{m}"
+    );
+    owner_exec(&fx, "DROP TRIGGER refs_movement_audited ON proposals").await;
+
+    // 2. Right table, wrong function.
+    owner_exec(&fx, "CREATE CONSTRAINT TRIGGER refs_movement_audited AFTER INSERT OR UPDATE OF head, version ON refs \
+        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.graphs_status_change_serializes()").await;
+    let m = assert_refused_by_schema(&fx, &running, "wrong function").await;
+    assert!(
+        m.contains("graphs_status_change_serializes")
+            && m.contains("instead of public.refs_movement_is_audited"),
+        "{m}"
+    );
+    owner_exec(&fx, "DROP TRIGGER refs_movement_audited ON refs").await;
+
+    // 3a. Weakened events: INSERT only.
+    owner_exec(&fx, "CREATE CONSTRAINT TRIGGER refs_movement_audited AFTER INSERT ON refs \
+        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.refs_movement_is_audited()").await;
+    let m = assert_refused_by_schema(&fx, &running, "INSERT-only trigger").await;
+    assert!(m.contains("timing/events"), "{m}");
+    owner_exec(&fx, "DROP TRIGGER refs_movement_audited ON refs").await;
+    // 3b. Weakened column list: UPDATE OF version only (a head move without a version bump
+    //     would no longer be audited).
+    owner_exec(&fx, "CREATE CONSTRAINT TRIGGER refs_movement_audited AFTER INSERT OR UPDATE OF version ON refs \
+        DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.refs_movement_is_audited()").await;
+    let m = assert_refused_by_schema(&fx, &running, "UPDATE OF version only").await;
+    assert!(m.contains("UPDATE OF"), "{m}");
+    owner_exec(&fx, "DROP TRIGGER refs_movement_audited ON refs").await;
+    // 3c. Not deferred: the event row written later in the transaction would never be seen.
+    owner_exec(&fx, "CREATE CONSTRAINT TRIGGER refs_movement_audited AFTER INSERT OR UPDATE OF head, version ON refs \
+        FOR EACH ROW EXECUTE FUNCTION public.refs_movement_is_audited()").await;
+    let m = assert_refused_by_schema(&fx, &running, "not deferrable").await;
+    assert!(m.contains("deferrable"), "{m}");
+    owner_exec(&fx, "DROP TRIGGER refs_movement_audited ON refs").await;
+    // 3d. A plain (non-constraint) BEFORE trigger with the right function and events.
+    owner_exec(
+        &fx,
+        "CREATE TRIGGER refs_movement_audited BEFORE INSERT OR UPDATE OF head, version ON refs \
+        FOR EACH ROW EXECUTE FUNCTION public.refs_movement_is_audited()",
+    )
+    .await;
+    let m =
+        assert_refused_by_schema(&fx, &running, "BEFORE instead of AFTER constraint trigger").await;
+    assert!(m.contains("timing/events"), "{m}");
+    owner_exec(&fx, "DROP TRIGGER refs_movement_audited ON refs").await;
+
+    // 4. Disabled real trigger; and a disabled write-once guard on another table.
+    owner_exec(&fx, REAL).await;
+    assert_healthy(&fx, "real trigger recreated").await;
+    owner_exec(
+        &fx,
+        "ALTER TABLE refs DISABLE TRIGGER refs_movement_audited",
+    )
+    .await;
+    let m = assert_refused_by_schema(&fx, &running, "disabled trigger").await;
+    assert!(m.contains("is disabled"), "{m}");
+    owner_exec(&fx, "ALTER TABLE refs ENABLE TRIGGER refs_movement_audited").await;
+    owner_exec(
+        &fx,
+        "ALTER TABLE decisions DISABLE TRIGGER decisions_write_once",
+    )
+    .await;
+    let m = assert_refused_by_schema(&fx, &running, "disabled write-once guard").await;
+    assert!(m.contains("decisions_write_once"), "{m}");
+    owner_exec(
+        &fx,
+        "ALTER TABLE decisions ENABLE TRIGGER decisions_write_once",
+    )
+    .await;
+    // A dropped write-once guard on a different table is missing, not merely disabled.
+    owner_exec(&fx, "DROP TRIGGER idempotency_write_once ON idempotency").await;
+    let m = assert_refused_by_schema(&fx, &running, "dropped write-once guard").await;
+    assert!(
+        m.contains("idempotency_write_once") && m.contains("missing"),
+        "{m}"
+    );
+    owner_exec(
+        &fx,
+        "CREATE TRIGGER idempotency_write_once BEFORE UPDATE OR DELETE ON idempotency \
+        FOR EACH ROW EXECUTE FUNCTION ledger_rows_are_write_once()",
+    )
+    .await;
+    assert_healthy(&fx, "all guards restored").await;
+    assert!(running.ready().await.is_ok());
+    fx.teardown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn weakened_content_address_check_is_refused_at_startup_and_readiness() {
+    let fx = fixture("ledger_check").await;
+    fx.migrate_and_grant().await;
+    let running = ledger_store::PostgresLedgerStore::connect(
+        &fx.runtime_db_url,
+        ledger_store::V1Binding::Reject,
+    )
+    .await
+    .unwrap();
+    const REAL: &str = "ALTER TABLE immutable_objects ADD CONSTRAINT immutable_objects_content_addressed \
+        CHECK (id = 'sha256:' || encode(sha256(bytes), 'hex'))";
+    // Dropped.
+    owner_exec(
+        &fx,
+        "ALTER TABLE immutable_objects DROP CONSTRAINT immutable_objects_content_addressed",
+    )
+    .await;
+    let m = assert_refused_by_schema(&fx, &running, "CHECK dropped").await;
+    assert!(
+        m.contains("immutable_objects_content_addressed") && m.contains("missing"),
+        "{m}"
+    );
+    // Same name, vacuous condition: the lock-free catalog check alone cannot tell (present,
+    // CHECK, validated), so start-up must catch it by definition + probe and a running
+    // server by the changed expression fingerprint.
+    owner_exec(&fx, "ALTER TABLE immutable_objects ADD CONSTRAINT immutable_objects_content_addressed CHECK (true)").await;
+    {
+        let rt = fx.runtime_pool().await;
+        ledger_store::schema::verify(&rt)
+            .await
+            .expect("catalog facts alone still pass");
+        match ledger_store::schema::probe_content_address_check(&rt).await {
+            Err(ledger_core::LedgerError::SchemaIncompatible(m)) => {
+                assert!(m.contains("definition"), "{m}")
+            }
+            other => panic!("CHECK (true): probe should refuse, got {other:?}"),
+        }
+        match ledger_store::PostgresLedgerStore::connect(
+            &fx.runtime_db_url,
+            ledger_store::V1Binding::Reject,
+        )
+        .await
+        {
+            Err(ledger_core::LedgerError::SchemaIncompatible(_)) => {}
+            other => panic!("CHECK (true): start-up should refuse, got {other:?}"),
+        }
+        match running.ready().await {
+            Err(ledger_core::LedgerError::SchemaIncompatible(m)) => {
+                assert!(m.contains("changed since start-up"), "{m}")
+            }
+            other => panic!("CHECK (true): readiness should refuse, got {other:?}"),
+        }
+        rt.close().await;
+    }
+    owner_exec(
+        &fx,
+        "ALTER TABLE immutable_objects DROP CONSTRAINT immutable_objects_content_addressed",
+    )
+    .await;
+    // Right definition, but NOT VALID (existing rows unverified).
+    owner_exec(
+        &fx,
+        "ALTER TABLE immutable_objects ADD CONSTRAINT immutable_objects_content_addressed \
+        CHECK (id = 'sha256:' || encode(sha256(bytes), 'hex')) NOT VALID",
+    )
+    .await;
+    let m = assert_refused_by_schema(&fx, &running, "NOT VALID").await;
+    assert!(m.contains("NOT VALID"), "{m}");
+    owner_exec(
+        &fx,
+        "ALTER TABLE immutable_objects DROP CONSTRAINT immutable_objects_content_addressed",
+    )
+    .await;
+    // Healthy again (validated on add, since the table is clean).
+    owner_exec(&fx, REAL).await;
+    assert_healthy(&fx, "CHECK restored").await;
+    assert!(running.ready().await.is_ok());
+    // The probe leaves nothing behind.
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM immutable_objects")
+        .fetch_one(&fx.owner)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "the rolled-back probe must not persist a row");
+    fx.teardown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn drifted_column_and_sequence_privileges_are_refused_at_startup() {
+    let fx = fixture("ledger_priv").await;
+    fx.migrate_and_grant().await;
+    assert_healthy(&fx, "exact grant").await;
+    let role = fx.role.clone();
+    let regrant = || async {
+        let mut conn = PgConnection::connect(&fx.owner_db_url).await.unwrap();
+        schema::grant_runtime_role(&mut conn, &fx.role)
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+        assert_healthy(&fx, "re-granted").await;
+    };
+
+    // Missing required INSERT column.
+    owner_exec(
+        &fx,
+        &format!("REVOKE INSERT (bytes) ON immutable_objects FROM {role}"),
+    )
+    .await;
+    let m = assert_refused_by_identity(&fx, "revoked INSERT (bytes)").await;
+    assert!(
+        m.contains("lacks INSERT on public.immutable_objects.bytes"),
+        "{m}"
+    );
+    regrant().await;
+
+    // Only one of several expected columns.
+    owner_exec(&fx, &format!("REVOKE INSERT ON proposals FROM {role}")).await;
+    owner_exec(
+        &fx,
+        &format!("GRANT INSERT (graph_id) ON proposals TO {role}"),
+    )
+    .await;
+    let m = assert_refused_by_identity(&fx, "partial proposals INSERT").await;
+    assert!(m.contains("lacks INSERT on public.proposals."), "{m}");
+    regrant().await;
+
+    // Full-table INSERT on refs (would make `protected` writable).
+    owner_exec(&fx, &format!("GRANT INSERT ON refs TO {role}")).await;
+    let m = assert_refused_by_identity(&fx, "table-level INSERT on refs").await;
+    assert!(m.contains("table-level INSERT on public.refs"), "{m}");
+    regrant().await;
+
+    // Excess column: INSERT on the excluded refs.protected.
+    owner_exec(&fx, &format!("GRANT INSERT (protected) ON refs TO {role}")).await;
+    let m = assert_refused_by_identity(&fx, "INSERT (protected)").await;
+    assert!(m.contains("holds INSERT on public.refs.protected"), "{m}");
+    regrant().await;
+
+    // Excess UPDATE on an audit column that must stay write-once.
+    owner_exec(
+        &fx,
+        &format!("GRANT UPDATE (reason) ON ref_events TO {role}"),
+    )
+    .await;
+    let m = assert_refused_by_identity(&fx, "UPDATE (reason) on ref_events").await;
+    assert!(
+        m.contains("holds UPDATE on public.ref_events.reason"),
+        "{m}"
+    );
+    regrant().await;
+
+    // Excess UPDATE column on refs (protected must not be flippable).
+    owner_exec(&fx, &format!("GRANT UPDATE (protected) ON refs TO {role}")).await;
+    let m = assert_refused_by_identity(&fx, "UPDATE (protected) on refs").await;
+    assert!(m.contains("holds UPDATE on public.refs.protected"), "{m}");
+    regrant().await;
+
+    // Table-level grants inherited through role membership are caught the same way.
+    owner_exec(&fx, "DROP ROLE IF EXISTS ledger_priv_parent").await;
+    owner_exec(&fx, "CREATE ROLE ledger_priv_parent").await;
+    owner_exec(&fx, "GRANT UPDATE ON decisions TO ledger_priv_parent").await;
+    owner_exec(&fx, &format!("GRANT ledger_priv_parent TO {role}")).await;
+    let m = assert_refused_by_identity(&fx, "inherited table-level UPDATE").await;
+    assert!(m.contains("table-level UPDATE on public.decisions"), "{m}");
+    owner_exec(&fx, &format!("REVOKE ledger_priv_parent FROM {role}")).await;
+    owner_exec(&fx, "DROP OWNED BY ledger_priv_parent").await;
+    owner_exec(&fx, "DROP ROLE ledger_priv_parent").await;
+    regrant().await;
+
+    // Sequences: a missing USAGE, then an excessive UPDATE.
+    owner_exec(
+        &fx,
+        &format!("REVOKE USAGE ON SEQUENCE proposals_proposal_id_seq FROM {role}"),
+    )
+    .await;
+    let m = assert_refused_by_identity(&fx, "revoked sequence USAGE").await;
+    assert!(
+        m.contains("lacks USAGE on sequence public.proposals_proposal_id_seq"),
+        "{m}"
+    );
+    regrant().await;
+    owner_exec(
+        &fx,
+        &format!("GRANT UPDATE ON SEQUENCE decisions_decision_id_seq TO {role}"),
+    )
+    .await;
+    let m = assert_refused_by_identity(&fx, "excess sequence UPDATE").await;
+    assert!(
+        m.contains("SELECT/UPDATE on sequence public.decisions_decision_id_seq"),
+        "{m}"
+    );
+    regrant().await;
+    // A sequence outside the model with any privilege is refused too.
+    owner_exec(&fx, "CREATE SEQUENCE stray_seq").await;
+    owner_exec(&fx, &format!("GRANT USAGE ON SEQUENCE stray_seq TO {role}")).await;
+    let m = assert_refused_by_identity(&fx, "stray sequence USAGE").await;
+    assert!(
+        m.contains("holds USAGE on sequence public.stray_seq"),
+        "{m}"
+    );
+    owner_exec(&fx, "DROP SEQUENCE stray_seq").await;
+    regrant().await;
+
+    // The healthy exact role still serves the workflow after all that.
+    let store = ledger_store::PostgresLedgerStore::connect(
+        &fx.runtime_db_url,
+        ledger_store::V1Binding::Reject,
+    )
+    .await
+    .expect("exact role connects");
+    assert!(store.ready().await.is_ok());
+    fx.teardown().await;
+}

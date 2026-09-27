@@ -157,6 +157,9 @@ pub struct PostgresLedgerStore {
     immutable: PostgresImmutableStore,
     graphs: PgGraphs,
     workflows: WorkflowRepository,
+    /// Expression fingerprint of the content-address CHECK validated at start-up (deparse
+    /// and probe); readiness refuses if the constraint's stored expression changed since.
+    content_check_fingerprint: Option<String>,
 }
 
 /// Session limits the runtime identity sets on every connection (ADR-0016): a statement,
@@ -225,9 +228,14 @@ impl PostgresLedgerStore {
             .connect(database_url)
             .await
             .map_err(db_error)?;
-        crate::schema::verify(&pool).await?;
+        // Order: schema facts, then the identity's exact privileges (the most actionable
+        // message for a drifted grant), then the semantic probe, which needs those grants.
+        let report = crate::schema::verify(&pool).await?;
         crate::schema::verify_runtime_identity(&pool).await?;
-        Ok(Self::from_pool_migrated(pool, v1_binding))
+        crate::schema::probe_content_address_check(&pool).await?;
+        let mut store = Self::from_pool_migrated(pool, v1_binding);
+        store.content_check_fingerprint = Some(report.content_check_fingerprint);
+        Ok(store)
     }
 
     /// Connect **and migrate**: tests and tooling only. The server never calls this; a
@@ -253,6 +261,7 @@ impl PostgresLedgerStore {
             workflows: WorkflowRepository::new(pool.clone(), immutable.clone()),
             immutable,
             pool,
+            content_check_fingerprint: None,
         }
     }
 
@@ -313,7 +322,17 @@ impl PostgresLedgerStore {
     /// Readiness probe: the database answers and the schema is exactly the level this
     /// build requires (ADR-0016). A drifted schema is `SchemaIncompatible`, not ready.
     pub async fn ready(&self) -> Result<(), LedgerError> {
-        crate::schema::verify(&self.pool).await.map(|_| ())
+        let report = crate::schema::verify(&self.pool).await?;
+        if let Some(expected) = &self.content_check_fingerprint
+            && *expected != report.content_check_fingerprint
+        {
+            return Err(LedgerError::SchemaIncompatible(
+                "the content-address CHECK on immutable_objects changed since start-up; \
+                 refusing to serve until it is verified again"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 }
 

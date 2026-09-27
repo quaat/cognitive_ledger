@@ -358,6 +358,18 @@ supply-chain, upgrade, backup harnesses), `docs/` (operations runbook, security)
   `FUZZ_SANITIZER=address` on a compatible host and record a longer (hours) run before the
   final qualification decision. Not fuzzed: the `Idempotency-Key` header parser and the
   path `CommitId`.
+- Corpus size (PR #2 review, 2026-09-27): `cargo fuzz cmin` on a copy of each checked-in
+  corpus (pinned nightly, explicit `x86_64-unknown-linux-gnu`) removes 78 of 8,148 files
+  (≈1 %) with identical coverage on every target (quad_parse 1621, patch_canonical 1720,
+  commit_decode 636, prepare_body 2712, accept_body 950, request_identity 1661, timestamp
+  203 edges); the corpora were already minimized when committed, so they are left unchanged
+  rather than churned. Hand-written boundary seeds and golden-vector seeds are preserved in
+  place; a crashing input would be added as a regression seed with its fix.
+- Hosted runs (2026-09-27, after the workflow fix — explicit `rustup toolchain install
+  nightly-2026-09-25 --component rust-src`, fuzz `--target` derived from `rustc -vV host`,
+  never from the prebuilt cargo-fuzz binary's own platform, sanitizer matrix `none` /
+  `address`, `workflow_dispatch` with `seconds_per_target` ≤ 1800 and `sanitizer`, weekly
+  900 s campaign): results recorded below when CI has run on the new head.
 
 ### Slice 7 — upgrade from the previous release (§7, 2026-09-27): executed, PASS
 - `scripts/upgrade.sh [rev] [commits]`: builds the previous release (`f027fbf`, the merged
@@ -398,8 +410,10 @@ supply-chain, upgrade, backup harnesses), `docs/` (operations runbook, security)
   instance 361 events / 3693 audit rows, all prefixes and present in live; no PUBLIC
   execute on any ledger function after the grant step; 10 + 10 restored heads served, states
   identical; both verifies clean; `BACKUP RESTORE OK`.
-  Restore forks history from the snapshot (versions reissued); runbook states the
-  consequences, PITR/fencing decision in tech-debt. The smoke does not write to a restore.
+  Four drifted restores (trigger, CHECK, column grant, sequence grant removed) were each
+  refused at server start-up (review round 2, §10). Restore forks history from the snapshot
+  (versions reissued); ADR-0017 decides the recovery semantics. The smoke does not write to
+  a restore.
 
 ### Slice 9 — adversarial resource limits (§9, 2026-09-26): executed
 - `pg_api::expensive_operations_are_admission_controlled_under_a_slow_database`: owner
@@ -495,6 +509,100 @@ supply-chain, upgrade, backup harnesses), `docs/` (operations runbook, security)
   Accepted/recorded: narrow upgrade data set (one graph, happy path), no write to a restore
   during the smoke, ASan validation deferred, remaining untested inputs (`Idempotency-Key`
   header parser, path `CommitId`).
+
+### Review round 2 (PR #2 Codex threads, 2026-09-27): schema and identity verifier redesigned
+- Codex found (P1) that `schema::verify` matched guard triggers by name only, anywhere in the
+  database; (P1) that the content-address CHECK of 0009 was not verified at all; (P1) that
+  `has_any_column_privilege` accepted any single column, so a role with `INSERT (id)` only,
+  or an inherited table-level `INSERT` on `refs` (making `protected` writable), passed;
+  (P2) that sequence privileges were not verified.
+- Redesign: one requirement — a server may start only when every database integrity
+  primitive the privilege model depends on is present, enabled, attached to the intended
+  object and semantically what this build expects. `schema::verify` now checks each of the
+  13 guard triggers (0004–0009) by *(table, name)* in `public` against an explicit
+  expectation: function schema/name, `tgenabled = 'O'`, `tgtype` (row-level, BEFORE/AFTER,
+  exact INSERT/UPDATE/DELETE set), the `UPDATE OF` column list from `tgattr`, and the
+  constraint / deferrable / initially-deferred flags, all from catalog metadata (no
+  `pg_get_triggerdef` string matching). It checks `immutable_objects_content_addressed`
+  exists on `public.immutable_objects`, is a validated CHECK whose deparsed definition
+  normalizes to the content-address condition, and probes it semantically inside a
+  rolled-back transaction (a mislabelled object must be refused with 23514). Rust still
+  verifies every object's digest on read; the CHECK is defence in depth.
+  `verify_runtime_identity` now holds the role to an explicit per-table model
+  (`RUNTIME_TABLE_MODEL`: whole-table SELECT; the exact INSERT and UPDATE column sets of
+  migration 0008; never table-level INSERT/UPDATE, DELETE, TRUNCATE, TRIGGER or
+  REFERENCES; nothing but SELECT on `_sqlx_migrations`), checking every column of every
+  table with `has_column_privilege` (inherited grants included) and requiring `USAGE` on
+  exactly the five audit sequences and no privilege on any other sequence.
+- Tests (`pg_least_privilege`, real PostgreSQL, throwaway databases): same-named trigger
+  moved to another table, right table with the wrong function, INSERT-only events, `UPDATE
+  OF version` only, not deferrable, plain BEFORE trigger, disabled trigger, disabled and
+  dropped write-once guards; CHECK dropped, `CHECK (true)`, `NOT VALID`, restored; one
+  required INSERT column revoked, one of several columns granted, table-level INSERT on
+  `refs`, `INSERT (protected)`, `UPDATE (reason)` on `ref_events`, `UPDATE (protected)`,
+  inherited table-level UPDATE through role membership, revoked sequence USAGE, excess
+  sequence UPDATE, a stray sequence with USAGE — each refused by `schema::verify` /
+  `verify_runtime_identity`, by `PostgresLedgerStore::connect` (server start-up) and by
+  `ready()` (readiness) with `SchemaIncompatible` / `RuntimeIdentity`; the exact role serves
+  again after every re-grant.
+
+### Admission-control decision (§15, 2026-09-27)
+Measured: under 1,000 concurrent clients on two replicas the 12-slot expensive semaphore per
+replica refuses the excess prepares immediately (`503 RESOURCE_LIMIT`), successful prepare p99
+stayed ≤ 327 ms, cheap paths (ref reads, readiness) kept answering, max 32 runtime sessions
+(= 2 × pool), 0 deadlocks; `accept` (≈4 ms, one short transaction) takes no slot and is bounded
+only by the 16-connection pool and the session timeouts; an edge timeout drops the handler and
+its slot while the PostgreSQL statement runs on until `lock_timeout`/`statement_timeout`.
+Decision for P1.5: **keep immediate rejection and the current budgets; no API or protocol
+change.** Rationale: the goals (bounded work, bounded connection use, predictable overload
+semantics, no starvation of cheap operations) are met by the measurements; a bounded wait
+queue would trade immediate, retryable refusals for latency without changing the bound.
+Follow-ups recorded as later-phase work, to be measured under an accept-heavy load before
+any change: a shared or separate bounded budget for `accept`, and cancellation of the
+abandoned statement (`pg_cancel_backend` or a cancellation-aware driver call) when the edge
+timeout fires. Not a production blocker: the pool and session limits already bound the
+damage, and the runtime identity cannot exceed them.
+
+### Live issuer smoke test (§13): PENDING_EXTERNAL
+`scripts/live-issuer-smoke.sh` runs `ledger-server` in `LEDGER_AUTH_MODE=oidc` against a real
+issuer/JWKS configuration with an externally issued bearer token (environment or file, never
+committed, printed or logged) and checks: no token → 401; tampered signature → 401;
+authenticated graph-scoped read of the token's tenant (404 NOT_FOUND on an empty ref *after*
+authentication); a foreign tenant's graph indistinguishable (404); prepare → 201 with the
+proposal row recording the expected tenant / principal / principal type when the token maps
+to `propose` (else 403 FORBIDDEN); accept never 200 under production auth. Required
+configuration (Entra ID): `LEDGER_LIVE_ISSUER=https://login.microsoftonline.com/<tenant>/v2.0`,
+`LEDGER_LIVE_AUDIENCE=<application id URI or client id>`,
+`LEDGER_LIVE_JWKS_URL=https://login.microsoftonline.com/<tenant>/discovery/v2.0/keys`,
+`LEDGER_LIVE_TENANT=<tid>`, `LEDGER_LIVE_PRINCIPAL=<oid>`, `LEDGER_LIVE_TOKEN_FILE=<path>` (or
+`LEDGER_LIVE_TOKEN`), optionally `LEDGER_AUTH_ROLE_MAP`, `LEDGER_AUTH_AGENT_CLIENT_IDS`,
+`LEDGER_LIVE_EXPECT_PROPOSE=1`, `LEDGER_LIVE_EXPECT_PRINCIPAL_TYPE`. Without a dev tenant and
+token the script exits with `LIVE_ISSUER=PENDING_EXTERNAL` and nothing is claimed.
+
+### Phase-2 handoff (§18): interfaces Phase 2 inherits from P1.5
+ADR-0014 and the specification's "Validation and acceptance" section still describe the
+architecture Phase 2 implements (two-phase prepare/accept, `ValidationRecord` referenced by
+candidates and decisions and never embedded in hashed bytes, validator-agnostic ledger). P1.5
+added operational controls Phase 2 must respect, none of which changes the semantic design:
+- **Two database identities (ADR-0016):** Phase 2's validation-record persistence needs a new
+  migration (0010+) with column-level grants for the runtime role, an entry in the verifier's
+  `RUNTIME_TABLE_MODEL` / `GUARD_TRIGGERS` / `RUNTIME_SEQUENCES`, and `pg_least_privilege`
+  coverage; the Sculpin adapter runs under the runtime identity (or as a separate service
+  with its own identity) and never needs owner rights.
+- **Acceptance is fail-closed in production:** `WorkflowRepository::accept` enforces
+  `ValidationPolicy::Required`; `decisions.validation_ids` already exists for the record ids;
+  the development switch `LEDGER_UNVALIDATED_ACCEPTANCE` is refused with production auth.
+- **Proposal/decision persistence and idempotency:** `proposals`, `decisions`, `ref_events`,
+  `projection_outbox` and `idempotency` are write-once audit tables with DB-enforced
+  fast-forward ref movement (0009); Phase 2 adds validation outcomes as new rows/records, never
+  updates.
+- **Projection outbox:** one row per accepted decision, delivered by the Phase-3 consumer
+  identity (grants for `delivered_at`/`attempts` are that phase's migration).
+- **Resource and admission limits:** validation calls are expensive operations and must take
+  the expensive-operation slot (or a dedicated budget) and respect `request_timeout`; the
+  §15 decision applies.
+- **Restore semantics (ADR-0017):** validation records are part of the single database and
+  restore with it; consumers reconcile to the declared restore point.
 
 ## Qualification decision (§22–23, 2026-09-27)
 **Production-qualified: NO.** Executed and passing on this branch: slices 1 (least

@@ -186,6 +186,37 @@ done | tee "${OUT}/checks.log"
 grep -q "^dump: .* exact prefix.*present identically" "${OUT}/checks.log" && grep -q "^basebackup: .* exact prefix.*present identically" "${OUT}/checks.log" \
   && grep -q "^dump: .* states identical" "${OUT}/checks.log" && grep -q "^basebackup: .* states identical" "${OUT}/checks.log" \
   || { echo "FAIL: not every restore check passed" >&2; exit 1; }
+# --- A restore that lost one integrity control or one grant must be refused at start-up,
+#     not fail on first use (ADR-0016 verifier). Each case restores the dump afresh.
+SERVER_IMAGE=$(docker inspect --format '{{.Image}}' "$("${COMPOSE[@]}" ps -q ledger)")
+try_start() { # $1=database  → prints the server's exit code and first refusal line
+  local out; out=$(timeout 60 docker run --rm --network "${NET}" \
+    -e LEDGER_ADDR=0.0.0.0:8080 -e LEDGER_DATABASE_URL="${RUNTIME_IN_NET}/$1?sslmode=disable" \
+    -e LEDGER_AUTH_MODE=dev-hs256 -e LEDGER_AUTH_ISSUER=https://dev-issuer.example/ -e LEDGER_AUTH_AUDIENCE=api://sculpin-ledger-dev \
+    -e LEDGER_AUTH_DEV_HS256_SECRET=development-only-hs256-secret-not-for-production-use \
+    -e LEDGER_ALLOW_INSECURE_NON_LOOPBACK=allow-insecure-non-loopback-development-only \
+    "${SERVER_IMAGE}" 2>&1); local code=$?
+  printf '%s\n%s\n' "${code}" "$(grep -m1 -E 'startup refused' <<<"${out}" || echo "${out}" | tail -1)"
+}
+declare -a DRIFTS=(
+  "trigger|DROP TRIGGER refs_movement_audited ON refs|integrity trigger refs_movement_audited is missing on public.refs"
+  "check|ALTER TABLE immutable_objects DROP CONSTRAINT immutable_objects_content_addressed|immutable_objects_content_addressed is missing"
+  "column grant|REVOKE INSERT (bytes) ON immutable_objects FROM ledger_runtime|lacks INSERT on public.immutable_objects.bytes"
+  "sequence grant|REVOKE USAGE ON SEQUENCE proposals_proposal_id_seq FROM ledger_runtime|lacks USAGE on sequence public.proposals_proposal_id_seq"
+)
+for d in "${DRIFTS[@]}"; do
+  IFS='|' read -r name sql expect <<<"${d}"
+  psql_q ledger "DROP DATABASE IF EXISTS restored_drift WITH (FORCE)" >/dev/null
+  psql_q ledger "CREATE DATABASE restored_drift" >/dev/null
+  docker exec "${PG_CID}" pg_restore -U ledger -d restored_drift --no-owner --no-acl /tmp/ledger.dump >/dev/null 2>&1 || { echo "FAIL: pg_restore for drift case ${name}" >&2; exit 1; }
+  psql_q ledger "GRANT CONNECT ON DATABASE restored_drift TO ledger_runtime" >/dev/null
+  "${COMPOSE[@]}" run --rm migrate migrate --runtime-role ledger_runtime --database-url 'postgres://ledger:ledger-development-only@postgres:5432/restored_drift?sslmode=disable' >/dev/null 2>&1
+  psql_q restored_drift "${sql}" >/dev/null
+  RESULT=$(try_start restored_drift); CODE=$(head -1 <<<"${RESULT}"); LINE=$(tail -1 <<<"${RESULT}")
+  [ "${CODE}" != 0 ] && grep -q "${expect}" <<<"${LINE}" && echo "drift refused (${name}): exit ${CODE}: ${LINE#*startup refused: }" || { echo "FAIL: drift ${name} not refused (exit ${CODE}): ${LINE}" >&2; exit 1; }
+done | tee -a "${OUT}/checks.log"
+psql_q ledger "DROP DATABASE IF EXISTS restored_drift WITH (FORCE)" >/dev/null
+[ "$(grep -c '^drift refused' "${OUT}/checks.log")" = 4 ] || { echo "FAIL: expected four refused drift cases" >&2; exit 1; }
 cp "${OUT}/load/report.md" "${OUT}/load-report.md"
 echo "report: ${OUT}/checks.log"
 echo "BACKUP RESTORE OK"

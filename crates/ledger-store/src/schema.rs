@@ -82,6 +82,9 @@ pub const REQUIRED_SCHEMA_VERSION: i64 = 9;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SchemaReport {
     pub version: i64,
+    /// `md5(pg_constraint.conbin::text)` of the content-address CHECK as found now: readiness
+    /// compares it with the value start-up validated (deparse + probe), lock-free.
+    pub content_check_fingerprint: String,
 }
 
 /// Verify that the database is at exactly `REQUIRED_SCHEMA_VERSION` with intact migration
@@ -168,141 +171,549 @@ pub async fn verify(pool: &PgPool) -> Result<SchemaReport, LedgerError> {
              build supports: deploy a build that knows this schema"
         )));
     }
-    // The integrity controls the least-privilege model relies on must be present and
-    // enabled; a disabled or missing guard is not a compatible schema.
-    let triggers = sqlx::query(
-        "SELECT tgname, tgenabled FROM pg_trigger WHERE NOT tgisinternal AND tgname = ANY($1)",
+    // Every database integrity primitive the runtime privilege model depends on must be
+    // present, enabled, attached to the intended object and semantically what this build
+    // expects; a same-named replacement elsewhere or with weaker semantics is not compatible.
+    verify_guard_triggers(pool).await?;
+    let content_check_fingerprint = verify_content_address_check(pool).await?;
+    Ok(SchemaReport {
+        version: highest,
+        content_check_fingerprint,
+    })
+}
+
+// ---------------------------------------------------------------------------------------
+// Expected database controls (derived from migrations 0004–0009)
+// ---------------------------------------------------------------------------------------
+
+/// A trigger the least-privilege model relies on, as `CREATE TRIGGER` in the migrations
+/// defines it. All triggers are `FOR EACH ROW` in schema `public` with functions in `public`.
+struct ExpectedTrigger {
+    name: &'static str,
+    table: &'static str,
+    function: &'static str,
+    /// `BEFORE` (true) or `AFTER` (false; every AFTER trigger here is a constraint trigger).
+    before: bool,
+    insert: bool,
+    update: bool,
+    delete: bool,
+    /// `UPDATE OF <columns>`; empty means any column.
+    update_columns: &'static [&'static str],
+    constraint: bool,
+    deferrable: bool,
+    initially_deferred: bool,
+}
+
+impl ExpectedTrigger {
+    /// `pg_trigger.tgtype` bit layout (TRIGGER_TYPE_*): ROW 1, BEFORE 2, INSERT 4, DELETE 8,
+    /// UPDATE 16, TRUNCATE 32, INSTEAD 64.
+    fn tgtype(&self) -> i16 {
+        1 | if self.before { 2 } else { 0 }
+            | if self.insert { 4 } else { 0 }
+            | if self.delete { 8 } else { 0 }
+            | if self.update { 16 } else { 0 }
+    }
+}
+
+const fn before(
+    name: &'static str,
+    table: &'static str,
+    function: &'static str,
+    insert: bool,
+    update: bool,
+    delete: bool,
+    update_columns: &'static [&'static str],
+) -> ExpectedTrigger {
+    ExpectedTrigger {
+        name,
+        table,
+        function,
+        before: true,
+        insert,
+        update,
+        delete,
+        update_columns,
+        constraint: false,
+        deferrable: false,
+        initially_deferred: false,
+    }
+}
+
+/// Triggers that make the ledger's write-once, identity and movement rules database facts.
+const GUARD_TRIGGERS: &[ExpectedTrigger] = &[
+    // 0004
+    before(
+        "graphs_identity_immutable",
+        "graphs",
+        "graphs_identity_is_immutable",
+        false,
+        true,
+        false,
+        &[],
+    ),
+    // 0005
+    before(
+        "immutable_objects_write_once",
+        "immutable_objects",
+        "ledger_rows_are_write_once",
+        false,
+        true,
+        true,
+        &[],
+    ),
+    before(
+        "commit_index_write_once",
+        "commit_index",
+        "ledger_rows_are_write_once",
+        false,
+        true,
+        true,
+        &[],
+    ),
+    before(
+        "commit_parents_write_once",
+        "commit_parents",
+        "ledger_rows_are_write_once",
+        false,
+        true,
+        true,
+        &[],
+    ),
+    before(
+        "refs_identity_immutable",
+        "refs",
+        "refs_identity_is_immutable",
+        false,
+        true,
+        false,
+        &[],
+    ),
+    // 0006
+    before(
+        "refs_version_monotonic",
+        "refs",
+        "refs_version_is_monotonic",
+        true,
+        true,
+        false,
+        &[],
+    ),
+    before(
+        "proposals_write_once",
+        "proposals",
+        "ledger_rows_are_write_once",
+        false,
+        true,
+        true,
+        &[],
+    ),
+    before(
+        "ref_events_write_once",
+        "ref_events",
+        "ledger_rows_are_write_once",
+        false,
+        true,
+        true,
+        &[],
+    ),
+    before(
+        "decisions_write_once",
+        "decisions",
+        "ledger_rows_are_write_once",
+        false,
+        true,
+        true,
+        &[],
+    ),
+    before(
+        "idempotency_write_once",
+        "idempotency",
+        "ledger_rows_are_write_once",
+        false,
+        true,
+        true,
+        &[],
+    ),
+    before(
+        "outbox_identity_immutable",
+        "projection_outbox",
+        "outbox_identity_is_immutable",
+        false,
+        true,
+        true,
+        &[],
+    ),
+    // 0009: audited fast-forward ref movement (deferred constraint trigger) and serialized
+    // graph status changes.
+    ExpectedTrigger {
+        name: "refs_movement_audited",
+        table: "refs",
+        function: "refs_movement_is_audited",
+        before: false,
+        insert: true,
+        update: true,
+        delete: false,
+        update_columns: &["head", "version"],
+        constraint: true,
+        deferrable: true,
+        initially_deferred: true,
+    },
+    before(
+        "graphs_status_change_serialized",
+        "graphs",
+        "graphs_status_change_serializes",
+        false,
+        true,
+        false,
+        &["status"],
+    ),
+];
+
+fn incompatible(message: String) -> LedgerError {
+    LedgerError::SchemaIncompatible(message)
+}
+
+/// Every guard trigger exists on its table, is enabled, calls its function and has exactly
+/// the timing, events, column list and constraint properties the migration gave it.
+async fn verify_guard_triggers(pool: &PgPool) -> Result<(), LedgerError> {
+    for t in GUARD_TRIGGERS {
+        let rows = sqlx::query(
+            "SELECT pn.nspname AS fn_schema, p.proname AS fn_name, tg.tgenabled::text AS enabled, \
+                    tg.tgtype, tg.tgconstraint <> 0 AS is_constraint, tg.tgdeferrable, tg.tginitdeferred, \
+                    coalesce((SELECT array_agg(a.attname::text ORDER BY a.attnum) \
+                              FROM unnest(tg.tgattr::int2[]) AS x(attnum) \
+                              JOIN pg_attribute a ON a.attrelid = tg.tgrelid AND a.attnum = x.attnum), \
+                             ARRAY[]::text[]) AS update_columns \
+             FROM pg_trigger tg \
+             JOIN pg_class c ON c.oid = tg.tgrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             JOIN pg_proc p ON p.oid = tg.tgfoid \
+             JOIN pg_namespace pn ON pn.oid = p.pronamespace \
+             WHERE NOT tg.tgisinternal AND n.nspname = 'public' AND c.relname = $1 AND tg.tgname = $2",
+        )
+        .bind(t.table)
+        .bind(t.name)
+        .fetch_all(pool)
+        .await
+        .map_err(db_error)?;
+        let row = match rows.as_slice() {
+            [row] => row,
+            [] => {
+                return Err(incompatible(format!(
+                    "integrity trigger {} is missing on public.{}; refusing to serve",
+                    t.name, t.table
+                )));
+            }
+            _ => {
+                return Err(incompatible(format!(
+                    "integrity trigger {} is ambiguous on public.{}; refusing to serve",
+                    t.name, t.table
+                )));
+            }
+        };
+        let fn_schema: String = row.try_get("fn_schema").map_err(db_error)?;
+        let fn_name: String = row.try_get("fn_name").map_err(db_error)?;
+        let enabled: String = row.try_get("enabled").map_err(db_error)?;
+        let tgtype: i16 = row.try_get("tgtype").map_err(db_error)?;
+        let is_constraint: bool = row.try_get("is_constraint").map_err(db_error)?;
+        let deferrable: bool = row.try_get("tgdeferrable").map_err(db_error)?;
+        let initially_deferred: bool = row.try_get("tginitdeferred").map_err(db_error)?;
+        let mut update_columns: Vec<String> = row.try_get("update_columns").map_err(db_error)?;
+        update_columns.sort();
+        let mut expected_columns: Vec<String> =
+            t.update_columns.iter().map(|c| (*c).to_owned()).collect();
+        expected_columns.sort();
+        let problem = if enabled != "O" {
+            Some(format!("is disabled (tgenabled = {enabled:?})"))
+        } else if fn_schema != "public" || fn_name != t.function {
+            Some(format!(
+                "calls {fn_schema}.{fn_name} instead of public.{}",
+                t.function
+            ))
+        } else if tgtype != t.tgtype() {
+            Some(format!(
+                "has timing/events {tgtype} instead of {} (row-level {} {}{}{})",
+                t.tgtype(),
+                if t.before { "BEFORE" } else { "AFTER" },
+                if t.insert { "INSERT " } else { "" },
+                if t.update { "UPDATE " } else { "" },
+                if t.delete { "DELETE" } else { "" }
+            ))
+        } else if update_columns != expected_columns {
+            Some(format!(
+                "fires on UPDATE OF {update_columns:?} instead of {expected_columns:?}"
+            ))
+        } else if is_constraint != t.constraint
+            || deferrable != t.deferrable
+            || initially_deferred != t.initially_deferred
+        {
+            Some(format!(
+                "constraint/deferrable/initially-deferred is {is_constraint}/{deferrable}/{initially_deferred} \
+                 instead of {}/{}/{}",
+                t.constraint, t.deferrable, t.initially_deferred
+            ))
+        } else {
+            None
+        };
+        if let Some(problem) = problem {
+            return Err(incompatible(format!(
+                "integrity trigger {} on public.{} {problem}; refusing to serve",
+                t.name, t.table
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Migration 0009's content-address CHECK on `immutable_objects`: the database-side
+/// guarantee that no bytes are stored under a false content id. Rust re-verifies every
+/// object's digest on read; this is defence in depth and must be present, validated and
+/// semantically the expected condition. `verify` checks the catalog (lock-free, used by
+/// readiness); `probe_content_address_check` additionally exercises it at start-up.
+const CONTENT_ADDRESS_CHECK: &str = "immutable_objects_content_addressed";
+/// `pg_get_constraintdef` output with whitespace and `::text` casts removed (PostgreSQL 15
+/// and 17 deparse the expression identically otherwise).
+const CONTENT_ADDRESS_CHECK_DEF: &str = "CHECK((id=('sha256:'||encode(sha256(bytes),'hex'))))";
+
+fn normalize_constraint_def(def: &str) -> String {
+    def.chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .replace("::text", "")
+}
+
+/// Catalog facts about the CHECK (lock-free: no relation is opened): present on the table,
+/// a CHECK, validated. Returns the fingerprint of its stored expression tree.
+async fn verify_content_address_check(pool: &PgPool) -> Result<String, LedgerError> {
+    let rows = sqlx::query(
+        "SELECT con.contype::text AS contype, con.convalidated, md5(con.conbin::text) AS fingerprint \
+         FROM pg_constraint con JOIN pg_class c ON c.oid = con.conrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = 'public' AND c.relname = 'immutable_objects' AND con.conname = $1",
     )
-    .bind(GUARD_TRIGGERS)
+    .bind(CONTENT_ADDRESS_CHECK)
     .fetch_all(pool)
     .await
     .map_err(db_error)?;
-    for name in GUARD_TRIGGERS {
-        match triggers
-            .iter()
-            .find(|r| r.try_get::<String, _>("tgname").is_ok_and(|n| n == *name))
-        {
-            Some(row) => {
-                let enabled: i8 = row.try_get("tgenabled").map_err(db_error)?;
-                if enabled as u8 as char != 'O' {
-                    return Err(LedgerError::SchemaIncompatible(format!(
-                        "integrity trigger {name} is disabled; refusing to serve"
-                    )));
-                }
-            }
-            None => {
-                return Err(LedgerError::SchemaIncompatible(format!(
-                    "integrity trigger {name} is missing; refusing to serve"
-                )));
-            }
+    let row = match rows.as_slice() {
+        [row] => row,
+        _ => {
+            return Err(incompatible(format!(
+                "constraint {CONTENT_ADDRESS_CHECK} is missing on public.immutable_objects; refusing to serve"
+            )));
         }
+    };
+    let contype: String = row.try_get("contype").map_err(db_error)?;
+    let validated: bool = row.try_get("convalidated").map_err(db_error)?;
+    if contype != "c" {
+        return Err(incompatible(format!(
+            "constraint {CONTENT_ADDRESS_CHECK} is not a CHECK constraint; refusing to serve"
+        )));
     }
-    Ok(SchemaReport { version: highest })
+    if !validated {
+        return Err(incompatible(format!(
+            "constraint {CONTENT_ADDRESS_CHECK} is NOT VALID (existing rows unverified); refusing to serve"
+        )));
+    }
+    row.try_get("fingerprint").map_err(db_error)
 }
 
-/// Triggers that make the ledger's write-once and movement rules database facts.
-const GUARD_TRIGGERS: &[&str] = &[
-    "graphs_identity_immutable",
-    "immutable_objects_write_once",
-    "commit_index_write_once",
-    "commit_parents_write_once",
-    "refs_identity_immutable",
-    "refs_version_monotonic",
-    "proposals_write_once",
-    "ref_events_write_once",
-    "decisions_write_once",
-    "idempotency_write_once",
-    "outbox_identity_immutable",
-    "refs_movement_audited",
-    "graphs_status_change_serialized",
-];
-
-/// The privilege the runtime identity must have on each table, and nothing beyond.
-const RUNTIME_TABLE_PRIVILEGES: &[(&str, &str)] = &[
-    ("graphs", "SELECT"),
-    ("refs", "SELECT"),
-    ("refs", "INSERT"),
-    ("immutable_objects", "SELECT"),
-    ("immutable_objects", "INSERT"),
-    ("commit_index", "SELECT"),
-    ("commit_index", "INSERT"),
-    ("commit_parents", "SELECT"),
-    ("commit_parents", "INSERT"),
-    ("proposals", "SELECT"),
-    ("proposals", "INSERT"),
-    ("ref_events", "SELECT"),
-    ("ref_events", "INSERT"),
-    ("decisions", "SELECT"),
-    ("decisions", "INSERT"),
-    ("projection_outbox", "SELECT"),
-    ("projection_outbox", "INSERT"),
-    ("idempotency", "SELECT"),
-    ("idempotency", "INSERT"),
-    ("_sqlx_migrations", "SELECT"),
-];
-
-/// Every ledger table the runtime identity may touch (plus the migration ledger).
-const RUNTIME_TABLES: &[&str] = &[
-    "immutable_objects",
-    "commit_index",
-    "commit_parents",
-    "graphs",
-    "refs",
-    "proposals",
-    "ref_events",
-    "decisions",
-    "projection_outbox",
-    "idempotency",
-    "_sqlx_migrations",
-];
-
-/// Privileges the runtime identity must NOT have on specific tables (any one defeats the
-/// boundary). `TRUNCATE`, `TRIGGER` and `REFERENCES` are forbidden on every table and any
-/// write on `_sqlx_migrations` (see `forbidden_privileges`).
-const RUNTIME_FORBIDDEN_PRIVILEGES: &[(&str, &str)] = &[
-    ("immutable_objects", "UPDATE"),
-    ("immutable_objects", "DELETE"),
-    ("commit_index", "UPDATE"),
-    ("commit_index", "DELETE"),
-    ("commit_parents", "UPDATE"),
-    ("commit_parents", "DELETE"),
-    ("proposals", "UPDATE"),
-    ("proposals", "DELETE"),
-    ("ref_events", "UPDATE"),
-    ("ref_events", "DELETE"),
-    ("decisions", "UPDATE"),
-    ("decisions", "DELETE"),
-    ("idempotency", "UPDATE"),
-    ("idempotency", "DELETE"),
-    ("projection_outbox", "UPDATE"),
-    ("projection_outbox", "DELETE"),
-    ("graphs", "INSERT"),
-    ("graphs", "UPDATE"),
-    ("graphs", "DELETE"),
-    ("refs", "DELETE"),
-    ("_sqlx_migrations", "INSERT"),
-    ("_sqlx_migrations", "UPDATE"),
-    ("_sqlx_migrations", "DELETE"),
-];
-
-/// The complete forbidden set: the explicit list plus `TRUNCATE` (bypasses the row-level
-/// write-once triggers), `TRIGGER` (could disable the guards) and `REFERENCES` on every table.
-fn forbidden_privileges() -> Vec<(&'static str, &'static str)> {
-    let mut all: Vec<(&'static str, &'static str)> = RUNTIME_FORBIDDEN_PRIVILEGES.to_vec();
-    for table in RUNTIME_TABLES {
-        for privilege in ["TRUNCATE", "TRIGGER", "REFERENCES"] {
-            all.push((table, privilege));
-        }
+/// Start-up verification of the content-address CHECK's semantics: its deparsed definition
+/// must normalize to the content-address condition, and a mislabelled object must be refused
+/// by the database itself (rolled-back probe), so a same-named constraint with a weaker
+/// condition cannot pass. Runs at server start-up only: deparsing opens the relation with
+/// `ACCESS SHARE` and the probe takes a row lock, neither of which belongs in readiness, which
+/// instead compares the expression fingerprint `verify` returns with the one validated here.
+pub async fn probe_content_address_check(pool: &PgPool) -> Result<(), LedgerError> {
+    let def: String = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(con.oid) FROM pg_constraint con \
+         JOIN pg_class c ON c.oid = con.conrelid JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = 'public' AND c.relname = 'immutable_objects' AND con.conname = $1",
+    )
+    .bind(CONTENT_ADDRESS_CHECK)
+    .fetch_one(pool)
+    .await
+    .map_err(db_error)?;
+    if normalize_constraint_def(&def) != CONTENT_ADDRESS_CHECK_DEF {
+        return Err(incompatible(format!(
+            "constraint {CONTENT_ADDRESS_CHECK} has definition {def:?} instead of the content-address \
+             condition; refusing to serve"
+        )));
     }
-    all
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    let probe = sqlx::query("INSERT INTO immutable_objects (id, bytes) VALUES ($1, $2)")
+        .bind(format!("sha256:{}", "0".repeat(64)))
+        .bind(b"not the preimage".as_slice())
+        .execute(&mut *tx)
+        .await;
+    tx.rollback().await.map_err(db_error)?;
+    match probe {
+        Err(sqlx::Error::Database(d)) if d.code().as_deref() == Some("23514") => Ok(()),
+        Err(sqlx::Error::Database(d)) if d.code().as_deref() == Some("42501") => {
+            Err(LedgerError::RuntimeIdentity(
+                "the connected role cannot probe immutable_objects (no INSERT (id, bytes) \
+                 grant); run `ledger-admin migrate --runtime-role <role>` (ADR-0016)"
+                    .into(),
+            ))
+        }
+        Err(e) => Err(db_error(e)),
+        Ok(_) => Err(incompatible(format!(
+            "constraint {CONTENT_ADDRESS_CHECK} accepted a mislabelled object; the content-address \
+             guard is not enforced; refusing to serve"
+        ))),
+    }
+}
+
+/// The runtime identity's exact table privileges (migration 0008 / `ledger_grant_runtime`):
+/// whole-table SELECT, column-level INSERT and UPDATE, nothing else. Column sets are the
+/// columns the store's statements name; a column added later is not writable until it is
+/// granted here and in 0008's successor.
+struct TablePrivileges {
+    table: &'static str,
+    insert_columns: &'static [&'static str],
+    update_columns: &'static [&'static str],
+}
+
+const RUNTIME_TABLE_MODEL: &[TablePrivileges] = &[
+    TablePrivileges {
+        table: "graphs",
+        insert_columns: &[],
+        update_columns: &[],
+    },
+    TablePrivileges {
+        table: "refs",
+        insert_columns: &["graph_id", "branch", "head", "version"],
+        update_columns: &["head", "version", "updated_at"],
+    },
+    TablePrivileges {
+        table: "immutable_objects",
+        insert_columns: &["id", "bytes"],
+        update_columns: &[],
+    },
+    TablePrivileges {
+        table: "commit_index",
+        insert_columns: &["id", "graph_id", "version", "patch_id", "parent_count"],
+        update_columns: &[],
+    },
+    TablePrivileges {
+        table: "commit_parents",
+        insert_columns: &["commit_id", "position", "parent_id"],
+        update_columns: &[],
+    },
+    TablePrivileges {
+        table: "proposals",
+        insert_columns: &[
+            "graph_id",
+            "branch",
+            "tenant_id",
+            "principal_id",
+            "principal_type",
+            "on_behalf_of",
+            "expected_head",
+            "requested_patch_id",
+            "effective_patch_id",
+            "candidate_commit",
+            "correlation_id",
+        ],
+        update_columns: &[],
+    },
+    TablePrivileges {
+        table: "ref_events",
+        insert_columns: &[
+            "graph_id",
+            "branch",
+            "old_head",
+            "new_head",
+            "old_version",
+            "new_version",
+            "operation",
+            "tenant_id",
+            "principal_id",
+            "principal_type",
+            "on_behalf_of",
+            "reason",
+            "correlation_id",
+        ],
+        update_columns: &[],
+    },
+    TablePrivileges {
+        table: "decisions",
+        insert_columns: &[
+            "proposal_id",
+            "graph_id",
+            "branch",
+            "candidate_commit",
+            "decision",
+            "tenant_id",
+            "principal_id",
+            "principal_type",
+            "on_behalf_of",
+            "reason",
+            "validation_ids",
+            "ref_event_id",
+            "correlation_id",
+        ],
+        update_columns: &[],
+    },
+    TablePrivileges {
+        table: "projection_outbox",
+        insert_columns: &[
+            "graph_id",
+            "branch",
+            "commit_id",
+            "ref_version",
+            "event_kind",
+            "ref_event_id",
+        ],
+        update_columns: &[],
+    },
+    TablePrivileges {
+        table: "idempotency",
+        insert_columns: &[
+            "tenant_id",
+            "principal_id",
+            "principal_type",
+            "on_behalf_of",
+            "graph_id",
+            "operation",
+            "idempotency_key",
+            "request_digest",
+            "result_kind",
+            "result_commit",
+            "result_ref_version",
+            "result_decision_id",
+            "result_proposal_id",
+        ],
+        update_columns: &[],
+    },
+    TablePrivileges {
+        table: "_sqlx_migrations",
+        insert_columns: &[],
+        update_columns: &[],
+    },
+];
+
+/// Sequences the workflow inserts draw from: `USAGE` only (0008), nothing on any other one.
+const RUNTIME_SEQUENCES: &[&str] = &[
+    "proposals_proposal_id_seq",
+    "ref_events_event_id_seq",
+    "decisions_decision_id_seq",
+    "projection_outbox_outbox_id_seq",
+    "idempotency_idempotency_id_seq",
+];
+
+fn identity(message: String) -> LedgerError {
+    LedgerError::RuntimeIdentity(message)
 }
 
 /// Verify that the connected identity is a least-privilege runtime identity (ADR-0016):
-/// not a superuser, not the owner of any ledger table, without CREATE on the schema, with
-/// the request path's grants present and every forbidden table privilege (writes to
-/// write-once rows, `TRUNCATE`, `TRIGGER`, `REFERENCES`, any write to the migration ledger)
-/// absent. Column-level grants are compared per table, not per column. The server refuses to start otherwise, so a
-/// deployment that kept the owner URL cannot silently serve with owner rights.
+/// not a superuser, not the owner of any ledger table, without CREATE on the schema, and
+/// holding exactly the privilege model of migration 0008 — whole-table SELECT, the listed
+/// INSERT/UPDATE columns and no others (checked per column, so neither a missing column nor
+/// a table-level grant passes), no DELETE/TRUNCATE/TRIGGER/REFERENCES anywhere, no write to
+/// the migration ledger, `USAGE` on exactly the audit sequences and nothing on any other
+/// sequence. The server refuses to start otherwise, so a deployment that kept the owner URL
+/// or a drifted role cannot silently serve.
 pub async fn verify_runtime_identity(pool: &PgPool) -> Result<(), LedgerError> {
     let row = sqlx::query(
         "SELECT current_user::text AS who, \
@@ -319,55 +730,201 @@ pub async fn verify_runtime_identity(pool: &PgPool) -> Result<(), LedgerError> {
     let can_create: bool = row.try_get("can_create").map_err(db_error)?;
     let owned: i64 = row.try_get("owned").map_err(db_error)?;
     if is_super.unwrap_or(false) {
-        return Err(LedgerError::RuntimeIdentity(format!(
+        return Err(identity(format!(
             "role {who} is a superuser; the server must run as the least-privilege runtime \
              identity (ADR-0016)"
         )));
     }
     if owned > 0 {
-        return Err(LedgerError::RuntimeIdentity(format!(
+        return Err(identity(format!(
             "role {who} owns {owned} ledger table(s); the server must not run as the schema \
              owner (ADR-0016)"
         )));
     }
     if can_create {
-        return Err(LedgerError::RuntimeIdentity(format!(
+        return Err(identity(format!(
             "role {who} holds CREATE on schema public; revoke it (ADR-0016)"
         )));
     }
-    for (table, privilege) in forbidden_privileges() {
-        if table_privilege(pool, table, privilege).await? {
-            return Err(LedgerError::RuntimeIdentity(format!(
-                "role {who} holds {privilege} on {table}; the runtime identity must not \
-                 (ADR-0016)"
+    for model in RUNTIME_TABLE_MODEL {
+        verify_table_privileges(pool, &who, model).await?;
+    }
+    verify_sequence_privileges(pool, &who).await
+}
+
+async fn verify_table_privileges(
+    pool: &PgPool,
+    who: &str,
+    model: &TablePrivileges,
+) -> Result<(), LedgerError> {
+    let qualified = format!("public.{}", model.table);
+    let table = sqlx::query(
+        "SELECT to_regclass($1) IS NOT NULL AS present, \
+                has_table_privilege(current_user, $1, 'SELECT') AS sel, \
+                has_table_privilege(current_user, $1, 'INSERT') AS ins, \
+                has_table_privilege(current_user, $1, 'UPDATE') AS upd, \
+                has_table_privilege(current_user, $1, 'DELETE') AS del, \
+                has_table_privilege(current_user, $1, 'TRUNCATE') AS trunc, \
+                has_table_privilege(current_user, $1, 'TRIGGER') AS trig, \
+                has_table_privilege(current_user, $1, 'REFERENCES') AS refs",
+    )
+    .bind(&qualified)
+    .fetch_one(pool)
+    .await
+    .map_err(db_error)?;
+    let present: bool = table.try_get("present").map_err(db_error)?;
+    if !present {
+        return Err(incompatible(format!(
+            "table {qualified} is missing; refusing to serve"
+        )));
+    }
+    let fix = format!(
+        "run `ledger-admin migrate --runtime-role {who}` with the owner identity (ADR-0016)"
+    );
+    if !table.try_get::<bool, _>("sel").map_err(db_error)? {
+        return Err(identity(format!(
+            "role {who} lacks SELECT on {qualified}; {fix}"
+        )));
+    }
+    for (column, privilege) in [
+        ("ins", "table-level INSERT"),
+        ("upd", "table-level UPDATE"),
+        ("del", "DELETE"),
+        ("trunc", "TRUNCATE"),
+        ("trig", "TRIGGER"),
+        ("refs", "REFERENCES"),
+    ] {
+        if table.try_get::<bool, _>(column).map_err(db_error)? {
+            return Err(identity(format!(
+                "role {who} holds {privilege} on {qualified}; the runtime identity must not \
+                 (only the column grants of migration 0008 are allowed; ADR-0016)"
             )));
         }
     }
-    for (table, privilege) in RUNTIME_TABLE_PRIVILEGES {
-        if !table_privilege(pool, table, privilege).await? {
-            return Err(LedgerError::RuntimeIdentity(format!(
-                "role {who} lacks {privilege} on {table}; run `ledger-admin migrate \
-                 --runtime-role {who}` with the owner identity (ADR-0016)"
+    // Per column: INSERT/UPDATE exactly where the model says (table-level grants are
+    // excluded above, so a true here is a genuine column grant, directly or inherited).
+    let columns = sqlx::query(
+        "SELECT a.attname::text AS name, \
+                has_column_privilege(current_user, a.attrelid, a.attnum, 'INSERT') AS ins, \
+                has_column_privilege(current_user, a.attrelid, a.attnum, 'UPDATE') AS upd \
+         FROM pg_attribute a \
+         WHERE a.attrelid = to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped",
+    )
+    .bind(&qualified)
+    .fetch_all(pool)
+    .await
+    .map_err(db_error)?;
+    let mut seen = Vec::with_capacity(columns.len());
+    for column in &columns {
+        let name: String = column.try_get("name").map_err(db_error)?;
+        let ins: bool = column.try_get("ins").map_err(db_error)?;
+        let upd: bool = column.try_get("upd").map_err(db_error)?;
+        let expect_ins = model.insert_columns.contains(&name.as_str());
+        let expect_upd = model.update_columns.contains(&name.as_str());
+        if ins != expect_ins {
+            return Err(identity(format!(
+                "role {who} {} INSERT on {qualified}.{name}; the runtime identity's INSERT \
+                 columns on {} are exactly {:?}; {fix}",
+                if ins { "holds" } else { "lacks" },
+                model.table,
+                model.insert_columns
+            )));
+        }
+        if upd != expect_upd {
+            return Err(identity(format!(
+                "role {who} {} UPDATE on {qualified}.{name}; the runtime identity's UPDATE \
+                 columns on {} are exactly {:?}; {fix}",
+                if upd { "holds" } else { "lacks" },
+                model.table,
+                model.update_columns
+            )));
+        }
+        seen.push(name);
+    }
+    for expected in model.insert_columns.iter().chain(model.update_columns) {
+        if !seen.iter().any(|c| c == expected) {
+            return Err(incompatible(format!(
+                "column {qualified}.{expected} is missing; this build's privilege model does \
+                 not match the schema; refusing to serve"
             )));
         }
     }
     Ok(())
 }
 
-async fn table_privilege(pool: &PgPool, table: &str, privilege: &str) -> Result<bool, LedgerError> {
-    // Column-level grants count as table-level for has_table_privilege only when the whole
-    // table is granted; the column grants on refs are checked through has_any_column_privilege.
-    // SQL AND is not guaranteed to short-circuit: guard with CASE so DELETE/TRUNCATE never
-    // reach has_any_column_privilege (which only knows SELECT/INSERT/UPDATE/REFERENCES).
-    let row = sqlx::query(
-        "SELECT has_table_privilege(current_user, $1, $2) \
-                OR CASE WHEN $2 IN ('INSERT', 'UPDATE') \
-                        THEN has_any_column_privilege(current_user, $1, $2) ELSE false END AS ok",
+async fn verify_sequence_privileges(pool: &PgPool, who: &str) -> Result<(), LedgerError> {
+    let rows = sqlx::query(
+        "SELECT c.relname::text AS name, \
+                has_sequence_privilege(current_user, c.oid, 'USAGE') AS usage, \
+                has_sequence_privilege(current_user, c.oid, 'SELECT') AS sel, \
+                has_sequence_privilege(current_user, c.oid, 'UPDATE') AS upd \
+         FROM pg_class c WHERE c.relkind = 'S' AND c.relnamespace = 'public'::regnamespace",
     )
-    .bind(format!("public.{table}"))
-    .bind(privilege)
-    .fetch_one(pool)
+    .fetch_all(pool)
     .await
     .map_err(db_error)?;
-    row.try_get("ok").map_err(db_error)
+    let mut seen = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let name: String = row.try_get("name").map_err(db_error)?;
+        let usage: bool = row.try_get("usage").map_err(db_error)?;
+        let sel: bool = row.try_get("sel").map_err(db_error)?;
+        let upd: bool = row.try_get("upd").map_err(db_error)?;
+        let expected = RUNTIME_SEQUENCES.contains(&name.as_str());
+        if usage != expected {
+            return Err(identity(format!(
+                "role {who} {} USAGE on sequence public.{name}; the runtime identity has USAGE \
+                 on exactly {RUNTIME_SEQUENCES:?}; run `ledger-admin migrate --runtime-role {who}` \
+                 with the owner identity (ADR-0016)",
+                if usage { "holds" } else { "lacks" }
+            )));
+        }
+        if sel || upd {
+            return Err(identity(format!(
+                "role {who} holds SELECT/UPDATE on sequence public.{name}; only USAGE is granted \
+                 to the runtime identity (ADR-0016)"
+            )));
+        }
+        seen.push(name);
+    }
+    for expected in RUNTIME_SEQUENCES {
+        if !seen.iter().any(|s| s == expected) {
+            return Err(incompatible(format!(
+                "sequence public.{expected} is missing; refusing to serve"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CONTENT_ADDRESS_CHECK_DEF, GUARD_TRIGGERS, normalize_constraint_def};
+
+    #[test]
+    fn constraint_definition_normalization_matches_postgres_deparse() {
+        // PostgreSQL 17 deparse of migration 0009's CHECK.
+        let pg17 = "CHECK ((id = ('sha256:'::text || encode(sha256(bytes), 'hex'::text))))";
+        assert_eq!(normalize_constraint_def(pg17), CONTENT_ADDRESS_CHECK_DEF);
+        assert_ne!(
+            normalize_constraint_def("CHECK (true)"),
+            CONTENT_ADDRESS_CHECK_DEF
+        );
+    }
+
+    #[test]
+    fn expected_trigger_types_match_the_catalog_bit_layout() {
+        // Values observed in pg_trigger.tgtype for a freshly migrated database.
+        let by_name = |n: &str| {
+            GUARD_TRIGGERS
+                .iter()
+                .find(|t| t.name == n)
+                .unwrap()
+                .tgtype()
+        };
+        assert_eq!(by_name("immutable_objects_write_once"), 27); // ROW BEFORE UPDATE DELETE
+        assert_eq!(by_name("graphs_identity_immutable"), 19); // ROW BEFORE UPDATE
+        assert_eq!(by_name("refs_version_monotonic"), 23); // ROW BEFORE INSERT UPDATE
+        assert_eq!(by_name("refs_movement_audited"), 21); // ROW AFTER INSERT UPDATE
+        assert_eq!(GUARD_TRIGGERS.len(), 13);
+    }
 }

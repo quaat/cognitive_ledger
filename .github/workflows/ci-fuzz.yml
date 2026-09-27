@@ -4,32 +4,79 @@ on:
   push:
     branches: [main]
   schedule:
+    # Weekly longer campaign (15 min per target, both sanitizers).
     - cron: "17 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      seconds_per_target:
+        description: "libFuzzer -max_total_time per target (60..1800)"
+        required: false
+        default: "900"
+      sanitizer:
+        description: "none, address, or both"
+        required: false
+        default: "both"
 permissions: {contents: read}
-# Bounded libFuzzer runs of every target on the checked-in corpora (Plan 0005 §5). Longer
-# local runs are recorded in docs/exec-plans/active/0005-*. Nightly is required by cargo-fuzz
-# (sanitizer builds); it is pinned to a date and used only for this job.
+# Bounded libFuzzer runs of every declared target on the checked-in corpora (Plan 0005 §5).
+# The nightly toolchain is installed explicitly with rustup (pinned by date; the SHA-pinned
+# dtolnay action only installs the stable baseline and does not take a toolchain input), and
+# the fuzz target triple is derived from that toolchain's host so the prebuilt cargo-fuzz
+# binary never chooses it implicitly. Pull requests run 45 s per target; the weekly schedule
+# and manual dispatch run the longer qualification campaign.
+env:
+  FUZZ_TOOLCHAIN: nightly-2026-09-25
 jobs:
   fuzz:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [none, address]
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with: {persist-credentials: false}
-      - uses: dtolnay/rust-toolchain@b4f984c1e7daae8e175614de3e73a8411a20333c # 1.89.0 (action commit; toolchain below)
-        with:
-          toolchain: nightly-2026-09-25
+      - name: Select run parameters
+        id: params
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ github.event_name }}" in
+            pull_request|push) seconds=45 ;;
+            schedule) seconds=900 ;;
+            workflow_dispatch) seconds='${{ inputs.seconds_per_target }}' ;;
+          esac
+          [[ "$seconds" =~ ^[0-9]+$ ]] && [ "$seconds" -ge 60 -o "${{ github.event_name }}" != workflow_dispatch ] && [ "$seconds" -le 1800 ] \
+            || { echo "seconds_per_target must be an integer in 60..1800 (got '$seconds')" >&2; exit 1; }
+          wanted='${{ inputs.sanitizer }}'; [ -n "$wanted" ] || wanted=both
+          case "$wanted" in none|address|both) ;; *) echo "sanitizer must be none, address or both" >&2; exit 1 ;; esac
+          run=true
+          if [ "$wanted" != both ] && [ "$wanted" != "${{ matrix.sanitizer }}" ]; then run=false; fi
+          echo "seconds=$seconds" >> "$GITHUB_OUTPUT"
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+      - name: Install the pinned nightly toolchain
+        if: steps.params.outputs.run == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal --component rust-src --no-self-update
+          rustc "+$FUZZ_TOOLCHAIN" -Vv
+          cargo "+$FUZZ_TOOLCHAIN" -V
       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
+        if: steps.params.outputs.run == 'true'
         with:
           tool: cargo-fuzz@0.13.2
-      - run: ./scripts/fuzz.sh 45
+      - name: Fuzz (${{ matrix.sanitizer }})
+        if: steps.params.outputs.run == 'true'
         env:
-          FUZZ_TOOLCHAIN: nightly-2026-09-25
+          FUZZ_SANITIZER: ${{ matrix.sanitizer }}
+        run: ./scripts/fuzz.sh "${{ steps.params.outputs.seconds }}"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.params.outputs.run == 'true' }}
         with:
-          name: fuzz-logs
+          name: fuzz-${{ matrix.sanitizer }}
           path: |
-            target/fuzz/**
+            target/fuzz/*/summary.txt
+            target/fuzz/*/*.log
             fuzz/artifacts/**
           if-no-files-found: ignore
