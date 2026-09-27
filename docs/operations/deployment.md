@@ -48,7 +48,9 @@ roles. Never give a serving container the owner URL (the server warns if it sees
 4. Upgrading from Phase 1 (single identity): create the runtime role with a managed
    password (`CREATE ROLE <role> LOGIN PASSWORD …`; it owns nothing and has no `CREATE`),
    and prepare the replicas' `LEDGER_DATABASE_URL` to use it — the owner URL moves to
-   `LEDGER_MIGRATION_DATABASE_URL` on the operator host only.
+   `LEDGER_MIGRATION_DATABASE_URL` on the operator host only. Rotate the owner password
+   afterwards: Phase-1 replicas held it in their environment and secret stores. Confirm the
+   runtime role has `CONNECT` on the database.
 5. Run `ledger-admin migrate --runtime-role <role>` with the new `ledger-admin` under the
    owner identity.
 6. Start the new build. A build started against another schema level, or with an identity
@@ -59,8 +61,10 @@ The path from the previous release is exercised by `scripts/upgrade.sh`
 schema at the required level with the checksums of already-applied migrations untouched,
 identical heads/versions and reconstructed states, verbatim replay of the previous
 release's idempotency keys, new writes, `ledger-admin verify`, and a `pg_dump --schema-only`
-diff between the upgraded database and a clean install, which must be empty). Run it
-before every release; its evidence is recorded in the active Plan 0005 document.
+diff between the upgraded database and a clean install plus an object-ownership comparison,
+both of which must be empty — role attributes, database-level ACLs, sequence values and seed
+rows are not covered). Run it before every release; its evidence is recorded in the active
+Plan 0005 document.
 
 ## Runtime limits
 - HTTP: `LEDGER_LIMIT_*` (body, operations, terms, metadata, reconstruction depth/quads/
@@ -103,8 +107,10 @@ it after every end-to-end scenario.
 - **What restore preserves:** every ref's event chain is an exact prefix of the live chain
   as of the snapshot, and a server on the restored database serves the restored heads and
   reconstructs states identical to the live server for the same commit ids (content
-  identity makes the comparison exact). `scripts/backup-restore.sh` proves both variants
-  under live load; run it per release.
+  identity makes the comparison exact). `scripts/backup-restore.sh` exercises both variants
+  under live load with development settings and checks these properties (verifier clean,
+  graph set, pre-backup watermark, exact prefixes, audit rows present in live, identical
+  states, no PUBLIC execute on ledger functions); run it per release.
 - **What restore does not preserve — decide before you need it:** everything acknowledged
   after the snapshot is gone, and the restored ledger will issue the same `(graph, branch,
   version)` numbers again for different commits. Before a restore: fence all writers, record

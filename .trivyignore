@@ -1,6 +1,6 @@
 # Container-scan exceptions (aquasecurity/trivy; ci-security "container" job, Plan 0005 slice 2).
 #
-# The CI gate fails on CRITICAL/HIGH findings that have a fix available. Findings below that
+# The CI gate fails on CRITICAL/HIGH findings (fixed or not). Findings below that
 # threshold are still reported in the uploaded JSON artefact and classified in
 # docs/quality/security.md (Supply chain → Container image). Nothing is listed here without
 # an ID, a rationale and a review trigger; an empty list means no exception is in force.

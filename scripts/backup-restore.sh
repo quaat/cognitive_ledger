@@ -84,6 +84,10 @@ psql_q ledger "CREATE DATABASE restored_dump" >/dev/null
 docker exec "${PG_CID}" pg_restore -U ledger -d restored_dump --no-owner --no-acl /tmp/ledger.dump >"${OUT}/pg_restore.log" 2>&1 || { echo "pg_restore reported errors:" >&2; cat "${OUT}/pg_restore.log" >&2; exit 1; }
 psql_q ledger "GRANT CONNECT ON DATABASE restored_dump TO ledger_runtime" >/dev/null
 "${COMPOSE[@]}" run --rm migrate migrate --runtime-role ledger_runtime --database-url 'postgres://ledger:ledger-development-only@postgres:5432/restored_dump?sslmode=disable' >"${OUT}/restored-migrate.log" 2>&1 || { echo "FAIL: migrate/grant on the restored database" >&2; cat "${OUT}/restored-migrate.log" >&2; exit 1; }
+# `--no-acl` also dropped the migrations' REVOKE … FROM PUBLIC on the ledger functions; the
+# grant step re-applies them, and no function may be executable by PUBLIC afterwards.
+PUBLIC_EXEC=$(psql_q restored_dump "SELECT count(*) FROM pg_proc p, aclexplode(p.proacl) a WHERE p.pronamespace = 'public'::regnamespace AND a.grantee = 0")
+[ "${PUBLIC_EXEC}" = "0" ] || { echo "FAIL: ${PUBLIC_EXEC} function privilege(s) granted to PUBLIC after restore" >&2; exit 1; }
 docker run -d --name "${BBNAME}" --network "${NET}" -e POSTGRES_PASSWORD=ledger-development-only \
   -v "${BBVOL}:/var/lib/postgresql/data" "${PG_IMAGE}" >/dev/null
 wait_pg "${BBNAME}"

@@ -83,15 +83,20 @@ redefine commit state):
 3. **Placement:** a checkpoint row `state_checkpoints(commit_id, snapshot_id, quads, bytes,
    verified_by, created_at)` every *k* commits per ref (k sized from the control run so a
    fold from the nearest checkpoint stays within tens of milliseconds), written outside the
-   acceptance transaction (after COMMIT, idempotent, never blocking acceptance).
+   acceptance transaction (after COMMIT, idempotent, never blocking acceptance) by a
+   dedicated checkpointer identity — not the serving runtime and not a long-lived owner
+   credential (ADR-0016 keeps the owner on the operator host): a role with `INSERT` on the
+   checkpoint table and `SELECT` elsewhere, excluded from `ledger_grant_runtime`, and the
+   server's forbidden-privilege startup check extended to that table.
 4. **Never dropped, never edited.** Snapshot objects live in `immutable_objects` (write-once
    guard, ADR-0012 leaves large snapshots to object storage later) and index rows are
    append-only; the `max_depth` limit keeps its ADR-0013 meaning (an accepted head stays
    readable under the limits that accepted it) because a checkpoint only shortens the fold,
    its absence never lengthens it beyond the history length that was accepted.
-5. **Verification:** `ledger-admin verify` gains "checkpoint digest equals fold digest" over
-   every checkpoint (or a bounded random subset per run, with the full set covered over a
-   schedule) and "no checkpoint referenced by a prepare was unverified".
+5. **Verification:** every checkpoint is verified (digest equals fold digest) before it is
+   ever used; `ledger-admin verify` re-checks a bounded random subset per run, covering the
+   full set over a schedule, and asserts "no checkpoint referenced by a prepare was
+   unverified".
 
 Decision required before Phase 4 (branches make deep histories more common): the ADR for the
 snapshot format and the checkpoint table (persistent identity of snapshots, who writes them,

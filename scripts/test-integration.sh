@@ -26,6 +26,8 @@ AUTH_ISSUER=https://dev-issuer.example/
 AUTH_AUDIENCE=api://sculpin-ledger-dev
 AUTH_SECRET=development-only-hs256-secret-not-for-production-use
 
+# Own compose project: never takes over or deletes the developer's default stack.
+export COMPOSE_PROJECT_NAME=ledger-qual-integration
 docker compose config --quiet
 # Production-shaped start (ADR-0016): PostgreSQL → owner migration (one-shot `migrate`
 # service, runtime role granted) → server with the least-privilege runtime identity.

@@ -21,7 +21,7 @@ jobs:
           toolchain: nightly-2026-09-25
       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
         with:
-          tool: cargo-fuzz
+          tool: cargo-fuzz@0.13.2
       - run: ./scripts/fuzz.sh 45
         env:
           FUZZ_TOOLCHAIN: nightly-2026-09-25

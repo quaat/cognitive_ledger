@@ -28,3 +28,5 @@ tests/differential/
 *.pem
 *.key
 credentials.*
+# Fuzz workspace (its own build output can reach gigabytes; never part of the image)
+fuzz/

@@ -375,7 +375,7 @@ supply-chain, upgrade, backup harnesses), `docs/` (operations runbook, security)
   sequence values, seed rows).
 - Evidence (`docs/quality/evidence/upgrade-2026-09-27.md`, rerun after the review fixes):
   25 commits before, schema 7 → 9, 25 states identical, 50 keys replayed identically,
-  version 26 after, verifier clean, 592 DDL lines and 55 owned objects identical;
+  version 26 after, verifier clean, 598 DDL lines and 55 owned objects identical;
   `UPGRADE OK`. Data set is one graph on the happy path (undecided/rejected proposals and
   imported v1 data not carried across; recorded).
 
@@ -393,10 +393,11 @@ supply-chain, upgrade, backup harnesses), `docs/` (operations runbook, security)
   restored heads with matching versions and reconstructing states identical to the live
   server at the same commit ids.
 - Evidence (`docs/quality/evidence/backup-restore-2026-09-27.md`, rerun after the review
-  fixes): dump at 279 commits (≥ 214 acknowledged before), base backup at 647 (≥ 279), live
-  898 when the load stopped; dump restore 253 events / 2,575 audit rows, base-backup
-  instance 374 events / 3,714 audit rows, all prefixes and present in live; 10 + 10
-  restored heads served, states identical; both verifies clean; `BACKUP RESTORE OK`.
+  fixes): dump at 275 commits (≥ 212 acknowledged before), base backup at 630 (≥ 275), live
+  876 when the load stopped; dump restore 249 events / 2609 audit rows, base-backup
+  instance 361 events / 3693 audit rows, all prefixes and present in live; no PUBLIC
+  execute on any ledger function after the grant step; 10 + 10 restored heads served, states
+  identical; both verifies clean; `BACKUP RESTORE OK`.
   Restore forks history from the snapshot (versions reissued); runbook states the
   consequences, PITR/fencing decision in tech-debt. The smoke does not write to a restore.
 
@@ -509,8 +510,18 @@ Open before the gate can pass:
 - Deployment decisions recorded in tech-debt that a production operator must take:
   restore semantics (PITR/WAL archiving, writer fencing, projection rebuild), checkpoint ADR
   before Phase 4, admission budget for `accept` and cancellation of abandoned statements.
-- Final independent security review of the complete branch before merge (requested with
-  the pull request).
+- Final independent security review of the complete branch (2026-09-27, Opus, read-only):
+  no P0/P1, nothing blocking the pull request. Fixed in the same change: the startup
+  identity check now also forbids `TRUNCATE`/`TRIGGER`/`REFERENCES` on every table and any
+  write to `_sqlx_migrations` (a later `GRANT TRUNCATE` could have wiped audit history
+  without firing the row-level guards); `ledger-admin migrate --runtime-role` re-applies the
+  migrations' `REVOKE … FROM PUBLIC` on the ledger functions, which `pg_restore --no-acl`
+  drops, and the restore smoke asserts no PUBLIC execute remains; `scripts/test-integration.sh`
+  runs in its own compose project (it could take over and delete a developer's default
+  stack); the stress tool refuses `host`/`hostaddr` DSN parameters; CI tool versions pinned;
+  documentation wording corrected ("exercises"/"checks" instead of "proves", fuzz coverage
+  exceptions, diff exclusions, owner password rotation, checkpointer identity). Recorded in
+  tech-debt: test-role teardown, zero timeouts, DSNs in process arguments.
 
 ## Sub-agent decomposition (§42)
 storage/concurrency (role split, kill injection), API/security (multi-replica auth,

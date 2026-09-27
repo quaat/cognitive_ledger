@@ -109,6 +109,15 @@ fn require_loopback(what: &str, url: &str, allow: bool) -> Result<(), String> {
     {
         return Err(format!("{what}: replica URLs must not carry credentials"));
     }
+    // libpq-style URLs can redirect the connection with `host=`/`hostaddr=` parameters.
+    if parsed
+        .query_pairs()
+        .any(|(k, _)| k.eq_ignore_ascii_case("host") || k.eq_ignore_ascii_case("hostaddr"))
+    {
+        return Err(format!(
+            "{what}: host/hostaddr query parameters are not allowed"
+        ));
+    }
     Ok(())
 }
 
@@ -1565,6 +1574,8 @@ mod tests {
             "http://ledger.internal:8080",
             "http://user:secret@127.0.0.1:8080",
             "postgres://ledger:pw@db.prod.example/ledger",
+            "postgres://ledger:pw@localhost/ledger?host=db.prod.example",
+            "postgres://ledger:pw@127.0.0.1/ledger?hostaddr=10.0.0.5",
         ] {
             let err = require_loopback("t", bad, false).unwrap_err();
             assert!(

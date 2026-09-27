@@ -112,8 +112,14 @@ integrity rules against real PostgreSQL, including a non-superuser owner.
   that an `on_behalf_of` human consented.
 - Executed P1.5 evidence so far: least privilege (slice 1), supply chain (slice 2), the
   1,000-writer and kill-injection runs (`docs/quality/evidence/`), two-replica JWKS
-  rotation and adversarial limits (`pg_api`), bounded fuzzing of every untrusted-input
-  parser (`fuzz/`, `ci-fuzz`). Upgrade/backup qualification,
+  rotation and adversarial limits (`pg_api`), bounded fuzzing of the RDF/patch/commit
+  decoders, the request bodies and the request-identity encoder (`fuzz/`, `ci-fuzz`; not
+  yet fuzzed: the `Idempotency-Key` header parser, the path `CommitId`, JWT/JWKS parsing,
+  which the `jsonwebtoken` crate owns), upgrade and backup/restore smoke runs, and the depth
+  baselines (`docs/quality/evidence/`, `performance-baselines.md`). ASan fuzz runs, a
+  multi-hour fuzz campaign and the **live Entra ID issuer smoke test (pending: no tenant
+  credentials available to the runs; never mark it passed)** remain. **The service is not
+  production-qualified until Plan 0005 passes in full.**
   performance baselines and the **live Entra ID issuer smoke test (pending: no tenant
   credentials available to the runs; never mark it passed)** remain. **The service is not
   production-qualified until Plan 0005 passes in full.**

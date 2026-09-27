@@ -56,7 +56,16 @@ fn db_migrate(e: sqlx::migrate::MigrateError) -> LedgerError {
 pub async fn grant_runtime_role(conn: &mut PgConnection, role: &str) -> Result<(), LedgerError> {
     sqlx::query("SELECT ledger_grant_runtime($1)")
         .bind(role)
-        .execute(conn)
+        .execute(&mut *conn)
+        .await
+        .map_err(db_error)?;
+    // No ledger function is executable by PUBLIC: the migrations revoke it on the functions
+    // they create, a database restored with `pg_restore --no-acl` comes back with the
+    // default public EXECUTE, and the grant function only shapes the runtime role's own
+    // rights (its `REVOKE … FROM <role>` even materializes the default ACL). Trigger
+    // functions fire regardless of EXECUTE (checked at CREATE TRIGGER, by the owner).
+    sqlx::query("REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC")
+        .execute(&mut *conn)
         .await
         .map_err(db_error)?;
     Ok(())
@@ -232,7 +241,24 @@ const RUNTIME_TABLE_PRIVILEGES: &[(&str, &str)] = &[
     ("_sqlx_migrations", "SELECT"),
 ];
 
-/// Privileges the runtime identity must NOT have (any one defeats the boundary).
+/// Every ledger table the runtime identity may touch (plus the migration ledger).
+const RUNTIME_TABLES: &[&str] = &[
+    "immutable_objects",
+    "commit_index",
+    "commit_parents",
+    "graphs",
+    "refs",
+    "proposals",
+    "ref_events",
+    "decisions",
+    "projection_outbox",
+    "idempotency",
+    "_sqlx_migrations",
+];
+
+/// Privileges the runtime identity must NOT have on specific tables (any one defeats the
+/// boundary). `TRUNCATE`, `TRIGGER` and `REFERENCES` are forbidden on every table and any
+/// write on `_sqlx_migrations` (see `forbidden_privileges`).
 const RUNTIME_FORBIDDEN_PRIVILEGES: &[(&str, &str)] = &[
     ("immutable_objects", "UPDATE"),
     ("immutable_objects", "DELETE"),
@@ -254,13 +280,28 @@ const RUNTIME_FORBIDDEN_PRIVILEGES: &[(&str, &str)] = &[
     ("graphs", "UPDATE"),
     ("graphs", "DELETE"),
     ("refs", "DELETE"),
-    ("refs", "TRUNCATE"),
-    ("immutable_objects", "TRUNCATE"),
+    ("_sqlx_migrations", "INSERT"),
+    ("_sqlx_migrations", "UPDATE"),
+    ("_sqlx_migrations", "DELETE"),
 ];
+
+/// The complete forbidden set: the explicit list plus `TRUNCATE` (bypasses the row-level
+/// write-once triggers), `TRIGGER` (could disable the guards) and `REFERENCES` on every table.
+fn forbidden_privileges() -> Vec<(&'static str, &'static str)> {
+    let mut all: Vec<(&'static str, &'static str)> = RUNTIME_FORBIDDEN_PRIVILEGES.to_vec();
+    for table in RUNTIME_TABLES {
+        for privilege in ["TRUNCATE", "TRIGGER", "REFERENCES"] {
+            all.push((table, privilege));
+        }
+    }
+    all
+}
 
 /// Verify that the connected identity is a least-privilege runtime identity (ADR-0016):
 /// not a superuser, not the owner of any ledger table, without CREATE on the schema, with
-/// exactly the request path's grants. The server refuses to start otherwise, so a
+/// the request path's grants present and every forbidden table privilege (writes to
+/// write-once rows, `TRUNCATE`, `TRIGGER`, `REFERENCES`, any write to the migration ledger)
+/// absent. Column-level grants are compared per table, not per column. The server refuses to start otherwise, so a
 /// deployment that kept the owner URL cannot silently serve with owner rights.
 pub async fn verify_runtime_identity(pool: &PgPool) -> Result<(), LedgerError> {
     let row = sqlx::query(
@@ -294,7 +335,7 @@ pub async fn verify_runtime_identity(pool: &PgPool) -> Result<(), LedgerError> {
             "role {who} holds CREATE on schema public; revoke it (ADR-0016)"
         )));
     }
-    for (table, privilege) in RUNTIME_FORBIDDEN_PRIVILEGES {
+    for (table, privilege) in forbidden_privileges() {
         if table_privilege(pool, table, privilege).await? {
             return Err(LedgerError::RuntimeIdentity(format!(
                 "role {who} holds {privilege} on {table}; the runtime identity must not \
