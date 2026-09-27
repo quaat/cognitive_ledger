@@ -2587,6 +2587,18 @@ async fn checks_recreated_as_a_logical_restore_does_are_accepted_and_changes_sti
         }
         other => panic!("a widened branch bound must refuse readiness: {other:?}"),
     }
+    // Whitespace inside a literal is content: a space added to the branch alphabet is refused.
+    owner_exec(
+        &fx,
+        "ALTER TABLE refs DROP CONSTRAINT refs_branch_bounds, ADD CONSTRAINT refs_branch_bounds \
+         CHECK (octet_length(branch) >= 1 AND octet_length(branch) <= 128 \
+         AND branch ~ '^[A-Za-z0-9._/ -]+$')",
+    )
+    .await;
+    match PostgresLedgerStore::connect(&fx.runtime_db_url, V1Binding::Reject).await {
+        Err(LedgerError::SchemaIncompatible(m)) => assert!(m.contains("refs_branch_bounds"), "{m}"),
+        other => panic!("a widened branch alphabet must refuse start-up: {other:?}"),
+    }
 }
 
 /// Composite foreign keys are `MATCH SIMPLE`: a key column that became nullable lets a row

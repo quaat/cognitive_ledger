@@ -1552,11 +1552,34 @@ const RESTORED_CHECKS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// Normalize a deparsed definition for comparison: whitespace and `::text` casts are removed
+/// *outside* string literals only, so a literal (a regex, an enum value) is compared exactly —
+/// `'^[a-z]+$'` and `'^[a-z ]+$'` must never normalize alike. `''` inside a literal is an
+/// escaped quote and keeps the literal open.
 fn normalize_constraint_def(def: &str) -> String {
-    def.chars()
-        .filter(|c| !c.is_whitespace())
-        .collect::<String>()
-        .replace("::text", "")
+    let mut out = String::with_capacity(def.len());
+    let mut outside = String::new();
+    let mut in_literal = false;
+    let flush = |outside: &mut String, out: &mut String| {
+        out.push_str(&outside.replace("::text", ""));
+        outside.clear();
+    };
+    for c in def.chars() {
+        if in_literal {
+            out.push(c);
+            if c == '\'' {
+                in_literal = false;
+            }
+        } else if c == '\'' {
+            flush(&mut outside, &mut out);
+            out.push(c);
+            in_literal = true;
+        } else if !c.is_whitespace() {
+            outside.push(c);
+        }
+    }
+    flush(&mut outside, &mut out);
+    out
 }
 
 /// Key of a definition fingerprint in [`SchemaReport::fingerprints`].
@@ -2619,6 +2642,30 @@ mod tests {
         assert_eq!(normalize_constraint_def(pg17), expected);
         assert_ne!(normalize_constraint_def("CHECK (true)"), expected);
         assert_eq!(EXPECTED_CHECKS.len(), 56);
+    }
+
+    #[test]
+    fn normalization_never_touches_string_literals() {
+        let expected = EXPECTED_CHECKS
+            .iter()
+            .find(|(_, n, _)| *n == "refs_branch_bounds")
+            .unwrap()
+            .2;
+        let real = "CHECK ((((octet_length(branch) >= 1) AND (octet_length(branch) <= 128)) AND (branch ~ '^[A-Za-z0-9._/-]+$'::text)))";
+        assert_eq!(normalize_constraint_def(real), expected);
+        // A space added inside the regex admits `a b`: it must not normalize to the original.
+        let widened = "CHECK ((((octet_length(branch) >= 1) AND (octet_length(branch) <= 128)) AND (branch ~ '^[A-Za-z0-9._/ -]+$'::text)))";
+        assert_ne!(normalize_constraint_def(widened), expected);
+        // `::text` inside a literal is content, not a cast.
+        assert_eq!(
+            normalize_constraint_def("CHECK ((x = 'a::text b'::text))"),
+            "CHECK((x='a::text b'))"
+        );
+        // An escaped quote keeps the literal open.
+        assert_eq!(
+            normalize_constraint_def("CHECK ((x = 'it''s  x'))"),
+            "CHECK((x='it''s  x'))"
+        );
     }
 
     #[test]

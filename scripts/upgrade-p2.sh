@@ -176,9 +176,21 @@ diff -u "${OUT}/schema-source-0009.sql" "${OUT}/schema-restored-0009.sql" >"${OU
 # A logical restore re-parses CHECK text: PostgreSQL flattens the nested AND of the three
 # BETWEEN-style *_branch_bounds CHECKs (identical meaning; the Phase-2 verifier accepts exactly
 # that form). Anything else differing is a failure.
-other=$(grep -E '^[-+] ' "${OUT}/restore-schema.diff" | grep -vcE 'CONSTRAINT (proposals|ref_events|refs)_branch_bounds CHECK' || true)
-flattened=$(grep -cE '^[+] +CONSTRAINT (proposals|ref_events|refs)_branch_bounds CHECK \(\(\(octet_length\(branch\) >= 1\) AND \(octet_length\(branch\) <= 128\) AND ' "${OUT}/restore-schema.diff" || true)
-[ "${other}" = 0 ] && [ "${flattened}" -le 3 ] || { head -40 "${OUT}/restore-schema.diff" >&2; fail "restored backup DDL/grants differ from the source beyond the re-parsed branch bounds"; }
+# Exactly these replacements, and nothing else: each nested form removed, its flattened form added.
+python3 - "${OUT}/restore-schema.diff" <<'PY' || { head -40 "${OUT}/restore-schema.diff" >&2; fail "restored backup DDL/grants differ from the source beyond the re-parsed branch bounds"; }
+import sys
+lines = {l.rstrip("\n") for l in open(sys.argv[1]) if l[:1] in "+-" and not l.startswith(("+++", "---"))}
+bounds = "(octet_length(branch) >= 1) AND (octet_length(branch) <= 128)"
+regex = "(branch ~ '^[A-Za-z0-9._/-]+$'::text)"
+tables = ("proposals", "ref_events", "refs")
+nested = {f"-    CONSTRAINT {t}_branch_bounds CHECK ((({bounds}) AND {regex}))," for t in tables}
+flat = {f"+    CONSTRAINT {t}_branch_bounds CHECK (({bounds} AND {regex}))," for t in tables}
+if lines != nested | flat:
+    print("unexpected restore DDL difference:", sorted(lines ^ (nested | flat)), file=sys.stderr)
+    sys.exit(1)
+print("restore DDL: exactly the 3 re-parsed branch-bound CHECKs differ")
+PY
+flattened=3
 diff -u "${OUT}/owners-source-0009.txt" "${OUT}/owners-restored-0009.txt" >"${OUT}/restore-owners.diff" || { head -40 "${OUT}/restore-owners.diff" >&2; fail "restored backup ownership differs from the source"; }
 admin "${OLD_IMAGE}" restored_0009 verify >"${OUT}/restore-verify-previous.log" 2>&1 && grep -q "VERIFY OK" "${OUT}/restore-verify-previous.log" || { cat "${OUT}/restore-verify-previous.log"; fail "previous ledger-admin verify on the restored backup"; }
 # Observation (known P1.5 defect, fixed in Phase 2): the released P1.5 server's strict CHECK
