@@ -1,6 +1,9 @@
 # Plan 0006: Phase 2 — semantic validation coordination
 
-Status: **merge candidate — P2.1–P2.6 implemented, locally qualified and reviewed; hosted CI on the final head and the live Sculpin run are external evidence (see "Closure" below)** (started 2026-09-27 after PR #2 merged). Branch
+Status: **completed / merge-ready** (2026-09-27; PR #7). Phase-2 ledger coordination is
+implemented and qualified; live Sculpin/pySHACL semantic-service integration is
+**PENDING_EXTERNAL**; P1.5 production deployment qualification is still pending separately
+(see "Closure status" below). Started 2026-09-27 after PR #2 merged. Branch
 `claude/p2-semantic-validation` from `main` at `f81be37d14b1de102c00fd339a63784b88d725c6`
 (the PR #2 merge, P1.5 production qualification). Execution slices, in order:
 (P2.1) validation protocol + persistent records; (P2.2) validation workflow + acceptance
@@ -345,23 +348,24 @@ upgraded schema identical (809 DDL/grant lines, 70 owned objects). Final run on 
 see the table below. NOTE recorded: the P1.5 server refuses a logically restored copy.
 
 ### Executed gates on the closure candidate
-Code candidate: `c43ffcf` (the only later commit is this documentation update). Heads are
-named where a gate ran on an earlier commit; every later change is listed with the suites
-re-run for it.
+Final code candidate: **`e264950`** (later commits change documentation only). Every row ran on
+`e264950` unless another head is named.
 | Gate | Head | Result |
 |---|---|---|
-| `./scripts/check-fast.sh` | `c43ffcf` | exit 0 (fmt, clippy `-D warnings`, workspace tests, doc links, architecture, Python references: 18 commit-v2, 12 request, 42 validation incl. invocation, 3 state) |
-| `./scripts/check-supply-chain.sh` | `a71fd09` (no dependency change since) | exit 0 (advisories/bans/licenses/sources ok, SBOM 213 components) |
-| PostgreSQL 15.19 — all 10 suites (`pg_validation` 9, `pg_verify` 2, `pg_workflow` 14, `pg_least_privilege` 18, `pg_cas_race` 1, `pg_immutable_store` 9, `pg_graphs_migration` 7, `pg_fs_migration` 8, `pg_validation_api` 17, `pg_api` 13) | `8d3ec1b` | all passed; `pg_verify` + `pg_validation` again on `c43ffcf` (only `verify.rs` and its test changed) |
-| PostgreSQL 17.11 — same 10 suites | `8d3ec1b` | all passed; `pg_verify` + `pg_validation` again on `c43ffcf` |
-| `validator_http` (5) | `c43ffcf` | passed (in `check-fast`) |
-| `./scripts/test-integration.sh` (compose PG 17.2, distroless image, all PG suites, container scenario, verify) | `8d3ec1b` | exit 0, `INTEGRATION OK`, `VERIFY OK` |
-| `./scripts/backup-restore.sh` (dump + base backup, restored servers, drift refusal) | `b54906f` → `c43ffcf` | **failed** on `b54906f` (logical restore refused at start-up, see above); `BACKUP RESTORE OK` on `c43ffcf` |
-| `scripts/upgrade-p2.sh` (0009 → 0010 from `f81be37`) | `8d3ec1b` | `UPGRADE-P2 OK`, run `target/upgrade-p2/20260927T172018Z`; NOTEs: the P1.5 server refuses a logically restored 0009 copy; the P1.5 `verify` does not check the schema level |
-| fuzz `validation_decode` (binary decoders + validator JSON response path), sanitizer none, 120 s | `07420ae` | 15.8 M execs, cov 2950, no crash |
-| fuzz `validation_decode`, sanitizer none, **900 s** | `32dc825` (target and protocol crate unchanged since) | **71.5 M execs, cov 3237, no crash** (nightly-2026-09-25, x86_64-unknown-linux-gnu, debug assertions on; `target/fuzz/20260927T170019Z`) |
-| fuzz `validation_decode`, AddressSanitizer | — | **not executable here**: SIGSEGV at start-up before the first input, no artifact (the host ASan runtime issue recorded in Plan 0005); runs on hosted `ci-fuzz` (`address` matrix) |
-| mutation checks | `07420ae` | old trust predicate → 2 PG tests red; invocation id from correlation id → 2 PG tests red |
+| branch contains current `main` (`d12c1b7`) | `e264950` | yes (`git merge-base --is-ancestor`) |
+| `./scripts/check-fast.sh` | `e264950` | exit 0 (fmt, clippy `-D warnings`, workspace tests, doc links, architecture, Python references: 18 commit-v2, 12 request, 42 validation incl. invocation, 3 state) |
+| `./scripts/check-supply-chain.sh` | `e264950` | exit 0 (advisories/bans/licenses/sources ok, SBOM 213 components) |
+| PostgreSQL 15.19 — all 10 suites (`pg_validation` 9, `pg_verify` 2, `pg_workflow` 14, `pg_least_privilege` 18, `pg_cas_race` 1, `pg_immutable_store` 9, `pg_graphs_migration` 7, `pg_fs_migration` 8, `pg_validation_api` 17, `pg_api` 13) | `e264950` | all passed |
+| PostgreSQL 17.11 — same 10 suites | `e264950` | all passed |
+| `validator_http` (5) | `e264950` | passed (in `check-fast`) |
+| `./scripts/test-integration.sh` (compose PG 17.2, distroless image, all PG suites, container scenario, verify) | `e264950` | exit 0, `INTEGRATION OK`, `VERIFY OK` |
+| `./scripts/backup-restore.sh` (dump + base backup, restored servers, drift refusal) | `e264950` | `BACKUP RESTORE OK` (it **failed** on `b54906f` — logical restore refused at start-up — which led to the ADR-0017 amendment) |
+| `scripts/upgrade-p2.sh` (0009 → 0010 from `f81be37`) | `e264950` | `UPGRADE-P2 OK`, run `target/upgrade-p2/20260927T181113Z`; NOTEs: the P1.5 server refuses a logically restored 0009 copy; the P1.5 `verify` does not check the schema level |
+| hosted `ci-fast` / `ci-integration` / `ci-security` / `ci-fuzz` (PR, 45 s per target, none + address) | `e264950` | all **success** (runs 36339857561 / 36339857501 / 36339857492 / 36339857541); also all success on `9018322` |
+| fuzz `validation_decode`, sanitizer none, **900 s** (local) | `32dc825` (fuzz target and protocol crate unchanged since) | **71.5 M execs, cov 3237, no crash** (nightly-2026-09-25, x86_64-unknown-linux-gnu, debug assertions on; `target/fuzz/20260927T170019Z`) |
+| fuzz, **AddressSanitizer, 900 s per target, all 8 targets** (hosted `ci-fuzz` `workflow_dispatch`, run **36337367782**, job `fuzz (address)` 17:33:14Z → 19:37:09Z) | `9018322` (fuzz targets and every crate they link unchanged in `e264950` except `ledger-store::verify`, which no target calls) | **success, no crash**: `validation_decode` **50.2 M execs, cov 4396**; accept_body 94.6 M, commit_decode 75.4 M, patch_canonical 25.4 M, prepare_body 38.1 M, quad_parse 63.0 M, request_identity 12.9 M, timestamp 226.7 M (nightly-2026-09-25 / rustc 1.100.0-nightly f7575a9da, x86_64-unknown-linux-gnu, debug assertions on) |
+| fuzz, AddressSanitizer, local | — | not executable here (host ASan runtime SIGSEGV at start-up before any input, no artifact; Plan 0005) |
+| mutation checks | `07420ae` / `e264950` | old trust predicate → 2 PG tests red; invocation id from correlation id → 2 PG tests red; verify inner join → orphan test red |
 
 ### Reviews
 - Round 4 (Opus, read-only, `1724216..a71fd09`): migration-0010 security review (no P0/P1;
@@ -387,15 +391,28 @@ re-run for it.
     `semantic_context_id` → fixed (`c43ffcf`). The `c43ffcf` delta (verify + docs) was not
     re-reviewed by Codex; it was re-tested (`pg_verify`/`pg_validation` on PG 15 and 17,
     `check-fast`, `backup-restore`).
+  - `9018322` (exact PR head, full-scope prompt): **no P0/P1**; P2 verify skipped validation
+    records whose context was removed behind a dropped FK → fixed in `e264950` (left join,
+    regression test, mutation-checked).
+  - `e264950` (focused on the fix and the full diff): **no P0/P1**; four P2s, all in the
+    offline verifier against owner-level FK removal (orphaned detail/decision/idempotency
+    rows) or FK referential actions in the start-up shape match — evaluated individually and
+    accepted for this release (not reachable by the runtime identity; DELETE refused by
+    verified write-once triggers and privileges), recorded in `docs/exec-plans/tech-debt.md`.
+  - Last reviewed code SHA: **`e264950`**.
 
-## Remaining before merge / release
-1. Hosted CI (ci-fast, ci-integration, ci-security, ci-fuzz) on the pushed final head.
-2. Sculpin: implement the service contract including invocation deduplication; a live
-   end-to-end run — **pending external** (no Sculpin endpoint exists; the fake proves the
-   ledger's coordination only, never SHACL or reasoning correctness).
-3. 900 s `validation_decode` under AddressSanitizer: **not executable here** (the host's ASan
-   runtime crashes at start-up, Plan 0005); runs on hosted `ci-fuzz` (`address` matrix, weekly
-   900 s schedule or `workflow_dispatch`).
+## Closure status
+- **Phase-2 ledger coordination: implemented and qualified** (all gates above, hosted CI,
+  900 s fuzz under both sanitizers, independent Opus reviews and six Codex rounds without an
+  unresolved P0/P1). Merge-ready; merging is the maintainers' decision.
+- **Live Sculpin / pySHACL semantic-service integration: PENDING_EXTERNAL.** No Sculpin
+  endpoint implements `docs/design/sculpin-validation-service.md` yet (including invocation
+  deduplication). It does not block merging the stable ledger-side contract. The fake
+  validator proves the ledger's protocol, workflow, persistence, freshness, idempotency and
+  acceptance coordination; it does **not** prove pySHACL correctness, domain reasoning
+  correctness, real Sculpin KB-revision generation, or Virtual A-Box behaviour in a live
+  Sculpin service.
+- **P1.5 production deployment qualification: still pending separately** (below).
 
 ## P1.5 external blockers (unchanged, still pending)
 Live Entra ID issuer smoke test; deployment PITR/WAL evidence; writer fencing / restore

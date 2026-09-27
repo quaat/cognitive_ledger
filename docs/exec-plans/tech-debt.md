@@ -56,6 +56,15 @@
   invocation id each need an ADR (and, for the id, new vectors) — security review, P2/P3.
 - `AppState::with_validation*` panic on a mismatching or malformed configuration
   (construction time only; `main` validates first); return `Result` if embedders appear.
+- Offline-verifier hardening against owner-level FK removal (Codex on `e264950`, P2,
+  accepted for this release): `ledger-admin verify` does not yet flag orphaned
+  `decision_validations` / `validation_violations` / `semantic_virtual_contexts` rows or a
+  validate idempotency row whose `result_commit`/graph disagree with its record *after the
+  corresponding FK was dropped* (records with a missing context are flagged since
+  `e264950`). The start-up FK-shape match ignores `ON DELETE`/`ON UPDATE` actions (all
+  0001–0010 FKs are `NO ACTION`); a cascade cannot fire because DELETE is refused by the
+  structurally verified write-once triggers and by runtime privileges. Add parent-existence
+  and binding checks per detail table and include referential actions in the FK shape.
 - The released P1.5 server refuses a database restored from a logical dump (strict CHECK
   deparse vs PostgreSQL's re-parse flattening; fixed in Phase 2, ADR-0017 amendment). A P1.5
   rollback must use a physical base backup.
