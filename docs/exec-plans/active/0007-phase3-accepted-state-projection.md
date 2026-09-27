@@ -34,10 +34,11 @@ explicit. Not general event streaming: a narrow projection subsystem consuming t
    reconciliation of idle streams and a periodic transactional probe.
 7. `ledger-admin projection enable | disable | status [--json]` (owner; status is the one
    status surface).
-8. Tests: unit (IRI vectors, marker parsing, decision table), PostgreSQL (claim race, lease
-   expiry, fencing, ordering, least privilege, verifier drift), real Fuseki (genesis,
-   advance, duplicate, outage and catch-up, crash before/after target commit with failpoints,
-   lost/corrupt marker → rebuild, two workers, multiple graphs, tenant isolation).
+8. Tests: unit (IRI vectors, marker parsing, decision table, request shapes), PostgreSQL
+   (claim race, lease expiry, fencing, ordering, least privilege, verifier drift), real
+   Fuseki (genesis, advance, duplicate, outage and catch-up, crash before/after target commit
+   with failpoints, lost/corrupt/foreign/ahead markers → rebuild or recovery, feed switch
+   across tenants with a held write, two workers, multiple graphs of two tenants).
 9. Slice 2: upgrade 0010 → 0011 harness from the Phase-2 release with a populated backlog;
    compose integration with Fuseki; reviews.
 
@@ -72,8 +73,11 @@ the ledger → `rebuild_required`. Crash anywhere → lease expiry and idempoten
 
 ## Migration impact
 Stop projectors (none exist before) → owner `ledger-admin migrate --runtime-role …
---projector-role …` → new server and projector builds. A 0010 build refuses 0011 (`ahead`),
-a 0011 build refuses 0010 (`behind`).
+--projector-role …` → new server and projector builds. A 0010 server refuses 0011 (`ahead`);
+a 0011 server refuses 0010 (`behind`); a 0011 projector started before the migration cannot
+read the schema level of an ungranted 0010 database and refuses with the grant instruction
+(`--projector-role`), and with only the metadata readable it refuses as `behind`
+(`scripts/upgrade-p3.sh` asserts all four).
 
 ## Affected crates
 new `ledger-projection`, `ledger-projection-fuseki`, `apps/ledger-projector`; `ledger-store`
@@ -123,6 +127,26 @@ projection fault suite, compose integration, upgrade 0010 → 0011; Phase-2 suit
   two snapshots (now one query); language-tagged marker values accepted; probe accepting any
   failure (now HTTP 500 naming `LOAD`); secret files not checked as regular bounded files;
   `MAINTAIN` (PostgreSQL 17) not in the privilege model.
+- Review round 2 (five read-only Opus reviewers on `d2daf55`: projection correctness,
+  storage/concurrency, security, tests, Sculpin boundary). Consensus P1: version-number
+  guards order nothing across streams, so a write in flight when an operator switched a KB's
+  feed (disable, enable another tenant's graph, rebuild) could land over the new feed; a
+  ceiling taken from garbage/ahead values admitted a queued stale replacement; an i64-
+  overflowing numeric `refVersion` made recovery impossible. Fixed in `e67790b` by a
+  compare-and-swap on the exact observed marker terms (transaction-local write token); a
+  malformed marker whose parseable version exceeds the head is `MARKER_AHEAD`. Also fixed:
+  reconciliation ignored backoff (tight loop on a failing idle stream) and a permanent
+  ledger-state error was retryable; projector readiness skipped fingerprints and identity;
+  0011 guard functions did not pin `search_path` and identities could hold CREATE outside
+  `public`; re-enable after a KB change reported the wrong graph; union default graph not
+  detected; architecture check bypassable by renamed/transitive dependencies (now on
+  `cargo metadata`); contract overstated reconciliation and had an unsound freshness rule;
+  upgrade harness failed its projector-skew check for the wrong reason (misleading identity
+  message fixed); tests: missing real-target coverage for `MARKER_COMMIT_MISMATCH`, read-back
+  and containment failures, probe pause, auth refusal; timing-dependent `attempts == 1`;
+  serialization only in the script. Recorded, not fixed (tech debt): binding keyed on target
+  id only, private CA, `_FILE` DB URL, response caps/copies, unauthenticated metrics DB work,
+  shared `delivered_at`, cross-tenant KB re-point without confirmation.
 
 ## Evidence
 (filled as slices land)

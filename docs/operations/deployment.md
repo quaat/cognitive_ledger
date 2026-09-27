@@ -214,7 +214,11 @@ Readers' contract: [reading the projection](../design/sculpin-projection.md).
   observed, so it can never overwrite something that changed meanwhile — verifies marker and
   containment, reactivates the stream);
   `ledger-projector verify --graph <id>` compares target and ledger content without writing
-  (the only check that also finds a count-preserving out-of-band edit). A Fuseki that lost
+  (the only check that also finds a count-preserving out-of-band edit). A stream blocked with
+  `TARGET_PROTOCOL` "cannot be named exactly" holds a hand-edited marker the write
+  precondition cannot express (blank node, > 64 values, unusual IRI or language tag):
+  delete the marker subject by hand (`DELETE WHERE { GRAPH
+  <urn:sculpin:ledger-projection:v1:markers> { <G> ?p ?o } }`), then rebuild. A Fuseki that lost
   its data is repaired by reconciliation or the same rebuild (the ledger is authoritative;
   nothing is ever read back into it).
 
