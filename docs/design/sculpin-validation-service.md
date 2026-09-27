@@ -31,8 +31,7 @@ ledger never logs it), `X-Correlation-Id` for tracing. Synchronous; one candidat
     "ontology": {"id": "urn:sculpin:ontology:core", "version": "O2"},
     "shapes": {"id": "urn:sculpin:shapes:material", "version": "12+shapes_hash:4b7e"},
     "reasoning_profile": "owl-rl",
-    "sources_revision": "urn:sculpin:source-catalog:rev-41",
-    "source_pins": [{"dataset_id": "urn:sculpin:datasource:lab", "source_version": "v41"}]
+    "sources_revision": "urn:sculpin:source-catalog:rev-41"
   },
   "correlation_id": "…"
 }
@@ -45,8 +44,10 @@ ledger never logs it), `X-Correlation-Id` for tracing. Synchronous; one candidat
   fetch (it needs the `read` capability for the graph's tenant).
 - `requested` are hints; every field is optional. An absent hint means "your current one".
   Sculpin may refuse a hint it cannot honour (4xx); a response that silently ignores a hint
-  (other base KB, ontology, shapes, reasoning profile, sources revision, or another version
-  of a pinned dataset) is refused as `VALIDATOR_ERROR`. Hints are part of the ledger's request
+  (other base KB, ontology, shapes, reasoning profile or sources revision) is refused as
+  `VALIDATOR_ERROR`. There is no per-dataset version pin: external-source versions are
+  selected only through `sources_revision`, so a run can never report the current revision
+  while using older source versions. Hints are part of the ledger's request
   identity, so they are also what an idempotent retry reproduces.
 
 ### Response (`sculpin-validation-response/v1`)
@@ -77,9 +78,10 @@ ledger never logs it), `X-Correlation-Id` for tracing. Synchronous; one candidat
 }
 ```
 - `context` is the **effective** context that was used (not the hints). `ontology`,
-  `reasoning` and `sources_revision` are omitted when none applied. `sources_revision` is
-  Sculpin's revision of the external-source catalog in force — it must change whenever the
-  versions Sculpin would hydrate change; it is the candidate-independent freshness key for
+  `reasoning` are omitted when none applied. `sources_revision` is Sculpin's revision of
+  the external-source catalog in force, declared per deployment (present whenever Sculpin
+  has a catalog, even if this run hydrated nothing; required whenever `virtual_contexts` is
+  non-empty) — it must change whenever the versions Sculpin would hydrate change; it is the candidate-independent freshness key for
   external data, while `virtual_contexts` record what this run actually hydrated. `virtual_contexts` identify external state
   only — never A-Box triples. The ledger adds `validator.service_id` from its own
   configuration (`LEDGER_VALIDATOR_SERVICE_ID`); a response cannot claim a service identity.

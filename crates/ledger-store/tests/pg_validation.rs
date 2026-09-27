@@ -175,7 +175,7 @@ fn context_for(
             implementation: "sculpin-python-reasoner".into(),
             version: "0.9".into(),
         }),
-        sources_revision: None,
+        sources_revision: Some(format!("catalog-{external_version}")),
         virtual_contexts: vec![VirtualContextRef {
             dataset_id: "urn:sculpin:datasource:lab".into(),
             source_version: external_version.into(),
@@ -1403,4 +1403,48 @@ async fn an_indexed_commit_without_a_proposal_is_not_a_validation_candidate() {
         validation_footprint(&store, &g, &commit, "v-unproposed").await,
         [0; 5]
     );
+}
+
+/// ADR-0019 (review round 3): with a configured validation service, a record produced by
+/// any other service is `VALIDATION_STALE` even in the named environment, and nothing moves;
+/// the same record accepts under a repository requiring its own service.
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn acceptance_requires_the_configured_validation_service() {
+    use ledger_store::WorkflowRepository;
+    let store = store().await;
+    let g = graph(&store).await;
+    let c1 = prepare(&store, &g, "p1", None, "a").await;
+    let v = validate_with(
+        &store,
+        &g,
+        "v1",
+        &c1,
+        RequestedContext::default(),
+        |g, c, s| conforms(context_for(g, c, s, "O1", "D")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(v.record.validator.service_id, validator().service_id);
+    let request = accept_request(
+        &g,
+        "a1",
+        None,
+        &c1,
+        ValidationPolicy::Validated {
+            validation_id: v.validation_id.clone(),
+            semantic_environment_id: v.environment_id.clone(),
+        },
+    );
+    let other_service = WorkflowRepository::new(store.pool().clone(), store.immutable().clone())
+        .with_required_validator("urn:sculpin:service:another-validator");
+    let before = snapshot(&store, &g).await;
+    let error = other_service.accept(&request).await.unwrap_err();
+    assert!(matches!(error, LedgerError::ValidationStale(_)), "{error}");
+    assert_eq!(snapshot(&store, &g).await, before, "nothing moved");
+    assert_eq!(ref_head(&store, &g).await, None);
+    let same_service = WorkflowRepository::new(store.pool().clone(), store.immutable().clone())
+        .with_required_validator(validator().service_id);
+    let accepted = same_service.accept(&request).await.unwrap();
+    assert_eq!(accepted.head, c1);
 }

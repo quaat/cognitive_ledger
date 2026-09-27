@@ -4,10 +4,9 @@
 //! and digests; the ledger only ships the immutable candidate it owns.
 
 use crate::{
-    BaseKb, Ontology, ProtocolError, Reasoning, SemanticExecutionContext, ShapeSet, SourcePin,
+    BaseKb, Ontology, ProtocolError, Reasoning, SemanticExecutionContext, ShapeSet,
     ValidationOutcome, ValidatorIdentity, VirtualContextRef,
-    context::canonical_pins,
-    encoding::{TAG_ABSENT, TAG_PRESENT, field, opt, u32be},
+    encoding::{TAG_ABSENT, TAG_PRESENT, field, opt},
 };
 use ledger_core::{CommitId, ContentId, GraphId, MAX_IDENTIFIER_BYTES, validate_token};
 use serde::{Deserialize, Serialize};
@@ -36,12 +35,11 @@ pub struct RequestedContext {
     pub shapes: Option<ShapeSet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_profile: Option<String>,
-    /// The external-source catalog revision the validation must run under.
+    /// The external-source catalog revision the validation must run under. (Individual
+    /// source-version pins are deliberately not a hint: a pinned run could report the
+    /// current catalog revision and alias the current environment.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sources_revision: Option<String>,
-    /// External source versions the validation must use (a set).
-    #[serde(default)]
-    pub source_pins: Vec<SourcePin>,
 }
 
 impl RequestedContext {
@@ -64,30 +62,12 @@ impl RequestedContext {
         if let Some(revision) = &self.sources_revision {
             token("sources_revision", revision)?;
         }
-        canonical_pins(&self.source_pins)?;
         Ok(())
     }
 
-    /// The source-pin set as it enters request identity: element encodings sorted, unique.
-    pub fn canonical_source_pins(&self) -> Result<Vec<Vec<u8>>, ProtocolError> {
-        canonical_pins(&self.source_pins)
-    }
-
-    /// The same hints with the source-pin set in canonical order and without duplicates:
-    /// what is forwarded to the validator (never the caller's raw list).
-    pub fn canonical(&self) -> Self {
-        let mut pins = self.source_pins.clone();
-        pins.sort_by_key(|p| p.canonical_bytes().unwrap_or_default());
-        pins.dedup();
-        Self {
-            source_pins: pins,
-            ..self.clone()
-        }
-    }
-
     /// A present hint the validator did not honour, if any: the effective context must use
-    /// exactly the hinted base KB, ontology, shapes and reasoning profile, and every hydrated
-    /// source whose dataset is pinned must have the pinned version. Opaque comparison only.
+    /// exactly the hinted base KB, ontology, shapes, reasoning profile and sources revision.
+    /// Opaque comparison only.
     pub fn unmet_by(&self, effective: &EffectiveContext) -> Option<&'static str> {
         if self
             .base_kb
@@ -110,19 +90,12 @@ impl RequestedContext {
         if self.sources_revision.is_some() && self.sources_revision != effective.sources_revision {
             return Some("sources_revision");
         }
-        for pin in &self.source_pins {
-            if effective.virtual_contexts.iter().any(|vc| {
-                vc.dataset_id == pin.dataset_id && vc.source_version != pin.source_version
-            }) {
-                return Some("source_pins");
-            }
-        }
         None
     }
 
     /// Append the hint encoding used by request identity v2 (ADR-0015 amendment):
     /// tagged pairs for base KB, ontology and shapes, `opt` reasoning profile, `opt`
-    /// sources revision, then the source-pin set (ascending by element encoding, unique).
+    /// sources revision.
     pub fn encode_into(&self, out: &mut Vec<u8>) -> Result<(), ProtocolError> {
         self.validate()?;
         let pair = |a: Option<(&str, &str)>, out: &mut Vec<u8>| -> Result<(), ProtocolError> {
@@ -156,11 +129,6 @@ impl RequestedContext {
         )?;
         opt(out, self.reasoning_profile.as_deref())?;
         opt(out, self.sources_revision.as_deref())?;
-        let pins = self.canonical_source_pins()?;
-        u32be(out, pins.len())?;
-        for element in &pins {
-            out.extend_from_slice(element);
-        }
         Ok(())
     }
 }
@@ -537,19 +505,24 @@ mod tests {
 
     #[test]
     fn requested_context_hints_encode_deterministically() {
-        let mut a = RequestedContext::default();
-        let mut b = RequestedContext::default();
-        let pin = |v: &str| SourcePin {
-            dataset_id: "ds".into(),
-            source_version: v.into(),
+        let a = RequestedContext {
+            sources_revision: Some("rev-22".into()),
+            ..RequestedContext::default()
         };
-        a.source_pins = vec![pin("22"), pin("1")];
-        b.source_pins = vec![pin("1"), pin("22"), pin("1")];
+        let b = a.clone();
         let mut ea = Vec::new();
         let mut eb = Vec::new();
         a.encode_into(&mut ea).unwrap();
         b.encode_into(&mut eb).unwrap();
         assert_eq!(ea, eb);
+        let mut other_revision = Vec::new();
+        RequestedContext {
+            sources_revision: Some("rev-23".into()),
+            ..RequestedContext::default()
+        }
+        .encode_into(&mut other_revision)
+        .unwrap();
+        assert_ne!(ea, other_revision);
         let mut c = a.clone();
         c.reasoning_profile = Some("rdfs".into());
         let mut ec = Vec::new();

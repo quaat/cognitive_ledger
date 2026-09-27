@@ -377,8 +377,6 @@ fn limits() -> Result<ApiLimits, String> {
             "LEDGER_LIMIT_VALIDATION_STATE_BYTES",
             d.max_validation_state_bytes,
         )?,
-        max_virtual_contexts: env_usize("LEDGER_LIMIT_SOURCE_PINS", d.max_virtual_contexts)?
-            .min(ledger_validation_protocol::MAX_VIRTUAL_CONTEXTS),
         max_validation_metadata_bytes: env_usize(
             "LEDGER_LIMIT_VALIDATION_METADATA_BYTES",
             d.max_validation_metadata_bytes,

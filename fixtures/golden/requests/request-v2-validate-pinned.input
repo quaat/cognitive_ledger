@@ -16,16 +16,6 @@
       "version": "S1"
     },
     "reasoning_profile": "rdfs",
-    "source_pins": [
-      {
-        "dataset_id": "urn:sculpin:datasource:lab-b",
-        "source_version": "2026-09-20T00:00:00Z#7"
-      },
-      {
-        "dataset_id": "urn:sculpin:datasource:lab-a",
-        "source_version": "41"
-      }
-    ],
     "sources_revision": "urn:sculpin:source-catalog:rev-41"
   }
 }

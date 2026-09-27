@@ -97,7 +97,11 @@ candidate — graph, commit, state digest, and the virtual contexts a run actual
 content) — and the ledger-side `validator.service_id`, so Sculpin can compute and publish
 the id of its *current* environment before any candidate exists. External-source drift is
 carried by `sources_revision`: Sculpin revises it whenever the source versions it would
-hydrate change. ADR-0019 binds acceptance to the environment.
+hydrate change. It is **deployment-declared**, not per run: present whenever Sculpin has a
+source catalog, whether or not this run hydrated anything, and **required** whenever a
+context carries virtual contexts (encoder, decoder and reference refuse hydration without a
+revision, which would make source drift invisible to freshness). ADR-0019 binds acceptance
+to the environment.
 
 ### `sculpin-validation-record/v1`
 ```

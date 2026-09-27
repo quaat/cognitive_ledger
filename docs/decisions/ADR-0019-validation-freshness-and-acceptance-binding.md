@@ -42,7 +42,8 @@ idempotent-replay lookup and before any write, the repository verifies:
 When the deployment configures a validation service (`LEDGER_VALIDATOR_SERVICE_ID`), the
 record must also have been produced by that service (`VALIDATION_STALE` otherwise): the
 environment deliberately omits the ledger-side service identity, so this is a separate,
-opaque ledger policy.
+opaque ledger policy. Without a configured service no validation can be requested, but
+records written earlier (by any service) remain acceptable under the environment rule.
 
 Predicates 2–5 are evaluated on the verified canonical bytes of the record and its context
 (hash checked, strictly decoded), never on the relational projection columns.

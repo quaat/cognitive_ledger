@@ -87,9 +87,11 @@ u8     base_kb tag    0x00 | 0x01 field kb_id, field revision
 u8     ontology tag   0x00 | 0x01 field id, field version
 u8     shapes tag     0x00 | 0x01 field id, field version
 opt    reasoning_profile
-u32    source_pin_count, then (field dataset_id, field source_version) elements exactly as
-       in sculpin-semantic-environment/v1 (ascending by element encoding, unique)
+opt    sources_revision
 ```
+Individual source-version pins are deliberately not a hint (review round 3): a run pinned to
+an older source version could report the current catalog revision and alias the current
+environment. The `validate` vectors were regenerated during review, before any release.
 Vectors: `fixtures/golden/requests/request-v2-*.{input,hex,sha256}`, checked by
 `scripts/golden/request_v1_reference.py` (which now also implements v2) and
 `crates/ledger-api/tests/request_goldens.rs`. The six v1 vectors are unchanged.

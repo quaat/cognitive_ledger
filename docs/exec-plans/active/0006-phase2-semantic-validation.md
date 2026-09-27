@@ -1,6 +1,6 @@
 # Plan 0006: Phase 2 — semantic validation coordination
 
-Status: **in progress** (started 2026-09-27 after PR #2 merged). Branch
+Status: **in progress — P2.1–P2.4 implemented and reviewed; P2.5 freshness implemented; P2.6 qualification partly executed** (started 2026-09-27 after PR #2 merged). Branch
 `claude/p2-semantic-validation` from `main` at `f81be37d14b1de102c00fd339a63784b88d725c6`
 (the PR #2 merge, P1.5 production qualification). Execution slices, in order:
 (P2.1) validation protocol + persistent records; (P2.2) validation workflow + acceptance
@@ -159,62 +159,113 @@ ci-security / ci-fuzz stay green; no existing golden vector changes.
 
 ## Evidence
 
-### Slice P2.1 — protocol + persistent records (2026-09-27): implemented, executed
-- ADR-0018 (context/record/state-digest identities), ADR-0019 (freshness + acceptance
-  binding), ADR-0015/0016 amendments, ADR-0014 status; `ledger-validation-protocol`
-  (`SemanticExecutionContext` v1, `ValidationRecord` v1, `ValidationOutcome`,
-  `ValidatorIdentity`, `VirtualContextRef`, `RequestedContext`, validator request/response
-  wire types, `ValidationClient` trait); `ledger_rdf::state_digest`
-  (`sculpin-rdf-state/v1`); golden vectors `fixtures/golden/validation/` (7 positive, 9
-  negative) and `fixtures/golden/states/` (3) produced by the independent Python references
-  `scripts/golden/validation_v1_reference.py` / `state_v1_reference.py` (wired into
-  `check-fast.sh`) and verified by the Rust encoders; migration 0010; schema verifier at
-  `REQUIRED_SCHEMA_VERSION = 10` (18 guard triggers, 53 CHECKs by deparse + fingerprint, two
-  new content-address probes, full PK/UNIQUE/FK inventory, runtime table model with the
-  five new tables and `result_validation_id`); `ledger_store::verify` +9 invariants;
-  `ValidationRepository` (`begin` / `record` / `load` / `list_for_candidate`, two
-  transactions around the validator call); `WorkflowRepository::accept` enforces the
-  ADR-0019 predicates and writes `decision_validations`; `reject` may cite a validation.
-- Executed 2026-09-27 (base `f81be37`): `check-fast` Python checks (doc links, architecture,
-  18 commit-v2, 6 request-v1, 16 validation-v1, 3 state vectors) exit 0; `cargo fmt --check`,
-  `cargo clippy --workspace --all-targets --all-features -D warnings`, `cargo test --workspace`
-  green (protocol crate 11 unit + 4 golden tests; store schema unit tests 12). Real
-  PostgreSQL 17.2 (compose) and 15.19 (`postgres:15-bookworm`): `pg_validation` 5/5 on both
-  (content-addressed write-once rows, two contexts per candidate with distinct ids by
-  external source version, replay identity under one key, `IDEMPOTENCY_CONFLICT` for other
-  hints, two racing validators → one record, foreign-tenant/unprepared/mismatching refusals
-  with nothing persisted, every acceptance predicate — required, unknown, foreign graph, other
-  candidate, violations, stale context — refused with an identical side-effect snapshot,
-  matching pair accepted + linked + replayed, cross-candidate link refused by FK 23503,
-  revalidation V1 violations → V2 conforms → accepted, HEAD race → `HEAD_CHANGED`, rejection
-  citing a validation); `pg_workflow` 14/14, `pg_verify` 1/1, `pg_cas_race` 1/1 (17),
-  `pg_graphs_migration` 7/7 (15); `pg_least_privilege` 15/15 on both versions incl. the new
-  `validation_persistence_runs_under_the_runtime_identity_and_its_controls_are_verified`
-  (runtime records + accepts under a cited validation; dropped `dv_validation_fk`,
-  `vr_context_fk`, disabled `validation_records_write_once`, vacuous `vr_content_addressed`,
-  dropped `idempotency_operation`, `UPDATE (outcome)` granted and `INSERT (canonical_bytes)`
-  revoked each refused at start-up/readiness/identity and healthy after restoration).
-- Not yet executed: `./scripts/test-integration.sh` (Docker compose end-to-end; the compose
-  scenario still runs the development `no-validation` acceptance and needs no change for
-  0010), `check-supply-chain.sh`, independent reviews (next step).
+### Slice P2.1 — protocol + persistent records: implemented, executed, reviewed (2 rounds)
+- ADR-0018 (context / environment / record / state-digest identities) and ADR-0019
+  (freshness + acceptance binding), ADR-0015 and ADR-0016 amendments, ADR-0014 status.
+- `ledger-validation-protocol`: `SemanticExecutionContext` v1, `SemanticEnvironment` v1
+  (candidate-independent: base KB, ontology, shapes, optional reasoning, Sculpin-declared
+  `sources_revision`, validator versions), `ValidationRecord` v1 (verdict, reported-result
+  count, bounded summary; conforming verdicts may carry non-blocking results),
+  `VirtualContextRef`, `SourcePin`, validator request/response, `ValidationClient`. Strict
+  decoders; every set ordered by element encoding. `ledger_rdf::state_digest`
+  (`sculpin-rdf-state/v1`).
+- Golden vectors: `fixtures/golden/validation/` (12 positive incl. mixed-length object refs,
+  one environment shared by another candidate hydrating other sources, warnings; 15
+  negative, each asserted by its rejection reason) and `fixtures/golden/states/` (3), produced
+  by the independent Python references (`validation_v1_reference.py`, `state_v1_reference.py`,
+  strict like Rust) and checked by Rust and by `check-fast.sh`. Commit v1/v2, patch and
+  request-v1 vectors unchanged.
+- Migration 0010 (unreleased; revised twice during review, dev databases reset each time):
+  content-addressed write-once contexts/records, virtual-context projection, bounded
+  summaries, `decision_validations`, record→context FK binding graph, candidate, state digest
+  and validator, composite idempotency→record FK with shape CHECK, re-issued
+  `ledger_grant_runtime`. Schema verifier at level 10: 18 guard triggers, 56 CHECKs by deparse
+  + fingerprint, three content-address probes matched by constraint name, full FK/PK/UNIQUE
+  inventory, runtime table model. `ledger-admin verify`: +11 SQL checks plus Rust decode of
+  every record/context with column agreement.
+- `ValidationRepository`: `replayed` / `begin(_with_limits)` / `record` (two transactions
+  around the validator call; private tickets; identical records across keys shared) /
+  `load` / `list_for_candidate`; acceptance and replay decide on hash-verified bytes.
 
-### Slices P2.2–P2.6: planned (see "Remaining work")
+### Slice P2.2 — acceptance binding: implemented, executed
+- `ValidationPolicy::Validated { validation_id, semantic_environment_id }`; inside the
+  acceptance transaction: record exists for graph + tenant (`VALIDATION_NOT_FOUND`), same
+  candidate (`LINEAGE_MISMATCH`), record/context agreement, conforming
+  (`VALIDATION_REJECTED`), produced by the configured validator service and run in the named
+  environment (`VALIDATION_STALE`); `decision_validations` + `validation_ids` written with
+  the decision. Reject may cite a validation.
 
-## Remaining work (handoff)
-1. `ledger-api`: `POST …/validations` (`validate` capability, `Idempotency-Key`, expensive
-   slot or dedicated budget), `GET …/validations/{id}`, `accept`/`reject` bodies with
-   `validation_id` + `semantic_context_id`, error codes `VALIDATION_REJECTED` /
-   `VALIDATION_STALE` / `VALIDATION_NOT_FOUND` / `VALIDATOR_UNAVAILABLE` / `VALIDATOR_ERROR`,
-   request identity v2 (ADR-0015 amendment; vectors `request-v2-*` + Python reference),
-   OpenAPI + router test, `Capability::Validate` (`ledger.validate`), `HttpValidationClient`
-   (reqwest, https in production, no redirects, bounded body, content-type, timeout, token
-   never logged), `FakeValidator` in `ledger-testkit`, `ApiLimits` additions, server
-   configuration (`LEDGER_VALIDATOR_URL`, `_SERVICE_ID`, `_BEARER_TOKEN`, limits).
-2. `docs/design/sculpin-validation-service.md` (contract with example JSON), docs updates
-   (storage-boundaries, security, deployment, README, tech-debt), `pg_api` scenarios for all
-   ADR-0014 cases with the fake validator, security tests (§27), `test-integration.sh`.
-3. Independent reviews of P2.1 (architecture, invariants, storage/concurrency, security,
-   test, semantic-integration) and fixes; then the same after P2.3.
+### Slices P2.3 / P2.4 — HTTP boundary, validator client, Sculpin contract: implemented, executed
+- Routes `POST /v1/graphs/{graph}/proposals/{candidate}/validations` (`validate`),
+  `GET …/validations/{validation}` (`read`); accept/reject bodies with `validation_id` and
+  `semantic_environment_id`; codes `VALIDATION_REJECTED`, `VALIDATION_STALE`,
+  `VALIDATION_NOT_FOUND`, `VALIDATOR_UNAVAILABLE`, `VALIDATOR_ERROR`; request identity v2
+  (6 vectors, Rust + Python); OpenAPI 1.1.0-p2, router-tested; `Capability::Validate`
+  (`ledger.validate`); limits (validation budget, validator timeout, response cap, shipped
+  state bytes, hint bytes); replay before admission; no reconstruction without a configured
+  validator; reconstruction capped at shippable bytes; ignored hints refused; summaries normalized deterministically.
+- `HttpValidationClient` (https, loopback-only http in development, no redirects, no proxy,
+  total timeout, streamed cap, strict content type and shape, redacted errors); server
+  configuration `LEDGER_VALIDATOR_URL` / `_SERVICE_ID` / `_TOKEN_FILE` (64 KiB cap).
+- `docs/design/sculpin-validation-service.md`: request/response schemas, derived identities,
+  pySHACL mapping, Sculpin prerequisites, timeouts/retries/idempotency, transport rules.
+
+### Executed gates (2026-09-27; exit codes recorded from the invoking shell, logs under `target/p2/`)
+| Gate | Result |
+|---|---|
+| `./scripts/check-fast.sh` (fmt, clippy `-D warnings`, workspace tests, doc links, architecture guard incl. the protocol crate, all Python reference checks: 18 commit-v2, 12 request, 28 validation, 3 state vectors) | exit 0 (round-3 content) |
+| `./scripts/check-supply-chain.sh` (audit, deny, SBOM 206 components) | exit 0 (run on `205272a`; no dependency change since) |
+| PostgreSQL 17.2 and 15.19 on the round-3 content: `pg_validation` 9, `pg_verify` 2, `pg_workflow` 14, `pg_least_privilege` 16, `pg_validation_api` 12, `pg_api` 13 (`pg_graphs_migration` 7 on `2650156`) | all passed on both |
+| `validator_http` (local server) 5 | passed |
+| `scripts/fuzz.sh 120 validation_decode` (sanitizer none) | 10.7 M executions, cov 1131, no crash |
+| `./scripts/test-integration.sh` (compose PostgreSQL 17.2, distroless image, all 10 PostgreSQL suites incl. `pg_validation` and `pg_validation_api`, end-to-end container scenario, `ledger-admin verify`) | exit 0, `INTEGRATION OK`, `VERIFY OK` (on `2650156`; re-run after round 3 below) |
+
+### ADR-0014 scenarios (executable, passing; `pg_validation_api`, deterministic fake validator)
+valid candidate → accepted; invalid SHACL → `VALIDATION_REJECTED`, ref unchanged, rejection
+citing the record; reasoning-derived violation naming the reasoning profile → refused; Virtual
+A-Box version A conforms / B violates, both records coexist; stale environment (O1 validated,
+O2 required) → `VALIDATION_STALE`, revalidation under O2 → accepted; validator unavailable /
+timeout / unconfigured → `VALIDATOR_UNAVAILABLE`, prepare and reads work, accept
+`VALIDATION_REQUIRED`, history unchanged; revalidation V1 violations → V2 conforms → accepted
+(`pg_validation`). **Scope note:** the fake decides by scripted rules on quad text; these prove
+the ledger's coordination, not semantics. A live Sculpin/pySHACL end-to-end run is external
+evidence and has not been run (no Sculpin endpoint exists).
+
+### Reviews
+- Round 1 on `562f468` (invariant, storage/concurrency, semantic-integration, test; Opus,
+  read-only): P1s fixed — object-ref sort mismatch between encoder and decoder/reference;
+  freshness key not implementable (context id); verifier checks without failure tests;
+  privilege matrix missing new tables; write-once tests passing for the wrong reason; no fault
+  injection for the new writes; context content address untested. P2s fixed as listed in the
+  commit messages (`205272a`, `9440a62`).
+- Round 2 on `b2c9579` (security, semantic-integration re-review): security no P0/P1, P2s
+  fixed (reconstruction before the state cap, reconstruction without a validator, raw pins
+  forwarded); semantic P1 fixed — per-run source pins made the environment
+  candidate-dependent → Sculpin-declared `sources_revision`; P2s fixed (configured-validator
+  rule, ignored hints refused, pySHACL message normalization, contract gaps).
+- Accepted/recorded (tech-debt): runtime is the trusted writer of new records; live Sculpin
+  endpoint pending; `upgrade.sh` from 0009 with populated data not re-run; a principal holding
+  both `validate` and `review` can pin an older environment Sculpin still honours (production
+  role maps should keep them separate; per-branch server-side pinning is a later policy).
+
+- Round 3 on `2650156` (semantic-integration + storage + invariant, Opus): P1s fixed —
+  source-version pins remained a hint and could alias the current environment → pins removed
+  from hints (only `sources_revision` selects source versions); ADR-0015 v2 text stale →
+  amended. P2s fixed: `sources_revision` deployment-declared and required with hydrated
+  sources (+ negative vector), configured-validator rule tested
+  (`acceptance_requires_the_configured_validation_service`), no-validator behaviour stated
+  in ADR-0019, plan evidence corrected.
+
+## Remaining Phase-2 work
+1. A further independent review of the round-3 changes before merge (optional; no open P0/P1).
+2. `scripts/upgrade.sh` from the P1.5 release with populated data (0009 → 0010).
+3. Sculpin: implement the service contract; then a live end-to-end run as external evidence.
+4. Longer fuzz campaign of `validation_decode` under both sanitizers on the hosted runner
+   (`ci-fuzz` picks the target up automatically).
+
+## P1.5 external blockers (unchanged, still pending)
+Live Entra ID issuer smoke test; deployment PITR/WAL evidence; writer fencing / restore
+operational evidence. Phase 2 does not change them; the service is **not production-qualified**.
 
 ## Sub-agent decomposition (§42)
 Main session owns protocol/canonicalization (crate, encodings, goldens, ADRs), the migration

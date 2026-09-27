@@ -214,6 +214,10 @@ fn negative_vectors_are_rejected_by_the_strict_decoders_for_the_right_reason() {
         ),
         ("context-v1-invalid-empty-ontology", "must not be empty"),
         ("context-v1-invalid-ontology-tag", "unknown ontology tag"),
+        (
+            "context-v1-invalid-hydrated-without-sources-revision",
+            "requires sources_revision",
+        ),
     ];
     for (stem, reason) in context_cases {
         let bytes = hex::decode(fixture(&format!("{stem}.hex")).trim()).unwrap();

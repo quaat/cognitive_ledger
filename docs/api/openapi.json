@@ -416,26 +416,6 @@
      }
     }
    },
-   "SourcePin": {
-    "type": "object",
-    "additionalProperties": false,
-    "required": [
-     "dataset_id",
-     "source_version"
-    ],
-    "properties": {
-     "dataset_id": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 512
-     },
-     "source_version": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 512
-     }
-    }
-   },
    "ValidateRequest": {
     "type": "object",
     "additionalProperties": false,
@@ -510,12 +490,11 @@
         "minLength": 1,
         "maxLength": 512
        },
-       "source_pins": {
-        "type": "array",
-        "maxItems": 64,
-        "items": {
-         "$ref": "#/components/schemas/SourcePin"
-        }
+       "sources_revision": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 512,
+        "description": "Sculpin external-source catalog revision the validation must run under."
        }
       }
      }

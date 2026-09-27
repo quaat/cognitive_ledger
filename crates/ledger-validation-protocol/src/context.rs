@@ -130,45 +130,6 @@ impl ValidatorIdentity {
     }
 }
 
-/// The version of one external data source a validation depended on (candidate-
-/// independent; part of the environment).
-#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SourcePin {
-    pub dataset_id: String,
-    pub source_version: String,
-}
-
-impl SourcePin {
-    pub fn validate(&self) -> Result<(), ProtocolError> {
-        token("source_pin.dataset_id", &self.dataset_id)?;
-        token("source_pin.source_version", &self.source_version)
-    }
-
-    pub fn canonical_bytes(&self) -> Result<Vec<u8>, ProtocolError> {
-        self.validate()?;
-        let mut out = Vec::new();
-        field(&mut out, &self.dataset_id)?;
-        field(&mut out, &self.source_version)?;
-        Ok(out)
-    }
-}
-
-/// Canonical form of a set of source pins: element encodings sorted and unique.
-pub(crate) fn canonical_pins(pins: &[SourcePin]) -> Result<Vec<Vec<u8>>, ProtocolError> {
-    let encoded = pins
-        .iter()
-        .map(SourcePin::canonical_bytes)
-        .collect::<Result<Vec<_>, _>>()?;
-    let set = canonical_set(encoded);
-    if set.len() > MAX_VIRTUAL_CONTEXTS {
-        return Err(ProtocolError::Invalid(format!(
-            "more than {MAX_VIRTUAL_CONTEXTS} distinct source pins"
-        )));
-    }
-    Ok(set)
-}
-
 /// Identifying provenance of transient external state (Virtual A-Box) a validation
 /// consulted: never the triples themselves. `object_refs` is a set.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -217,14 +178,6 @@ impl VirtualContextRef {
         });
         refs.dedup();
         refs
-    }
-
-    /// The candidate-independent pin this reference implies.
-    pub fn pin(&self) -> SourcePin {
-        SourcePin {
-            dataset_id: self.dataset_id.clone(),
-            source_version: self.source_version.clone(),
-        }
     }
 
     /// The element encoding (also the sort key inside a context).
@@ -498,6 +451,13 @@ impl SemanticExecutionContext {
         for context in &self.virtual_contexts {
             context.validate()?;
         }
+        // External data consulted without a declared catalog revision would make source
+        // drift invisible to freshness (ADR-0019): hydrating requires the revision.
+        if !self.virtual_contexts.is_empty() && self.sources_revision.is_none() {
+            return Err(ProtocolError::Invalid(
+                "a context with virtual contexts requires sources_revision".into(),
+            ));
+        }
         if self.canonical_virtual_contexts()?.len() > MAX_VIRTUAL_CONTEXTS {
             return Err(ProtocolError::Invalid(format!(
                 "more than {MAX_VIRTUAL_CONTEXTS} distinct virtual contexts"
@@ -751,10 +711,14 @@ mod tests {
         fewer.virtual_contexts.truncate(1);
         assert_ne!(a.id().unwrap(), fewer.id().unwrap());
         assert_eq!(a.environment_id().unwrap(), fewer.environment_id().unwrap());
+        let mut hydrated_without_revision = sample();
+        hydrated_without_revision.sources_revision = None;
+        assert!(hydrated_without_revision.canonical_bytes().is_err());
         let mut c = sample();
         c.ontology = None;
         c.reasoning = None;
         c.sources_revision = None;
+        c.virtual_contexts.clear();
         assert_ne!(a.id().unwrap(), c.id().unwrap());
         let c_bytes = c.canonical_bytes().unwrap();
         let decoded = SemanticExecutionContext::from_canonical_bytes(&c_bytes).unwrap();

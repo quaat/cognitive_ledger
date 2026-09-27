@@ -130,12 +130,7 @@ def semantics(logical: dict) -> bytes:
     return out
 
 
-def source_pin(pin: dict) -> bytes:
-    keys("source_pin", pin, {"dataset_id", "source_version"})
-    return field(token("dataset_id", pin["dataset_id"])) + field(token("source_version", pin["source_version"]))
-
-
-def encode_context(logical: dict) -> bytes:
+def encode_context(logical: dict, *, allow_missing_revision: bool = False) -> bytes:
     keys("context", logical, {"graph_id", "candidate_commit", "candidate_state_digest", "base_kb", "ontology",
                               "shapes", "reasoning", "sources_revision", "virtual_contexts", "validator"},
          {"graph_id", "candidate_commit", "candidate_state_digest", "base_kb", "shapes", "validator"})
@@ -146,6 +141,8 @@ def encode_context(logical: dict) -> bytes:
     out += field(content_id("candidate_commit", logical["candidate_commit"]))
     out += field(content_id("candidate_state_digest", logical["candidate_state_digest"]))
     out += semantics(logical)
+    if logical.get("virtual_contexts") and logical.get("sources_revision") is None and not allow_missing_revision:
+        raise Invalid("a context with virtual contexts requires sources_revision")
     out += counted_set([virtual_context(vc) for vc in logical.get("virtual_contexts", [])], "virtual contexts")
     validator = keys("validator", logical["validator"], {"service_id", "service_version", "configuration_version"})
     out += field(token("validator.service_id", validator["service_id"]))
@@ -296,6 +293,8 @@ def negative_cases() -> dict[str, bytes]:
     assert absent[prefix] == 0
     cases["context-v1-invalid-empty-ontology"] = absent[:prefix] + b"\x01" + field("") + field("1") + absent[prefix + 1:]
     cases["context-v1-invalid-ontology-tag"] = absent[:prefix] + b"\x02" + absent[prefix + 1:]
+    unrevised = dict(context); unrevised.pop("sources_revision")
+    cases["context-v1-invalid-hydrated-without-sources-revision"] = encode_context(unrevised, allow_missing_revision=True)
     env = encode_environment(environment_of(context))
     cases["environment-v1-invalid-trailing-bytes"] = env + b"\x00"
     return cases

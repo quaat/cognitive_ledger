@@ -16,7 +16,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from commit_v2_reference import normalize_time  # noqa: E402  (same timestamp rules)
-from validation_v1_reference import counted_set, source_pin, token  # noqa: E402
+from validation_v1_reference import token  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / "fixtures" / "golden" / "requests"
@@ -82,7 +82,6 @@ def encode_v2(req: dict) -> bytes:
         if revision == "":
             raise ValueError("sources_revision present but empty")
         out += optional(None if revision is None else token("sources_revision", revision))
-        out += counted_set([source_pin(p) for p in hints.get("source_pins", [])], "source pins")
     else:
         raise ValueError(op)
     return bytes(out)

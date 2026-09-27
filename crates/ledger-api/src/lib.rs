@@ -64,8 +64,6 @@ pub struct ApiLimits {
     pub validator_response_bytes: usize,
     /// Maximum bytes of candidate N-Quads shipped inline to the validator.
     pub max_validation_state_bytes: usize,
-    /// Maximum distinct Virtual A-Box references a request may name (≤ protocol cap 64).
-    pub max_virtual_contexts: usize,
     /// Maximum bytes of the encoded context hints of a validate request.
     pub max_validation_metadata_bytes: usize,
 }
@@ -87,7 +85,6 @@ impl Default for ApiLimits {
             validator_timeout: Duration::from_secs(20),
             validator_response_bytes: 1024 * 1024,
             max_validation_state_bytes: 8 * 1024 * 1024,
-            max_virtual_contexts: 16,
             max_validation_metadata_bytes: 16 * 1024,
         }
     }
@@ -1216,20 +1213,6 @@ pub fn canonical_validate(
     body.requested
         .validate()
         .map_err(|e| ApiError::invalid(format!("invalid context hints: {e}"), correlation))?;
-    let distinct = body
-        .requested
-        .canonical_source_pins()
-        .map_err(|e| ApiError::invalid(format!("invalid context hints: {e}"), correlation))?
-        .len();
-    if distinct > limits.max_virtual_contexts {
-        return Err(ApiError::resource_limit(
-            format!(
-                "at most {} source pins per request",
-                limits.max_virtual_contexts
-            ),
-            correlation,
-        ));
-    }
     let mut encoded = Vec::new();
     body.requested
         .encode_into(&mut encoded)
@@ -1505,7 +1488,7 @@ async fn validate(
             state_href: Some(format!("/v1/graphs/{graph}/commits/{candidate}/state")),
             quads,
         },
-        request.requested.canonical(),
+        request.requested.clone(),
     );
     outbound.correlation_id = Some(correlation.clone());
     let answer =

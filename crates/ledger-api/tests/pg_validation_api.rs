@@ -80,6 +80,8 @@ enum Mode {
     Unavailable,
     Refuses,
     WrongCandidate,
+    /// Answers with the default catalog revision whatever the hint says.
+    WrongRevision,
     Slow(Duration),
     /// Wait until the notify fires (to saturate the validation budget).
     Blocked(Arc<tokio::sync::Notify>),
@@ -126,7 +128,7 @@ impl ValidationClient for FakeValidator {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let mode = self.mode.lock().unwrap().clone();
         match mode {
-            Mode::Normal | Mode::WrongCandidate => {}
+            Mode::Normal | Mode::WrongCandidate | Mode::WrongRevision => {}
             Mode::Unavailable => {
                 return Err(ValidationClientError::Unavailable(
                     "validator answered HTTP 503".into(),
@@ -145,10 +147,17 @@ impl ValidationClient for FakeValidator {
             .ontology
             .as_ref()
             .map_or("O1".to_owned(), |o| o.version.clone());
-        let external = hints
-            .source_pins
-            .first()
-            .map_or("D-A".to_owned(), |p| p.source_version.clone());
+        // The fake's catalog: revision "catalog-<X>" hydrates external version <X>.
+        let external = if matches!(mode, Mode::WrongRevision) {
+            "D-A".to_owned()
+        } else {
+            hints
+                .sources_revision
+                .as_deref()
+                .and_then(|r| r.strip_prefix("catalog-"))
+                .unwrap_or("D-A")
+                .to_owned()
+        };
         let reasoning = hints.reasoning_profile.clone().map(|profile| Reasoning {
             profile,
             implementation: "sculpin-python-reasoner".into(),
@@ -668,7 +677,7 @@ async fn virtual_abox_versions_yield_distinct_contexts_that_coexist_immutably() 
             "<urn:material:abox-dependent> <urn:p> \"x\" .",
         )
         .await;
-    let pin = |v: &str| json!({"source_pins": [{"dataset_id": "urn:sculpin:datasource:lab", "source_version": v}]});
+    let pin = |v: &str| json!({"sources_revision": format!("catalog-{v}")});
     let (sa, a) = h.validate(&g, &t, &c, "v-a", pin("D-A")).await;
     let (sb, b) = h.validate(&g, &t, &c, "v-b", pin("D-B")).await;
     assert_eq!(
@@ -1110,7 +1119,6 @@ async fn clients_cannot_forge_validation_identity_and_foreign_records_are_invisi
 #[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
 async fn validation_resource_limits_have_stable_codes() {
     let limits = ApiLimits {
-        max_virtual_contexts: 2,
         max_validation_metadata_bytes: 300,
         max_validation_state_bytes: 60,
         max_concurrent_validations: 1,
@@ -1120,13 +1128,6 @@ async fn validation_resource_limits_have_stable_codes() {
     let g = h.graph("tenant-v").await;
     let t = token("tenant-v", "orchestrator", &ROLES);
     let c = h.prepare(&g, &t, None, "<urn:m:a> <urn:p> \"1\" .").await;
-    let pins: Vec<Value> = (0..3)
-        .map(|i| json!({"dataset_id": format!("ds-{i}"), "source_version": "1"}))
-        .collect();
-    let reply = h
-        .validate(&g, &t, &c, "v-pins", json!({"source_pins": pins}))
-        .await;
-    assert_code(&reply, StatusCode::PAYLOAD_TOO_LARGE, "RESOURCE_LIMIT");
     let long = "x".repeat(400);
     let reply = h
         .validate(&g, &t, &c, "v-meta", json!({"reasoning_profile": long}))
@@ -1262,4 +1263,46 @@ async fn one_declared_environment_accepts_candidates_that_hydrate_different_sour
         .await;
     assert_eq!(status, StatusCode::OK, "{a2}");
     assert_eq!(h.head(&g).await, Some((c2, 2)));
+}
+
+/// Review round 3: a validator that honours a hint by silently returning another catalog
+/// revision is refused, and a source-version pin cannot be requested at all (it could report
+/// the current revision and alias the current environment).
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn pins_are_not_hints_and_an_ignored_revision_hint_is_a_validator_error() {
+    let h = harness().await;
+    let g = h.graph("tenant-v").await;
+    let t = token("tenant-v", "orchestrator", &ROLES);
+    let c = h
+        .prepare(&g, &t, None, "<urn:material:a> <urn:label> \"A\" .")
+        .await;
+    let pinned = h
+        .validate(
+            &g,
+            &t,
+            &c,
+            "v-pin",
+            json!({"source_pins": [{"dataset_id": "urn:sculpin:datasource:lab", "source_version": "v40"}]}),
+        )
+        .await;
+    assert_code(&pinned, StatusCode::BAD_REQUEST, "INVALID_REQUEST");
+    h.validator.set(Mode::WrongRevision);
+    let ignored = h
+        .validate(
+            &g,
+            &t,
+            &c,
+            "v-rev",
+            json!({"sources_revision": "catalog-D-B"}),
+        )
+        .await;
+    assert_code(&ignored, StatusCode::BAD_GATEWAY, "VALIDATOR_ERROR");
+    let records = h
+        .count(
+            "SELECT count(*) FROM validation_records WHERE graph_id = $1",
+            &g,
+        )
+        .await;
+    assert_eq!(records, 0);
 }

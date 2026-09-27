@@ -16,20 +16,6 @@
       "revision": "kbrev-7",
       "kb_id": "urn:exodus:kb:material-science"
     },
-    "source_pins": [
-      {
-        "dataset_id": "urn:sculpin:datasource:lab-a",
-        "source_version": "41"
-      },
-      {
-        "dataset_id": "urn:sculpin:datasource:lab-b",
-        "source_version": "2026-09-20T00:00:00Z#7"
-      },
-      {
-        "dataset_id": "urn:sculpin:datasource:lab-a",
-        "source_version": "41"
-      }
-    ],
     "sources_revision": "urn:sculpin:source-catalog:rev-41"
   }
 }

@@ -17,11 +17,10 @@
   content-identifying ontology/shape versions, Virtual A-Box identification, and a way to
   publish its current semantic environment. A live end-to-end test is external evidence,
   never part of the workspace gate.
-- Environment freshness assumes external source versions are known before hydration (a
-  source pin). A Virtual A-Box whose version is discovered only during hydration can still
-  be validated, but an orchestrator must then accept under the environment the record
-  reports or revalidate with an explicit pin; a Sculpin "current environment" endpoint would
-  make that uniform.
+- Environment freshness for external data rests on Sculpin's `sources_revision` changing
+  whenever the source versions it would hydrate change; the ledger cannot verify that
+  discipline. A Sculpin "current environment" endpoint (publishing the environment id) would
+  make orchestration uniform.
 - The runtime remains the trusted writer of new validation records (ADR-0016 residual): a
   compromised runtime could fabricate a conforming record for its own tenants. The report
   digest/reference allows cross-checking against Sculpin's report store; signed validator
