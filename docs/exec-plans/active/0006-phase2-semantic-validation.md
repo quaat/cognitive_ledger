@@ -345,17 +345,23 @@ upgraded schema identical (809 DDL/grant lines, 70 owned objects). Final run on 
 see the table below. NOTE recorded: the P1.5 server refuses a logically restored copy.
 
 ### Executed gates on the closure candidate
+Code candidate: `c43ffcf` (the only later commit is this documentation update). Heads are
+named where a gate ran on an earlier commit; every later change is listed with the suites
+re-run for it.
 | Gate | Head | Result |
 |---|---|---|
-| `./scripts/check-fast.sh` | `32dc825` | exit 0 (fmt, clippy `-D warnings`, workspace tests, doc links, architecture, Python references: 18 commit-v2, 12 request, 42 validation incl. invocation, 3 state) |
+| `./scripts/check-fast.sh` | `c43ffcf` | exit 0 (fmt, clippy `-D warnings`, workspace tests, doc links, architecture, Python references: 18 commit-v2, 12 request, 42 validation incl. invocation, 3 state) |
 | `./scripts/check-supply-chain.sh` | `a71fd09` (no dependency change since) | exit 0 (advisories/bans/licenses/sources ok, SBOM 213 components) |
-| PostgreSQL 15.19 — all 10 suites (`pg_validation` 9, `pg_verify` 2, `pg_workflow` 14, `pg_least_privilege` 17, `pg_cas_race` 1, `pg_immutable_store` 9, `pg_graphs_migration` 7, `pg_fs_migration` 8, `pg_validation_api` 17, `pg_api` 13) | `b54906f` | all passed; `pg_least_privilege` 18 and `pg_verify` 2 again on `32dc825` |
-| PostgreSQL 17.11 — same 10 suites | `b54906f` | all passed; `pg_least_privilege` 18 and `pg_verify` 2 again on `32dc825` |
-| `validator_http` (5) | `b54906f` | passed (in `check-fast`) |
-| `./scripts/test-integration.sh` (compose PG 17.2, distroless image, all PG suites, container scenario, verify) | `b54906f` | exit 0, `INTEGRATION OK` |
-| `./scripts/backup-restore.sh` | `b54906f` / fix | **failed** on `b54906f` (dump restore refused, above) → `BACKUP RESTORE OK` with the fix |
-| `scripts/upgrade-p2.sh` | fix | `UPGRADE-P2 OK` |
-| fuzz `validation_decode` (now also the validator JSON response path), sanitizer none, 120 s | `07420ae` | 15.8 M execs, cov 2950, no crash |
+| PostgreSQL 15.19 — all 10 suites (`pg_validation` 9, `pg_verify` 2, `pg_workflow` 14, `pg_least_privilege` 18, `pg_cas_race` 1, `pg_immutable_store` 9, `pg_graphs_migration` 7, `pg_fs_migration` 8, `pg_validation_api` 17, `pg_api` 13) | `8d3ec1b` | all passed; `pg_verify` + `pg_validation` again on `c43ffcf` (only `verify.rs` and its test changed) |
+| PostgreSQL 17.11 — same 10 suites | `8d3ec1b` | all passed; `pg_verify` + `pg_validation` again on `c43ffcf` |
+| `validator_http` (5) | `c43ffcf` | passed (in `check-fast`) |
+| `./scripts/test-integration.sh` (compose PG 17.2, distroless image, all PG suites, container scenario, verify) | `8d3ec1b` | exit 0, `INTEGRATION OK`, `VERIFY OK` |
+| `./scripts/backup-restore.sh` (dump + base backup, restored servers, drift refusal) | `b54906f` → `c43ffcf` | **failed** on `b54906f` (logical restore refused at start-up, see above); `BACKUP RESTORE OK` on `c43ffcf` |
+| `scripts/upgrade-p2.sh` (0009 → 0010 from `f81be37`) | `8d3ec1b` | `UPGRADE-P2 OK`, run `target/upgrade-p2/20260927T172018Z`; NOTEs: the P1.5 server refuses a logically restored 0009 copy; the P1.5 `verify` does not check the schema level |
+| fuzz `validation_decode` (binary decoders + validator JSON response path), sanitizer none, 120 s | `07420ae` | 15.8 M execs, cov 2950, no crash |
+| fuzz `validation_decode`, sanitizer none, **900 s** | `32dc825` (target and protocol crate unchanged since) | **71.5 M execs, cov 3237, no crash** (nightly-2026-09-25, x86_64-unknown-linux-gnu, debug assertions on; `target/fuzz/20260927T170019Z`) |
+| fuzz `validation_decode`, AddressSanitizer | — | **not executable here**: SIGSEGV at start-up before the first input, no artifact (the host ASan runtime issue recorded in Plan 0005); runs on hosted `ci-fuzz` (`address` matrix) |
+| mutation checks | `07420ae` | old trust predicate → 2 PG tests red; invocation id from correlation id → 2 PG tests red |
 
 ### Reviews
 - Round 4 (Opus, read-only, `1724216..a71fd09`): migration-0010 security review (no P0/P1;
@@ -368,8 +374,19 @@ see the table below. NOTE recorded: the P1.5 server refuses a logically restored
   upgrade-harness assertions, contract gaps (retention, single flight, failure, same-key
   retry), security notes (service id is an operator assertion; invocation id unkeyed).
   Recorded as risk decisions: signed validator responses / keyed invocation id (ADR needed).
-- Codex (read-only `codex exec`, focused prompt) on `b54906f`: **no P0/P1**; one P2 (upgrade
-  harness force-removed a fixed worktree path) fixed in `32dc825`.
+- Codex (`codex exec -s read-only`, focused prompt on security, distributed concurrency,
+  freshness, idempotency, verifier omissions, upgrade hazards, canonical identities), four
+  rounds, **no P0/P1 in any**:
+  - `b54906f`: P2 upgrade harness force-removed a fixed worktree path → per-run path (`32dc825`).
+  - `32dc825`: P2 whitespace inside CHECK string literals was normalized away (pre-existing
+    since P1.5: a widened branch regex passed start-up) → literals compared exactly; P2
+    restore-diff check too permissive → exact pairs (`af2d439`).
+  - `af2d439`: P2 quoted identifiers normalized (CHECK on a look-alike column passed); P2
+    `recorded_at` not compared by verify; P2 restore diff as a set → all fixed (`24d73ed`).
+  - `8d3ec1b`: P2 context validator versions not compared by verify; P2 plan named
+    `semantic_context_id` → fixed (`c43ffcf`). The `c43ffcf` delta (verify + docs) was not
+    re-reviewed by Codex; it was re-tested (`pg_verify`/`pg_validation` on PG 15 and 17,
+    `check-fast`, `backup-restore`).
 
 ## Remaining before merge / release
 1. Hosted CI (ci-fast, ci-integration, ci-security, ci-fuzz) on the pushed final head.
