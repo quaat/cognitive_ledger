@@ -54,6 +54,8 @@ struct ProjectionArgs {
     target: Option<String>,
     branch: String,
     json: bool,
+    /// `disable` without the target fence (escape hatch; ADR-0021).
+    unfenced: bool,
 }
 
 struct MigrateArgs {
@@ -83,7 +85,7 @@ struct Args {
 fn usage() -> &'static str {
     "usage: ledger-admin migrate [--runtime-role <role>] [--projector-role <role>] [--database-url <url>]\n\
      \x20      ledger-admin projection enable|disable --graph <graph_id> --target <target_id> \
-     [--ref <name>] [--database-url <url>]\n\
+     [--ref <name>] [--unfenced] [--database-url <url>]\n\
      \x20      ledger-admin projection status [--target <target_id>] [--json] [--database-url <url>]\n\
      \x20      ledger-admin migrate-fs-to-pg --source <dir> [--database-url <url>] \
      [--graph <graph_id>] [--branch <name>] [--runtime-role <role>] [--json]\n\
@@ -319,6 +321,7 @@ fn parse_projection(mut argv: impl Iterator<Item = String>) -> Result<Projection
     };
     let mut database_url = database_url_from_env();
     let (mut graph, mut target, mut branch, mut json) = (None, None, "main".to_owned(), false);
+    let mut unfenced = false;
     while let Some(flag) = argv.next() {
         match flag.as_str() {
             "--database-url" => database_url = Some(value(&mut argv, "--database-url")?),
@@ -326,6 +329,7 @@ fn parse_projection(mut argv: impl Iterator<Item = String>) -> Result<Projection
             "--target" => target = Some(value(&mut argv, "--target")?),
             "--ref" => branch = value(&mut argv, "--ref")?,
             "--json" => json = true,
+            "--unfenced" if matches!(action, ProjectionAction::Disable) => unfenced = true,
             other if other.starts_with("--") => {
                 return Err(format!("unknown flag {other}\n{}", usage()));
             }
@@ -352,6 +356,7 @@ fn parse_projection(mut argv: impl Iterator<Item = String>) -> Result<Projection
         target,
         branch,
         json,
+        unfenced,
     })
 }
 
@@ -386,13 +391,26 @@ async fn projection(args: &ProjectionArgs) -> Result<(), Box<dyn std::error::Err
         }
         ProjectionAction::Disable => {
             let key = key()?;
-            if !repo.disable(&key).await? {
-                return Err("no such projection stream".into());
+            if args.unfenced {
+                if !repo.disable_unfenced(&key).await? {
+                    return Err("no such projection stream".into());
+                }
+                println!(
+                    "projection disabled WITHOUT fencing the target: graph {} ref {} target {} \
+                     (a write of this stream still in flight could land after another stream \
+                     takes its cognitive graph; ADR-0021)",
+                    key.graph_id, key.branch, key.target_id
+                );
+            } else {
+                if !repo.disable(&key).await? {
+                    return Err("no such projection stream".into());
+                }
+                println!(
+                    "projection disabling: graph {} ref {} target {} — a projector fences the \
+                     target, then the stream is disabled (check `projection status`)",
+                    key.graph_id, key.branch, key.target_id
+                );
             }
-            println!(
-                "projection disabled: graph {} ref {} target {}",
-                key.graph_id, key.branch, key.target_id
-            );
         }
         ProjectionAction::Status => {
             let streams = repo.status(args.target.as_deref()).await?;

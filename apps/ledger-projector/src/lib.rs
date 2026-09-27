@@ -74,6 +74,8 @@ pub enum StepOutcome {
     /// A newer projection of this stream landed first; the lease was released and the next
     /// claim acknowledges it (not a failure).
     Superseded,
+    /// A `disabling` stream fenced the target and is now `disabled`.
+    Fenced,
     /// Failed and recorded (retry scheduled, blocked or rebuild required).
     Failed { code: Code, class: ErrorClass },
     /// Failed, and the failure could not be recorded (database unavailable); the lease
@@ -94,6 +96,8 @@ pub struct Projector<C: ProjectionClient + ?Sized> {
     metrics: Arc<Metrics>,
     /// Set while the periodic transactional probe fails: no stream is claimed.
     paused: Arc<AtomicBool>,
+    /// Distinguishes write ids minted by this process.
+    writes: std::sync::atomic::AtomicU64,
 }
 
 /// Map a ledger-side failure to the projection error taxonomy: transient database conditions
@@ -111,7 +115,8 @@ pub fn ledger_failure(e: LedgerError) -> ProjectionError {
 
 /// The marker a write produced, compared field by field except the target-computed count.
 fn same_projection(observed: &ProjectionMarker, written: &ProjectionMarker) -> bool {
-    observed.graph_id == written.graph_id
+    observed.write_id == written.write_id
+        && observed.graph_id == written.graph_id
         && observed.branch == written.branch
         && observed.commit == written.commit
         && observed.ref_version == written.ref_version
@@ -139,7 +144,25 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
             failpoint: None,
             metrics,
             paused: Arc::new(AtomicBool::new(false)),
+            writes: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// A write id never used before (ADR-0020: marker terms never repeat, so no ABA): the
+    /// digest of this lease, this process's counter and the clock. Unique, not secret.
+    fn next_write_id(&self, claim: &Claim) -> String {
+        let n = self.writes.fetch_add(1, Ordering::SeqCst);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        ledger_core::ContentId::for_bytes(
+            format!(
+                "sculpin-ledger-projection/v1 write|{}|{}|{}|{}|{}|{n}|{nanos}",
+                claim.key.graph_id, claim.key.branch, claim.key.target_id, claim.owner, claim.epoch
+            )
+            .as_bytes(),
+        )
+        .to_string()
     }
 
     /// Tests only: simulate a crash at `point` on every step.
@@ -251,6 +274,12 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
         if self.crash(FailPoint::AfterClaim) {
             return StepOutcome::Crashed(FailPoint::AfterClaim);
         }
+        if claim.disabling {
+            return match self.fence_out(claim).await {
+                Ok(outcome) => outcome,
+                Err(e) => self.failed(claim, None, e).await,
+            };
+        }
         let work = match self.repo.work_for(claim, mode).await {
             Ok(Some(work)) => work,
             Ok(None) => {
@@ -335,6 +364,7 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
             ref_version: work.ref_version,
             state_digest: projected.digest().clone(),
             triple_count: 0, // computed by the target in the write transaction
+            write_id: self.next_write_id(claim),
         };
         // Never start a target write with less than a quarter of the lease left: a write
         // that outlives its lease is still harmless (guarded), but it is wasted work.
@@ -457,6 +487,41 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
         capped + capped.mul_f64((seed % 256) as f64 / 1024.0)
     }
 
+    /// A `disabling` stream (ADR-0020/0021): rotate the marker's write id under the
+    /// compare-and-swap on what is observed now, so no write planned under this stream's
+    /// authority before this point can land; then the stream is `disabled` and its cognitive
+    /// graph free for another stream.
+    async fn fence_out(&self, claim: &Claim) -> Result<StepOutcome, ProjectionError> {
+        let graph = CognitiveGraph::parse(&claim.cognitive_graph)?;
+        let observed = self.client.observe(&graph).await?;
+        let write_id = self.next_write_id(claim);
+        self.client
+            .fence(&graph, &observed.terms, &write_id)
+            .await?;
+        let after = self.client.observe(&graph).await?;
+        let write_id_predicate = format!("{}writeId", ledger_projection::LP_NAMESPACE);
+        if !after
+            .terms
+            .iter()
+            .any(|(p, o)| *p == write_id_predicate && o.value == write_id)
+        {
+            // The marker changed between observation and fence (a write landed): retry.
+            return Err(ProjectionError::retryable(
+                Code::VerificationFailed,
+                "the target does not read back the fence just written",
+            ));
+        }
+        match self
+            .repo
+            .finish_disable(claim)
+            .await
+            .map_err(ledger_failure)?
+        {
+            LeaseOutcome::Committed => Ok(StepOutcome::Fenced),
+            LeaseOutcome::LeaseLost => Ok(StepOutcome::LeaseLost),
+        }
+    }
+
     async fn failed(
         &self,
         claim: &Claim,
@@ -464,6 +529,8 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
         error: ProjectionError,
     ) -> StepOutcome {
         let disposition = match (error.class(), error.code()) {
+            // Disabling only ever needs its fence: retry it (the stream stays `disabling`).
+            _ if claim.disabling => FailureDisposition::Retry(self.backoff(claim)),
             (_, Code::MarkerAhead | Code::TargetConflict) => FailureDisposition::RebuildRequired,
             (ErrorClass::Permanent, _) => FailureDisposition::Block,
             (ErrorClass::Retryable, _) => FailureDisposition::Retry(self.backoff(claim)),

@@ -147,6 +147,16 @@ projection fault suite, compose integration, upgrade 0010 → 0011; Phase-2 suit
   serialization only in the script. Recorded, not fixed (tech debt): binding keyed on target
   id only, private CA, `_FILE` DB URL, response caps/copies, unauthenticated metrics DB work,
   shared `delivered_at`, cross-tenant KB re-point without confirmation.
+- Codex (`codex exec -s read-only`) on `e78b1bd`: **P0** — the compare-and-swap was not
+  ABA-free across feeds (B's stalled rebuild observed A's marker; B disabled, A re-enabled
+  with an unchanged marker; B's late write would land in A's graph; not covered by the
+  feed-switch test, where the marker changed). Fixed: a fresh `lp:writeId` per write and a
+  two-phase disable that fences the target before the graph is freed (ADR-0020/0021);
+  `fuseki_projection::a_stalled_rebuild_of_a_disabled_feed_never_lands_after_the_old_feed_returns`
+  reproduces the sequence, and skipping the fence turns it red. P2s fixed: zero reconcile/
+  probe intervals accepted (now minimums), the status server bound after the workers started
+  (now before), CREATE reachable through a settable parent role not refused (now refused,
+  tested).
 
 ## Evidence
 (filled as slices land)

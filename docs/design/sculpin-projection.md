@@ -44,6 +44,8 @@ reference implementation and frozen vectors are in `crates/ledger-projection/src
   confirms `?commit` is its `main` head or an ancestor at that version (e.g. `GET
   /v1/graphs/{g}/refs?name=main`). Otherwise wait, or read the ledger's own state (`GET
   /v1/graphs/{g}/commits/{head}/state`). Never order by timestamps.
+- **`lp:writeId`** changes with every write and every fence (it exists so stale writers can
+  never match an old marker); it carries no meaning for readers. Do not compare it.
 - **`lp:stateDigest`** is the digest of the ledger's accepted state (`sculpin-rdf-state/v1`
   over the exact accepted lexical forms); it cannot be recomputed from the target's content
   (below) and identifies what was projected, not what the target returns.

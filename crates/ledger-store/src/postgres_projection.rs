@@ -38,6 +38,9 @@ pub struct Claim {
     pub epoch: i64,
     /// Failed attempts since the last success (backoff input).
     pub consecutive_failures: i32,
+    /// The stream is being disabled: the only work is fencing the target (ADR-0020), then
+    /// [`ProjectionRepository::finish_disable`].
+    pub disabling: bool,
 }
 
 /// What a claimed stream must project: the latest accepted outbox event beyond its recorded
@@ -304,7 +307,7 @@ impl ProjectionRepository {
             "INSERT INTO projection_state (graph_id, branch, target_id, tenant_id, cognitive_graph) \
              VALUES ($1, $2, $3, $4, $5) \
              ON CONFLICT (graph_id, branch, target_id) DO UPDATE SET status = 'active' \
-             WHERE projection_state.status = 'disabled'",
+             WHERE projection_state.status IN ('disabled', 'disabling')",
         )
         .bind(key.graph_id.as_str())
         .bind(&key.branch)
@@ -329,8 +332,31 @@ impl ProjectionRepository {
         Ok(cognitive_graph)
     }
 
-    /// Stop projecting `key` (the row stays; progress is kept).
+    /// Start disabling `key` (the row stays; progress is kept): the stream becomes
+    /// `disabling` and keeps its cognitive graph until a projector has fenced the target
+    /// (ADR-0020) — so no write of this stream still in flight can land after another stream
+    /// takes the graph — and then marks it `disabled`. A live lease is left to finish or
+    /// expire first. `false` if there is no such stream.
     pub async fn disable(&self, key: &StreamKey) -> Result<bool, LedgerError> {
+        validate_key(key)?;
+        let done = sqlx::query(
+            "UPDATE projection_state SET status = CASE WHEN status = 'disabled' THEN status \
+                 ELSE 'disabling' END, next_attempt_at = now() \
+             WHERE graph_id = $1 AND branch = $2 AND target_id = $3",
+        )
+        .bind(key.graph_id.as_str())
+        .bind(&key.branch)
+        .bind(&key.target_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_error)?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    /// Disable `key` at once, **without** fencing the target (operator escape hatch when the
+    /// target is gone for good): a write of this stream still in flight could then land after
+    /// another stream took its cognitive graph. Clears any lease.
+    pub async fn disable_unfenced(&self, key: &StreamKey) -> Result<bool, LedgerError> {
         validate_key(key)?;
         let done = sqlx::query(
             "UPDATE projection_state SET status = 'disabled', lease_owner = NULL, lease_until = NULL \
@@ -345,10 +371,34 @@ impl ProjectionRepository {
         Ok(done.rows_affected() == 1)
     }
 
+    /// Complete a disable after the claim's holder fenced the target: `disabling` →
+    /// `disabled`, lease released (under the claim's fencing).
+    pub async fn finish_disable(&self, claim: &Claim) -> Result<LeaseOutcome, LedgerError> {
+        let done = sqlx::query(
+            "UPDATE projection_state SET status = 'disabled', lease_owner = NULL, lease_until = NULL, \
+                 consecutive_failures = 0 \
+             WHERE graph_id = $1 AND branch = $2 AND target_id = $3 AND lease_owner = $4 \
+               AND lease_epoch = $5 AND status = 'disabling'",
+        )
+        .bind(claim.key.graph_id.as_str())
+        .bind(&claim.key.branch)
+        .bind(&claim.key.target_id)
+        .bind(&claim.owner)
+        .bind(claim.epoch)
+        .execute(&self.pool)
+        .await
+        .map_err(db_error)?;
+        Ok(if done.rows_affected() == 1 {
+            LeaseOutcome::Committed
+        } else {
+            LeaseOutcome::LeaseLost
+        })
+    }
+
     // ---- projector ----------------------------------------------------------------------
 
-    /// Lease one due, active stream of `target_id` that has accepted events beyond its
-    /// recorded progress. `SKIP LOCKED` keeps concurrent claimers from blocking each other;
+    /// Lease one due stream of `target_id` that is `disabling` (to be fenced) or `active` with
+    /// accepted events beyond its recorded progress. `SKIP LOCKED` keeps concurrent claimers from blocking each other;
     /// an expired lease is claimable (crash recovery). Commits before returning.
     pub async fn claim(
         &self,
@@ -360,19 +410,21 @@ impl ProjectionRepository {
         let row = sqlx::query(
             "WITH candidate AS ( \
                  SELECT s.graph_id, s.branch, s.target_id FROM projection_state s \
-                 WHERE s.target_id = $1 AND s.status = 'active' AND s.next_attempt_at <= now() \
+                 WHERE s.target_id = $1 AND s.next_attempt_at <= now() \
                    AND (s.lease_until IS NULL OR s.lease_until < now()) \
-                   AND EXISTS (SELECT 1 FROM projection_outbox o WHERE o.graph_id = s.graph_id \
-                               AND o.branch = s.branch \
-                               AND o.ref_version > coalesce(s.projected_ref_version, 0)) \
-                 ORDER BY s.next_attempt_at, s.graph_id, s.branch \
+                   AND (s.status = 'disabling' OR (s.status = 'active' \
+                        AND EXISTS (SELECT 1 FROM projection_outbox o WHERE o.graph_id = s.graph_id \
+                                    AND o.branch = s.branch \
+                                    AND o.ref_version > coalesce(s.projected_ref_version, 0)))) \
+                 ORDER BY (s.status = 'disabling') DESC, s.next_attempt_at, s.graph_id, s.branch \
                  LIMIT 1 FOR UPDATE OF s SKIP LOCKED) \
              UPDATE projection_state s SET lease_owner = $2, \
                  lease_until = now() + make_interval(secs => $3), lease_epoch = s.lease_epoch + 1 \
              FROM candidate c \
              WHERE s.graph_id = c.graph_id AND s.branch = c.branch AND s.target_id = c.target_id \
              RETURNING s.graph_id, s.branch, s.target_id, s.tenant_id, s.cognitive_graph, \
-                       s.projected_commit, s.projected_ref_version, s.lease_epoch, s.consecutive_failures",
+                       s.projected_commit, s.projected_ref_version, s.lease_epoch, s.consecutive_failures, \
+                       s.status",
         )
         .bind(target_id)
         .bind(owner)
@@ -384,7 +436,7 @@ impl ProjectionRepository {
     }
 
     /// Lease a specific stream for an operator rebuild, whatever its status except
-    /// `disabled`, as long as no live lease is held.
+    /// `disabling` / `disabled`, as long as no live lease is held.
     pub async fn claim_stream(
         &self,
         key: &StreamKey,
@@ -396,10 +448,12 @@ impl ProjectionRepository {
         let row = sqlx::query(
             "UPDATE projection_state s SET lease_owner = $4, \
                  lease_until = now() + make_interval(secs => $5), lease_epoch = s.lease_epoch + 1 \
-             WHERE s.graph_id = $1 AND s.branch = $2 AND s.target_id = $3 AND s.status <> 'disabled' \
+             WHERE s.graph_id = $1 AND s.branch = $2 AND s.target_id = $3 \
+               AND s.status NOT IN ('disabling', 'disabled') \
                AND (s.lease_until IS NULL OR s.lease_until < now()) \
              RETURNING s.graph_id, s.branch, s.target_id, s.tenant_id, s.cognitive_graph, \
-                       s.projected_commit, s.projected_ref_version, s.lease_epoch, s.consecutive_failures",
+                       s.projected_commit, s.projected_ref_version, s.lease_epoch, s.consecutive_failures, \
+                       s.status",
         )
         .bind(key.graph_id.as_str())
         .bind(&key.branch)
@@ -440,7 +494,8 @@ impl ProjectionRepository {
              FROM candidate c \
              WHERE s.graph_id = c.graph_id AND s.branch = c.branch AND s.target_id = c.target_id \
              RETURNING s.graph_id, s.branch, s.target_id, s.tenant_id, s.cognitive_graph, \
-                       s.projected_commit, s.projected_ref_version, s.lease_epoch, s.consecutive_failures",
+                       s.projected_commit, s.projected_ref_version, s.lease_epoch, s.consecutive_failures, \
+                       s.status",
         )
         .bind(target_id)
         .bind(owner)
@@ -569,7 +624,8 @@ impl ProjectionRepository {
         let done = sqlx::query(
             "UPDATE projection_state SET projected_commit = $6, projected_ref_version = $7, \
                  lease_owner = NULL, lease_until = NULL, consecutive_failures = 0, \
-                 last_success_at = now(), next_attempt_at = now(), status = 'active', \
+                 last_success_at = now(), next_attempt_at = now(), \
+                 status = CASE WHEN status = 'disabling' THEN status ELSE 'active' END, \
                  rebuilds = rebuilds + $8 \
              WHERE graph_id = $1 AND branch = $2 AND target_id = $3 AND lease_owner = $4 \
                AND lease_epoch = $5",
@@ -624,7 +680,7 @@ impl ProjectionRepository {
             "UPDATE projection_state SET lease_owner = NULL, lease_until = NULL, \
                  consecutive_failures = consecutive_failures + 1, last_error_at = now(), \
                  last_error_code = $6, next_attempt_at = now() + make_interval(secs => $7), \
-                 status = coalesce($8, status) \
+                 status = CASE WHEN status = 'disabling' THEN status ELSE coalesce($8, status) END \
              WHERE graph_id = $1 AND branch = $2 AND target_id = $3 AND lease_owner = $4 \
                AND lease_epoch = $5",
         )
@@ -771,5 +827,6 @@ fn claim_from_row(row: &sqlx::postgres::PgRow, owner: &str) -> Result<Claim, Led
         owner: owner.to_owned(),
         epoch: row.try_get("lease_epoch").map_err(db_error)?,
         consecutive_failures: row.try_get("consecutive_failures").map_err(db_error)?,
+        disabling: row.try_get::<String, _>("status").map_err(db_error)? == "disabling",
     })
 }

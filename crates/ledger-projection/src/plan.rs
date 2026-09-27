@@ -169,6 +169,7 @@ mod tests {
             ref_version: version,
             state_digest: ContentId::for_bytes(b"s"),
             triple_count: count,
+            write_id: format!("w{version}"),
         })
     }
 

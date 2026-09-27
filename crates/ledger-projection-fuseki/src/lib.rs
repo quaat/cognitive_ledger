@@ -364,6 +364,16 @@ impl ProjectionClient for FusekiClient {
             .await
     }
 
+    async fn fence(
+        &self,
+        graph: &CognitiveGraph,
+        expected: &[(String, MarkerTerm)],
+        write_id: &str,
+    ) -> Result<(), ProjectionError> {
+        self.update(sparql::fence_update(graph, expected, write_id)?)
+            .await
+    }
+
     async fn contains_all(
         &self,
         graph: &CognitiveGraph,

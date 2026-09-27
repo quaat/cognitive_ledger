@@ -25,7 +25,7 @@ graph_id, branch, target_id                 PRIMARY KEY
 tenant_id                                   (graph_id, tenant_id) → graphs
 cognitive_graph                             UNIQUE (target_id, cognitive_graph)
                                             WHERE status <> 'disabled'  (partial index)
-status             'active' | 'blocked' | 'rebuild_required' | 'disabled'
+status             'active' | 'blocked' | 'rebuild_required' | 'disabling' | 'disabled'
 projected_commit, projected_ref_version    both NULL or both set;
                                            (graph_id, branch, projected_ref_version, projected_commit)
                                            → ref_events (graph_id, branch, new_version, new_head)
@@ -75,8 +75,19 @@ acknowledging transaction, sets `delivered_at` on every row of the stream up to 
 `projection_state`). Outbox rows are never deleted; streams that are not enabled keep their
 rows pending and are reported as unconfigured.
 
+### Two-phase disable (review round 3)
+`ledger-admin projection disable` sets `disabling`; the stream keeps its cognitive graph (it
+counts for the partial unique index) and any live lease is left to finish or expire. The
+projector's claim prefers `disabling` streams; for them the only work is the ADR-0020 fence,
+after which `finish_disable` (same lease fencing) sets `disabled`. The guard trigger allows
+the projector exactly this one transition (`disabling` → `disabled`); entering `disabling`,
+cancelling it (→ `active`, what `enable` does) and leaving `disabled` stay owner-only.
+Acknowledgements and failures never change a `disabling` status, and a failing fence always
+retries with backoff. `--unfenced` sets `disabled` at once (owner) and waives the fence.
+
 ### Leases (exclusivity without a transaction across HTTP)
-1. **Claim** (one short transaction): pick one eligible, `active`, due, unleased (or
+1. **Claim** (one short transaction): pick one due, unleased (or lease-expired) stream that
+   is `disabling` (preferred; to be fenced) or eligible and `active`, unleased (or
    lease-expired) stream of the projector's target with `FOR UPDATE SKIP LOCKED`, set
    `lease_owner`, `lease_until = now() + ttl`, `lease_epoch = lease_epoch + 1`; commit.
 2. Outside any transaction: reconstruct, read the marker, write, read back (ADR-0020).

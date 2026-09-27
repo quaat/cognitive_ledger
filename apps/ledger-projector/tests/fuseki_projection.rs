@@ -188,6 +188,15 @@ impl ProjectionClient for Scripted {
         Ok(())
     }
 
+    async fn fence(
+        &self,
+        graph: &CognitiveGraph,
+        expected: &[(String, MarkerTerm)],
+        write_id: &str,
+    ) -> Result<(), ProjectionError> {
+        self.inner.fence(graph, expected, write_id).await
+    }
+
     async fn read_graph(&self, graph: &CognitiveGraph) -> Result<BTreeSet<Quad>, ProjectionError> {
         self.inner.read_graph(graph).await
     }
@@ -313,9 +322,10 @@ async fn assert_projected(
         one("stateDigest"),
         ledger_rdf::state_digest(expected).to_string()
     );
+    assert!(!one("writeId").is_empty());
     assert_eq!(
         marker.len(),
-        7,
+        8,
         "exactly the protocol predicates: {marker:?}"
     );
 }
@@ -333,6 +343,7 @@ fn marker(
         ref_version: version,
         state_digest: ledger_rdf::state_digest(state),
         triple_count: 0, // target-computed
+        write_id: unique("test-write"),
     }
 }
 
@@ -1211,9 +1222,19 @@ async fn a_write_in_flight_across_a_feed_switch_never_lands_in_the_new_feeds_gra
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(reached, "the stale worker reached its target write");
-    // The operator switches the KB's feed to another tenant's graph: disable, enable, and
-    // (after the conflict is reported) rebuild.
+    // The operator switches the KB's feed to another tenant's graph: disable (the graph
+    // stays taken until a projector fenced it), enable, and (after the conflict is
+    // reported) rebuild.
     assert!(w.owner().disable(&w.key(&g1)).await.unwrap());
+    assert_eq!(w.status(&g1).await.status, "disabling");
+    assert_eq!(
+        healthy.step().await.unwrap(),
+        StepOutcome::Idle,
+        "the stalled worker holds g1"
+    );
+    w.expire_lease(&g1).await;
+    assert_eq!(healthy.step().await.unwrap(), StepOutcome::Fenced);
+    assert_eq!(w.status(&g1).await.status, "disabled");
     let (g2, cg2) = w.graph_of("tenant-it2", &kb).await;
     assert_eq!(cg2, cg);
     let d1 = w.accept(&g2, None, &[Q3]).await;
@@ -1389,4 +1410,74 @@ async fn a_refused_target_credential_blocks_the_stream() {
         ("blocked", Some("TARGET_AUTH"))
     );
     assert!(raw_graph(&cg).await.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL and Fuseki: LEDGER_TEST_DATABASE_URL, LEDGER_TEST_FUSEKI_URL"]
+async fn a_stalled_rebuild_of_a_disabled_feed_never_lands_after_the_old_feed_returns() {
+    let _serial = serial().await;
+    let w = World::new().await;
+    let kb = format!("urn:it:kb:{}", unique("aba"));
+    let healthy = w.healthy().await;
+    // Feed A projects v1, then is disabled (fenced) in favour of feed B.
+    let (ga, cg) = w.graph_of("tenant-it", &kb).await;
+    let ca = w.accept(&ga, None, &[Q1]).await;
+    assert_eq!(healthy.step().await.unwrap(), projected(1, false));
+    assert!(w.owner().disable(&w.key(&ga)).await.unwrap());
+    assert_eq!(healthy.step().await.unwrap(), StepOutcome::Fenced);
+    let (gb, _) = w.graph_of("tenant-it2", &kb).await;
+    w.accept(&gb, None, &[Q3]).await;
+    assert_failed(
+        healthy.step().await.unwrap(),
+        ProjectionErrorCode::TargetConflict,
+        ErrorClass::Permanent,
+    );
+    // An operator rebuild of B observes A's marker and stalls inside its write.
+    let scripted = Scripted::new();
+    let gate = Arc::new(tokio::sync::Notify::new());
+    *scripted.hold.lock().unwrap() = Some(gate.clone());
+    let stale = Arc::new(w.projector(scripted.clone(), "stale-rebuild", None).await);
+    let stale_rebuild = tokio::spawn({
+        let (stale, key) = (stale.clone(), w.key(&gb));
+        async move { stale.rebuild(&key).await.unwrap() }
+    });
+    let mut reached = false;
+    for _ in 0..500 {
+        if scripted.hold.lock().unwrap().is_none() {
+            reached = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(reached, "the rebuild reached its target write");
+    // The operator changes their mind: B is disabled (fenced once its lease is gone) and A
+    // re-enabled. A's marker content is back exactly as B's rebuild observed it — except the
+    // write id the fence rotated.
+    assert!(w.owner().disable(&w.key(&gb)).await.unwrap());
+    w.expire_lease(&gb).await;
+    assert_eq!(healthy.step().await.unwrap(), StepOutcome::Fenced);
+    w.owner()
+        .enable(&w.key(&ga), |kb| {
+            CognitiveGraph::for_knowledge_base(kb)
+                .map(|g| g.as_iri().to_owned())
+                .map_err(|e| e.to_string())
+        })
+        .await
+        .unwrap();
+    assert_eq!(w.status(&ga).await.status, "active");
+    // B's stalled replacement lands now and must be a no-op.
+    gate.notify_one();
+    let outcome = stale_rebuild.await.unwrap();
+    assert!(
+        matches!(outcome, Some(StepOutcome::LeaseLost)),
+        "the disabled stream's rebuild is fenced: {outcome:?}"
+    );
+    assert_eq!(raw_graph(&cg).await, quads(&[Q1]), "A's content, not B's");
+    let marker = raw_marker(&cg).await;
+    assert_eq!(marker["graphId"], [ga.as_str()]);
+    assert_eq!(marker["commitId"], [ca.to_string()]);
+    // A carries on normally (the fence left A's marker well-formed).
+    let ca2 = w.accept(&ga, Some(&ca), &[Q2]).await;
+    assert_eq!(healthy.step().await.unwrap(), projected(2, false));
+    assert_projected(&cg, &ga, &quads(&[Q1, Q2]), &ca2, 2).await;
 }

@@ -124,8 +124,10 @@ Preserve object digest verification and atomic ref updates. Never commit secrets
   a second deployment pointed at it refuses to start rather than overwriting it.
 - Stale or concurrent writers cannot regress or cross-write the target: every write,
   including recovery replacements, is a compare-and-swap in the target transaction on the
-  exact marker terms the writer observed (ADR-0020), so a late write after a version change,
-  a repair or a feed switch to another tenant's graph is a no-op; leases are an efficiency
+  exact marker terms the writer observed (ADR-0020), every write stamps a fresh write id (no
+  ABA), and a disable fences the target before the graph can go to another stream, so a
+  late write after a version change, a repair, or a feed switch to another tenant's graph —
+  including a switch back — is a no-op; leases are an efficiency
   measure, not the safety mechanism. Observed terms are embedded only as validated IRIs or
   `ECHAR`-escaped literals; anything else (blank nodes, forbidden IRI characters, invalid
   language tags, > 64 values) refuses the write.

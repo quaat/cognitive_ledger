@@ -162,6 +162,37 @@ pub fn write_update(
     Ok(ops.join(" ;\n"))
 }
 
+/// Fence `graph` (ADR-0020): under the same compare-and-swap precondition as a write, replace
+/// only the marker's `lp:writeId` with `write_id`, so every write planned from an earlier
+/// observation fails its precondition from now on.
+pub fn fence_update(
+    graph: &CognitiveGraph,
+    expected: &[(String, MarkerTerm)],
+    write_id: &str,
+) -> Result<String, ProjectionError> {
+    let g = graph.as_iri();
+    let guard = precondition(graph, expected)?;
+    let token =
+        format!("GRAPH <{MARKER_GRAPH}> {{ <{WRITE_SUBJECT}> <{LP_NAMESPACE}writeFor> <{g}> }}");
+    let clear = format!(
+        "DELETE WHERE {{ GRAPH <{MARKER_GRAPH}> {{ <{WRITE_SUBJECT}> <{LP_NAMESPACE}writeFor> ?any }} }}"
+    );
+    Ok([
+        clear.clone(),
+        format!("INSERT {{ {token} }} WHERE {{ {guard} }}"),
+        format!(
+            "DELETE {{ GRAPH <{MARKER_GRAPH}> {{ <{g}> <{LP_NAMESPACE}writeId> ?w }} }} WHERE {{ {token} \
+             GRAPH <{MARKER_GRAPH}> {{ <{g}> <{LP_NAMESPACE}writeId> ?w }} }}"
+        ),
+        format!(
+            "INSERT {{ GRAPH <{MARKER_GRAPH}> {{ <{g}> <{LP_NAMESPACE}writeId> \"{}\" }} }} WHERE {{ {token} }}",
+            escape_literal(write_id)
+        ),
+        clear,
+    ]
+    .join(" ;\n"))
+}
+
 /// Whether the dataset's default graph shows the target binding: true only for a union
 /// default graph (or a binding written into the default graph), which the projector refuses.
 pub fn union_default_graph_ask() -> String {
@@ -347,6 +378,7 @@ mod tests {
             ref_version: 3,
             state_digest: projected.digest().clone(),
             triple_count: 1,
+            write_id: "sha256:w".into(),
         };
         (graph, projected, marker)
     }
@@ -416,6 +448,23 @@ mod tests {
         assert_eq!(ops.len(), 7);
         assert!(ops[1].contains("FILTER NOT EXISTS { GRAPH <urn:sculpin:ledger-projection:v1:markers> { <urn:sculpin:kb:kb:cognitive> ?cp ?co } }"));
         assert!(!update.contains("COALESCE"));
+    }
+
+    #[test]
+    fn fences_rotate_only_the_write_id_under_the_exact_observed_marker() {
+        let (graph, _, _) = fixture();
+        let observed = vec![(format!("{LP_NAMESPACE}writeId"), term("old", None))];
+        let update = fence_update(&graph, &observed, "sha256:new").unwrap();
+        let ops: Vec<&str> = update.split(" ;\n").collect();
+        assert_eq!(ops.len(), 5);
+        assert!(ops[1].contains("sameTerm(?co, \"old\")"), "{}", ops[1]);
+        assert!(ops[2].starts_with("DELETE {") && ops[2].contains("writeId> ?w"));
+        assert!(ops[3].contains("writeId> \"sha256:new\""));
+        assert!(
+            !update.contains("?s ?p ?o"),
+            "the graph itself is untouched"
+        );
+        assert_eq!(ops[0], ops[4]);
     }
 
     #[test]

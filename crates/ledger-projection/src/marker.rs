@@ -7,8 +7,12 @@ use std::str::FromStr;
 /// Maximum branch bytes (the ledger's ref-name bound).
 const MAX_BRANCH_BYTES: usize = 128;
 
-/// The marker's predicates, in the order they are written.
-pub fn marker_predicates() -> [String; 7] {
+/// Maximum bytes of a write id.
+const MAX_WRITE_ID_BYTES: usize = 128;
+
+/// The marker's predicates, in the order they are written (`tripleCount` last: the target
+/// adds it).
+pub fn marker_predicates() -> [String; 8] {
     [
         "protocol",
         "graphId",
@@ -16,6 +20,7 @@ pub fn marker_predicates() -> [String; 7] {
         "commitId",
         "refVersion",
         "stateDigest",
+        "writeId",
         "tripleCount",
     ]
     .map(|local| format!("{LP_NAMESPACE}{local}"))
@@ -34,6 +39,9 @@ pub struct ProjectionMarker {
     /// write transaction** (the target may merge literals it canonicalizes to one value, so
     /// the ledger cannot predict it). Ignored when writing.
     pub triple_count: u64,
+    /// Unique per write (and rotated by a fence, ADR-0020): the marker's terms never repeat,
+    /// so a compare-and-swap planned from an old observation can never match again (no ABA).
+    pub write_id: String,
 }
 
 /// One object term of a marker triple as a SPARQL result binding reports it.
@@ -76,7 +84,16 @@ impl ProjectionMarker {
     /// The ledger-written marker statements about `graph` (valid SPARQL template syntax).
     /// `lp:tripleCount` is not among them: the write adds it from the target's own count.
     pub fn triples(&self, graph: &CognitiveGraph) -> Vec<String> {
-        let [protocol, graph_id, branch, commit, version, digest, _count] = marker_predicates();
+        let [
+            protocol,
+            graph_id,
+            branch,
+            commit,
+            version,
+            digest,
+            write_id,
+            _count,
+        ] = marker_predicates();
         let s = format!("<{}>", graph.as_iri());
         let text = |v: &str| format!("\"{}\"", escape(v));
         let int = |v: String| format!("\"{v}\"^^<{XSD_INTEGER}>");
@@ -87,6 +104,7 @@ impl ProjectionMarker {
             format!("{s} <{commit}> {} .", text(&self.commit.to_string())),
             format!("{s} <{version}> {} .", int(self.ref_version.to_string())),
             format!("{s} <{digest}> {} .", text(&self.state_digest.to_string())),
+            format!("{s} <{write_id}> {} .", text(&self.write_id)),
         ]
     }
 
@@ -94,7 +112,9 @@ impl ProjectionMarker {
     /// the marker graph: every v1 predicate exactly once with the right literal type, no
     /// other predicate, values valid under the ledger's own rules.
     pub fn from_terms(pairs: &[(String, MarkerTerm)]) -> MarkerRead {
-        if pairs.is_empty() {
+        // Nothing, or only the write id a fence left on a subject without a marker.
+        let write_id = &marker_predicates()[6];
+        if pairs.iter().all(|(p, _)| p == write_id) && pairs.len() <= 1 {
             return MarkerRead::Absent;
         }
         match Self::parse_terms(pairs) {
@@ -105,7 +125,7 @@ impl ProjectionMarker {
 
     fn parse_terms(pairs: &[(String, MarkerTerm)]) -> Result<Self, String> {
         let predicates = marker_predicates();
-        let mut values: [Option<&MarkerTerm>; 7] = Default::default();
+        let mut values: [Option<&MarkerTerm>; 8] = Default::default();
         for (predicate, term) in pairs {
             let index = predicates
                 .iter()
@@ -152,7 +172,9 @@ impl ProjectionMarker {
             return Err("refVersion must be >= 1".into());
         }
         let state_digest = ContentId::from_str(string(5)?).map_err(|e| e.to_string())?;
-        let triple_count: u64 = integer(6)?
+        let write_id = string(6)?.to_owned();
+        validate_token("writeId", &write_id, MAX_WRITE_ID_BYTES).map_err(|e| e.to_string())?;
+        let triple_count: u64 = integer(7)?
             .parse()
             .map_err(|_| "tripleCount out of range")?;
         Ok(Self {
@@ -162,6 +184,7 @@ impl ProjectionMarker {
             ref_version,
             state_digest,
             triple_count,
+            write_id,
         })
     }
 }
@@ -178,6 +201,7 @@ mod tests {
             ref_version: 7,
             state_digest: ContentId::for_bytes(b"state"),
             triple_count: 42,
+            write_id: "sha256:write".into(),
         }
     }
 
@@ -209,7 +233,7 @@ mod tests {
             })
             .collect();
         pairs.push((
-            marker_predicates()[6].clone(),
+            marker_predicates()[7].clone(),
             MarkerTerm {
                 value: m.triple_count.to_string(),
                 datatype: Some(XSD_INTEGER.into()),
@@ -233,7 +257,11 @@ mod tests {
             triples[4],
             "<urn:sculpin:kb:kb:cognitive> <urn:sculpin:ledger-projection:v1#refVersion> \"7\"^^<http://www.w3.org/2001/XMLSchema#integer> ."
         );
-        assert_eq!(triples.len(), 6, "tripleCount is added by the target");
+        assert_eq!(
+            triples[6],
+            "<urn:sculpin:kb:kb:cognitive> <urn:sculpin:ledger-projection:v1#writeId> \"sha256:write\" ."
+        );
+        assert_eq!(triples.len(), 7, "tripleCount is added by the target");
     }
 
     #[test]
@@ -243,6 +271,12 @@ mod tests {
             MarkerRead::Present(marker())
         );
         assert_eq!(ProjectionMarker::from_terms(&[]), MarkerRead::Absent);
+        // A fenced subject without a marker holds only a write id: still no marker.
+        let fenced = observed(&marker())
+            .into_iter()
+            .filter(|(p, _)| p.ends_with("#writeId"))
+            .collect::<Vec<_>>();
+        assert_eq!(ProjectionMarker::from_terms(&fenced), MarkerRead::Absent);
     }
 
     type Pairs = Vec<(String, MarkerTerm)>;
@@ -281,7 +315,14 @@ mod tests {
             ("untyped version", Box::new(|p| p[4].1.datatype = None)),
             ("zero version", Box::new(|p| p[4].1.value = "0".into())),
             ("leading zero", Box::new(|p| p[4].1.value = "07".into())),
-            ("negative count", Box::new(|p| p[6].1.value = "-1".into())),
+            ("negative count", Box::new(|p| p[7].1.value = "-1".into())),
+            (
+                "missing write id",
+                Box::new(|p| {
+                    p.remove(6);
+                }),
+            ),
+            ("empty write id", Box::new(|p| p[6].1.value = String::new())),
             (
                 "bad commit",
                 Box::new(|p| p[3].1.value = "sha256:XYZ".into()),

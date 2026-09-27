@@ -179,8 +179,12 @@ Readers' contract: [reading the projection](../design/sculpin-projection.md).
   no projection event: accept a change first). The cognitive graph is
   `urn:sculpin:kb:<pct(kb_id)>:cognitive`; no two non-disabled streams of a target may share
   one. Existing outbox backlog is consumed as soon as the stream is enabled. `projection
-  disable` (owner only — the projector role cannot enable or disable) frees the cognitive
-  graph; to switch a KB's feed graph: disable the old stream, enable the new one, then
+  disable` (owner only — the projector role cannot enable or disable) sets `disabling`: a
+  running projector fences the target (rotates the marker's write id so no write of that
+  stream still in flight can land), then the stream is `disabled` and its cognitive graph is
+  free — so a projector must be running for a disable to complete (`projection status`
+  shows it); `--unfenced` disables at once when the target is gone for good, waiving that
+  guarantee; to switch a KB's feed graph: disable the old stream, enable the new one, then
   `ledger-projector rebuild` it (the target holds the old feed's marker until then:
   `TARGET_CONFLICT`); a write of the old stream still in flight cannot land afterwards
   (ADR-0020 compare-and-swap). Re-enabling a disabled stream reactivates it with its

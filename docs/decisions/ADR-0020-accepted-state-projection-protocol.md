@@ -95,9 +95,10 @@ The marker is a set of triples in the marker graph whose subject is the cognitiv
     lp:commitId    "sha256:<commit id>" ;
     lp:refVersion  "<n>"^^xsd:integer ;
     lp:stateDigest "sha256:<sculpin-rdf-state/v1 digest of the ledger state>" ;
+    lp:writeId     "<unique per write and per fence>" ;
     lp:tripleCount "<n>"^^xsd:integer .
 ```
-A marker is **well formed** only if every predicate appears exactly once with the stated
+A marker is **well formed** only if every predicate (`lp:writeId` included) appears exactly once with the stated
 datatype (plain string literals without a language tag for the string fields), no other
 `lp:` predicate is present, `protocol` is the v1 value and the identifiers parse under the
 ledger's own rules. `lp:stateDigest` is the digest of the **ledger's** accepted state (the
@@ -200,6 +201,25 @@ canonicalized literals match. Containment plus the target-computed count bounds 
 additions; an out-of-band *replacement* that preserves the count is detected by `verify` and
 by reconciliation's re-observation only when it changes the count — full content comparison
 (`verify`) is the operator control for that residual.
+
+### Write ids, fencing and authority changes (review round 3)
+The compare-and-swap alone is not ABA-free: a write planned from marker `M` would apply again
+whenever the marker returns to exactly `M` — e.g. feed B's operator rebuild observes feed A's
+marker and stalls, B is disabled and A re-enabled, A's marker is unchanged, and B's late write
+would pass (Codex review, P0). Two rules close it:
+- **Every write carries a fresh `lp:writeId`** (the digest of the lease, a process counter and
+  the clock; unique, not secret), so marker terms never repeat and an observation can never
+  become current again once anything wrote.
+- **An authority change changes the target.** Disabling a stream is two-phase (ADR-0021): the
+  stream becomes `disabling` and keeps its cognitive graph; a projector claims it (after any
+  in-flight step's lease is released or expired), **fences** the target — rotates only the
+  marker's `lp:writeId` under the compare-and-swap on what it observes now — verifies the new
+  id reads back, and only then marks the stream `disabled`, which frees the graph for another
+  stream. Every write planned under the old authority observed an older write id and is a
+  no-op from then on; a write that landed *before* the fence landed while that stream still
+  held the graph. A subject holding only a write id (a fenced graph without a marker) reads
+  as no marker. `ledger-admin projection disable --unfenced` skips the fence (escape hatch
+  for a target that is gone for good), with that guarantee explicitly waived.
 
 ### Reconciliation
 The outbox only drives work when the ledger moves. So that a target that lost its data

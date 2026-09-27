@@ -1629,7 +1629,7 @@ const EXPECTED_CHECKS: &[(&str, &str, &str)] = &[
     (
         "projection_state",
         "ps_status",
-        "CHECK((status=ANY(ARRAY['active','blocked','rebuild_required','disabled'])))",
+        "CHECK((status=ANY(ARRAY['active','blocked','rebuild_required','disabling','disabled'])))",
     ),
     (
         "projection_state",
@@ -2620,6 +2620,10 @@ async fn verify_role_attributes_and_memberships(
                 (SELECT count(*) FROM pg_tables t WHERE t.schemaname = 'public' AND t.tableowner = r.rolname) AS owned, \
                 (SELECT count(*) FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace AND p.proowner = r.oid) AS owned_functions, \
                 has_schema_privilege(r.oid, 'public', 'CREATE') AS can_create, \
+                (has_database_privilege(r.oid, current_database(), 'CREATE') \
+                 OR EXISTS (SELECT 1 FROM pg_namespace n WHERE n.nspname <> 'public' \
+                            AND n.nspname <> 'information_schema' AND n.nspname NOT LIKE 'pg\\_%' \
+                            AND has_schema_privilege(r.oid, n.oid, 'CREATE'))) AS can_create_elsewhere, \
                 {srr} AS can_set_srr \
          FROM m JOIN pg_roles r ON r.oid = m.roleid",
         srr = if version >= 150_000 {
@@ -2666,6 +2670,11 @@ async fn verify_role_attributes_and_memberships(
             (
                 row.try_get::<bool, _>("can_create").map_err(db_error)?,
                 "a CREATE holder on schema public",
+            ),
+            (
+                row.try_get::<bool, _>("can_create_elsewhere")
+                    .map_err(db_error)?,
+                "a CREATE holder on the database or another schema",
             ),
             (
                 row.try_get::<bool, _>("can_set_srr").map_err(db_error)?,

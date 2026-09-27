@@ -213,24 +213,55 @@ async fn enabling_needs_a_knowledge_base_and_cognitive_graphs_are_never_shared()
     );
     // Another target may project the same KB.
     repo.enable(&key(&b, &unique("t3")), derive).await.unwrap();
-    // Disable, then re-enable reactivates the same row.
+    let status_of = |g: GraphId| {
+        let (pool, target) = (store.pool().clone(), target.clone());
+        async move {
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM projection_state WHERE graph_id = $1 AND target_id = $2",
+            )
+            .bind(g.as_str())
+            .bind(&target)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    // Disable is two-phase: `disabling` until a projector fenced the target; re-enabling
+    // meanwhile cancels it.
     assert!(repo.disable(&key(&a, &target)).await.unwrap());
-    let status: String = sqlx::query_scalar(
-        "SELECT status FROM projection_state WHERE graph_id = $1 AND target_id = $2",
-    )
-    .bind(a.as_str())
-    .bind(&target)
-    .fetch_one(store.pool())
-    .await
-    .unwrap();
-    assert_eq!(status, "disabled");
+    assert_eq!(status_of(a.clone()).await, "disabling");
     repo.enable(&key(&a, &target), derive).await.unwrap();
-    // A disabled stream frees its cognitive graph (the index is partial): another graph may
-    // then take it over, and the disabled one cannot come back while it is taken.
+    assert_eq!(status_of(a.clone()).await, "active");
+    // A `disabling` stream still holds its cognitive graph: nobody else may take it before
+    // the fence (no in-flight write of the old feed can land afterwards, ADR-0020).
     assert!(repo.disable(&key(&a, &target)).await.unwrap());
+    let error = repo.enable(&key(&b, &target), derive).await.unwrap_err();
+    assert!(error.to_string().contains("already projects"), "{error}");
+    // The fence claim comes first; finishing it disables the stream and frees the graph.
+    let fence = repo
+        .claim(&target, "fencer", Duration::from_secs(30))
+        .await
+        .unwrap()
+        .expect("a disabling stream is claimable");
+    assert!(fence.disabling && fence.key.graph_id == a);
+    assert_eq!(
+        repo.finish_disable(&fence).await.unwrap(),
+        LeaseOutcome::Committed
+    );
+    assert_eq!(status_of(a.clone()).await, "disabled");
+    assert_eq!(
+        repo.finish_disable(&fence).await.unwrap(),
+        LeaseOutcome::LeaseLost,
+        "once"
+    );
+    // The disabled stream freed its cognitive graph (the index is partial): another graph
+    // may take it over, and the disabled one cannot come back while it is taken.
     assert_eq!(repo.enable(&key(&b, &target), derive).await.unwrap(), iri);
     let error = repo.enable(&key(&a, &target), derive).await.unwrap_err();
     assert!(error.to_string().contains("already projects"), "{error}");
+    // The escape hatch disables at once, without a fence.
+    assert!(repo.disable_unfenced(&key(&b, &target)).await.unwrap());
+    assert_eq!(status_of(b.clone()).await, "disabled");
 }
 
 #[tokio::test]
@@ -531,7 +562,8 @@ async fn the_projector_identity_holds_exactly_its_model() {
         assert!(sqlx::query(sql).execute(&projector).await.is_err(), "{sql}");
     }
     // Enabling and disabling are the owner's (ADR-0021): the projector may update `status`
-    // among active/blocked/rebuild_required, but never into or out of `disabled`.
+    // among active/blocked/rebuild_required and complete a disable (`disabling` →
+    // `disabled`), but never start one, cancel one or re-enable a stream.
     let owner = owner_repo(&store).await;
     let target = unique("t");
     let g = graph(&store, "tenant-a", Some(&unique("kb"))).await;
@@ -551,11 +583,21 @@ async fn the_projector_identity_holds_exactly_its_model() {
         }
     };
     assert_eq!(sqlstate(set_status("disabled").await), "42501");
+    assert_eq!(sqlstate(set_status("disabling").await), "42501");
     set_status("blocked")
         .await
         .expect("the projector may block");
     assert!(owner.disable(&key(&g, &target)).await.unwrap());
+    assert_eq!(
+        sqlstate(set_status("active").await),
+        "42501",
+        "cancel is the owner's"
+    );
+    set_status("disabled")
+        .await
+        .expect("the projector completes a disable");
     assert_eq!(sqlstate(set_status("active").await), "42501");
+    assert_eq!(sqlstate(set_status("disabling").await), "42501");
     projector.close().await;
     // Drift in either direction is refused at start-up.
     let refused = |grant: String, revoke: String| {
@@ -624,6 +666,39 @@ async fn the_projector_identity_holds_exactly_its_model() {
     )
     .await;
     assert!(m.contains(&schema), "{m}");
+    // …also through a role it can SET ROLE to without inheriting it (PostgreSQL 16+), or
+    // simply a member of (15).
+    let parent = format!("lp_parent_{}", std::process::id());
+    let version: i32 = sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+        .fetch_one(&admin)
+        .await
+        .unwrap();
+    let membership = if version >= 160_000 {
+        format!("GRANT {parent} TO {role} WITH INHERIT FALSE, SET TRUE")
+    } else {
+        format!("GRANT {parent} TO {role}")
+    };
+    sqlx::raw_sql(&format!(
+        "DROP ROLE IF EXISTS {parent}; CREATE ROLE {parent} NOLOGIN; \
+         GRANT CREATE ON DATABASE {db} TO {parent}; {membership}"
+    ))
+    .execute(&admin)
+    .await
+    .unwrap();
+    let outcome =
+        ProjectionRepository::connect(&projector_url, ledger_store::DbSessionLimits::default())
+            .await;
+    sqlx::raw_sql(&format!(
+        "REVOKE {parent} FROM {role}; REVOKE CREATE ON DATABASE {db} FROM {parent}; DROP ROLE {parent}"
+    ))
+    .execute(&admin)
+    .await
+    .unwrap();
+    match outcome {
+        Err(LedgerError::RuntimeIdentity(m)) => assert!(m.contains("CREATE"), "{m}"),
+        Err(other) => panic!("expected an identity refusal, got {other}"),
+        Ok(_) => panic!("CREATE reachable through SET ROLE must refuse start-up"),
+    }
     // The runtime identity check refuses a projector role (and vice versa).
     let pool: PgPool = PgPoolOptions::new()
         .max_connections(1)
@@ -778,5 +853,5 @@ async fn a_stream_keeps_its_cognitive_graph_when_the_graphs_kb_changes() {
     .fetch_one(store.pool())
     .await
     .unwrap();
-    assert_eq!((status.as_str(), recorded), ("disabled", iri));
+    assert_eq!((status.as_str(), recorded), ("disabling", iri));
 }

@@ -125,6 +125,16 @@ pub trait ProjectionClient: Send + Sync {
         mode: WriteMode,
         expected: &[(String, MarkerTerm)],
     ) -> Result<(), ProjectionError>;
+    /// Fence the cognitive graph against every write planned before now (ADR-0020): replace
+    /// the marker's `lp:writeId` with `write_id`, only while the marker is still exactly
+    /// `expected`; nothing else changes. Done before a stream loses its authority (disable),
+    /// so no in-flight write of that stream can land afterwards.
+    async fn fence(
+        &self,
+        graph: &CognitiveGraph,
+        expected: &[(String, MarkerTerm)],
+        write_id: &str,
+    ) -> Result<(), ProjectionError>;
     /// The complete content of `graph` as default-graph quads, as the target returns them
     /// (the target may canonicalize literal lexical forms; diagnostics and tests).
     async fn read_graph(&self, graph: &CognitiveGraph) -> Result<BTreeSet<Quad>, ProjectionError>;

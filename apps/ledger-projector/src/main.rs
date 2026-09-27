@@ -51,6 +51,15 @@ fn number<T: std::str::FromStr>(env: Env, name: &str, default: T) -> Result<T, S
     }
 }
 
+/// A number setting with a lower bound (refused below it).
+fn at_least(env: Env, name: &str, default: u64, minimum: u64) -> Result<u64, String> {
+    let value = number(env, name, default)?;
+    if value < minimum {
+        return Err(format!("{name} must be at least {minimum}"));
+    }
+    Ok(value)
+}
+
 /// A lease owner: at most `max` bytes (never splitting a character), control characters
 /// replaced, so a hostname can never make every claim fail validation.
 fn truncate_bytes(value: &str, max: usize) -> String {
@@ -198,17 +207,26 @@ fn settings(env: Env) -> Result<Settings, String> {
             },
             backoff_base: Duration::from_secs(1),
             backoff_max: Duration::from_secs(300),
-            poll_interval: Duration::from_millis(number(env, "LEDGER_PROJECTOR_POLL_MS", 1000u64)?),
-            concurrency: number(env, "LEDGER_PROJECTOR_CONCURRENCY", 2usize)?,
-            reconcile_interval: Duration::from_secs(number(
+            poll_interval: Duration::from_millis(at_least(
+                env,
+                "LEDGER_PROJECTOR_POLL_MS",
+                1000,
+                10,
+            )?),
+            concurrency: at_least(env, "LEDGER_PROJECTOR_CONCURRENCY", 2, 1)? as usize,
+            // Never zero: an idle stream re-checked continuously, or a probe loop without
+            // delay, would hammer the database and the target.
+            reconcile_interval: Duration::from_secs(at_least(
                 env,
                 "LEDGER_PROJECTOR_RECONCILE_SECONDS",
-                300u64,
+                300,
+                1,
             )?),
-            probe_interval: Duration::from_secs(number(
+            probe_interval: Duration::from_secs(at_least(
                 env,
                 "LEDGER_PROJECTOR_PROBE_SECONDS",
-                300u64,
+                300,
+                1,
             )?),
         },
         address: env("LEDGER_PROJECTOR_ADDR").unwrap_or_else(|| "127.0.0.1:9464".into()),
@@ -250,7 +268,7 @@ fn parse(target_id: &str, mut argv: impl Iterator<Item = String>) -> Result<Comm
 async fn serve(
     projector: Arc<Projector<FusekiClient>>,
     metrics: Arc<Metrics>,
-    address: String,
+    listener: tokio::net::TcpListener,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), String> {
     use axum::{Router, http::StatusCode, routing::get};
@@ -295,9 +313,7 @@ async fn serve(
                 }
             }),
         );
-    let listener = tokio::net::TcpListener::bind(&address)
-        .await
-        .map_err(|_| "cannot bind LEDGER_PROJECTOR_ADDR (value not shown)".to_owned())?;
+
     let mut stop = shutdown;
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -372,13 +388,13 @@ async fn real_main() -> Result<(), String> {
         concurrency = projector.config().concurrency,
         "projector started"
     );
+    // Bind before any worker starts: a projector without health, readiness and metrics
+    // endpoints must not run.
+    let listener = tokio::net::TcpListener::bind(&settings.address)
+        .await
+        .map_err(|_| "cannot bind LEDGER_PROJECTOR_ADDR (value not shown)".to_owned())?;
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-    let server = tokio::spawn(serve(
-        projector.clone(),
-        metrics,
-        settings.address,
-        stop_rx.clone(),
-    ));
+    let server = tokio::spawn(serve(projector.clone(), metrics, listener, stop_rx.clone()));
     let workers = tokio::spawn(projector.clone().run(stop_rx));
     shutdown_signal().await;
     tracing::info!("shutting down: finishing current steps");

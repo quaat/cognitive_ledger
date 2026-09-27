@@ -43,7 +43,7 @@ CREATE TABLE projection_state (
     CONSTRAINT projection_state_progress_fk
         FOREIGN KEY (graph_id, branch, projected_ref_version, projected_commit)
         REFERENCES ref_events (graph_id, branch, new_version, new_head),
-    CONSTRAINT ps_status CHECK (status IN ('active', 'blocked', 'rebuild_required', 'disabled')),
+    CONSTRAINT ps_status CHECK (status IN ('active', 'blocked', 'rebuild_required', 'disabling', 'disabled')),
     CONSTRAINT ps_progress_shape CHECK ((projected_commit IS NULL) = (projected_ref_version IS NULL)),
     CONSTRAINT ps_lease_shape CHECK ((lease_owner IS NULL) = (lease_until IS NULL)),
     CONSTRAINT ps_target_id_format CHECK (target_id ~ '^[A-Za-z0-9._:-]{1,128}$'),
@@ -88,9 +88,13 @@ BEGIN
         RAISE EXCEPTION 'projection_state progress never moves backwards'
             USING ERRCODE = 'integrity_constraint_violation';
     END IF;
-    -- Enabling and disabling a stream are owner (operator) decisions; the projector role
-    -- can never re-activate a disabled stream or disable a live one.
-    IF (OLD.status = 'disabled') <> (NEW.status = 'disabled')
+    -- Enabling and disabling a stream are owner (operator) decisions (ADR-0021): the
+    -- projector role never enters or leaves 'disabling' / 'disabled' on its own; its only
+    -- such transition is completing a disable ('disabling' -> 'disabled') after it fenced the
+    -- target (ADR-0020).
+    IF OLD.status IS DISTINCT FROM NEW.status
+       AND (OLD.status IN ('disabling', 'disabled') OR NEW.status IN ('disabling', 'disabled'))
+       AND NOT (OLD.status = 'disabling' AND NEW.status = 'disabled')
        AND current_user::text IS DISTINCT FROM (SELECT t.tableowner::text FROM pg_catalog.pg_tables t
                                            WHERE t.schemaname = 'public' AND t.tablename = 'projection_state') THEN
         RAISE EXCEPTION 'only the schema owner enables or disables a projection stream'
