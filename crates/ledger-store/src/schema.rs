@@ -175,6 +175,7 @@ pub async fn verify(pool: &PgPool) -> Result<SchemaReport, LedgerError> {
     // present, enabled, attached to the intended object and semantically what this build
     // expects; a same-named replacement elsewhere or with weaker semantics is not compatible.
     verify_guard_triggers(pool).await?;
+    verify_guard_functions(pool).await?;
     let content_check_fingerprint = verify_content_address_check(pool).await?;
     Ok(SchemaReport {
         version: highest,
@@ -371,6 +372,174 @@ const GUARD_TRIGGERS: &[ExpectedTrigger] = &[
 
 fn incompatible(message: String) -> LedgerError {
     LedgerError::SchemaIncompatible(message)
+}
+
+/// A function the guard triggers execute, exactly as the shipped migrations define it. The
+/// expectation is derived from the embedded migration SQL (the last `CREATE OR REPLACE
+/// FUNCTION` for each name), so the verifier can never drift from the migrations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpectedFunction {
+    pub name: String,
+    pub returns: String,
+    pub language: String,
+    /// `SET search_path = …` clause value, if the definition pins one.
+    pub search_path: Option<String>,
+    /// The dollar-quoted body verbatim (PostgreSQL stores it as `pg_proc.prosrc`).
+    pub body: String,
+}
+
+/// Functions whose bodies the integrity model depends on: every guard trigger's function
+/// plus the lock-key helper the 0009 triggers call.
+const GUARD_FUNCTIONS: &[&str] = &[
+    "graphs_identity_is_immutable",
+    "ledger_rows_are_write_once",
+    "refs_identity_is_immutable",
+    "refs_version_is_monotonic",
+    "outbox_identity_is_immutable",
+    "refs_movement_is_audited",
+    "graphs_status_change_serializes",
+    "ledger_lock_key",
+];
+
+/// Parse every `CREATE OR REPLACE FUNCTION … AS $$ … $$` in the embedded migrations (up to
+/// the required version) and keep the last definition per function name.
+pub fn expected_guard_functions() -> Vec<ExpectedFunction> {
+    let mut found: Vec<ExpectedFunction> = Vec::new();
+    for migration in migrator()
+        .migrations
+        .iter()
+        .filter(|m| m.version <= REQUIRED_SCHEMA_VERSION)
+    {
+        let sql: &str = &migration.sql;
+        let mut rest = sql;
+        while let Some(start) = rest.find("CREATE OR REPLACE FUNCTION ") {
+            let header_start = start + "CREATE OR REPLACE FUNCTION ".len();
+            let Some(body_open_rel) = rest[header_start..].find("AS $$") else {
+                break;
+            };
+            let header = &rest[header_start..header_start + body_open_rel];
+            let body_start = header_start + body_open_rel + "AS $$".len();
+            let Some(body_len) = rest[body_start..].find("$$") else {
+                break;
+            };
+            let body = &rest[body_start..body_start + body_len];
+            rest = &rest[body_start + body_len + 2..];
+            let name = header
+                .split('(')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .trim_start_matches("public.")
+                .to_owned();
+            if !GUARD_FUNCTIONS.contains(&name.as_str()) {
+                continue;
+            }
+            let word_after = |key: &str| -> Option<String> {
+                header.find(key).map(|i| {
+                    header[i + key.len()..]
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .to_owned()
+                })
+            };
+            let returns = word_after("RETURNS ").unwrap_or_default();
+            let language = word_after("LANGUAGE ").unwrap_or_default();
+            let search_path = header.find("SET search_path = ").map(|i| {
+                header[i + "SET search_path = ".len()..]
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_owned()
+            });
+            found.retain(|f| f.name != name);
+            found.push(ExpectedFunction {
+                name,
+                returns,
+                language,
+                search_path,
+                body: body.to_owned(),
+            });
+        }
+    }
+    found
+}
+
+/// Every guard function in the database has exactly the body, language, return type and
+/// `search_path` setting the migrations gave it and is not `SECURITY DEFINER`: a same-named
+/// no-op replacement would otherwise keep every trigger "present and enabled".
+async fn verify_guard_functions(pool: &PgPool) -> Result<(), LedgerError> {
+    let expected = expected_guard_functions();
+    for name in GUARD_FUNCTIONS {
+        if !expected.iter().any(|f| f.name == *name) {
+            return Err(incompatible(format!(
+                "this build's migrations define no function {name}; refusing to serve"
+            )));
+        }
+    }
+    for f in &expected {
+        let rows = sqlx::query(
+            "SELECT p.prosrc, l.lanname::text AS language, p.prosecdef, \
+                    pg_catalog.format_type(p.prorettype, NULL) AS returns, p.proconfig \
+             FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+             JOIN pg_language l ON l.oid = p.prolang \
+             WHERE n.nspname = 'public' AND p.proname = $1",
+        )
+        .bind(&f.name)
+        .fetch_all(pool)
+        .await
+        .map_err(db_error)?;
+        let row = match rows.as_slice() {
+            [row] => row,
+            [] => {
+                return Err(incompatible(format!(
+                    "integrity function public.{} is missing; refusing to serve",
+                    f.name
+                )));
+            }
+            _ => {
+                return Err(incompatible(format!(
+                    "integrity function public.{} is overloaded; refusing to serve",
+                    f.name
+                )));
+            }
+        };
+        let prosrc: String = row.try_get("prosrc").map_err(db_error)?;
+        let language: String = row.try_get("language").map_err(db_error)?;
+        let secdef: bool = row.try_get("prosecdef").map_err(db_error)?;
+        let returns: String = row.try_get("returns").map_err(db_error)?;
+        let proconfig: Option<Vec<String>> = row.try_get("proconfig").map_err(db_error)?;
+        let expected_config = f
+            .search_path
+            .as_ref()
+            .map(|sp| vec![format!("search_path={sp}")]);
+        let problem = if prosrc != f.body {
+            Some("has a different body than this build's migration defines".to_owned())
+        } else if language != f.language {
+            Some(format!(
+                "is written in {language} instead of {}",
+                f.language
+            ))
+        } else if secdef {
+            Some("is SECURITY DEFINER".to_owned())
+        } else if returns != f.returns {
+            Some(format!("returns {returns} instead of {}", f.returns))
+        } else if proconfig != expected_config {
+            Some(format!(
+                "has settings {proconfig:?} instead of {expected_config:?}"
+            ))
+        } else {
+            None
+        };
+        if let Some(problem) = problem {
+            return Err(incompatible(format!(
+                "integrity function public.{} {problem}; refusing to serve",
+                f.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Every guard trigger exists on its table, is enabled, calls its function and has exactly
@@ -746,10 +915,100 @@ pub async fn verify_runtime_identity(pool: &PgPool) -> Result<(), LedgerError> {
             "role {who} holds CREATE on schema public; revoke it (ADR-0016)"
         )));
     }
+    verify_role_attributes_and_memberships(pool, &who).await?;
     for model in RUNTIME_TABLE_MODEL {
         verify_table_privileges(pool, &who, model).await?;
     }
     verify_sequence_privileges(pool, &who).await
+}
+
+/// The runtime role must not be able to *become* anything more privileged: no role
+/// attributes beyond LOGIN, and no membership — inherited or merely settable (`SET ROLE`),
+/// direct or transitive — in a superuser, a table owner, a CREATE holder, a role with
+/// CREATEROLE/CREATEDB/REPLICATION/BYPASSRLS, or any predefined `pg_*` role.
+async fn verify_role_attributes_and_memberships(
+    pool: &PgPool,
+    who: &str,
+) -> Result<(), LedgerError> {
+    let me = sqlx::query(
+        "SELECT rolcreaterole, rolcreatedb, rolreplication, rolbypassrls \
+         FROM pg_roles WHERE rolname = current_user",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(db_error)?;
+    for (col, attr) in [
+        ("rolcreaterole", "CREATEROLE"),
+        ("rolcreatedb", "CREATEDB"),
+        ("rolreplication", "REPLICATION"),
+        ("rolbypassrls", "BYPASSRLS"),
+    ] {
+        if me.try_get::<bool, _>(col).map_err(db_error)? {
+            return Err(identity(format!(
+                "role {who} has the {attr} attribute; the runtime identity must be a plain LOGIN \
+                 role (ADR-0016)"
+            )));
+        }
+    }
+    let rows = sqlx::query(
+        "WITH RECURSIVE m AS ( \
+             SELECT am.roleid, am.inherit_option, am.set_option \
+             FROM pg_auth_members am WHERE am.member = (SELECT oid FROM pg_roles WHERE rolname = current_user) \
+           UNION \
+             SELECT am.roleid, am.inherit_option, am.set_option \
+             FROM pg_auth_members am JOIN m ON am.member = m.roleid) \
+         SELECT r.rolname::text AS name, r.rolsuper, r.rolcreaterole, r.rolcreatedb, r.rolreplication, \
+                r.rolbypassrls, m.inherit_option, m.set_option, \
+                (SELECT count(*) FROM pg_tables t WHERE t.schemaname = 'public' AND t.tableowner = r.rolname) AS owned, \
+                has_schema_privilege(r.oid, 'public', 'CREATE') AS can_create \
+         FROM m JOIN pg_roles r ON r.oid = m.roleid",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(db_error)?;
+    for row in &rows {
+        let name: String = row.try_get("name").map_err(db_error)?;
+        let flags = [
+            (
+                row.try_get::<bool, _>("rolsuper").map_err(db_error)?,
+                "a superuser",
+            ),
+            (
+                row.try_get::<bool, _>("rolcreaterole").map_err(db_error)?,
+                "CREATEROLE",
+            ),
+            (
+                row.try_get::<bool, _>("rolcreatedb").map_err(db_error)?,
+                "CREATEDB",
+            ),
+            (
+                row.try_get::<bool, _>("rolreplication").map_err(db_error)?,
+                "REPLICATION",
+            ),
+            (
+                row.try_get::<bool, _>("rolbypassrls").map_err(db_error)?,
+                "BYPASSRLS",
+            ),
+            (
+                row.try_get::<i64, _>("owned").map_err(db_error)? > 0,
+                "an owner of ledger tables",
+            ),
+            (
+                row.try_get::<bool, _>("can_create").map_err(db_error)?,
+                "a CREATE holder on schema public",
+            ),
+            (name.starts_with("pg_"), "a predefined pg_* role"),
+        ];
+        let inherit: bool = row.try_get("inherit_option").map_err(db_error)?;
+        let set: bool = row.try_get("set_option").map_err(db_error)?;
+        if let Some((_, what)) = flags.iter().find(|(bad, _)| *bad) {
+            return Err(identity(format!(
+                "role {who} is a member of {name} ({what}; inherit={inherit}, set={set}); the \
+                 runtime identity must not be able to assume more privilege (ADR-0016)"
+            )));
+        }
+    }
+    Ok(())
 }
 
 async fn verify_table_privileges(
@@ -909,6 +1168,40 @@ mod tests {
             normalize_constraint_def("CHECK (true)"),
             CONTENT_ADDRESS_CHECK_DEF
         );
+    }
+
+    #[test]
+    fn guard_functions_are_parsed_from_the_embedded_migrations() {
+        let functions = super::expected_guard_functions();
+        let names: Vec<&str> = functions.iter().map(|f| f.name.as_str()).collect();
+        for expected in super::GUARD_FUNCTIONS {
+            assert!(
+                names.contains(expected),
+                "{expected} not found in migrations"
+            );
+        }
+        let audited = functions
+            .iter()
+            .find(|f| f.name == "refs_movement_is_audited")
+            .unwrap();
+        assert_eq!(audited.language, "plpgsql");
+        assert_eq!(audited.returns, "trigger");
+        assert_eq!(audited.search_path.as_deref(), Some("pg_catalog, public"));
+        assert!(audited.body.contains("BEGIN") && audited.body.contains("RETURN"));
+        let lock = functions
+            .iter()
+            .find(|f| f.name == "ledger_lock_key")
+            .unwrap();
+        assert_eq!(
+            (lock.language.as_str(), lock.returns.as_str()),
+            ("sql", "bigint")
+        );
+        let write_once = functions
+            .iter()
+            .find(|f| f.name == "ledger_rows_are_write_once")
+            .unwrap();
+        assert_eq!(write_once.search_path, None);
+        assert!(write_once.body.contains("write-once"));
     }
 
     #[test]

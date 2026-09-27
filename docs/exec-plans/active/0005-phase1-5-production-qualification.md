@@ -333,7 +333,7 @@ supply-chain, upgrade, backup harnesses), `docs/` (operations runbook, security)
 - **Live Entra ID issuer smoke test: PENDING** (no tenant or credentials available to
   these runs; it is not marked passed). Blocker for production qualification.
 
-### Slice 6 — fuzzing (§5, 2026-09-27): executed, bounded run clean; ASan deferred
+### Slice 6 — fuzzing (§5, 2026-09-27): executed, bounded runs clean under both sanitizers on the hosted runner
 - `fuzz/` (own cargo-fuzz workspace, excluded from the root; nightly only for this job) with
   seven libFuzzer targets over every untrusted-input parser and canonical encoder:
   `quad_parse` (N-Quads single quad; canonical text is a fixed point), `patch_canonical`
@@ -369,7 +369,17 @@ supply-chain, upgrade, backup harnesses), `docs/` (operations runbook, security)
   nightly-2026-09-25 --component rust-src`, fuzz `--target` derived from `rustc -vV host`,
   never from the prebuilt cargo-fuzz binary's own platform, sanitizer matrix `none` /
   `address`, `workflow_dispatch` with `seconds_per_target` ≤ 1800 and `sanitizer`, weekly
-  900 s campaign): results recorded below when CI has run on the new head.
+  900 s campaign): on head `985e789` (run 36307859547) both matrix jobs passed with every
+  declared target executed — `none`: quad_parse 9.1 M (cov 1708), patch_canonical 4.2 M
+  (1777), commit_decode 9.5 M (645), prepare_body 7.7 M (2916), accept_body 14.2 M (1032),
+  request_identity 2.1 M (1745), timestamp 27.7 M (203); `address`: quad_parse 3.6 M (cov
+  2299), patch_canonical 1.5 M (2509), commit_decode 4.4 M (1008), prepare_body 2.9 M
+  (4165), accept_body 5.1 M (1602), request_identity 0.7 M (2411), timestamp 11.2 M (397);
+  no crash under either sanitizer; toolchain `nightly-2026-09-25 (rustc 1.100.0-nightly
+  f7575a9da)`, target `x86_64-unknown-linux-gnu`, debug assertions on, 45 s per target.
+  **The ASan start-up crash is therefore host-specific (local Debian/5.10 box); ASan
+  fuzzing is no longer pending.** A 900 s-per-target campaign for both sanitizers was
+  dispatched (run 36308371828); its result is recorded when it completes.
 
 ### Slice 7 — upgrade from the previous release (§7, 2026-09-27): executed, PASS
 - `scripts/upgrade.sh [rev] [commits]`: builds the previous release (`f027fbf`, the merged
@@ -546,6 +556,29 @@ supply-chain, upgrade, backup harnesses), `docs/` (operations runbook, security)
   `ready()` (readiness) with `SchemaIncompatible` / `RuntimeIdentity`; the exact role serves
   again after every re-grant.
 
+### Review round 3 (fresh Codex review of `985e789`, 2026-09-27): two new P1s, fixed
+- **Trigger function bodies.** Binding a trigger to its function by name and OID does not
+  stop an owner from `CREATE OR REPLACE FUNCTION … $$ BEGIN RETURN NULL; END $$` — the trigger
+  stays present, enabled and correctly attached while the guard is gone. Fix: the verifier
+  derives the expected definition of every guard function (`graphs_identity_is_immutable`,
+  `ledger_rows_are_write_once`, `refs_identity_is_immutable`, `refs_version_is_monotonic`,
+  `outbox_identity_is_immutable`, `refs_movement_is_audited`,
+  `graphs_status_change_serializes`, `ledger_lock_key`) from the *embedded migration SQL*
+  (last `CREATE OR REPLACE FUNCTION` per name: body, language, return type, pinned
+  `search_path`) and compares `pg_proc.prosrc`, `pg_language`, `format_type(prorettype)`,
+  `proconfig` and `prosecdef = false` at start-up and readiness (catalog-only, lock-free).
+  Tests: no-op body, `SECURITY DEFINER` variant, dropped `search_path`, permissive
+  write-once guard — each refused by `schema::verify`, start-up and readiness; restored
+  definitions serve again.
+- **Settable owner-role memberships.** A `GRANT owner TO runtime WITH INHERIT FALSE, SET
+  TRUE` leaves every direct grant exact yet lets the runtime credentials `SET ROLE` into the
+  owner. Fix: `verify_runtime_identity` walks `pg_auth_members` transitively from the
+  current role and refuses any membership — inherited or settable — in a superuser, a table
+  owner, a CREATE holder on `public`, a role with CREATEROLE/CREATEDB/REPLICATION/BYPASSRLS,
+  or a predefined `pg_*` role; it also refuses those attributes on the runtime role itself.
+  Tests: settable owner membership, transitive membership through an intermediate role,
+  `pg_read_all_data`, `CREATEDB` — each refused at start-up; the plain role serves again.
+
 ### Admission-control decision (§15, 2026-09-27)
 Measured: under 1,000 concurrent clients on two replicas the 12-slot expensive semaphore per
 replica refuses the excess prepares immediately (`503 RESOURCE_LIMIT`), successful prepare p99
@@ -613,8 +646,8 @@ privilege, ADR-0016), 2 (supply chain, image), 3 (1,000 writers over two replica
 Open before the gate can pass:
 - **Live Entra ID issuer smoke test — PENDING** (no tenant credentials available to these
   runs; never marked passed). Release prerequisite.
-- AddressSanitizer fuzz runs and a multi-hour fuzz campaign (deferred: ASan runtime crashes
-  at start-up on the qualification host; validate on the CI runner or another host).
+- The longer fuzz campaign (900 s per target, both sanitizers) dispatched on the hosted
+  runner: recorded when complete. ASan itself is no longer pending (hosted matrix passes).
 - Deployment decisions recorded in tech-debt that a production operator must take:
   restore semantics (PITR/WAL archiving, writer fencing, projection rebuild), checkpoint ADR
   before Phase 4, admission budget for `accept` and cancellation of abandoned statements.

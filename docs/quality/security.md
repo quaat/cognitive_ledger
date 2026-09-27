@@ -120,12 +120,16 @@ integrity rules against real PostgreSQL, including a non-superuser owner.
   a sequence grant), and the depth baselines (`docs/quality/evidence/`,
   `performance-baselines.md`). Start-up and readiness verify the database controls the
   privilege model depends on structurally: every guard trigger by table, function, timing,
-  event set, `UPDATE OF` columns and deferral flags; the content-address CHECK by presence,
+  event set, `UPDATE OF` columns and deferral flags; every guard function's body, language,
+  return type and pinned `search_path` against the embedded migrations (no `SECURITY
+  DEFINER`); the runtime role's attributes and its transitive memberships (no settable or
+  inherited path to a superuser, table owner, CREATE holder or `pg_*` role); the content-address CHECK by presence,
   validation, deparsed definition and a rolled-back semantic probe (start-up) and by
   expression fingerprint (readiness); the runtime role's exact per-column INSERT/UPDATE
   grants, absence of table-level writes, DELETE/TRUNCATE/TRIGGER/REFERENCES, and USAGE on
-  exactly the audit sequences. ASan and long-campaign fuzzing run on the hosted runner
-  (`ci-fuzz` matrix; results recorded in the plan) and the **live Entra ID issuer smoke test
+  exactly the audit sequences. ASan fuzzing passes on the hosted runner (`ci-fuzz` matrix `none`/`address`, pinned
+  nightly, explicit target triple; the local host's ASan start-up crash is host-specific);
+  the long campaign result is recorded in the plan. The **live Entra ID issuer smoke test
   (`scripts/live-issuer-smoke.sh`; pending: no tenant credentials available to the runs;
   never mark it passed)** remain. **The service is not
   production-qualified until Plan 0005 passes in full.**

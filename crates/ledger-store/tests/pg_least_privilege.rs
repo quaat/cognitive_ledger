@@ -1549,3 +1549,122 @@ async fn drifted_column_and_sequence_privileges_are_refused_at_startup() {
     assert!(store.ready().await.is_ok());
     fx.teardown().await;
 }
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn replaced_guard_function_bodies_are_refused_at_startup_and_readiness() {
+    let fx = fixture("ledger_fnbody").await;
+    fx.migrate_and_grant().await;
+    let running = ledger_store::PostgresLedgerStore::connect(
+        &fx.runtime_db_url,
+        ledger_store::V1Binding::Reject,
+    )
+    .await
+    .unwrap();
+    let original = ledger_store::schema::expected_guard_functions()
+        .into_iter()
+        .find(|f| f.name == "refs_movement_is_audited")
+        .unwrap();
+    // Same name, OID, trigger binding and events — but a no-op body.
+    owner_exec(
+        &fx,
+        "CREATE OR REPLACE FUNCTION public.refs_movement_is_audited() RETURNS trigger \
+        LANGUAGE plpgsql SET search_path = pg_catalog, public AS $$ BEGIN RETURN NULL; END $$",
+    )
+    .await;
+    let m = assert_refused_by_schema(&fx, &running, "no-op trigger function").await;
+    assert!(
+        m.contains("refs_movement_is_audited") && m.contains("different body"),
+        "{m}"
+    );
+    // Same body but SECURITY DEFINER, and the same body without the pinned search_path.
+    let restore = format!(
+        "CREATE OR REPLACE FUNCTION public.refs_movement_is_audited() RETURNS trigger LANGUAGE {} \
+         SET search_path = {} AS $${}$$",
+        original.language,
+        original.search_path.clone().unwrap(),
+        original.body
+    );
+    owner_exec(&fx, &format!("{restore} SECURITY DEFINER")).await;
+    let m = assert_refused_by_schema(&fx, &running, "SECURITY DEFINER guard").await;
+    assert!(m.contains("SECURITY DEFINER"), "{m}");
+    owner_exec(&fx, &format!(
+        "CREATE OR REPLACE FUNCTION public.refs_movement_is_audited() RETURNS trigger LANGUAGE {} AS $${}$$",
+        original.language, original.body
+    )).await;
+    let m = assert_refused_by_schema(&fx, &running, "search_path dropped").await;
+    assert!(m.contains("settings"), "{m}");
+    // A write-once guard replaced with a permissive body (returns NEW instead of raising).
+    owner_exec(&fx, &restore).await;
+    assert_healthy(&fx, "audited function restored").await;
+    owner_exec(
+        &fx,
+        "CREATE OR REPLACE FUNCTION ledger_rows_are_write_once() RETURNS trigger \
+        LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$",
+    )
+    .await;
+    let m = assert_refused_by_schema(&fx, &running, "permissive write-once guard").await;
+    assert!(
+        m.contains("ledger_rows_are_write_once") && m.contains("different body"),
+        "{m}"
+    );
+    let wo = ledger_store::schema::expected_guard_functions()
+        .into_iter()
+        .find(|f| f.name == "ledger_rows_are_write_once")
+        .unwrap();
+    owner_exec(&fx, &format!(
+        "CREATE OR REPLACE FUNCTION ledger_rows_are_write_once() RETURNS trigger LANGUAGE {} AS $${}$$",
+        wo.language, wo.body
+    )).await;
+    assert_healthy(&fx, "write-once guard restored").await;
+    assert!(running.ready().await.is_ok());
+    fx.teardown().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn settable_or_inherited_memberships_in_privileged_roles_are_refused() {
+    let fx = fixture("ledger_member").await;
+    fx.migrate_and_grant().await;
+    assert_healthy(&fx, "exact role").await;
+    let role = fx.role.clone();
+    // A non-inheriting but settable membership in the (superuser) owner: `SET ROLE` would
+    // hand the runtime credentials owner powers while every direct grant still looks exact.
+    owner_exec(
+        &fx,
+        &format!("GRANT ledger TO {role} WITH INHERIT FALSE, SET TRUE"),
+    )
+    .await;
+    let m = assert_refused_by_identity(&fx, "settable owner membership").await;
+    assert!(
+        m.contains("is a member of ledger") && m.contains("set=true"),
+        "{m}"
+    );
+    owner_exec(&fx, &format!("REVOKE ledger FROM {role}")).await;
+    assert_healthy(&fx, "membership revoked").await;
+    // Transitive: runtime → intermediate → owner.
+    owner_exec(&fx, "DROP ROLE IF EXISTS ledger_member_mid").await;
+    owner_exec(&fx, "CREATE ROLE ledger_member_mid").await;
+    owner_exec(
+        &fx,
+        "GRANT ledger TO ledger_member_mid WITH INHERIT FALSE, SET TRUE",
+    )
+    .await;
+    owner_exec(&fx, &format!("GRANT ledger_member_mid TO {role}")).await;
+    let m = assert_refused_by_identity(&fx, "transitive owner membership").await;
+    assert!(m.contains("is a member of ledger"), "{m}");
+    owner_exec(&fx, &format!("REVOKE ledger_member_mid FROM {role}")).await;
+    owner_exec(&fx, "REVOKE ledger FROM ledger_member_mid").await;
+    owner_exec(&fx, "DROP ROLE ledger_member_mid").await;
+    // Predefined roles and role attributes are refused too.
+    owner_exec(&fx, &format!("GRANT pg_read_all_data TO {role}")).await;
+    let m = assert_refused_by_identity(&fx, "pg_read_all_data").await;
+    assert!(m.contains("pg_read_all_data"), "{m}");
+    owner_exec(&fx, &format!("REVOKE pg_read_all_data FROM {role}")).await;
+    owner_exec(&fx, &format!("ALTER ROLE {role} CREATEDB")).await;
+    let m = assert_refused_by_identity(&fx, "CREATEDB attribute").await;
+    assert!(m.contains("CREATEDB"), "{m}");
+    owner_exec(&fx, &format!("ALTER ROLE {role} NOCREATEDB")).await;
+    assert_healthy(&fx, "plain login role again").await;
+    fx.teardown().await;
+}
