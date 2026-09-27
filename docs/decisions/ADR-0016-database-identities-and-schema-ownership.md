@@ -170,7 +170,9 @@ owner-only, idempotent `ledger_grant_projector(role)` (`ledger-admin migrate
 `projection_state` (status reads); the runtime identity gains no write on projection state
 or on the outbox delivery columns, so the HTTP server can never mark projection progress.
 Verification is one parameterized routine (`IdentityModel`: table model, sequence model,
-exhaustive "no unlisted table privilege" check) used for both identities at start-up, and by
+exhaustive "no unlisted table privilege" check — exhaustive for both identities since the
+Phase-3 Codex review; before, the runtime check covered only its listed tables) used for
+both identities at start-up, and by
 the projector's readiness as well (the runtime server's readiness compares definition
 fingerprints). Since 0011 it also refuses CREATE on the database and on any schema, not just
 `public`, and the 0011 guard functions pin `search_path` like the 0009 ones: an identity

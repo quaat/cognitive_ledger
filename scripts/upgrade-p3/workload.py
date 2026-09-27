@@ -201,7 +201,8 @@ def projection(out, url):
             marker.setdefault(r["p"]["value"].replace(LP, ""), []).append(r["o"]["value"])
         expect(marker.get("graphId") == [graph] and marker.get("branch") == ["main"]
                and marker.get("commitId") == [ref["head"]] and marker.get("refVersion") == [str(ref["version"])]
-               and marker.get("tripleCount") == [str(len(target))] and len(marker) == 7,
+               and marker.get("tripleCount") == [str(len(target))] and len(marker.get("writeId", [])) == 1
+               and len(marker) == 8,
                f"{graph}: marker {marker} does not name the ref head {ref['head']} v{ref['version']}")
         checked.append(f"{graph}@v{ref['version']}={len(target)} triples")
     for g in p2.GRAPHS:  # named-graph state: refused visibly, nothing written

@@ -190,7 +190,10 @@ within the ledger's history, so the ledger (authoritative) decides; a foreign or
 marker may belong to a newer or different ledger and needs an operator. An operator rebuild
 (`ledger-projector rebuild`) replaces whatever it observed (any marker, including an ahead or
 foreign one), still under CAS, so it cannot overwrite something that changed after its own
-observation.
+observation — with one exception: if the observed marker is this stream's and names the
+ledger's own commit at a version above the rebuild's work item, the work item is stale (its
+claim reply was delayed while another worker projected on; Codex round 2) and the rebuild
+stops as superseded instead of regressing it.
 
 After every write the projector reads the marker and count back in one query: the marker
 must name `T`, its count must equal the observed count and be plausible (`0 < count ≤ state

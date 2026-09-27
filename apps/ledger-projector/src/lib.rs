@@ -321,6 +321,26 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
         let graph = CognitiveGraph::parse(&claim.cognitive_graph)?;
         let observation = self.client.observe(&graph).await?;
         let (mode, rebuilt) = if force {
+            // An operator rebuild replaces whatever it observes — except a newer genuine
+            // projection of this stream: if the target holds a later accepted state of this
+            // ref (its marker names the ledger's own commit at that version), this rebuild's
+            // work item is stale (e.g. its claim reply was delayed while another worker
+            // projected on) and must not regress it.
+            if let MarkerRead::Present(m) = &observation.marker
+                && m.graph_id == claim.key.graph_id
+                && m.branch == claim.key.branch
+                && m.ref_version > work.ref_version
+                && self
+                    .repo
+                    .commit_at(&claim.key.graph_id, &claim.key.branch, m.ref_version)
+                    .await
+                    .map_err(ledger_failure)?
+                    .as_ref()
+                    == Some(&m.commit)
+            {
+                let _ = self.repo.release(claim).await;
+                return Ok(StepOutcome::Superseded);
+            }
             (WriteMode::Replace, true)
         } else {
             let at_marker = self.commit_at_marker(claim, work, &observation).await?;

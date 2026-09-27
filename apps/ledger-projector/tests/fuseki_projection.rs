@@ -130,6 +130,9 @@ struct Scripted {
     inner: Arc<FusekiClient>,
     /// Hold the next write until notified (a stalled worker).
     hold: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    /// Hold the next observation until notified (a worker stalled between selecting its
+    /// work and looking at the target, e.g. a delayed claim reply).
+    hold_observe: Mutex<Option<Arc<tokio::sync::Notify>>>,
     /// Forward the next write, then report a timeout (the target committed; the response
     /// was lost).
     lose_response: AtomicBool,
@@ -147,6 +150,7 @@ impl Scripted {
         Arc::new(Self {
             inner: target(),
             hold: Mutex::new(None),
+            hold_observe: Mutex::new(None),
             lose_response: AtomicBool::new(false),
             swallow: AtomicBool::new(false),
             deny_containment: AtomicBool::new(false),
@@ -158,6 +162,10 @@ impl Scripted {
 #[async_trait::async_trait]
 impl ProjectionClient for Scripted {
     async fn observe(&self, graph: &CognitiveGraph) -> Result<Observation, ProjectionError> {
+        let gate = self.hold_observe.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.notified().await;
+        }
         self.inner.observe(graph).await
     }
 
@@ -1480,4 +1488,42 @@ async fn a_stalled_rebuild_of_a_disabled_feed_never_lands_after_the_old_feed_ret
     let ca2 = w.accept(&ga, Some(&ca), &[Q2]).await;
     assert_eq!(healthy.step().await.unwrap(), projected(2, false));
     assert_projected(&cg, &ga, &quads(&[Q1, Q2]), &ca2, 2).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL and Fuseki: LEDGER_TEST_DATABASE_URL, LEDGER_TEST_FUSEKI_URL"]
+async fn a_delayed_operator_rebuild_never_regresses_a_newer_projection() {
+    let _serial = serial().await;
+    let w = World::new().await;
+    let (g, cg) = w.graph().await;
+    let healthy = w.healthy().await;
+    let c1 = w.accept(&g, None, &[Q1]).await;
+    assert_eq!(healthy.step().await.unwrap(), projected(1, false));
+    // An operator rebuild selects the head (v1) and stalls before observing the target.
+    let scripted = Scripted::new();
+    let gate = Arc::new(tokio::sync::Notify::new());
+    *scripted.hold_observe.lock().unwrap() = Some(gate.clone());
+    let stale = Arc::new(w.projector(scripted.clone(), "slow-rebuild", None).await);
+    let stale_rebuild = tokio::spawn({
+        let (stale, key) = (stale.clone(), w.key(&g));
+        async move { stale.rebuild(&key).await.unwrap() }
+    });
+    let mut reached = false;
+    for _ in 0..500 {
+        if scripted.hold_observe.lock().unwrap().is_none() {
+            reached = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(reached, "the rebuild selected its work");
+    // Its lease runs out; v2 is accepted and projected by another worker.
+    w.expire_lease(&g).await;
+    let c2 = w.accept(&g, Some(&c1), &[Q2]).await;
+    assert_eq!(healthy.step().await.unwrap(), projected(2, false));
+    // The rebuild now observes v2 — genuine ledger history newer than its work — and stops.
+    gate.notify_one();
+    assert_eq!(stale_rebuild.await.unwrap(), Some(StepOutcome::Superseded));
+    assert_projected(&cg, &g, &quads(&[Q1, Q2]), &c2, 2).await;
+    assert_eq!(w.status(&g).await.projected_ref_version, Some(2));
 }

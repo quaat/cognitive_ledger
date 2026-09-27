@@ -157,6 +157,14 @@ projection fault suite, compose integration, upgrade 0010 → 0011; Phase-2 suit
   probe intervals accepted (now minimums), the status server bound after the workers started
   (now before), CREATE reachable through a settable parent role not refused (now refused,
   tested).
+- Codex round 2 on `212433c` (after the write-id fix): the write-id fence closes
+  the ABA sequence; **P1** — an operator rebuild whose claim reply was delayed could observe
+  another worker's newer projection and replace it with its older head (Replace has no
+  version rule) → a forced rebuild now stops as superseded when the target holds a newer
+  genuine state of the stream (`a_delayed_operator_rebuild_never_regresses_a_newer_projection`;
+  a mutation removing the check turns it red); **P2** — the runtime identity model was not
+  exhaustive (privileges on unlisted tables passed) → exhaustive for both identities
+  (`weakened_projection_controls…` asserts the refusal for both).
 
 ## Evidence
 (filled as slices land)

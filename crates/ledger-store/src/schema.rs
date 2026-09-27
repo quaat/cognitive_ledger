@@ -2426,7 +2426,7 @@ const RUNTIME_IDENTITY: IdentityModel = IdentityModel {
     adr: "ADR-0016",
     tables: RUNTIME_TABLE_MODEL,
     sequences: RUNTIME_SEQUENCES,
-    exhaustive: false,
+    exhaustive: true,
 };
 
 const PROJECTOR_IDENTITY: IdentityModel = IdentityModel {

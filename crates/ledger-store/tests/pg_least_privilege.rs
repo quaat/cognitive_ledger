@@ -3032,6 +3032,18 @@ async fn weakened_projection_controls_are_refused_at_startup_and_readiness() {
         .ready()
         .await
         .expect("projector readiness after restore");
+    // Both identity models are exhaustive: a privilege on any other public table refuses.
+    owner_exec(&fx, "CREATE TABLE public.lp_extra (x int)").await;
+    for role in [fx.role.clone(), projector_role.clone()] {
+        owner_exec(&fx, &format!("GRANT SELECT ON public.lp_extra TO {role}")).await;
+    }
+    let m = assert_refused_by_identity(&fx, "runtime SELECT on an unlisted table").await;
+    assert!(m.contains("lp_extra"), "{m}");
+    match projector.ready().await {
+        Err(LedgerError::RuntimeIdentity(m)) => assert!(m.contains("lp_extra"), "{m}"),
+        other => panic!("projector readiness must refuse an unlisted grant: {other:?}"),
+    }
+    owner_exec(&fx, "DROP TABLE public.lp_extra").await;
     drop(running);
     projector.pool().close().await;
     drop(projector);
