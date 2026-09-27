@@ -859,6 +859,53 @@ async fn each_phase2_check_detects_exactly_its_own_tampering() {
             failing(&restored)
         );
     }
+    // The context's validator versions are compared with its bytes too. For a referenced
+    // context the composite FK `vr_context_fk` already forbids the change, so the owner drops
+    // it (as a compromised owner could), tampers, and restores the exact FK afterwards; the
+    // record/context validator agreement check may fire as well.
+    let fk: String = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'vr_context_fk'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    committed(vec![
+        "ALTER TABLE validation_records DROP CONSTRAINT vr_context_fk".into(),
+    ])
+    .await;
+    for column in [
+        "validator_service_version",
+        "validator_configuration_version",
+    ] {
+        let original: String = sqlx::query_scalar(&format!(
+            "SELECT {column} FROM semantic_execution_contexts WHERE context_id = $1"
+        ))
+        .bind(&bad_ctx)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let set = |value: &str| {
+            vec![
+                "ALTER TABLE semantic_execution_contexts DISABLE TRIGGER semantic_execution_contexts_write_once".to_owned(),
+                format!("UPDATE semantic_execution_contexts SET {column} = '{}' WHERE context_id = '{bad_ctx}'", value.replace('\'', "''")),
+                "ALTER TABLE semantic_execution_contexts ENABLE TRIGGER semantic_execution_contexts_write_once".to_owned(),
+            ]
+        };
+        committed(set("forged-version")).await;
+        let report = verify::run(&pool).await.unwrap();
+        assert!(
+            failing(&report).contains(&CONTEXT_BYTES),
+            "{column}: {:?}",
+            failing(&report)
+        );
+        committed(set(&original)).await;
+        let restored = verify::run(&pool).await.unwrap();
+        assert!(restored.is_clean(), "{column}: {:?}", failing(&restored));
+    }
+    committed(vec![format!(
+        "ALTER TABLE validation_records ADD CONSTRAINT vr_context_fk {fk}"
+    )])
+    .await;
     // A missing detail row is seen too (the count check sees it as well for contexts).
     let saved: (i32, String, String, String) = sqlx::query_as(
         "SELECT position, severity, code, message FROM validation_violations \

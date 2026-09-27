@@ -397,7 +397,8 @@ async fn verify_validation_bytes(pool: &PgPool) -> Result<Vec<CheckResult>, Ledg
     let rows = sqlx::query(
         "SELECT context_id, graph_id, candidate_commit, candidate_state_digest, base_kb_id, base_kb_revision, \
                 ontology_id, ontology_version, shapes_id, shapes_version, reasoning_profile, \
-                reasoning_implementation, reasoning_version, sources_revision, validator_service_id, virtual_context_count, \
+                reasoning_implementation, reasoning_version, sources_revision, validator_service_id, \
+                validator_service_version, validator_configuration_version, virtual_context_count, \
                 canonical_bytes FROM semantic_execution_contexts",
     )
     .fetch_all(&mut *tx)
@@ -428,6 +429,8 @@ async fn verify_validation_bytes(pool: &PgPool) -> Result<Vec<CheckResult>, Ledg
                 && c.reasoning.as_ref().map(|x| x.version.clone()) == o("reasoning_version")?
                 && c.sources_revision == o("sources_revision")?
                 && c.validator.service_id == s("validator_service_id")?
+                && c.validator.service_version == s("validator_service_version")?
+                && c.validator.configuration_version == s("validator_configuration_version")?
                 && c.virtual_contexts.len() as i64
                     == i64::from(
                         row.try_get::<i32, _>("virtual_context_count")

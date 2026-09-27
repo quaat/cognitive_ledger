@@ -46,10 +46,12 @@ Fuseki projection (ADR-0014, spec invariant 14).
    transaction), load / list records, verify candidate–graph association. Shares the
    application pool.
 6. **Acceptance binding** (ADR-0019): `AcceptRequest` carries `validation_id` +
-   `semantic_context_id`; inside the existing acceptance transaction the repository verifies
-   existence, graph, tenant, candidate, state digest agreement (FK-enforced), outcome
-   `conforms`, exact context match, and records `decision_validations` alongside the
-   existing `validation_ids`. Any mismatch leaves zero accepted-workflow side effects.
+   `semantic_environment_id` (the draft's `semantic_context_id` was replaced in review
+   round 1); inside the existing acceptance transaction the repository verifies existence,
+   graph, tenant, candidate, state digest agreement (FK-enforced), the trusted validation
+   service, outcome `conforms`, exact environment match, and records `decision_validations`
+   alongside the existing `validation_ids`. Any mismatch leaves zero accepted-workflow side
+   effects.
 7. **HTTP boundary**: `POST /v1/graphs/{graph}/proposals/{candidate}/validations`
    (`validate` capability, `Idempotency-Key`), `GET …/validations/{validation}` (`read`),
    `accept` body extended; new stable codes `VALIDATION_REJECTED`, `VALIDATION_STALE`,
