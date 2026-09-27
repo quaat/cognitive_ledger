@@ -1,6 +1,6 @@
 # Plan 0006: Phase 2 — semantic validation coordination
 
-Status: **in progress — P2.1–P2.4 implemented and reviewed; P2.5 freshness implemented; P2.6 qualification partly executed** (started 2026-09-27 after PR #2 merged). Branch
+Status: **merge candidate — P2.1–P2.6 implemented, locally qualified and reviewed; hosted CI on the final head and the live Sculpin run are external evidence (see "Closure" below)** (started 2026-09-27 after PR #2 merged). Branch
 `claude/p2-semantic-validation` from `main` at `f81be37d14b1de102c00fd339a63784b88d725c6`
 (the PR #2 merge, P1.5 production qualification). Execution slices, in order:
 (P2.1) validation protocol + persistent records; (P2.2) validation workflow + acceptance
@@ -256,12 +256,127 @@ evidence and has not been run (no Sculpin endpoint exists).
   (`acceptance_requires_the_configured_validation_service`), no-validator behaviour stated
   in ADR-0019, plan evidence corrected.
 
-## Remaining Phase-2 work
-1. A further independent review of the round-3 changes before merge (optional; no open P0/P1).
-2. `scripts/upgrade.sh` from the P1.5 release with populated data (0009 → 0010).
-3. Sculpin: implement the service contract; then a live end-to-end run as external evidence.
-4. Longer fuzz campaign of `validation_decode` under both sanitizers on the hosted runner
-   (`ci-fuzz` picks the target up automatically).
+## Closure (2026-09-27): main integration, trust anchor, invocation identity, qualification
+Labels: **implemented** (code + docs in the branch), **executed ✓** (ran here, passed, log
+under `target/p2/` or the named run directory), **not executable here**, **pending external**.
+
+### Main integration and dependencies — executed ✓
+- `origin/main` `d12c1b7` merged with `--no-ff` as `1724216` (no conflicts; `Cargo.toml` keeps
+  `crates/ledger-validation-protocol` and `sha2 = "0.11.0"`; `Cargo.lock` resolved by cargo,
+  unchanged by resolution; the fuzz workspace lock re-resolved for sha2 0.11 in `a71fd09`).
+  Brought in: `actions/checkout` 6.1.0 → 7.0.1, `dependency-review-action` 4.9.0 → 5.0.0,
+  `sha2` 0.10.9 → 0.11.0 (0.10.9 remains only under `sqlx-core`). SQLx 0.9 (Rust 1.94) is out
+  of scope; tech-debt entry added; MSRV stays 1.89.
+- **sha2 0.11 protocol gate — executed ✓:** `check-fast.sh` on `1724216` with no fixture
+  change: commit v1 (3 tests) and v2 (18 vectors), patch v1, request v1/v2 (12), semantic
+  context / environment / record (28), state digest (3) — Rust goldens and every independent
+  Python reference byte- and hash-identical.
+
+### Validator trust separated from reachability — implemented, executed ✓
+- Before: `AppState::with_validation` installed the client *and* the required service; with
+  `LEDGER_VALIDATOR_URL` unset no service was required, so a conforming record of any
+  service satisfied acceptance.
+- Now (ADR-0019 amendment "validator trust anchor"): `ValidationTrustPolicy` from
+  `LEDGER_VALIDATOR_SERVICE_ID`; the URL is only the client. URL without id, token file
+  without URL, empty token file with production auth, and production auth without an id are
+  refused at start-up; no trust anchor → validated acceptance `VALIDATION_STALE`; trust is
+  checked before the verdict (an untrusted verdict is never disclosed); foreign/nonexistent
+  records stay `VALIDATION_NOT_FOUND` under every configuration; `AppState` seeds trust from
+  the store and never silently replaces it.
+- Tests: `ledger-server` `validator_trust_is_the_service_id_and_never_the_endpoint`
+  (configuration matrix); `pg_validation::acceptance_requires_the_configured_validation_service`
+  (other service, no anchor, NOT_FOUND without anchor, untrusted non-conforming → STALE);
+  `pg_validation_api::validator_trust_is_independent_of_the_endpoint_and_fails_closed`
+  (restarts: S1+URL → validate; S1 without URL → `VALIDATOR_UNAVAILABLE`, replay still works,
+  old S1 record accepted; S2 → STALE; none → STALE; foreign tenant NOT_FOUND; no service
+  named in refusals). Mutation check: restoring the old predicate turns both PG tests red.
+
+### Validation invocation identity — implemented, executed ✓
+- `sculpin-validation-invocation/v1` (`crates/ledger-validation-protocol/src/invocation.rs`):
+  SHA-256 over header + tenant, principal type byte, principal id, delegation, graph,
+  `validate`, key, request-v2 digest; never in any content identity, never stored. Sent as
+  `invocation_id` and `Idempotency-Key` (one value). Vectors `invocation-v1-*` (6 positive
+  incl. human / 256-byte / non-ASCII keys, 8 refused inputs) from the Python reference,
+  checked by Rust. Sculpin contract: at-least-once delivery, exactly-once logical validation
+  within Sculpin's declared retention; single flight, body binding, caller scoping,
+  Sculpin-side failure definition, same-key-retry semantics
+  (`docs/design/sculpin-validation-service.md`).
+- Tests (`pg_validation_api`, deduplicating fake with gate, live KB revision, crash hook):
+  `concurrent_same_key_validations_are_one_logical_invocation` (both requests reach the
+  validator with one id, one logical validation, the environment at start wins over one that
+  moved mid-flight, one idempotency row, one record, both responses name it; control: another
+  key sees the moved environment); `a_retry_after_a_lost_answer_reuses_the_invocation`;
+  `a_retry_after_a_crash_between_answer_and_record_reuses_the_invocation` (store failpoints
+  after context, after record, before commit); `same_key_with_other_hints_is_another_invocation_and_conflicts`
+  (`IDEMPOTENCY_CONFLICT`, one record); `validator_http` asserts header = body id. Mutation
+  check: deriving the id from the correlation id turns the concurrent and retry tests red.
+  **Scope:** the fake implements the contract; Sculpin's deduplication is pending external.
+
+### Schema verifier and verify — implemented, executed ✓
+- NOT NULL of every migration-declared column verified at start-up/readiness (composite FKs
+  are `MATCH SIMPLE`); exact inventory test; `NOT VALID` not-null (PG18) not counted; drift
+  test on five key columns.
+- Logically restored CHECKs (ADR-0017 amendment): `backup-restore.sh` on `b54906f` showed the
+  server refusing a `pg_dump` restore (strict deparse from P1.5's `7842f14`, also on main);
+  the verifier accepts exactly the flattened re-parse of the 7 affected CHECKs; tested by
+  recreating every CHECK from its deparsed text. The released P1.5 binary keeps the defect.
+- `ledger-admin verify`: every summary / virtual-context row compared with the decoded bytes
+  in one REPEATABLE READ snapshot (the first version raced a live writer — reproduced by
+  parallel suites, fixed; pg_validation then 10/10 repeated runs); `insert_record` collision
+  compares graph and tenant.
+
+### 0009 → 0010 upgrade from the P1.5 release — executed ✓
+`scripts/upgrade-p2.sh` (new): previous `f81be37` (schema 9) built from git; populated
+through its API — 3 graphs / 2 tenants, 4 refs, 21 accepted commits, 3 rejected and 3 pending
+proposals, 24 decisions, 21 ref events, 21 outbox rows, 51 idempotency keys, 21 states; stop →
+`pg_dump -Fc` (restored twice: rows identical, DDL/ownership identical except the 3
+re-parsed branch-bound CHECKs, previous `verify` VERIFY OK) → owner `migrate --runtime-role`
+(re-run idempotent) → Phase-2 server as runtime. Proven: all 11 pre-upgrade tables
+byte-identical after migrate and after replay (commit/patch ids, parents, objects, refs,
+ref events, decisions, outbox, idempotency, proposals, graphs); 21 states identical; 51 old
+keys replay identically, refs unmoved, no validator call; VERIFY OK; runtime-only connection,
+18 runtime write probes denied; unvalidated accept `409 VALIDATION_REQUIRED` (ref unchanged),
+validation (header = `invocation_id`) and validated acceptance on upgraded graphs; P1.5
+server refuses 0010 (`ahead`), Phase-2 server and verify refuse 0009 (`behind`); 0010 guard
+refuses a pre-existing validation id and leaves 0009 untouched; clean 0010 install and
+upgraded schema identical (809 DDL/grant lines, 70 owned objects). Final run on `32dc825`:
+see the table below. NOTE recorded: the P1.5 server refuses a logically restored copy.
+
+### Executed gates on the closure candidate
+| Gate | Head | Result |
+|---|---|---|
+| `./scripts/check-fast.sh` | `32dc825` | exit 0 (fmt, clippy `-D warnings`, workspace tests, doc links, architecture, Python references: 18 commit-v2, 12 request, 42 validation incl. invocation, 3 state) |
+| `./scripts/check-supply-chain.sh` | `a71fd09` (no dependency change since) | exit 0 (advisories/bans/licenses/sources ok, SBOM 213 components) |
+| PostgreSQL 15.19 — all 10 suites (`pg_validation` 9, `pg_verify` 2, `pg_workflow` 14, `pg_least_privilege` 17, `pg_cas_race` 1, `pg_immutable_store` 9, `pg_graphs_migration` 7, `pg_fs_migration` 8, `pg_validation_api` 17, `pg_api` 13) | `b54906f` | all passed; `pg_least_privilege` 18 and `pg_verify` 2 again on `32dc825` |
+| PostgreSQL 17.11 — same 10 suites | `b54906f` | all passed; `pg_least_privilege` 18 and `pg_verify` 2 again on `32dc825` |
+| `validator_http` (5) | `b54906f` | passed (in `check-fast`) |
+| `./scripts/test-integration.sh` (compose PG 17.2, distroless image, all PG suites, container scenario, verify) | `b54906f` | exit 0, `INTEGRATION OK` |
+| `./scripts/backup-restore.sh` | `b54906f` / fix | **failed** on `b54906f` (dump restore refused, above) → `BACKUP RESTORE OK` with the fix |
+| `scripts/upgrade-p2.sh` | fix | `UPGRADE-P2 OK` |
+| fuzz `validation_decode` (now also the validator JSON response path), sanitizer none, 120 s | `07420ae` | 15.8 M execs, cov 2950, no crash |
+
+### Reviews
+- Round 4 (Opus, read-only, `1724216..a71fd09`): migration-0010 security review (no P0/P1;
+  P2 NOT NULL verification fixed; P2 insert-after-seal on detail tables accepted as the
+  ADR-0016 trusted-writer class, recorded; P3s fixed or recorded); invariant, storage/
+  concurrency, security, semantic-integration and test reviews — no P0/P1 anywhere; fixed:
+  trust-before-verdict, verify snapshot race, neutral STALE text, empty/oversized token file,
+  trust seeding, NOT VALID guard, doc misplacement, crash/lost-answer tests, bounded race
+  tests, exact inventory, table-driven verify tampering, more vectors, fuzz binding,
+  upgrade-harness assertions, contract gaps (retention, single flight, failure, same-key
+  retry), security notes (service id is an operator assertion; invocation id unkeyed).
+  Recorded as risk decisions: signed validator responses / keyed invocation id (ADR needed).
+- Codex (read-only `codex exec`, focused prompt) on `b54906f`: **no P0/P1**; one P2 (upgrade
+  harness force-removed a fixed worktree path) fixed in `32dc825`.
+
+## Remaining before merge / release
+1. Hosted CI (ci-fast, ci-integration, ci-security, ci-fuzz) on the pushed final head.
+2. Sculpin: implement the service contract including invocation deduplication; a live
+   end-to-end run — **pending external** (no Sculpin endpoint exists; the fake proves the
+   ledger's coordination only, never SHACL or reasoning correctness).
+3. 900 s `validation_decode` under AddressSanitizer: **not executable here** (the host's ASan
+   runtime crashes at start-up, Plan 0005); runs on hosted `ci-fuzz` (`address` matrix, weekly
+   900 s schedule or `workflow_dispatch`).
 
 ## P1.5 external blockers (unchanged, still pending)
 Live Entra ID issuer smoke test; deployment PITR/WAL evidence; writer fencing / restore
