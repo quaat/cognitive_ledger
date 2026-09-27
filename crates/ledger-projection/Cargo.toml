@@ -1,0 +1,17 @@
+[package]
+name = "ledger-projection"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Accepted-state projection protocol (ADR-0020): cognitive graph identity, projection marker, the projection decision table, the ProjectionClient boundary and error taxonomy. Infrastructure-free: no HTTP, SQL or target adapters."
+
+[dependencies]
+async-trait.workspace = true
+ledger-core = { path = "../ledger-core" }
+ledger-rdf = { path = "../ledger-rdf" }
+thiserror.workspace = true
+
+[lints]
+workspace = true

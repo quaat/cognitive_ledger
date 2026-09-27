@@ -2,7 +2,7 @@
 import pathlib,subprocess,sys
 root=pathlib.Path(__file__).resolve().parents[1]
 forbidden=('axum','sqlx','postgres','fuseki','docker','aws-sdk-s3','fluree','reqwest','pyshacl','jena','ledger-store','ledger-api')
-for crate in ('ledger-core','ledger-rdf','ledger-validation-protocol'):
+for crate in ('ledger-core','ledger-rdf','ledger-validation-protocol','ledger-projection'):
  text=(root/'crates'/crate/'Cargo.toml').read_text().lower()
  hits=[x for x in forbidden if x in text]
  if hits: print(f'{crate}: forbidden dependencies {hits}',file=sys.stderr);sys.exit(1)

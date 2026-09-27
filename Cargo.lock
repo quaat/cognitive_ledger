@@ -986,6 +986,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ledger-projection"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ledger-core",
+ "ledger-rdf",
+ "thiserror",
+]
+
+[[package]]
 name = "ledger-rdf"
 version = "0.1.0"
 dependencies = [

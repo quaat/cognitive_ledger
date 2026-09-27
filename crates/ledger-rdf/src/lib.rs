@@ -69,6 +69,20 @@ impl FromStr for Quad {
         Ok(Self(format!("{quad} .")))
     }
 }
+impl Quad {
+    /// The quad as an N-Triples statement (`<s> <p> <o> .`) when it is in the default graph,
+    /// `None` for a named-graph quad. The terms are the canonical N-Triples forms (valid
+    /// SPARQL term syntax), so the statement can be embedded in a SPARQL template verbatim.
+    pub fn default_graph_triple(&self) -> Option<String> {
+        let quad = NQuadsParser::new()
+            .for_slice(self.0.as_bytes())
+            .next()?
+            .expect("a Quad holds one canonical N-Quad");
+        quad.graph_name
+            .is_default_graph()
+            .then(|| format!("{} {} {} .", quad.subject, quad.predicate, quad.object))
+    }
+}
 impl Serialize for Quad {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&self.0)
@@ -187,6 +201,17 @@ mod tests {
             b"sculpin-rdf-patch-v1\nA <urn:s> <urn:p> \"v\" .\n"
         );
     }
+    #[test]
+    fn default_graph_triples_are_exposed_and_named_graph_quads_are_not() {
+        let default: Quad = "<urn:s> <urn:p> \"x\\ny\"@en .".parse().unwrap();
+        assert_eq!(
+            default.default_graph_triple().as_deref(),
+            Some("<urn:s> <urn:p> \"x\\ny\"@en .")
+        );
+        let named: Quad = "<urn:s> <urn:p> <urn:o> <urn:g> .".parse().unwrap();
+        assert_eq!(named.default_graph_triple(), None);
+    }
+
     #[test]
     fn rejects_blank_nodes() {
         assert_eq!(
