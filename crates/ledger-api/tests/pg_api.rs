@@ -10,10 +10,12 @@ use axum::{
 };
 use ledger_api::{
     AcceptancePolicy, ApiLimits, AppState,
-    auth::{ClaimsPolicy, DevHs256Authenticator},
+    auth::{ClaimsPolicy, DevHs256Authenticator, OidcAuthenticator, SharedAuthenticator},
 };
 use ledger_core::{GraphId, TenantId};
-use ledger_store::{GraphStatus, NewGraph, PostgresLedgerStore, ReconstructionLimits, V1Binding};
+use ledger_store::{
+    DbSessionLimits, GraphStatus, NewGraph, PostgresLedgerStore, ReconstructionLimits, V1Binding,
+};
 use serde_json::{Value, json};
 use sqlx::Row;
 use std::{
@@ -76,23 +78,126 @@ fn token(tenant: &str, subject: &str, roles: &[&str]) -> String {
 }
 
 struct Harness {
+    /// Runtime-identity store behind the router.
     store: PostgresLedgerStore,
+    /// Owner-identity store for provisioning and raw assertions.
+    owner: PostgresLedgerStore,
     app: Router,
 }
 
+/// Owner migrates and grants once; the served store connects as a least-privilege runtime
+/// role (created here if absent), so every HTTP test runs under production privileges.
 async fn harness_with(
     acceptance: AcceptancePolicy,
     limits: ApiLimits,
     policy: ClaimsPolicy,
 ) -> Harness {
-    let store = PostgresLedgerStore::connect(&database_url(), V1Binding::Reject)
-        .await
-        .unwrap();
-    let auth = Arc::new(
+    let auth: SharedAuthenticator = Arc::new(
         DevHs256Authenticator::new(ISSUER.into(), AUDIENCE.into(), SECRET, policy).unwrap(),
     );
+    harness_full(acceptance, limits, auth, DbSessionLimits::default()).await
+}
+
+/// One "replica": its own runtime-identity pool and authenticator over the shared database.
+async fn harness_full(
+    acceptance: AcceptancePolicy,
+    limits: ApiLimits,
+    auth: SharedAuthenticator,
+    session: DbSessionLimits,
+) -> Harness {
+    harness_in(&database_url(), acceptance, limits, auth, session).await
+}
+
+/// The test URL with its database name replaced (`…/ledger?…` → `…/<name>?…`).
+fn url_for_database(base: &str, name: &str) -> String {
+    let (head, query) = match base.split_once('?') {
+        Some((h, q)) => (h, Some(q)),
+        None => (base, None),
+    };
+    let slash = head.rfind('/').expect("database url has a path");
+    let mut url = format!("{}/{name}", &head[..slash]);
+    if let Some(q) = query {
+        url.push('?');
+        url.push_str(q);
+    }
+    url
+}
+
+/// A throwaway database (owner URL) for tests that take table locks or otherwise disturb
+/// every other session of the database; the shared database stays undisturbed.
+async fn fresh_database(prefix: &str) -> String {
+    let base = database_url();
+    let admin = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&base)
+        .await
+        .unwrap();
+    let name = unique(prefix).replace('-', "_").to_lowercase();
+    sqlx::query(&format!("CREATE DATABASE {name}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    url_for_database(&base, &name)
+}
+
+/// `harness_full` against an explicit owner URL (shared or throwaway database).
+async fn harness_in(
+    url: &str,
+    acceptance: AcceptancePolicy,
+    limits: ApiLimits,
+    auth: SharedAuthenticator,
+    session: DbSessionLimits,
+) -> Harness {
+    let owner = PostgresLedgerStore::connect_and_migrate(url, V1Binding::Reject)
+        .await
+        .unwrap();
+    // Role creation touches cluster-wide catalog rows and the grant on the shared database
+    // touches its per-database ACLs; tests in this binary run in parallel, so this happens
+    // exactly once per process. Throwaway databases grant separately below (per-database
+    // ACLs only; nothing else runs against a throwaway database).
+    static SETUP: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    SETUP
+        .get_or_init(|| async {
+            use sqlx::Connection;
+            let mut conn = sqlx::postgres::PgConnection::connect(&database_url())
+                .await
+                .unwrap();
+            // The shared database may not have been migrated yet when a throwaway-database
+            // test reaches this first: migrate it before granting (idempotent).
+            ledger_store::schema::migrate_all_on(&mut conn).await.unwrap();
+            sqlx::query(
+                "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'ledger_rt_api') THEN \
+                 CREATE ROLE ledger_rt_api LOGIN PASSWORD 'rt-api-test-secret'; END IF; END $$",
+            )
+            .execute(&mut conn)
+            .await
+            .unwrap();
+            ledger_store::schema::grant_runtime_role(&mut conn, "ledger_rt_api")
+                .await
+                .unwrap();
+            conn.close().await.unwrap();
+        })
+        .await;
+    if url != database_url() {
+        // A throwaway database: grants are per database, so the (cluster-wide) role is
+        // granted here as well; nothing else runs against this database concurrently.
+        use sqlx::Connection;
+        let mut conn = sqlx::postgres::PgConnection::connect(url).await.unwrap();
+        ledger_store::schema::grant_runtime_role(&mut conn, "ledger_rt_api")
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+    }
+    let runtime_url = {
+        let (scheme, rest) = url.split_once("://").unwrap();
+        let (_, host_part) = rest.rsplit_once('@').unwrap();
+        format!("{scheme}://ledger_rt_api:rt-api-test-secret@{host_part}")
+    };
+    let store = PostgresLedgerStore::connect_with(&runtime_url, V1Binding::Reject, session)
+        .await
+        .expect("runtime role connects with verify-only startup");
     let app = ledger_api::router(AppState::new(store.clone(), auth, limits, acceptance));
-    Harness { store, app }
+    Harness { store, owner, app }
 }
 
 async fn harness(acceptance: AcceptancePolicy, limits: ApiLimits) -> Harness {
@@ -104,7 +209,7 @@ type Reply = (StatusCode, Value, Option<String>);
 impl Harness {
     async fn graph(&self, tenant: &str) -> GraphId {
         let id = GraphId::new(unique("api")).unwrap();
-        self.store
+        self.owner
             .graphs()
             .create(&NewGraph {
                 graph_id: id.clone(),
@@ -177,7 +282,7 @@ impl Harness {
             "SELECT count(*) AS n FROM {table} WHERE graph_id = $1"
         ))
         .bind(graph.as_str())
-        .fetch_one(self.store.pool())
+        .fetch_one(self.owner.pool())
         .await
         .unwrap()
         .get::<i64, _>("n")
@@ -553,7 +658,7 @@ async fn persisted_actor_and_correlation_come_from_the_verified_token() {
         "SELECT tenant_id, principal_id, principal_type, on_behalf_of, correlation_id FROM proposals WHERE proposal_id = $1",
     )
     .bind(prepared["proposal_id"].as_i64().unwrap())
-    .fetch_one(h.store.pool())
+    .fetch_one(h.owner.pool())
     .await
     .unwrap();
     assert_eq!(row.get::<String, _>("tenant_id"), "tenant-a");
@@ -592,7 +697,7 @@ async fn persisted_actor_and_correlation_come_from_the_verified_token() {
          JOIN idempotency i ON i.result_decision_id = d.decision_id WHERE d.decision_id = $1",
     )
     .bind(accepted["decision_id"].as_i64().unwrap())
-    .fetch_one(h.store.pool())
+    .fetch_one(h.owner.pool())
     .await
     .unwrap();
     assert_eq!(row.get::<String, _>("dp"), "urn:sculpin:human:reviewer-1");
@@ -875,7 +980,7 @@ async fn lost_responses_replay_identically_and_conflicts_are_detected() {
     let outbox: i64 =
         sqlx::query("SELECT count(*) AS n FROM projection_outbox WHERE graph_id = $1")
             .bind(g.as_str())
-            .fetch_one(h.store.pool())
+            .fetch_one(h.owner.pool())
             .await
             .unwrap()
             .get("n");
@@ -1432,6 +1537,15 @@ async fn resource_limits_are_enforced_with_a_stable_code() {
 #[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
 async fn readiness_reports_the_database_and_openapi_is_served() {
     let h = harness(dev(), ApiLimits::default()).await;
+    // The served store runs as the least-privilege runtime role, not the owner.
+    let (who, is_super): (String, bool) = sqlx::query_as(
+        "SELECT current_user::text, (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)",
+    )
+    .fetch_one(h.store.pool())
+    .await
+    .unwrap();
+    assert_eq!(who, "ledger_rt_api");
+    assert!(!is_super);
     let (status, body, _) = h.call("GET", "/ready", None, None, None).await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
     let (status, doc, _) = h.call("GET", "/openapi.json", None, None, None).await;
@@ -1444,4 +1558,645 @@ async fn readiness_reports_the_database_and_openapi_is_served() {
         .call("POST", "/v1/commits", None, None, Some(json!({})))
         .await;
     assert_error(&r, StatusCode::NOT_FOUND, "NOT_FOUND");
+}
+
+// =========================================================================================
+// Plan 0005 §4 — two replicas, one key source: JWKS rotation, expiry boundaries, replay
+// =========================================================================================
+
+const RSA_A: &str = include_str!("fixtures/test-rsa-a.pkcs8");
+const RSA_C: &str = include_str!("fixtures/test-rsa-c.pkcs8");
+const JWKS_INITIAL: &str = include_str!("fixtures/jwks-initial.json");
+const JWKS_ROTATED: &str = include_str!("fixtures/jwks-rotated.json");
+const OIDC_ISS: &str = "https://issuer.test/";
+const OIDC_AUD: &str = "api://ledger";
+
+/// A local JWKS endpoint whose document can be swapped; counts fetches.
+struct JwksServer {
+    url: String,
+    document: Arc<std::sync::Mutex<String>>,
+    hits: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+async fn jwks_server(initial: &str) -> JwksServer {
+    let document = Arc::new(std::sync::Mutex::new(initial.to_owned()));
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (d, h) = (document.clone(), hits.clone());
+    let app = Router::new().route(
+        "/keys",
+        axum::routing::get(move || {
+            let d = d.clone();
+            let h = h.clone();
+            async move {
+                h.fetch_add(1, Ordering::SeqCst);
+                (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    d.lock().unwrap().clone(),
+                )
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/keys", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    JwksServer {
+        url,
+        document,
+        hits,
+    }
+}
+
+fn rs256(kid: &str, pem: &str, claims: &Value) -> String {
+    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+    header.kid = Some(kid.to_owned());
+    jsonwebtoken::encode(
+        &header,
+        claims,
+        &jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap(),
+    )
+    .unwrap()
+}
+
+fn oidc_claims(exp_offset: i64, nbf_offset: i64) -> Value {
+    let now = now() as i64;
+    json!({
+        "iss": OIDC_ISS, "aud": OIDC_AUD, "exp": now + exp_offset, "nbf": now + nbf_offset,
+        "tid": "t1", "oid": "actor-1", "sculpin_principal_type": "agent", "roles": ALL,
+    })
+}
+
+fn oidc(url: &str) -> SharedAuthenticator {
+    Arc::new(
+        OidcAuthenticator::new(
+            OIDC_ISS.into(),
+            OIDC_AUD.into(),
+            url.to_owned(),
+            ClaimsPolicy::default(),
+        )
+        .with_refresh_policy(Duration::ZERO, Duration::from_secs(3600)),
+    )
+}
+
+/// Two identical requests answered by two replicas: both succeed, exactly one is the
+/// original execution, and the durable result is the same.
+fn assert_replayed_pair(a: &Reply, b: &Reply, fields: &[&str]) {
+    for r in [a, b] {
+        assert!(r.0 == StatusCode::CREATED || r.0 == StatusCode::OK, "{r:?}");
+    }
+    let originals = [a, b]
+        .iter()
+        .filter(|r| r.1["replayed"] == Value::Bool(false))
+        .count();
+    assert_eq!(originals, 1, "exactly one original execution: {a:?} {b:?}");
+    for f in fields {
+        assert_eq!(a.1[*f], b.1[*f], "{f} differs across replicas: {a:?} {b:?}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn two_replicas_share_one_key_source_and_replay_identically_across_rotation() {
+    let jwks = jwks_server(JWKS_INITIAL).await;
+    let a = harness_full(
+        dev(),
+        ApiLimits::default(),
+        oidc(&jwks.url),
+        DbSessionLimits::default(),
+    )
+    .await;
+    let b = harness_full(
+        dev(),
+        ApiLimits::default(),
+        oidc(&jwks.url),
+        DbSessionLimits::default(),
+    )
+    .await;
+    let g = a.graph("t1").await;
+    let proposals = format!("/v1/graphs/{g}/proposals");
+    let refs = format!("/v1/graphs/{g}/refs?name=main");
+    let t_a = rs256("kid-a", RSA_A, &oidc_claims(300, -5));
+
+    // 1. Concurrent identical prepare and accept landing on different replicas.
+    let body = prepare_body(None, &[("add", "<urn:s> <urn:p> \"1\" .")], "m");
+    let (pa, pb) = tokio::join!(
+        a.call(
+            "POST",
+            &proposals,
+            Some(&t_a),
+            Some("mr-p1"),
+            Some(body.clone())
+        ),
+        b.call(
+            "POST",
+            &proposals,
+            Some(&t_a),
+            Some("mr-p1"),
+            Some(body.clone())
+        )
+    );
+    assert_replayed_pair(
+        &pa,
+        &pb,
+        &[
+            "proposal_id",
+            "candidate",
+            "requested_patch",
+            "effective_patch",
+        ],
+    );
+    let candidate = pa.1["candidate"].as_str().unwrap().to_owned();
+    assert_eq!(
+        a.count("proposals", &g).await,
+        1,
+        "one durable proposal for the pair"
+    );
+    let accept = format!("{proposals}/{candidate}/accept");
+    let accept_body = json!({"ref": "main", "expected_head": null, "reason": "multi-replica"});
+    let (aa, ab) = tokio::join!(
+        a.call(
+            "POST",
+            &accept,
+            Some(&t_a),
+            Some("mr-a1"),
+            Some(accept_body.clone())
+        ),
+        b.call(
+            "POST",
+            &accept,
+            Some(&t_a),
+            Some("mr-a1"),
+            Some(accept_body.clone())
+        )
+    );
+    assert_replayed_pair(
+        &aa,
+        &ab,
+        &[
+            "decision_id",
+            "ref_event_id",
+            "outbox_id",
+            "ref_version",
+            "head",
+        ],
+    );
+    assert_eq!(aa.1["ref_version"], 1);
+    assert_eq!(
+        a.count("ref_events", &g).await,
+        1,
+        "the ref moved exactly once"
+    );
+    assert_eq!(a.count("projection_outbox", &g).await, 1);
+
+    // 2. Rotation: a new `kid` appears at the issuer; each replica picks it up on first
+    //    sight (unknown kid → refresh) without a restart or any shared state between them.
+    *jwks.document.lock().unwrap() = JWKS_ROTATED.to_owned();
+    let t_c = rs256("kid-c", RSA_C, &oidc_claims(300, -5));
+    let hits = jwks.hits.load(Ordering::SeqCst);
+    for h in [&a, &b] {
+        let (status, r, _) = h.call("GET", &refs, Some(&t_c), None, None).await;
+        assert_eq!(status, StatusCode::OK, "{r:?}");
+        assert_eq!(r["head"], candidate);
+    }
+    assert!(
+        jwks.hits.load(Ordering::SeqCst) >= hits + 2,
+        "each replica fetched the rotated document"
+    );
+
+    // 3. Withdrawal: the issuer drops kid-a. A refresh (forced here by an unknown kid) makes
+    //    the withdrawn key stop validating on each replica; kid-c keeps working.
+    let mut only_c: Value = serde_json::from_str(JWKS_ROTATED).unwrap();
+    only_c["keys"] = Value::Array(
+        only_c["keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|k| k["kid"] == "kid-c")
+            .cloned()
+            .collect(),
+    );
+    *jwks.document.lock().unwrap() = only_c.to_string();
+    let t_unknown = rs256("kid-zzz", RSA_A, &oidc_claims(300, -5));
+    for h in [&a, &b] {
+        assert_error(
+            &h.call("GET", &refs, Some(&t_unknown), None, None).await,
+            StatusCode::UNAUTHORIZED,
+            "UNAUTHENTICATED",
+        );
+        assert_error(
+            &h.call("GET", &refs, Some(&t_a), None, None).await,
+            StatusCode::UNAUTHORIZED,
+            "UNAUTHENTICATED",
+        );
+        let (status, _, _) = h.call("GET", &refs, Some(&t_c), None, None).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    // 4. Expiry boundaries (leeway is 30 s): inside the leeway is accepted, beyond it is
+    //    refused, identically on both replicas; same for `nbf`.
+    for h in [&a, &b] {
+        for (exp, nbf, ok) in [
+            (-10, -5, true),
+            (-25, -5, true),
+            (-35, -5, false),
+            (-60, -5, false),
+            (300, 10, true),
+            (300, 60, false),
+            (300, 25, true),
+            (300, 35, false),
+        ] {
+            let t = rs256("kid-c", RSA_C, &oidc_claims(exp, nbf));
+            let r = h.call("GET", &refs, Some(&t), None, None).await;
+            if ok {
+                assert_eq!(r.0, StatusCode::OK, "exp{exp} nbf{nbf}: {r:?}");
+            } else {
+                assert_error(&r, StatusCode::UNAUTHORIZED, "UNAUTHENTICATED");
+            }
+        }
+    }
+
+    // 5. Idempotency is bound to the complete actor, not to the token: the step-1 accept
+    //    retried after rotation, with the new key, on the other replica, replays.
+    let (status, r, _) = b
+        .call(
+            "POST",
+            &accept,
+            Some(&t_c),
+            Some("mr-a1"),
+            Some(accept_body),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{r:?}");
+    assert_eq!(r["replayed"], true);
+    assert_eq!(r["decision_id"], aa.1["decision_id"]);
+    assert_eq!(a.count("ref_events", &g).await, 1);
+
+    // 6. Production refresh policy (60 s minimum interval, 1 h max key age) with an
+    //    injectable clock: a token under a `kid` published *after* the last fetch is refused
+    //    while the throttle holds and accepted once the interval has elapsed. This is the
+    //    documented rotation latency: issuers publish keys ahead of use (Entra: days), so
+    //    an unknown `kid` at request time is a rotation the ledger has not fetched yet.
+    let now = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+    let clock_now = now.clone();
+    let c_auth: SharedAuthenticator = Arc::new(
+        OidcAuthenticator::new(
+            OIDC_ISS.into(),
+            OIDC_AUD.into(),
+            jwks.url.clone(),
+            ClaimsPolicy::default(),
+        )
+        .with_clock(Arc::new(move || *clock_now.lock().unwrap())),
+    );
+    let c = harness_full(
+        dev(),
+        ApiLimits::default(),
+        c_auth,
+        DbSessionLimits::default(),
+    )
+    .await;
+    let (status, _, _) = c.call("GET", &refs, Some(&t_c), None, None).await;
+    assert_eq!(status, StatusCode::OK, "first fetch loads kid-c");
+    *jwks.document.lock().unwrap() = JWKS_ROTATED.to_owned();
+    let t_a2 = rs256("kid-a", RSA_A, &oidc_claims(300, -5));
+    assert_error(
+        &c.call("GET", &refs, Some(&t_a2), None, None).await,
+        StatusCode::UNAUTHORIZED,
+        "UNAUTHENTICATED",
+    );
+    *now.lock().unwrap() += Duration::from_secs(61);
+    let (status, _, _) = c.call("GET", &refs, Some(&t_a2), None, None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "after the refresh interval the new kid is fetched"
+    );
+}
+
+// =========================================================================================
+// Plan 0005 §9 — adversarial resource limits: admission control under a slow database,
+// edge timeout, slow-loris body, body-size boundary, pool health
+// =========================================================================================
+
+/// Runtime-role sessions of *this* database currently waiting on a heavyweight lock
+/// (observability barrier; the test runs on a throwaway database so nothing else counts).
+async fn runtime_sessions_waiting(owner: &PostgresLedgerStore) -> i64 {
+    sqlx::query(
+        "SELECT count(*) AS n FROM pg_stat_activity \
+         WHERE usename = 'ledger_rt_api' AND datname = current_database() \
+           AND wait_event_type = 'Lock'",
+    )
+    .fetch_one(owner.pool())
+    .await
+    .unwrap()
+    .get::<i64, _>("n")
+}
+
+async fn wait_until(mut condition: impl AsyncFnMut() -> bool, what: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !condition().await {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn rss_kib() -> u64 {
+    std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| {
+            s.split_whitespace()
+                .nth(1)
+                .and_then(|p| p.parse::<u64>().ok())
+        })
+        .map(|pages| pages * 4)
+        .unwrap_or(0)
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn expensive_operations_are_admission_controlled_under_a_slow_database() {
+    // Two expensive slots; the database side gives up on a lock after 2 s (→ 503
+    // DEPENDENCY_TIMEOUT), well inside the edge timeout.
+    let limits = ApiLimits {
+        max_concurrent_expensive: 2,
+        request_timeout: Duration::from_secs(20),
+        ..ApiLimits::default()
+    };
+    let session = DbSessionLimits {
+        lock_timeout: Duration::from_secs(2),
+        ..DbSessionLimits::default()
+    };
+    let auth: SharedAuthenticator = Arc::new(
+        DevHs256Authenticator::new(
+            ISSUER.into(),
+            AUDIENCE.into(),
+            SECRET,
+            ClaimsPolicy::default(),
+        )
+        .unwrap(),
+    );
+    // A table lock disturbs every session of a database: use a throwaway one.
+    let url = fresh_database("api_saturation").await;
+    let h = harness_in(&url, dev(), limits, auth, session).await;
+    let g = h.graph("tenant-a").await;
+    let t = token("tenant-a", "actor", &ALL);
+    let head = commit(&h, &g, &t, "<urn:a> <urn:p> \"1\" .").await;
+    let state_path = format!("/v1/graphs/{g}/commits/{head}/state");
+    let refs = format!("/v1/graphs/{g}/refs?name=main");
+    let rss_before = rss_kib();
+
+    // The owner makes every object read wait: the runtime cannot read immutable_objects
+    // until this transaction ends (a slow/blocked database, not a slow authenticator).
+    let mut blocker = h.owner.pool().begin().await.unwrap();
+    sqlx::query("LOCK TABLE immutable_objects IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    // Two expensive reads take both slots and block inside PostgreSQL.
+    let hold1 = tokio::spawn({
+        let (h, p, t) = (h.app.clone(), state_path.clone(), t.clone());
+        async move { call_app(h, "GET", &p, Some(&t)).await }
+    });
+    let hold2 = tokio::spawn({
+        let (h, p, t) = (h.app.clone(), state_path.clone(), t.clone());
+        async move { call_app(h, "GET", &p, Some(&t)).await }
+    });
+    wait_until(
+        async || runtime_sessions_waiting(&h.owner).await >= 2,
+        "two runtime sessions blocked on the table lock",
+    )
+    .await;
+    // Saturated: the third expensive request is refused immediately with a stable code,
+    // for reads and for prepare alike; cheap paths keep working.
+    let r = h.call("GET", &state_path, Some(&t), None, None).await;
+    assert_error(&r, StatusCode::SERVICE_UNAVAILABLE, "RESOURCE_LIMIT");
+    assert!(
+        r.1["message"].as_str().unwrap().contains("concurrent"),
+        "{r:?}"
+    );
+    let refused_at = std::time::Instant::now();
+    let r = h
+        .call(
+            "POST",
+            &format!("/v1/graphs/{g}/proposals"),
+            Some(&t),
+            Some("saturated"),
+            Some(prepare_body(
+                Some(&head),
+                &[("add", "<urn:a> <urn:p> \"2\" .")],
+                "m",
+            )),
+        )
+        .await;
+    assert_error(&r, StatusCode::SERVICE_UNAVAILABLE, "RESOURCE_LIMIT");
+    assert!(
+        r.1["message"].as_str().unwrap().contains("concurrent"),
+        "{r:?}"
+    );
+    assert!(
+        refused_at.elapsed() < Duration::from_secs(1),
+        "refusal must be immediate, took {:?}",
+        refused_at.elapsed()
+    );
+    let (status, r, _) = h.call("GET", &refs, Some(&t), None, None).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "cheap ref read under saturation: {r:?}"
+    );
+    let (status, _, _) = h.call("GET", "/ready", None, None, None).await;
+    assert_eq!(status, StatusCode::OK, "readiness under saturation");
+    // Pool bound at the peak of the episode: the runtime never opens more sessions than
+    // its configured pool, even with two blocked expensive reads plus cheap traffic.
+    let pool_max = i64::from(DbSessionLimits::default().max_connections);
+    let peak: i64 = sqlx::query(
+        "SELECT count(*) AS n FROM pg_stat_activity \
+         WHERE usename = 'ledger_rt_api' AND datname = current_database()",
+    )
+    .fetch_one(h.owner.pool())
+    .await
+    .unwrap()
+    .get("n");
+    assert!(
+        peak <= pool_max,
+        "runtime sessions at peak {peak} > pool {pool_max}"
+    );
+    // The blocked reads end with the database's own timeout, classified as a dependency
+    // timeout (retryable), never as success or as an internal error.
+    for held in [hold1, hold2] {
+        let r = held.await.unwrap();
+        assert_error(&r, StatusCode::SERVICE_UNAVAILABLE, "DEPENDENCY_TIMEOUT");
+    }
+    // Slots are released with the failed requests: capacity is back while the lock is
+    // still held (the next expensive request blocks again instead of being refused).
+    let hold3 = tokio::spawn({
+        let (h, p, t) = (h.app.clone(), state_path.clone(), t.clone());
+        async move { call_app(h, "GET", &p, Some(&t)).await }
+    });
+    wait_until(
+        async || runtime_sessions_waiting(&h.owner).await >= 1,
+        "a runtime session blocked again",
+    )
+    .await;
+    blocker.rollback().await.unwrap();
+    let r = hold3.await.unwrap();
+    assert_eq!(r.0, StatusCode::OK, "released: {r:?}");
+    assert_eq!(r.1["quads"].as_array().unwrap().len(), 1);
+    // Pool and memory health over the episode: sessions never exceed the pool, later
+    // requests all succeed, resident memory did not balloon.
+    let sessions: i64 =
+        sqlx::query("SELECT count(*) AS n FROM pg_stat_activity WHERE usename = 'ledger_rt_api' AND datname = current_database()")
+            .fetch_one(h.owner.pool())
+            .await
+            .unwrap()
+            .get("n");
+    assert!(
+        sessions <= pool_max,
+        "runtime sessions after the episode {sessions} > pool {pool_max}"
+    );
+    for _ in 0..20 {
+        let (status, _, _) = h.call("GET", &state_path, Some(&t), None, None).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let rss_after = rss_kib();
+    println!("rss before {rss_before} KiB, after {rss_after} KiB");
+    // Whole-process RSS (other tests run in parallel in this binary): recorded as a
+    // measurement only; the qualification run's memory evidence is the stress harness.
+    let _ = (rss_before, rss_after);
+}
+
+async fn call_app(app: Router, method: &str, path: &str, bearer: Option<&str>) -> Reply {
+    let mut request = Request::builder().method(method).uri(path);
+    if let Some(bearer) = bearer {
+        request = request.header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+    }
+    let response = app
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let correlation = response
+        .headers()
+        .get("x-correlation-id")
+        .map(|v| v.to_str().unwrap().to_owned());
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()))
+    };
+    (status, value, correlation)
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn edge_timeout_slow_loris_and_body_boundary_are_bounded() {
+    // Edge timeout under a slow database: the database waits longer than the request is
+    // allowed to take, so the edge answers RESOURCE_LIMIT and the client is never left
+    // hanging (the store's own timeout is 10 s here, longer than the edge's 1 s).
+    let limits = ApiLimits {
+        body_bytes: 600,
+        request_timeout: Duration::from_secs(1),
+        ..ApiLimits::default()
+    };
+    let session = DbSessionLimits {
+        lock_timeout: Duration::from_secs(10),
+        ..DbSessionLimits::default()
+    };
+    let auth: SharedAuthenticator = Arc::new(
+        DevHs256Authenticator::new(
+            ISSUER.into(),
+            AUDIENCE.into(),
+            SECRET,
+            ClaimsPolicy::default(),
+        )
+        .unwrap(),
+    );
+    let url = fresh_database("api_edge").await;
+    let h = harness_in(&url, dev(), limits, auth, session).await;
+    let g = h.graph("tenant-a").await;
+    let t = token("tenant-a", "actor", &ALL);
+    let head = commit(&h, &g, &t, "<urn:a> <urn:p> \"1\" .").await;
+    let state_path = format!("/v1/graphs/{g}/commits/{head}/state");
+    let mut blocker = h.owner.pool().begin().await.unwrap();
+    sqlx::query("LOCK TABLE immutable_objects IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let r = h.call("GET", &state_path, Some(&t), None, None).await;
+    assert_error(&r, StatusCode::SERVICE_UNAVAILABLE, "RESOURCE_LIMIT");
+    assert!(
+        r.1["message"].as_str().unwrap().contains("time limit"),
+        "{r:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "edge timeout fired at {:?}",
+        started.elapsed()
+    );
+    blocker.rollback().await.unwrap();
+    // The abandoned query finishes once the lock is gone; wait for the pool to be quiet
+    // before timing further requests (observability, not sleep).
+    wait_until(
+        async || runtime_sessions_waiting(&h.owner).await == 0,
+        "no runtime session left waiting",
+    )
+    .await;
+
+    // Slow-loris body: one byte every 100 ms, never finishing. The edge timeout covers body
+    // reading, so the request ends with RESOURCE_LIMIT after ~1 s instead of holding a
+    // connection open indefinitely.
+    let proposals = format!("/v1/graphs/{g}/proposals");
+    let drip = futures_util::stream::unfold(0u32, |i| async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        Some((
+            Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(b" ")),
+            i + 1,
+        ))
+    });
+    let request = Request::builder()
+        .method("POST")
+        .uri(&proposals)
+        .header(header::AUTHORIZATION, format!("Bearer {t}"))
+        .header("idempotency-key", "loris")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from_stream(drip))
+        .unwrap();
+    let started = std::time::Instant::now();
+    let r = h.raw(request).await;
+    assert_error(&r, StatusCode::SERVICE_UNAVAILABLE, "RESOURCE_LIMIT");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "slow-loris cut at {:?}",
+        started.elapsed()
+    );
+
+    // Body-size boundary: exactly `body_bytes` is accepted, one byte more is refused with the
+    // stable code before any parsing.
+    let core = prepare_body(Some(&head), &[("add", "<urn:a> <urn:p> \"2\" .")], "m").to_string();
+    assert!(
+        core.len() < 600,
+        "fixture must fit under the limit: {}",
+        core.len()
+    );
+    let exact = format!("{}{core}", " ".repeat(600 - core.len()));
+    assert_eq!(exact.len(), 600);
+    let r = h
+        .call_raw("POST", &proposals, Some(&t), Some("exact"), Some(exact))
+        .await;
+    assert_eq!(r.0, StatusCode::CREATED, "exactly at the limit: {r:?}");
+    let over = format!("{}{core}", " ".repeat(601 - core.len()));
+    let r = h
+        .call_raw("POST", &proposals, Some(&t), Some("over"), Some(over))
+        .await;
+    assert_error(&r, StatusCode::PAYLOAD_TOO_LARGE, "RESOURCE_LIMIT");
+    assert!(
+        r.1["message"].as_str().unwrap().contains("request body"),
+        "{r:?}"
+    );
+    // Nothing leaked from the refused attempts; the accepted one is a proposal.
+    assert_eq!(h.count("proposals", &g).await, 2);
 }

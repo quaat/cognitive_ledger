@@ -34,7 +34,7 @@ fn unique(prefix: &str) -> String {
 }
 
 async fn store() -> PostgresLedgerStore {
-    PostgresLedgerStore::connect(&database_url(), V1Binding::Reject)
+    PostgresLedgerStore::connect_and_migrate(&database_url(), V1Binding::Reject)
         .await
         .unwrap()
 }
@@ -499,10 +499,10 @@ async fn prepare_idempotency_yields_one_candidate_identity_even_under_concurrenc
     assert_eq!((c.proposals, c.idempotency), (1, 1));
 
     // Two replicas prepare the same key simultaneously: one candidate identity.
-    let replica_a = PostgresLedgerStore::connect(&database_url(), V1Binding::Reject)
+    let replica_a = PostgresLedgerStore::connect_and_migrate(&database_url(), V1Binding::Reject)
         .await
         .unwrap();
-    let replica_b = PostgresLedgerStore::connect(&database_url(), V1Binding::Reject)
+    let replica_b = PostgresLedgerStore::connect_and_migrate(&database_url(), V1Binding::Reject)
         .await
         .unwrap();
     let indexed_before = indexed_commits(&store, &g).await;
@@ -604,7 +604,7 @@ async fn acceptance_is_idempotent_and_serialized_across_replicas() {
     let barrier = Arc::new(tokio::sync::Barrier::new(n));
     let mut handles = Vec::new();
     for (i, candidate) in candidates.iter().enumerate() {
-        let replica = PostgresLedgerStore::connect(&database_url(), V1Binding::Reject)
+        let replica = PostgresLedgerStore::connect_and_migrate(&database_url(), V1Binding::Reject)
             .await
             .unwrap();
         let barrier = Arc::clone(&barrier);
@@ -658,7 +658,7 @@ async fn acceptance_is_idempotent_and_serialized_across_replicas() {
     let barrier = Arc::new(tokio::sync::Barrier::new(4));
     let mut handles = Vec::new();
     for _ in 0..4 {
-        let replica = PostgresLedgerStore::connect(&database_url(), V1Binding::Reject)
+        let replica = PostgresLedgerStore::connect_and_migrate(&database_url(), V1Binding::Reject)
             .await
             .unwrap();
         let barrier = Arc::clone(&barrier);
@@ -722,7 +722,7 @@ async fn concurrent_genesis_accepts_replay_for_the_same_key_and_race_for_differe
     let barrier = Arc::new(tokio::sync::Barrier::new(4));
     let mut handles = Vec::new();
     for _ in 0..4 {
-        let replica = PostgresLedgerStore::connect(&database_url(), V1Binding::Reject)
+        let replica = PostgresLedgerStore::connect_and_migrate(&database_url(), V1Binding::Reject)
             .await
             .unwrap();
         let barrier = Arc::clone(&barrier);
@@ -776,7 +776,7 @@ async fn concurrent_genesis_accepts_replay_for_the_same_key_and_race_for_differe
     let barrier = Arc::new(tokio::sync::Barrier::new(4));
     let mut handles = Vec::new();
     for (i, candidate) in candidates.iter().enumerate() {
-        let replica = PostgresLedgerStore::connect(&database_url(), V1Binding::Reject)
+        let replica = PostgresLedgerStore::connect_and_migrate(&database_url(), V1Binding::Reject)
             .await
             .unwrap();
         let barrier = Arc::clone(&barrier);
@@ -1373,10 +1373,10 @@ async fn concurrent_accept_and_reject_of_one_candidate_yield_exactly_one_decisio
         .await
         .unwrap();
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
-    let accepting = PostgresLedgerStore::connect(&database_url(), V1Binding::Reject)
+    let accepting = PostgresLedgerStore::connect_and_migrate(&database_url(), V1Binding::Reject)
         .await
         .unwrap();
-    let rejecting = PostgresLedgerStore::connect(&database_url(), V1Binding::Reject)
+    let rejecting = PostgresLedgerStore::connect_and_migrate(&database_url(), V1Binding::Reject)
         .await
         .unwrap();
     let (b1, b2) = (Arc::clone(&barrier), Arc::clone(&barrier));

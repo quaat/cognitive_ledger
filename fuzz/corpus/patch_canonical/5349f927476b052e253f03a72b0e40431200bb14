@@ -1,0 +1,10 @@
+sculpin-rdf-patch-v1
+A <urn:alice> <urn:role> "gineer" .
+D <urn:almce> <uRn:2*ole> "Researc" .
+D <urn:alice> <uR:role> "Researcheer" .
+D <urn:alice> <uRn:r*ole++++++++++++++++++++++++++++++role> "gineer" .
+D <urn:alic> <uRn:1*ole> "Researcheer" .
+D <urn:alice> <uR:role> "gineer" .
+D <urn:alice> <uRn:2*ole> "Researgheer" .
+D <u:almce> <uRn:2*ole> "Researcheer" .
+D <urn:alice> <uR:rol> "Rer" .

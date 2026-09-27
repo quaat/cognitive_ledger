@@ -74,13 +74,25 @@ async fn migration(dir: &std::path::Path, branch: &str) -> FsToPgMigration {
 /// A migration whose destination ref is `(graph, branch)` and whose v1 binding is that
 /// same graph.
 async fn migration_to(dir: &std::path::Path, graph: &str, branch: &str) -> FsToPgMigration {
-    let url = database_url();
+    migration_to_at(&database_url(), dir, graph, branch).await
+}
+
+/// `migration_to` against an explicit destination database (throwaway databases for tests
+/// that seed corruption; the shared database must stay clean for `ledger-admin verify`).
+async fn migration_to_at(
+    url: &str,
+    dir: &std::path::Path,
+    graph: &str,
+    branch: &str,
+) -> FsToPgMigration {
     let source = FileStore::open_existing(dir).unwrap();
-    let destination =
-        PostgresImmutableStore::connect(&url, V1Binding::BindTo(GraphId::new(graph).unwrap()))
-            .await
-            .unwrap();
-    let refs = PgRefStore::connect_ref(&url, graph, branch).await.unwrap();
+    let destination = PostgresImmutableStore::connect_and_migrate(
+        url,
+        V1Binding::BindTo(GraphId::new(graph).unwrap()),
+    )
+    .await
+    .unwrap();
+    let refs = PgRefStore::connect_ref(url, graph, branch).await.unwrap();
     FsToPgMigration::new(source, destination, refs).unwrap()
 }
 
@@ -100,9 +112,12 @@ async fn create_graph(pool: &sqlx::PgPool, graph: &str, status: ledger_store::Gr
 async fn destination_ledger(branch: &str) -> Ledger {
     let url = database_url();
     let immutable: Arc<dyn ImmutableStore> = Arc::new(
-        PostgresImmutableStore::connect(&url, V1Binding::BindTo(GraphId::new("default").unwrap()))
-            .await
-            .unwrap(),
+        PostgresImmutableStore::connect_and_migrate(
+            &url,
+            V1Binding::BindTo(GraphId::new("default").unwrap()),
+        )
+        .await
+        .unwrap(),
     );
     let refs: Arc<dyn RefStore> = Arc::new(
         PgRefStore::connect_ref(&url, "default", branch)
@@ -245,7 +260,7 @@ async fn interrupted_migration_resumes_to_the_same_result() {
     let fs = FileStore::open_existing(dir.path()).unwrap();
     let genesis = fs.get_commit(&commits[0]).await.unwrap().unwrap();
     let second = fs.get_commit(&commits[1]).await.unwrap().unwrap();
-    let destination = PostgresImmutableStore::connect(
+    let destination = PostgresImmutableStore::connect_and_migrate(
         &database_url(),
         V1Binding::BindTo(GraphId::new("default").unwrap()),
     )
@@ -491,7 +506,7 @@ async fn a_ref_is_never_installed_onto_another_graphs_history() {
     let fs = Arc::new(FileStore::open(dir.path()).unwrap());
     let graph_a = unique("graph-a");
     let graph_b = unique("graph-b");
-    let destination = PostgresImmutableStore::connect(&url, V1Binding::Reject)
+    let destination = PostgresImmutableStore::connect_and_migrate(&url, V1Binding::Reject)
         .await
         .unwrap();
     create_graph(
@@ -556,10 +571,12 @@ async fn a_ref_is_never_installed_onto_another_graphs_history() {
 
     // A destination whose v1 binding names a different graph than the ref is refused at
     // construction, before any I/O.
-    let mismatched =
-        PostgresImmutableStore::connect(&url, V1Binding::BindTo(GraphId::new(&graph_a).unwrap()))
-            .await
-            .unwrap();
+    let mismatched = PostgresImmutableStore::connect_and_migrate(
+        &url,
+        V1Binding::BindTo(GraphId::new(&graph_a).unwrap()),
+    )
+    .await
+    .unwrap();
     assert!(
         FsToPgMigration::new(
             FileStore::open_existing(dir.path()).unwrap(),
@@ -627,7 +644,17 @@ async fn destination_collision_and_conflicting_head_abort_without_overwriting() 
         .unwrap()
         .unwrap();
     let patch_id: ContentId = genesis.patch().0.clone();
-    let destination = PostgresImmutableStore::connect(&database_url(), V1Binding::Reject)
+    // A throwaway database: this test seeds a corrupt object, which must never reach the
+    // shared database that `ledger-admin verify` inspects at the end of the harness.
+    let (collision_url, _admin_pool) = fresh_database("collide").await;
+    let destination =
+        PostgresImmutableStore::connect_and_migrate(&collision_url, V1Binding::Reject)
+            .await
+            .unwrap();
+    // Since migration 0009 PostgreSQL itself refuses a mislabelled object; drop the CHECK
+    // (owner only) so this test can seed the corruption the read path must still survive.
+    sqlx::query("ALTER TABLE immutable_objects DROP CONSTRAINT IF EXISTS immutable_objects_content_addressed")
+        .execute(destination.pool())
         .await
         .unwrap();
     sqlx::query("INSERT INTO immutable_objects (id, bytes) VALUES ($1, $2)")
@@ -637,7 +664,7 @@ async fn destination_collision_and_conflicting_head_abort_without_overwriting() 
         .await
         .unwrap();
     let branch = unique("collide");
-    let error = migration(dir.path(), &branch)
+    let error = migration_to_at(&collision_url, dir.path(), "default", &branch)
         .await
         .run()
         .await
@@ -646,7 +673,7 @@ async fn destination_collision_and_conflicting_head_abort_without_overwriting() 
         matches!(error, LedgerError::ObjectCollision(ref id) if *id == patch_id),
         "{error}"
     );
-    let refs = PgRefStore::connect_ref(&database_url(), "default", &branch)
+    let refs = PgRefStore::connect_ref(&collision_url, "default", &branch)
         .await
         .unwrap();
     assert_eq!(refs.head().await.unwrap(), None);

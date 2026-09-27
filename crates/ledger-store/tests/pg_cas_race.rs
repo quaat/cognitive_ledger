@@ -16,10 +16,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Since migration 0006 a ref may only point at an indexed commit of its graph, so the
 /// race targets are real v1 commits published under the bootstrap graph.
 async fn published_commit(url: &str, seed: &str) -> CommitId {
-    let store =
-        PostgresImmutableStore::connect(url, V1Binding::BindTo(GraphId::new("default").unwrap()))
-            .await
-            .unwrap();
+    let store = PostgresImmutableStore::connect_and_migrate(
+        url,
+        V1Binding::BindTo(GraphId::new("default").unwrap()),
+    )
+    .await
+    .unwrap();
     let patch = Patch::new([Operation {
         kind: OperationKind::Add,
         quad: format!("<urn:cas-race:{seed}> <urn:p> \"v\" .")

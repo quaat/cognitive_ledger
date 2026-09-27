@@ -88,6 +88,18 @@ pub enum LedgerError {
     /// idempotency key. Never raised for a request that was refused on its merits.
     #[error("DEPENDENCY_UNAVAILABLE: {0}")]
     DependencyUnavailable(String),
+    /// A database statement or lock wait exceeded the session's configured time limit
+    /// (ADR-0016). The transaction was rolled back; retry with the same idempotency key.
+    #[error("DEPENDENCY_TIMEOUT: {0}")]
+    DependencyTimeout(String),
+    /// The database schema is not the exact level this build requires (behind, ahead,
+    /// absent or corrupt migration metadata). Startup and readiness refuse (ADR-0016).
+    #[error("SCHEMA_INCOMPATIBLE: {0}")]
+    SchemaIncompatible(String),
+    /// The runtime database identity is more privileged than the least-privilege model
+    /// allows, or lacks a grant the request path needs (ADR-0016). Startup refuses.
+    #[error("RUNTIME_IDENTITY: {0}")]
+    RuntimeIdentity(String),
     #[error(
         "VALIDATION_REQUIRED: acceptance onto protected state requires semantic validation, which is not available yet"
     )]

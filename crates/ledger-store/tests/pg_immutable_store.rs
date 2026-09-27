@@ -24,6 +24,39 @@ fn database_url() -> String {
     std::env::var("LEDGER_TEST_DATABASE_URL").expect("LEDGER_TEST_DATABASE_URL must be set")
 }
 
+/// The test URL with its database name replaced (`…/ledger?…` → `…/<name>?…`).
+fn url_for_database(base: &str, name: &str) -> String {
+    let (head, query) = match base.split_once('?') {
+        Some((h, q)) => (h, Some(q)),
+        None => (base, None),
+    };
+    let slash = head.rfind('/').expect("database url has a path");
+    let mut url = format!("{}/{name}", &head[..slash]);
+    if let Some(q) = query {
+        url.push('?');
+        url.push_str(q);
+    }
+    url
+}
+
+/// A throwaway database for tests that seed corruption (dropped CHECK, mislabelled
+/// objects). The shared database must stay clean: the integration harness ends with
+/// `ledger-admin verify` against it.
+async fn fresh_database(prefix: &str) -> String {
+    let base = database_url();
+    let admin = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&base)
+        .await
+        .unwrap();
+    let name = unique(prefix).replace('-', "_").to_lowercase();
+    sqlx::query(&format!("CREATE DATABASE {name}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    url_for_database(&base, &name)
+}
+
 fn unique(prefix: &str) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -101,7 +134,7 @@ async fn replica_b_reconstructs_what_replica_a_committed() {
     let bootstrap = GraphId::new("default").unwrap();
     let make_replica = || async {
         let immutable: Arc<dyn ImmutableStore> = Arc::new(
-            PostgresImmutableStore::connect(&url, V1Binding::BindTo(bootstrap.clone()))
+            PostgresImmutableStore::connect_and_migrate(&url, V1Binding::BindTo(bootstrap.clone()))
                 .await
                 .unwrap(),
         );
@@ -172,7 +205,7 @@ async fn commit_index_is_verified_typed_and_idempotent() {
     let _ = IGNORE;
     let url = database_url();
     let graph = unique("graph");
-    let store = PostgresImmutableStore::connect(&url, V1Binding::Reject)
+    let store = PostgresImmutableStore::connect_and_migrate(&url, V1Binding::Reject)
         .await
         .unwrap();
     create_graph(store.pool(), &graph, "tenant-a").await;
@@ -267,7 +300,7 @@ async fn commit_index_is_verified_typed_and_idempotent() {
 async fn v1_binding_policy_is_enforced_on_write() {
     let url = database_url();
     let p = patch(&unique("policy"));
-    let rejecting = PostgresImmutableStore::connect(&url, V1Binding::Reject)
+    let rejecting = PostgresImmutableStore::connect_and_migrate(&url, V1Binding::Reject)
         .await
         .unwrap();
     rejecting
@@ -282,7 +315,7 @@ async fn v1_binding_policy_is_enforced_on_write() {
     assert!(!rejecting.exists(&legacy.id().unwrap().0).await.unwrap());
 
     let bootstrap = GraphId::new("default").unwrap();
-    let binding = PostgresImmutableStore::connect(&url, V1Binding::BindTo(bootstrap))
+    let binding = PostgresImmutableStore::connect_and_migrate(&url, V1Binding::BindTo(bootstrap))
         .await
         .unwrap();
     let id = binding.put_commit(&legacy).await.unwrap();
@@ -301,7 +334,7 @@ async fn v1_binding_policy_is_enforced_on_write() {
     // Re-binding the same v1 commit to another graph is impossible: one id, one graph.
     let other_graph = unique("graph");
     create_import_graph(binding.pool(), &other_graph, "tenant-b").await;
-    let other = PostgresImmutableStore::connect(
+    let other = PostgresImmutableStore::connect_and_migrate(
         &url,
         V1Binding::BindTo(GraphId::new(other_graph).unwrap()),
     )
@@ -321,10 +354,12 @@ async fn v1_binding_policy_is_enforced_on_write() {
     // v1 history cannot be bound to an *active* graph (ADR-0010: bootstrap/importing only).
     let active = unique("active");
     create_graph(binding.pool(), &active, "tenant-c").await;
-    let into_active =
-        PostgresImmutableStore::connect(&url, V1Binding::BindTo(GraphId::new(&active).unwrap()))
-            .await
-            .unwrap();
+    let into_active = PostgresImmutableStore::connect_and_migrate(
+        &url,
+        V1Binding::BindTo(GraphId::new(&active).unwrap()),
+    )
+    .await
+    .unwrap();
     let fresh_v1 = v1(vec![], &p, "into active");
     assert!(matches!(
         into_active.put_commit(&fresh_v1).await,
@@ -337,7 +372,7 @@ async fn v1_binding_policy_is_enforced_on_write() {
 #[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
 async fn commit_bytes_are_refused_as_content_and_corrupt_envelopes_are_errors_not_absent() {
     let url = database_url();
-    let store = PostgresImmutableStore::connect(&url, V1Binding::Reject)
+    let store = PostgresImmutableStore::connect_and_migrate(&url, V1Binding::Reject)
         .await
         .unwrap();
     let p = patch(&unique("content"));
@@ -405,8 +440,8 @@ async fn commit_bytes_are_refused_as_content_and_corrupt_envelopes_are_errors_no
 #[tokio::test]
 #[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
 async fn commit_patch_must_be_a_canonical_rdf_patch() {
-    let url = database_url();
-    let store = PostgresImmutableStore::connect(&url, V1Binding::Reject)
+    let url = fresh_database("tamper").await;
+    let store = PostgresImmutableStore::connect_and_migrate(&url, V1Binding::Reject)
         .await
         .unwrap();
     let graph = unique("graph");
@@ -512,6 +547,12 @@ async fn commit_patch_must_be_a_canonical_rdf_patch() {
     // 6. A *corrupted* stored patch (bytes no longer hash to the id) is storage
     //    corruption, not a client error, and publishes nothing.
     let good = patch(&unique("corrupt-me"));
+    // Since migration 0009 PostgreSQL itself refuses a mislabelled object; drop the CHECK
+    // (owner only) so this test can seed the corruption the read path must still survive.
+    sqlx::query("ALTER TABLE immutable_objects DROP CONSTRAINT IF EXISTS immutable_objects_content_addressed")
+        .execute(store.pool())
+        .await
+        .unwrap();
     sqlx::query("INSERT INTO immutable_objects (id, bytes) VALUES ($1, $2)")
         .bind(good.id().to_string())
         .bind(b"sculpin-rdf-patch-v1\nA <urn:s> <urn:p> \"tampered\" .\n".as_slice())
@@ -529,13 +570,19 @@ async fn commit_patch_must_be_a_canonical_rdf_patch() {
 #[tokio::test]
 #[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
 async fn publication_is_truthful_against_inconsistent_stored_bytes() {
-    let url = database_url();
-    let store = PostgresImmutableStore::connect(&url, V1Binding::Reject)
+    let url = fresh_database("tamper").await;
+    let store = PostgresImmutableStore::connect_and_migrate(&url, V1Binding::Reject)
         .await
         .unwrap();
     // Seed a damaged row directly: the id is well-formed but the bytes are not its preimage.
     let good = unique("payload").into_bytes();
     let id = ContentId::for_bytes(&good);
+    // Since migration 0009 PostgreSQL itself refuses a mislabelled object; drop the CHECK
+    // (owner only) so this test can seed the corruption the read path must still survive.
+    sqlx::query("ALTER TABLE immutable_objects DROP CONSTRAINT IF EXISTS immutable_objects_content_addressed")
+        .execute(store.pool())
+        .await
+        .unwrap();
     sqlx::query("INSERT INTO immutable_objects (id, bytes) VALUES ($1, $2)")
         .bind(id.to_string())
         .bind(b"damaged".as_slice())
@@ -569,6 +616,12 @@ async fn publication_is_truthful_against_inconsistent_stored_bytes() {
     create_graph(store.pool(), &graph, "tenant-a").await;
     let commit = v2(&graph, vec![], &p, "victim");
     let commit_id = commit.id().unwrap();
+    // Since migration 0009 PostgreSQL itself refuses a mislabelled object; drop the CHECK
+    // (owner only) so this test can seed the corruption the read path must still survive.
+    sqlx::query("ALTER TABLE immutable_objects DROP CONSTRAINT IF EXISTS immutable_objects_content_addressed")
+        .execute(store.pool())
+        .await
+        .unwrap();
     sqlx::query("INSERT INTO immutable_objects (id, bytes) VALUES ($1, $2)")
         .bind(commit_id.to_string())
         .bind(b"damaged commit".as_slice())
@@ -593,14 +646,18 @@ async fn concurrent_incompatible_v1_bindings_resolve_to_exactly_one_graph() {
     let url = database_url();
     let graph_a = unique("graph-a");
     let graph_b = unique("graph-b");
-    let store_a =
-        PostgresImmutableStore::connect(&url, V1Binding::BindTo(GraphId::new(&graph_a).unwrap()))
-            .await
-            .unwrap();
-    let store_b =
-        PostgresImmutableStore::connect(&url, V1Binding::BindTo(GraphId::new(&graph_b).unwrap()))
-            .await
-            .unwrap();
+    let store_a = PostgresImmutableStore::connect_and_migrate(
+        &url,
+        V1Binding::BindTo(GraphId::new(&graph_a).unwrap()),
+    )
+    .await
+    .unwrap();
+    let store_b = PostgresImmutableStore::connect_and_migrate(
+        &url,
+        V1Binding::BindTo(GraphId::new(&graph_b).unwrap()),
+    )
+    .await
+    .unwrap();
     create_import_graph(store_a.pool(), &graph_a, "tenant-a").await;
     create_import_graph(store_a.pool(), &graph_b, "tenant-b").await;
     let p = patch(&unique("race"));
@@ -686,14 +743,18 @@ async fn cross_graph_ancestry_is_rejected() {
     let url = database_url();
     let graph_a = unique("graph-a");
     let graph_b = unique("graph-b");
-    let store_a =
-        PostgresImmutableStore::connect(&url, V1Binding::BindTo(GraphId::new(&graph_a).unwrap()))
-            .await
-            .unwrap();
-    let store_b =
-        PostgresImmutableStore::connect(&url, V1Binding::BindTo(GraphId::new(&graph_b).unwrap()))
-            .await
-            .unwrap();
+    let store_a = PostgresImmutableStore::connect_and_migrate(
+        &url,
+        V1Binding::BindTo(GraphId::new(&graph_a).unwrap()),
+    )
+    .await
+    .unwrap();
+    let store_b = PostgresImmutableStore::connect_and_migrate(
+        &url,
+        V1Binding::BindTo(GraphId::new(&graph_b).unwrap()),
+    )
+    .await
+    .unwrap();
     create_import_graph(store_a.pool(), &graph_a, "tenant-a").await;
     create_import_graph(store_a.pool(), &graph_b, "tenant-b").await;
     let p = patch(&unique("cross"));
@@ -769,10 +830,12 @@ async fn blocked_publication_reads_the_winner_after_commit_and_proceeds_after_ro
     let url = database_url();
     let graph_a = unique("graph-a");
     let graph_b = unique("graph-b");
-    let store_a =
-        PostgresImmutableStore::connect(&url, V1Binding::BindTo(GraphId::new(&graph_a).unwrap()))
-            .await
-            .unwrap();
+    let store_a = PostgresImmutableStore::connect_and_migrate(
+        &url,
+        V1Binding::BindTo(GraphId::new(&graph_a).unwrap()),
+    )
+    .await
+    .unwrap();
     create_import_graph(store_a.pool(), &graph_a, "tenant-a").await;
     create_import_graph(store_a.pool(), &graph_b, "tenant-b").await;
     let p = patch(&unique("blocked"));

@@ -88,25 +88,122 @@ Preserve object digest verification and atomic ref updates. Never commit secrets
   concurrency limit) means the outcome is unknown to the client: **retry with the same
   `Idempotency-Key`**; a completed request replays, an aborted one runs once.
 
+## Database privilege boundary (ADR-0016)
+The runtime identity (`LEDGER_DATABASE_URL`) holds exactly the DML the request path
+executes (migration 0008: `SELECT`, column-level `INSERT`, `UPDATE (head, version,
+updated_at)` on `refs`) and cannot `ALTER`, `DROP`, `TRUNCATE`, `DISABLE TRIGGER`, modify
+or delete existing immutable or audit rows, back-date or pre-mark new rows, provision
+graphs or run migrations. Migration 0009 makes ref movement itself a database fact: a head
+move needs a matching ref event in the same transaction and must be a fast-forward, status
+changes serialize against in-flight workflows, and objects must be content-addressed.
+Migrations run only through `ledger-admin migrate` with the owner identity; the server
+verifies the exact schema level, contiguity, checksums and enabled guards, and verifies
+that its own role is a least-privilege identity, refusing otherwise. Every runtime session
+is bounded by `statement_timeout`, `lock_timeout` and `idle_in_transaction_session_timeout`
+(set per connection; requires a direct or session-mode connection). **Accepted residual
+risk:** the runtime is the trusted writer of new audit rows, so a compromised runtime can
+still fabricate a consistent forward move within its tenants; `SECURITY DEFINER` write
+functions would close this (tech-debt). `pg_least_privilege` proves the denied statement
+set, the privilege matrix, the schema-level refusals, the identity refusal and the 0009
+integrity rules against real PostgreSQL, including a non-superuser owner.
+
 ## Assumptions and status
 - The identity provider is trusted for the claims it signs; the ledger does not verify
   that an `on_behalf_of` human consented.
-- The PostgreSQL runtime role still owns the schema and migrations run on connect; the
-  role split, kill-based fault injection, dependency/container scanning and live-issuer
-  tests are P1.5. **The service is not production-qualified until P1.5 passes.**
+- Executed P1.5 evidence so far: least privilege (slice 1), supply chain (slice 2), the
+  1,000-writer and kill-injection runs (`docs/quality/evidence/`), two-replica JWKS
+  rotation and adversarial limits (`pg_api`), bounded fuzzing of the RDF/patch/commit
+  decoders, the request bodies and the request-identity encoder (`fuzz/`, `ci-fuzz`; not
+  yet fuzzed: the `Idempotency-Key` header parser, the path `CommitId`, JWT/JWKS parsing,
+  which the `jsonwebtoken` crate owns), upgrade and backup/restore smoke runs (including
+  refusal of a restore that lost a guard trigger, the content-address CHECK, a column grant or
+  a sequence grant), and the depth baselines (`docs/quality/evidence/`,
+  `performance-baselines.md`). Start-up and readiness verify the database controls the
+  privilege model depends on structurally: every guard trigger by table, function, timing,
+  event set, `UPDATE OF` columns, deferral flags and absence of a `WHEN` condition; every guard function's body, language,
+  return type, pinned `search_path` and schema-owner ownership against the embedded
+  migrations (no `SECURITY DEFINER`); `session_replication_role = origin` with no SET/ALTER
+  SYSTEM privilege on it; the runtime role's attributes and its transitive memberships (no
+  settable or inherited path to a superuser, table or function owner, CREATE holder, a role
+  allowed to SET or ALTER SYSTEM `session_replication_role`, a `pg_*` role, or any role whose own table,
+  column, sequence or grant-function privileges exceed the runtime model; PostgreSQL 15
+  and 16+ membership semantics both handled); every FOREIGN KEY, PRIMARY KEY and UNIQUE constraint of
+  the migrations by shape (key columns, referenced `public` table and columns, at least one
+  validated non-deferrable match, `NULLS NOT DISTINCT` where defined), the unique indexes
+  with their predicates, and all 32 named CHECKs — definitions compared by deparse at
+  start-up against the values the migrations produce (identical on PostgreSQL 15 and 17)
+  and by expression fingerprint on readiness; the content-address CHECK additionally by a
+  rolled-back semantic probe at start-up; the runtime role's exact per-column INSERT/UPDATE
+  grants, absence of table-level writes, DELETE/TRUNCATE/TRIGGER/REFERENCES, and USAGE on
+  exactly the audit sequences. ASan fuzzing passes on the hosted runner (`ci-fuzz` matrix `none`/`address`, pinned
+  nightly, explicit target triple; the local host's ASan start-up crash is host-specific);
+  a 900 s-per-target campaign under both sanitizers (≈2.2 G executions, no crash) is recorded in the plan and repeats weekly. The **live Entra ID issuer smoke test
+  (`scripts/live-issuer-smoke.sh`; pending: no tenant credentials available to the runs;
+  never mark it passed)** remain. **The service is not
+  production-qualified until Plan 0005 passes in full.**
+  performance baselines and the **live Entra ID issuer smoke test (pending: no tenant
+  credentials available to the runs; never mark it passed)** remain. **The service is not
+  production-qualified until Plan 0005 passes in full.**
 
-## Supply chain
-`scripts/check-supply-chain.sh` (blocking in `ci-security`) runs `cargo audit` with the
-single exception documented in `.cargo/audit.toml` — RUSTSEC-2023-0071 (`rsa 0.9`), a
-lockfile-only optional dependency of sqlx's MySQL driver that no feature of this workspace
-enables — and first re-proves the premise: `rsa` must be unreachable in the feature-resolved
-build graph of every target, have `sqlx-mysql` as its only lockfile dependent, and stay on
-the advisory's 0.9 line; any change fails the gate so the exception is re-evaluated (trigger:
-every sqlx upgrade, Plan 0005 supply-chain slice). GitHub dependency review runs on every
-pull request (Dependency graph enabled 2026-09-26); its first run found GHSA-h395-gr6q-cpjc
-in `jsonwebtoken 9.3.1` (a malformed `exp`/`nbf` JSON type was treated as an absent claim),
-fixed by upgrading to `jsonwebtoken 11.1.0` on the `aws-lc-rs` backend (chosen over
-`rust_crypto`, which would have made the `rsa` crate reachable).
+## Supply chain (Plan 0005 slice 2)
+`scripts/check-supply-chain.sh` (blocking in `ci-security`) runs, in order:
+1. the RUSTSEC-2023-0071 premise proof (`rsa 0.9` is a lockfile-only optional dependency
+   of sqlx's MySQL driver: unreachable in the feature-resolved graph of every target, only
+   dependent `sqlx-mysql`, still on the 0.9 line) and `cargo audit` with that single
+   documented exception (`.cargo/audit.toml`);
+2. `cargo deny check advisories licenses bans sources` against `deny.toml`: RustSec
+   advisories on the feature-resolved graph (no exception needed there; `rsa` is banned so
+   its becoming reachable is a hard failure), a permissive-only licence allow list (MIT,
+   Apache-2.0, BSD-2/3, ISC, Zlib, Unicode-3.0, Unlicense, CC0-1.0,
+   BSL-1.0, CDLA-Permissive-2.0; strong copyleft requires review), bans on Fluree and on
+   SPARQL/query engines (boundaries), duplicates reported as warnings and reviewed,
+   crates.io as the only source. Workspace crates are `publish = false`;
+3. CycloneDX 1.5 SBOMs of the two shipped binaries (`cargo cyclonedx --describe binaries`),
+   filtered to the feature-resolved build graph of `cargo tree -e normal,build` for
+   `x86_64-unknown-linux-gnu` (cargo-cyclonedx reads `cargo metadata`, which also lists the
+   lockfile-only `rsa`, `sqlx-mysql`, `sqlx-sqlite`, Windows/wasm and dev-only crates), and
+   failed if `rsa`, `sqlx-mysql`, `sqlx-sqlite`, `openssl`, `openssl-sys` or `native-tls`
+   appear; sanity-checked and uploaded as CI artefacts (never committed). `deny.toml` bans
+   the OpenSSL and native-tls crates outright (TLS is rustls, JWT crypto is aws-lc-rs).
+GitHub dependency review runs on every pull request (Dependency graph enabled 2026-09-26);
+its first run found GHSA-h395-gr6q-cpjc in `jsonwebtoken 9.3.1` (a malformed `exp`/`nbf`
+JSON type was treated as an absent claim), fixed by upgrading to `jsonwebtoken 11.1.0` on
+the `aws-lc-rs` backend (chosen over `rust_crypto`, which would have made the `rsa` crate
+reachable). Every third-party GitHub Action is pinned to an immutable commit SHA with the
+release name in a comment and checks out without persisting the token; Dependabot
+(`.github/dependabot.yml`) proposes weekly updates for Actions and the Cargo lockfile as
+ordinary gated pull requests (never auto-merged). Both container images the build depends on
+are digest-pinned: the `rust:1.89-bookworm` builder and the distroless runtime.
+
+### Container image
+The runtime image is `gcr.io/distroless/cc-debian12:nonroot` pinned by digest (glibc,
+libgcc, libstdc++, openssl libs, tzdata, ca-certificates; no shell, package manager or
+curl; uid 65532; 11 OS packages, ≈47 MB). Health probes use `ledger-admin probe` (a loopback
+GET that accepts only a parsed plain-http URL whose host is a loopback address or exactly
+`localhost`, without userinfo; no proxy, no redirects, 2 s bound, URL never echoed).
+`ci-security`'s `container` job builds the image, emits its CycloneDX SBOM and the full JSON
+report first (uploaded even when the gate fails), then fails on any CRITICAL/HIGH finding
+whether or not a fix exists: an unfixed one must be classified in `.trivyignore` with
+rationale and review trigger (it is empty), never dropped by `ignore-unfixed`. The scanner
+version is pinned to the one this classification used.
+Classification of the 2026-09-26 scan (Trivy 0.74.0; 0 CRITICAL, 0 HIGH, 17 MEDIUM, 16 LOW,
+1 UNKNOWN):
+- `libc6` 2.36 — 15 MEDIUM and 7 LOW, all `affected`/`fix_deferred` in Debian 12 (no fix
+  available): **accepted**; the ledger does not expose glibc parsing surfaces to untrusted
+  input beyond what Rust's std uses (no `wordexp`, `strfmon`, iconv, nscd, getaddrinfo-
+  driven DNS on untrusted names — the only outbound connections are PostgreSQL and the
+  configured JWKS URL). Review trigger: each distroless base refresh.
+- `libssl3` 3.0.20 — 2 MEDIUM + 4 LOW with a fix in 3.0.22 (`fixed`) plus CVE-2025-27587
+  (LOW, `affected`, no fix): **fix pending base refresh** / **not applicable** respectively;
+  the ledger links `aws-lc-rs` and `rustls`, not OpenSSL (`deny.toml` bans the OpenSSL
+  crates), so the library is unused by the process. Refresh the distroless digest when the
+  base ships 3.0.22; the CI gate would fail on it only if a finding reached HIGH.
+- `gcc-12-base`/`libgcc-s1`/`libgomp1`/`libstdc++6` CVE-2022-27943 (LOW, `affected`, a
+  libiberty demangler issue): **not applicable** (no demangling at runtime).
+- `tzdata` DLA-4792-1 (UNKNOWN, data update): **fix pending base refresh**.
+The previous `debian:bookworm-slim` base carried 4 CRITICAL and 63 HIGH unfixed findings
+(perl, util-linux, curl, systemd, zlib) in 106 packages; moving to distroless removed them
+rather than accepting them.
 
 Dependency and license findings must be classified rather than ignored. Fluree's BSL image
 is optional test infrastructure and is not shipped. The intended runtime dependency policy

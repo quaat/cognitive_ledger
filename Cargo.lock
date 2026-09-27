@@ -960,11 +960,13 @@ dependencies = [
  "ledger-api",
  "ledger-core",
  "ledger-store",
+ "reqwest",
  "serde_json",
  "sqlx",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
@@ -982,6 +984,21 @@ dependencies = [
  "tempfile",
  "time",
  "tokio",
+]
+
+[[package]]
+name = "ledger-stress"
+version = "0.1.0"
+dependencies = [
+ "jsonwebtoken",
+ "ledger-core",
+ "ledger-store",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "url",
 ]
 
 [[package]]

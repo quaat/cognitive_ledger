@@ -1,0 +1,1 @@
+{"ref": "main", "expected_head": null, "operations": [{"op": "add", "quad": "DDDDDDDDD:DDDDDDDDrn:p> \"1\" ."}], "activity": "a", "event_time":  "fuzz", "message": "m"}

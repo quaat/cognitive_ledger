@@ -251,12 +251,53 @@ fn storage(e: impl std::fmt::Display) -> LedgerError {
 /// dependency failure (503 at the boundary), anything else is a storage error (500).
 #[cfg(feature = "postgres")]
 pub(crate) fn db_error(e: sqlx::Error) -> LedgerError {
-    match e {
-        sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed | sqlx::Error::Io(_) => {
+    match &e {
+        sqlx::Error::PoolTimedOut
+        | sqlx::Error::PoolClosed
+        | sqlx::Error::Io(_)
+        | sqlx::Error::WorkerCrashed => LedgerError::DependencyUnavailable(e.to_string()),
+        sqlx::Error::Database(d) if d.code().is_some_and(|code| sqlstate_is_unavailable(&code)) => {
             LedgerError::DependencyUnavailable(e.to_string())
         }
-        other => LedgerError::Storage(other.to_string()),
+        sqlx::Error::Database(d) if d.code().is_some_and(|code| sqlstate_is_timeout(&code)) => {
+            LedgerError::DependencyTimeout(e.to_string())
+        }
+        _ => LedgerError::Storage(e.to_string()),
     }
+}
+
+/// SQLSTATEs PostgreSQL returns while it is shutting down, restarting, failing over or
+/// losing the connection: class 08 (connection exception), 57P01 `admin_shutdown`, 57P02
+/// `crash_shutdown`, 57P03 `cannot_connect_now`, 53300 `too_many_connections`, 53400
+/// `configuration_limit_exceeded`, 25P03 `idle_in_transaction_session_timeout`. Requests
+/// hitting these are retryable (503), not storage faults (500).
+#[cfg(feature = "postgres")]
+pub fn sqlstate_is_unavailable(code: &str) -> bool {
+    code.starts_with("08")
+        || matches!(
+            code,
+            "57P01" | "57P02" | "57P03" | "53300" | "53400" | "25P03"
+        )
+}
+
+/// SQLSTATEs after which the transaction was rolled back and the request is retryable:
+/// 57014 `query_canceled` (statement_timeout) and 55P03 `lock_not_available`
+/// (lock_timeout) from the session limits ADR-0016 sets, plus 40001
+/// `serialization_failure` and 40P01 `deadlock_detected`.
+#[cfg(feature = "postgres")]
+pub fn sqlstate_is_timeout(code: &str) -> bool {
+    matches!(code, "57014" | "55P03" | "40001" | "40P01")
+}
+
+/// Advisory-lock key derivation shared with migration 0009's `ledger_lock_key`: the first
+/// eight bytes (big-endian) of SHA-256 over the UTF-8 key string. Domain-separated key
+/// strings (`graph-status:…`, `proposal-decision:…`, the idempotency scope) cannot be made
+/// to collide by choosing request values, unlike `hashtextextended`.
+#[cfg(feature = "postgres")]
+pub fn lock_key(key: &str) -> i64 {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(key.as_bytes());
+    i64::from_be_bytes(digest[..8].try_into().expect("8 bytes"))
 }
 fn sync_directory(path: &Path) -> Result<(), LedgerError> {
     fs::File::open(path)
@@ -519,6 +560,8 @@ mod postgres_immutable;
 #[cfg(feature = "postgres")]
 pub mod schema;
 #[cfg(feature = "postgres")]
+pub mod verify;
+#[cfg(feature = "postgres")]
 pub use postgres_immutable::{PostgresImmutableStore, V1Binding};
 #[cfg(feature = "postgres")]
 mod postgres_graphs;
@@ -528,7 +571,7 @@ pub use postgres_graphs::{GraphRecord, GraphStatus, NewGraph, PgGraphs};
 mod postgres_workflow;
 #[cfg(feature = "postgres")]
 pub use postgres_workflow::{
-    AcceptRequest, Accepted, FailPoint, MAX_BRANCH_BYTES, MAX_CORRELATION_BYTES,
+    AcceptRequest, Accepted, DbSessionLimits, FailPoint, MAX_BRANCH_BYTES, MAX_CORRELATION_BYTES,
     MAX_IDEMPOTENCY_KEY_BYTES, MAX_REASON_BYTES, PostgresLedgerStore, PrepareRequest, Prepared,
     RejectRequest, Rejected, RequestScope, ValidationPolicy, WorkflowRepository,
 };

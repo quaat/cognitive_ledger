@@ -1,0 +1,14 @@
+# Keeps the SHA-pinned GitHub Actions and the Rust lockfile under review (Plan 0005 slice 2).
+# Updates arrive as pull requests that run the full gates; they are never auto-merged.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: {interval: weekly}
+    open-pull-requests-limit: 5
+  - package-ecosystem: cargo
+    directory: /
+    schedule: {interval: weekly}
+    open-pull-requests-limit: 5
+    # Lockfile-only and security updates; version bumps of direct dependencies are reviewed
+    # against the protocol freeze (golden vectors) before merging.

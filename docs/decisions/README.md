@@ -24,3 +24,5 @@ and `product_development_plan.md`.
 - [ADR-0013: Atomic acceptance transaction](ADR-0013-atomic-acceptance-transaction.md)
 - [ADR-0014: Two-phase semantic-validation protocol and contracts](ADR-0014-semantic-validation-protocol.md)
 - [ADR-0015: Canonical HTTP request identity](ADR-0015-canonical-request-identity.md)
+- [ADR-0016: Database identities, schema ownership and runtime least privilege](ADR-0016-database-identities-and-schema-ownership.md)
+- [ADR-0017: Backup, restore and recovery semantics](ADR-0017-backup-restore-and-recovery-semantics.md)

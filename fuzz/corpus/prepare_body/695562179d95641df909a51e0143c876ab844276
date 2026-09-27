@@ -1,0 +1,1 @@
+{"ref": "main", "expected_head": null, "operations": [{"op": "add", "quad": "<urcc#cccccccccccccccccc/cccccp> \"1\" ."}], "activity": "$a", "event_time": "2026z", "message": "m"}

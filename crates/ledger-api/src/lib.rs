@@ -477,6 +477,18 @@ impl ApiError {
                 "DEPENDENCY_UNAVAILABLE",
                 "the ledger database is not available; retry with the same idempotency key".into(),
             ),
+            E::DependencyTimeout(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "DEPENDENCY_TIMEOUT",
+                "the database operation exceeded its time limit or lost a lock race and was \
+                 rolled back; retry with the same idempotency key"
+                    .into(),
+            ),
+            E::SchemaIncompatible(_) | E::RuntimeIdentity(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "DEPENDENCY_UNAVAILABLE",
+                "the ledger database is not compatible with this build's configuration".into(),
+            ),
             E::UnknownGraph(_) | E::NotFound(_) | E::MissingTarget(_) => (
                 StatusCode::NOT_FOUND,
                 "NOT_FOUND",
@@ -1268,6 +1280,7 @@ mod tests {
             "VALIDATION_REQUIRED",
             "RESOURCE_LIMIT",
             "DEPENDENCY_UNAVAILABLE",
+            "DEPENDENCY_TIMEOUT",
             "INTERNAL",
         ] {
             assert!(codes.contains(code), "OpenAPI error enum lacks {code}");

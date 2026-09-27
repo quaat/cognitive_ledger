@@ -22,3 +22,11 @@ tests/differential/
 *.zip
 .zprofile
 .zshrc
+# Credential-like files never enter the build context or BuildKit cache
+.env
+.env.*
+*.pem
+*.key
+credentials.*
+# Fuzz workspace (its own build output can reach gigabytes; never part of the image)
+fuzz/
