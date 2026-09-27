@@ -575,14 +575,23 @@ impl ValidationRepository {
             }
             return Ok(());
         }
-        let stored: Vec<u8> = sqlx::query_scalar(
-            "SELECT canonical_bytes FROM validation_records WHERE validation_id = $1",
+        // Same rule as contexts: an existing row must agree in bytes *and* in the graph and
+        // tenant it is bound to, so a mismatching projection is a collision, not a later FK
+        // failure.
+        let row = sqlx::query(
+            "SELECT canonical_bytes, graph_id, tenant_id FROM validation_records WHERE validation_id = $1",
         )
         .bind(id.to_string())
         .fetch_one(&mut *conn)
         .await
         .map_err(db_error)?;
-        if stored != bytes {
+        let stored: Vec<u8> = row.try_get("canonical_bytes").map_err(db_error)?;
+        let graph: String = row.try_get("graph_id").map_err(db_error)?;
+        let tenant: String = row.try_get("tenant_id").map_err(db_error)?;
+        if stored != bytes
+            || graph != scope.graph.as_str()
+            || tenant != scope.principal.tenant_id.as_str()
+        {
             return Err(LedgerError::ObjectCollision(id.0.clone()));
         }
         Ok(())

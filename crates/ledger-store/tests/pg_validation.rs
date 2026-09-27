@@ -11,8 +11,8 @@ use ledger_core::{
 use ledger_rdf::{Operation, OperationKind, Patch, state_digest};
 use ledger_store::{
     AcceptRequest, GraphStatus, NewGraph, PostgresLedgerStore, PrepareRequest, RejectRequest,
-    RequestScope, V1Binding, ValidateRequest, ValidationBegin, ValidationPolicy, ValidatorOutcome,
-    verify,
+    RequestScope, V1Binding, ValidateRequest, ValidationBegin, ValidationPolicy,
+    ValidationTrustPolicy, ValidatorOutcome, verify,
 };
 use ledger_validation_protocol::{
     BaseKb, Ontology, OutcomeKind, Reasoning, RequestedContext, SemanticExecutionContext, ShapeSet,
@@ -36,10 +36,16 @@ fn unique(prefix: &str) -> String {
     format!("{prefix}-{}-{nanos}", std::process::id())
 }
 
+/// The shared store trusts the test validator service (ADR-0019 trust anchor).
 async fn store() -> PostgresLedgerStore {
     PostgresLedgerStore::connect_and_migrate(&database_url(), V1Binding::Reject)
         .await
         .unwrap()
+        .with_validation_trust(trust())
+}
+
+fn trust() -> ValidationTrustPolicy {
+    ValidationTrustPolicy::single(validator().service_id).unwrap()
 }
 
 const TENANT: &str = "tenant-val";
@@ -1316,6 +1322,7 @@ async fn an_interrupted_validated_acceptance_persists_nothing_and_the_same_key_t
         FailPoint::BeforeCommit,
     ] {
         let faulty = WorkflowRepository::new(store.pool().clone(), store.immutable().clone())
+            .with_validation_trust(trust())
             .with_failpoint(point);
         let error = faulty.accept(&request).await.unwrap_err();
         assert!(
@@ -1405,9 +1412,10 @@ async fn an_indexed_commit_without_a_proposal_is_not_a_validation_candidate() {
     );
 }
 
-/// ADR-0019 (review round 3): with a configured validation service, a record produced by
-/// any other service is `VALIDATION_STALE` even in the named environment, and nothing moves;
-/// the same record accepts under a repository requiring its own service.
+/// ADR-0019 trust anchor: a record produced by any service other than the trusted one is
+/// `VALIDATION_STALE` even in the named environment, and nothing moves; a repository with no
+/// trust anchor refuses every validated acceptance (fail closed, never "any service"); the
+/// same record accepts under a repository trusting its own service.
 #[tokio::test]
 #[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
 async fn acceptance_requires_the_configured_validation_service() {
@@ -1437,14 +1445,32 @@ async fn acceptance_requires_the_configured_validation_service() {
         },
     );
     let other_service = WorkflowRepository::new(store.pool().clone(), store.immutable().clone())
-        .with_required_validator("urn:sculpin:service:another-validator");
+        .with_validation_trust(
+            ValidationTrustPolicy::single("urn:sculpin:service:another-validator").unwrap(),
+        );
     let before = snapshot(&store, &g).await;
     let error = other_service.accept(&request).await.unwrap_err();
     assert!(matches!(error, LedgerError::ValidationStale(_)), "{error}");
     assert_eq!(snapshot(&store, &g).await, before, "nothing moved");
     assert_eq!(ref_head(&store, &g).await, None);
+    // No trust anchor: fail closed for a conforming record in its own environment.
+    let untrusting = WorkflowRepository::new(store.pool().clone(), store.immutable().clone());
+    let error = untrusting.accept(&request).await.unwrap_err();
+    assert!(matches!(error, LedgerError::ValidationStale(_)), "{error}");
+    assert_eq!(snapshot(&store, &g).await, before, "nothing moved");
+    assert_eq!(ref_head(&store, &g).await, None);
+    // A foreign or nonexistent validation stays NOT_FOUND without a trust anchor too: the
+    // missing anchor never reveals whether a record exists.
+    let mut missing = request.clone();
+    missing.scope.idempotency_key = "a-missing".into();
+    missing.validation = ValidationPolicy::Validated {
+        validation_id: ValidationId(ContentId::for_bytes(b"no such record")),
+        semantic_environment_id: v.environment_id.clone(),
+    };
+    let error = untrusting.accept(&missing).await.unwrap_err();
+    assert!(matches!(error, LedgerError::ValidationNotFound), "{error}");
     let same_service = WorkflowRepository::new(store.pool().clone(), store.immutable().clone())
-        .with_required_validator(validator().service_id);
+        .with_validation_trust(trust());
     let accepted = same_service.accept(&request).await.unwrap();
     assert_eq!(accepted.head, c1);
 }

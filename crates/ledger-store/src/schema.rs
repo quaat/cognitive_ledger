@@ -180,6 +180,7 @@ pub async fn verify(pool: &PgPool) -> Result<SchemaReport, LedgerError> {
     verify_guard_triggers(pool).await?;
     verify_guard_functions(pool).await?;
     let fingerprints = verify_constraints_and_indexes(pool).await?;
+    verify_not_null(pool).await?;
     Ok(SchemaReport {
         version: highest,
         fingerprints,
@@ -745,6 +746,179 @@ const fn uq(table: &'static str, columns: &'static [&'static str]) -> ExpectedCo
         nulls_not_distinct: false,
     }
 }
+
+/// Every column migrations 0001–0010 declare `NOT NULL`, by table. Composite foreign keys use
+/// `MATCH SIMPLE`, so a key column that became nullable would let a row skip its foreign key
+/// entirely; the verifier therefore checks nullability structurally like every other
+/// control (a column that is additionally `NOT NULL` is harmless and accepted).
+const EXPECTED_NOT_NULL: &[(&str, &[&str])] = &[
+    (
+        "commit_index",
+        &[
+            "graph_id",
+            "id",
+            "indexed_at",
+            "parent_count",
+            "patch_id",
+            "version",
+        ],
+    ),
+    ("commit_parents", &["commit_id", "parent_id", "position"]),
+    (
+        "decision_validations",
+        &[
+            "candidate_commit",
+            "decision_id",
+            "graph_id",
+            "validation_id",
+        ],
+    ),
+    (
+        "decisions",
+        &[
+            "branch",
+            "candidate_commit",
+            "decided_at",
+            "decision",
+            "decision_id",
+            "graph_id",
+            "principal_id",
+            "principal_type",
+            "tenant_id",
+            "validation_ids",
+        ],
+    ),
+    ("graphs", &["created_at", "graph_id", "status", "tenant_id"]),
+    (
+        "idempotency",
+        &[
+            "created_at",
+            "graph_id",
+            "idempotency_id",
+            "idempotency_key",
+            "operation",
+            "principal_id",
+            "principal_type",
+            "request_digest",
+            "result_kind",
+            "tenant_id",
+        ],
+    ),
+    ("immutable_objects", &["bytes", "created_at", "id"]),
+    (
+        "projection_outbox",
+        &[
+            "attempts",
+            "branch",
+            "commit_id",
+            "created_at",
+            "event_kind",
+            "graph_id",
+            "outbox_id",
+            "ref_event_id",
+            "ref_version",
+        ],
+    ),
+    (
+        "proposals",
+        &[
+            "branch",
+            "candidate_commit",
+            "created_at",
+            "effective_patch_id",
+            "graph_id",
+            "principal_id",
+            "principal_type",
+            "proposal_id",
+            "requested_patch_id",
+            "tenant_id",
+        ],
+    ),
+    (
+        "ref_events",
+        &[
+            "branch",
+            "event_id",
+            "graph_id",
+            "new_head",
+            "new_version",
+            "operation",
+            "principal_id",
+            "principal_type",
+            "recorded_at",
+            "tenant_id",
+        ],
+    ),
+    (
+        "refs",
+        &[
+            "branch",
+            "graph_id",
+            "head",
+            "protected",
+            "updated_at",
+            "version",
+        ],
+    ),
+    (
+        "semantic_execution_contexts",
+        &[
+            "base_kb_id",
+            "base_kb_revision",
+            "candidate_commit",
+            "candidate_state_digest",
+            "canonical_bytes",
+            "context_id",
+            "created_at",
+            "graph_id",
+            "shapes_id",
+            "shapes_version",
+            "tenant_id",
+            "validator_configuration_version",
+            "validator_service_id",
+            "validator_service_version",
+            "virtual_context_count",
+        ],
+    ),
+    (
+        "semantic_virtual_contexts",
+        &[
+            "context_id",
+            "dataset_id",
+            "hydration_plan_digest",
+            "object_refs",
+            "position",
+            "query_spec_digest",
+            "source_version",
+        ],
+    ),
+    (
+        "validation_records",
+        &[
+            "candidate_commit",
+            "candidate_state_digest",
+            "canonical_bytes",
+            "context_id",
+            "created_at",
+            "graph_id",
+            "outcome",
+            "principal_id",
+            "principal_type",
+            "recorded_at",
+            "report_digest",
+            "tenant_id",
+            "validation_id",
+            "validator_configuration_version",
+            "validator_service_id",
+            "validator_service_version",
+            "violation_count",
+        ],
+    ),
+    (
+        "validation_violations",
+        &["code", "message", "position", "severity", "validation_id"],
+    ),
+];
 
 const EXPECTED_CONSTRAINTS: &[ExpectedConstraint] = &[
     // 0001–0004: content, index, graphs
@@ -1356,6 +1530,38 @@ fn index_key(name: &str) -> String {
 /// exists with the expected columns and partiality. Catalog-only (attnums resolved to names,
 /// no deparse), so it is lock-free and runs on readiness. Returns the expression fingerprints
 /// of the CHECKs and partial-index predicates for readiness comparison.
+/// Refuse a database in which any column the migrations declare `NOT NULL` accepts NULL
+/// (catalog read only; runs at start-up and on readiness).
+async fn verify_not_null(pool: &PgPool) -> Result<(), LedgerError> {
+    let rows = sqlx::query(
+        "SELECT c.relname::text AS table_name, a.attname::text AS column_name \
+         FROM pg_attribute a \
+         JOIN pg_class c ON c.oid = a.attrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = 'public' AND c.relkind = 'r' AND a.attnum > 0 \
+           AND NOT a.attisdropped AND a.attnotnull",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(db_error)?;
+    let mut not_null = std::collections::BTreeSet::new();
+    for row in &rows {
+        let table: String = row.try_get("table_name").map_err(db_error)?;
+        let column: String = row.try_get("column_name").map_err(db_error)?;
+        not_null.insert((table, column));
+    }
+    for (table, columns) in EXPECTED_NOT_NULL {
+        for column in *columns {
+            if !not_null.contains(&((*table).to_owned(), (*column).to_owned())) {
+                return Err(incompatible(format!(
+                    "column {table}.{column} must be NOT NULL (or is missing); refusing to serve"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn verify_constraints_and_indexes(
     pool: &PgPool,
 ) -> Result<BTreeMap<String, String>, LedgerError> {

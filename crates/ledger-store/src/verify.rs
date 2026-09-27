@@ -185,7 +185,7 @@ const CHECKS: &[(&str, &str)] = &[
             OR c.validator_configuration_version <> r.validator_configuration_version",
     ),
     (
-        "every validation record was produced by exactly one validate request",
+        "every validation record was produced by at least one validate request (identical records are shared across keys)",
         "SELECT r.validation_id FROM validation_records r \
          WHERE (SELECT count(*) FROM idempotency i WHERE i.result_validation_id = r.validation_id AND i.operation = 'validate') < 1",
     ),
@@ -280,10 +280,54 @@ pub async fn run(pool: &PgPool) -> Result<Report, LedgerError> {
 }
 
 /// Rust-side checks the SQL cannot express: every validation record and context decodes from
-/// its hashed canonical bytes, and every relational projection column agrees with the bytes
+/// its hashed canonical bytes, and every relational projection column — including each
+/// summary and virtual-context detail row at its position — agrees with the bytes
 /// (acceptance decides on the bytes; the columns are for queries and audit).
 async fn verify_validation_bytes(pool: &PgPool) -> Result<Vec<CheckResult>, LedgerError> {
     use ledger_validation_protocol::{SemanticExecutionContext, ValidationId};
+    use std::collections::HashMap;
+    // Detail rows, grouped by parent and ordered by position (one query per table).
+    let mut summaries: HashMap<String, Vec<(i32, String, String, String)>> = HashMap::new();
+    for row in sqlx::query(
+        "SELECT validation_id, position, severity, code, message FROM validation_violations \
+         ORDER BY validation_id, position",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(db_error)?
+    {
+        summaries
+            .entry(row.try_get("validation_id").map_err(db_error)?)
+            .or_default()
+            .push((
+                row.try_get("position").map_err(db_error)?,
+                row.try_get("severity").map_err(db_error)?,
+                row.try_get("code").map_err(db_error)?,
+                row.try_get("message").map_err(db_error)?,
+            ));
+    }
+    type VirtualRow = (i32, String, String, Vec<String>, String, String);
+    let mut virtuals: HashMap<String, Vec<VirtualRow>> = HashMap::new();
+    for row in sqlx::query(
+        "SELECT context_id, position, dataset_id, source_version, object_refs, query_spec_digest, \
+                hydration_plan_digest FROM semantic_virtual_contexts ORDER BY context_id, position",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(db_error)?
+    {
+        virtuals
+            .entry(row.try_get("context_id").map_err(db_error)?)
+            .or_default()
+            .push((
+                row.try_get("position").map_err(db_error)?,
+                row.try_get("dataset_id").map_err(db_error)?,
+                row.try_get("source_version").map_err(db_error)?,
+                row.try_get("object_refs").map_err(db_error)?,
+                row.try_get("query_spec_digest").map_err(db_error)?,
+                row.try_get("hydration_plan_digest").map_err(db_error)?,
+            ));
+    }
     let mut record_bad = Vec::new();
     let rows = sqlx::query(
         "SELECT r.validation_id, r.graph_id, r.candidate_commit, r.candidate_state_digest, r.context_id, \
@@ -321,7 +365,19 @@ async fn verify_validation_bytes(pool: &PgPool) -> Result<Vec<CheckResult>, Ledg
                         .try_get::<Option<String>, _>("report_reference")
                         .map_err(db_error)?
                 && record.outcome.violations.len() as i64
-                    == row.try_get::<i64, _>("summaries").map_err(db_error)?)
+                    == row.try_get::<i64, _>("summaries").map_err(db_error)?
+                // every summary row is the decoded entry at its position (0..n, no gaps)
+                && summaries.get(&id).map_or(0, Vec::len) == record.outcome.violations.len()
+                && summaries.get(&id).is_none_or(|rows| {
+                    rows.iter().zip(&record.outcome.violations).enumerate().all(
+                        |(i, ((position, severity, code, message), v))| {
+                            usize::try_from(*position).is_ok_and(|p| p == i)
+                                && *severity == v.severity
+                                && *code == v.code
+                                && *message == v.message
+                        },
+                    )
+                }))
         })();
         if !matches!(agree, Ok(true)) {
             record_bad.push(id);
@@ -366,7 +422,21 @@ async fn verify_validation_bytes(pool: &PgPool) -> Result<Vec<CheckResult>, Ledg
                     == i64::from(
                         row.try_get::<i32, _>("virtual_context_count")
                             .map_err(db_error)?,
-                    ))
+                    )
+                // every virtual-context row is the decoded element at its position
+                && virtuals.get(&id).map_or(0, Vec::len) == c.virtual_contexts.len()
+                && virtuals.get(&id).is_none_or(|rows| {
+                    rows.iter().zip(&c.virtual_contexts).enumerate().all(
+                        |(i, ((position, dataset, version, refs, query, plan), vc))| {
+                            usize::try_from(*position).is_ok_and(|p| p == i)
+                                && *dataset == vc.dataset_id
+                                && *version == vc.source_version
+                                && *refs == vc.object_refs
+                                && *query == vc.query_spec_digest.to_string()
+                                && *plan == vc.hydration_plan_digest.to_string()
+                        },
+                    )
+                }))
         })();
         if !matches!(agree, Ok(true)) {
             context_bad.push(id);

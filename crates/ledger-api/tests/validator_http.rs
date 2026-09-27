@@ -14,7 +14,7 @@ use ledger_api::validator::{HttpValidationClient, HttpValidatorConfig};
 use ledger_core::{CommitId, ContentId, GraphId};
 use ledger_validation_protocol::{
     CandidateDescriptor, RequestedContext, VALIDATION_RESPONSE_PROTOCOL, ValidationClient,
-    ValidationClientError, ValidationRequest,
+    ValidationClientError, ValidationInvocationId, ValidationRequest,
 };
 use serde_json::json;
 use std::{
@@ -22,8 +22,13 @@ use std::{
     time::Duration,
 };
 
+fn invocation() -> ValidationInvocationId {
+    ValidationInvocationId(ContentId::for_bytes(b"one logical invocation"))
+}
+
 fn request() -> ValidationRequest {
     ValidationRequest::new(
+        invocation(),
         CandidateDescriptor {
             graph_id: GraphId::new("g").unwrap(),
             knowledge_base_id: None,
@@ -52,24 +57,40 @@ fn valid_response() -> serde_json::Value {
     })
 }
 
+/// What the local server saw of the last request.
+#[derive(Default)]
+struct Seen {
+    authorization: Option<String>,
+    idempotency_key: Option<String>,
+    body_invocation_id: Option<String>,
+}
+
 /// A local server whose single POST handler returns whatever `respond` builds; records the
-/// Authorization header it saw.
+/// Authorization and Idempotency-Key headers and the body's `invocation_id` it saw.
 async fn server(
     respond: impl Fn() -> Response + Clone + Send + Sync + 'static,
-) -> (String, Arc<Mutex<Option<String>>>) {
-    let seen = Arc::new(Mutex::new(None));
+) -> (String, Arc<Mutex<Seen>>) {
+    let seen = Arc::new(Mutex::new(Seen::default()));
     let seen_in = seen.clone();
     let app = Router::new()
         .route(
             "/validate",
-            post(move |headers: HeaderMap| {
+            post(move |headers: HeaderMap, body: axum::body::Bytes| {
                 let respond = respond.clone();
                 let seen = seen_in.clone();
                 async move {
-                    *seen.lock().unwrap() = headers
-                        .get(header::AUTHORIZATION)
-                        .and_then(|v| v.to_str().ok())
-                        .map(str::to_owned);
+                    let header = |name| {
+                        headers
+                            .get(name)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_owned)
+                    };
+                    let body: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+                    *seen.lock().unwrap() = Seen {
+                        authorization: header(header::AUTHORIZATION.as_str()),
+                        idempotency_key: header("idempotency-key"),
+                        body_invocation_id: body["invocation_id"].as_str().map(str::to_owned),
+                    };
                     respond()
                 }
             }),
@@ -100,10 +121,16 @@ async fn a_valid_response_is_parsed_and_the_credential_is_sent() {
     let (url, seen) = server(|| axum::Json(valid_response()).into_response()).await;
     let response = client(&url, 64 * 1024).validate(&request()).await.unwrap();
     assert!(response.outcome.is_conforming());
+    let seen = seen.lock().unwrap();
     assert_eq!(
-        seen.lock().unwrap().as_deref(),
+        seen.authorization.as_deref(),
         Some("Bearer workload-token-123")
     );
+    // One identifier, two representations: the Idempotency-Key header is the body's
+    // invocation id (ADR-0019 amendment).
+    let expected = invocation().to_string();
+    assert_eq!(seen.idempotency_key.as_deref(), Some(expected.as_str()));
+    assert_eq!(seen.body_invocation_id.as_deref(), Some(expected.as_str()));
 }
 
 #[tokio::test]

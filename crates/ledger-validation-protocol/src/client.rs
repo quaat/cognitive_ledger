@@ -5,7 +5,7 @@
 
 use crate::{
     BaseKb, Ontology, ProtocolError, Reasoning, SemanticExecutionContext, ShapeSet,
-    ValidationOutcome, ValidatorIdentity, VirtualContextRef,
+    ValidationInvocationId, ValidationOutcome, ValidatorIdentity, VirtualContextRef,
     encoding::{TAG_ABSENT, TAG_PRESENT, field, opt},
 };
 use ledger_core::{CommitId, ContentId, GraphId, MAX_IDENTIFIER_BYTES, validate_token};
@@ -156,6 +156,11 @@ pub struct CandidateDescriptor {
 #[serde(deny_unknown_fields)]
 pub struct ValidationRequest {
     pub protocol: String,
+    /// The logical invocation (`sculpin-validation-invocation/v1`): identical for every
+    /// delivery of the same ledger request (concurrent duplicate, retry, crash recovery). The
+    /// validator must resolve equal ids to one logical validation; the HTTP adapter also
+    /// sends it as `Idempotency-Key`.
+    pub invocation_id: ValidationInvocationId,
     pub candidate: CandidateDescriptor,
     #[serde(default)]
     pub requested: RequestedContext,
@@ -164,9 +169,14 @@ pub struct ValidationRequest {
 }
 
 impl ValidationRequest {
-    pub fn new(candidate: CandidateDescriptor, requested: RequestedContext) -> Self {
+    pub fn new(
+        invocation_id: ValidationInvocationId,
+        candidate: CandidateDescriptor,
+        requested: RequestedContext,
+    ) -> Self {
         Self {
             protocol: VALIDATION_REQUEST_PROTOCOL.into(),
+            invocation_id,
             candidate,
             requested,
             correlation_id: None,

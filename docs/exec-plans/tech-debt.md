@@ -25,9 +25,33 @@
   compromised runtime could fabricate a conforming record for its own tenants. The report
   digest/reference allows cross-checking against Sculpin's report store; signed validator
   responses (a validator key verified by the ledger) would close it and need an ADR.
-- The 0010 upgrade path is exercised by the migration and verifier suites on fresh databases;
-  `scripts/upgrade.sh` has not yet been re-run from the P1.5 release (schema 0009) with
-  populated data. Run it before the Phase 2 release.
+- The 0009 → 0010 upgrade from the P1.5 release with populated data is qualified by
+  `scripts/upgrade-p2.sh` (Plan 0006 evidence); re-run it on the final release candidate.
+- Sculpin must honour the validation invocation identity (`invocation_id` /
+  `Idempotency-Key`, ADR-0019 amendment): repeated or concurrent calls with one id resolve to
+  one logical validation. The ledger sends it on every delivery and its tests prove its own
+  side against a fake that implements the contract; the ledger cannot verify Sculpin's
+  deduplication. Until Sculpin implements it, concurrent same-key requests (or a retry after
+  a crash between answer and record) may record a result from whichever environment was
+  current when the winning delivery ran.
+- Detail rows under sealed parents (security review, P2, accepted for this release): the
+  write-once triggers on `decision_validations`, `validation_violations` and
+  `semantic_virtual_contexts` block UPDATE/DELETE but the runtime keeps INSERT, so a
+  compromised runtime could add a citation to an already-decided decision, a summary row to a
+  recorded validation, or a virtual-context row to a context. This is the same class as the
+  accepted ADR-0016 residual (runtime is the trusted writer of new rows); acceptance never
+  reads these rows (it decides on the hashed bytes) and `ledger-admin verify` detects every
+  such row (count/array agreement plus element-by-element comparison with the decoded
+  bytes). Closing it needs insert-time guards bound to the parent's transaction (a
+  `decision_validations` INSERT trigger requiring `validation_id = ANY(decisions.validation_ids)`,
+  deferred count triggers for the detail tables) plus verifier coverage and an ADR — or the
+  `SECURITY DEFINER` write-function model below.
+- Database-level size bounds (security review, P3): `semantic_virtual_contexts.object_refs`
+  elements and the `canonical_bytes` columns have no `octet_length` CHECK (the protocol
+  bounds them; only a compromised runtime could exceed them), and `ledger-admin verify` loads
+  all records and contexts into memory. Add CHECKs in a later migration and stream in verify.
+- A P1.5 `ledger-admin verify` does not check the schema level and prints `VERIFY OK` against
+  a 0010 database; always run the verifier from the same build as the servers.
 - Validation calls are synchronous inside the request (bounded by the validator timeout and a
   dedicated budget). A queued/async validation flow is a later orchestration layer above
   these primitives, not a replacement for them.
@@ -59,3 +83,5 @@
 - Evaluate `cargo-deny`, SBOM, and container scanning with classified findings (`cargo audit` is now a blocking gate via `scripts/check-supply-chain.sh`; its single exception, RUSTSEC-2023-0071 for the lockfile-only `rsa` under `sqlx-mysql`, is re-proven on every run and must be deleted when sqlx/rsa move).
 - Third-party GitHub Actions are pinned by commit SHA (Plan 0005 slice 2); bumping them is a deliberate change with the release name in the comment. The distroless runtime base is pinned by digest and must be refreshed when the classified container findings gain fixes (`docs/quality/security.md`).
 - Establish benchmark baselines and checkpoint policy before performance gates.
+- Dedicated Rust >=1.94 / SQLx 0.9 migration and full requalification (Dependabot's
+  `sqlx 0.8.6 → 0.9.0` needs Rust 1.94 and source changes; the workspace targets Rust 1.89).

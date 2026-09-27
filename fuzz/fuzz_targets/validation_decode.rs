@@ -1,8 +1,15 @@
 #![no_main]
 //! Phase 2 strict decoders (ADR-0018): semantic context, semantic environment and validation
 //! record never panic; accepted bytes re-encode identically (content identity is a fixed
-//! point of decode∘encode), and a context's environment is always encodable.
-use ledger_validation_protocol::{SemanticEnvironment, SemanticExecutionContext, ValidationRecord};
+//! point of decode∘encode), and a context's environment is always encodable. The validator's
+//! JSON response (the network-facing untrusted input) never panics through strict decoding,
+//! summary normalization and conversion into a context, and every context it yields is
+//! canonical and decodes back to itself.
+use ledger_core::GraphId;
+use ledger_validation_protocol::{
+    RequestedContext, SemanticEnvironment, SemanticExecutionContext, ValidationRecord,
+    ValidatorResponse,
+};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -16,6 +23,23 @@ fuzz_target!(|data: &[u8]| {
     }
     if let Ok(environment) = SemanticEnvironment::from_canonical_bytes(data) {
         assert_eq!(environment.canonical_bytes().unwrap(), data);
+    }
+    if let Ok(response) = serde_json::from_slice::<ValidatorResponse>(data) {
+        let response = response.with_bounded_summary();
+        assert!(response.outcome.violations.len() <= ledger_validation_protocol::MAX_VIOLATION_SUMMARY);
+        let graph = GraphId::new("fuzz-graph").unwrap();
+        if let Ok(context) = response.into_context(
+            &graph,
+            &response.candidate_commit,
+            &response.candidate_state_digest,
+            "urn:fuzz:validator",
+            &RequestedContext::default(),
+        ) {
+            let bytes = context.canonical_bytes().expect("a converted context encodes");
+            let decoded = SemanticExecutionContext::from_canonical_bytes(&bytes).unwrap();
+            assert_eq!(decoded.canonical_bytes().unwrap(), bytes);
+            assert_eq!(decoded.id().unwrap(), context.id().unwrap());
+        }
     }
     if let Ok(record) = ValidationRecord::from_canonical_bytes(data) {
         assert_eq!(record.canonical_bytes().unwrap(), data);

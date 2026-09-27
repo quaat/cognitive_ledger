@@ -1,11 +1,14 @@
-//! Golden vectors for `sculpin-semantic-context/v1`, `sculpin-semantic-environment/v1` and
-//! `sculpin-validation-record/v1` (ADR-0018). `.input` files are logical values (JSON),
+//! Golden vectors for `sculpin-semantic-context/v1`, `sculpin-semantic-environment/v1`,
+//! `sculpin-validation-record/v1` (ADR-0018) and `sculpin-validation-invocation/v1`
+//! (ADR-0019 amendment). `.input` files are logical values (JSON),
 //! `.hex` the canonical bytes and `.sha256` the identity, produced by the independent Python
 //! reference `scripts/golden/validation_v1_reference.py`; the Rust encoders are verified
 //! against them here and never rewrite them.
 
 use ledger_core::ContentId;
-use ledger_validation_protocol::{SemanticEnvironment, SemanticExecutionContext, ValidationRecord};
+use ledger_validation_protocol::{
+    SemanticEnvironment, SemanticExecutionContext, ValidationInvocation, ValidationRecord,
+};
 
 fn fixture(name: &str) -> String {
     let path = format!(
@@ -235,4 +238,31 @@ fn negative_vectors_are_rejected_by_the_strict_decoders_for_the_right_reason() {
             .to_string()
             .contains("trailing bytes")
     );
+}
+
+const INVOCATIONS: [&str; 3] = [
+    "invocation-v1-basic",
+    "invocation-v1-delegated",
+    "invocation-v1-other-key",
+];
+
+#[test]
+fn invocation_vectors_encode_and_hash_stably_and_differ_per_scope() {
+    let mut ids = std::collections::HashSet::new();
+    for stem in INVOCATIONS {
+        let invocation: ValidationInvocation =
+            serde_json::from_str(&fixture(&format!("{stem}.input")))
+                .unwrap_or_else(|e| panic!("{stem}.input: {e}"));
+        let (bytes, id) = bytes_and_id(stem);
+        assert_eq!(
+            invocation.canonical_bytes().unwrap(),
+            bytes,
+            "{stem}: bytes"
+        );
+        assert_eq!(invocation.id().unwrap().to_string(), id, "{stem}: id");
+        assert!(
+            ids.insert(id),
+            "{stem}: distinct scopes share an invocation id"
+        );
+    }
 }

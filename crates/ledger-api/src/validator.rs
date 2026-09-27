@@ -152,6 +152,9 @@ impl ValidationClient for HttpValidationClient {
             .http
             .post(&self.endpoint)
             .header(reqwest::header::ACCEPT, "application/json")
+            // The logical invocation identity (same value as the body's `invocation_id`):
+            // every delivery of one ledger validation carries it (ADR-0019 amendment).
+            .header("idempotency-key", request.invocation_id.to_string())
             .json(request);
         if let Some(token) = &self.bearer_token {
             builder = builder.bearer_auth(token);

@@ -71,7 +71,18 @@ release's idempotency keys, new writes, `ledger-admin verify`, and a `pg_dump --
 diff between the upgraded database and a clean install plus an object-ownership comparison,
 both of which must be empty — role attributes, database-level ACLs, sequence values and seed
 rows are not covered). Run it before every release; its evidence is recorded in the active
-Plan 0005 document.
+Plan 0005 document. The Phase-2 transition from the P1.5 release (schema 0009 → 0010) is
+exercised by `scripts/upgrade-p2.sh` (additionally: `pg_dump -Fc` backup restored and
+compared, byte-identical pre-upgrade rows, runtime write probes, validation and validated
+acceptance on upgraded graphs, ahead/behind refusal of both binaries, migration 0010's
+pre-existing-validation-id guard; evidence in Plan 0006). Always run `ledger-admin verify`
+from the same build as the servers: the P1.5 verifier does not check the schema level.
+
+Phase 2 validator configuration: set `LEDGER_VALIDATOR_SERVICE_ID` (the trusted validation
+service; required with production authentication) and, to allow new validations,
+`LEDGER_VALIDATOR_URL` (+ optional `LEDGER_VALIDATOR_TOKEN_FILE`). Removing only the URL
+during a validator outage keeps earlier trusted validations acceptable (ADR-0019
+amendment).
 
 ## Runtime limits
 - HTTP: `LEDGER_LIMIT_*` (body, operations, terms, metadata, reconstruction depth/quads/

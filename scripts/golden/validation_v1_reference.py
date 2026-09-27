@@ -28,6 +28,9 @@ FIXTURES = ROOT / "fixtures" / "golden" / "validation"
 CONTEXT_HEADER = b"sculpin-semantic-context-v1\0"
 ENVIRONMENT_HEADER = b"sculpin-semantic-environment-v1\0"
 RECORD_HEADER = b"sculpin-validation-record-v1\0"
+INVOCATION_HEADER = b"sculpin-validation-invocation-v1\0"
+MAX_INVOCATION_KEY_BYTES = 256
+PRINCIPAL_TYPE_BYTE = {"human": 0, "agent": 1, "service": 2}
 MAX_IDENTIFIER_BYTES = 512
 MAX_SET = 64
 MAX_SEVERITY_BYTES = 64
@@ -229,6 +232,32 @@ def encode_record(logical: dict, *, summary_override: list[bytes] | None = None,
     return bytes(out)
 
 
+def encode_invocation(logical: dict) -> bytes:
+    """sculpin-validation-invocation/v1: the opaque identity of one logical outbound
+    validation, derived from the authenticated idempotency scope and the request digest."""
+    keys("invocation", logical,
+         {"tenant_id", "principal_type", "principal_id", "on_behalf_of", "graph_id",
+          "idempotency_key", "request_digest"},
+         {"tenant_id", "principal_type", "principal_id", "graph_id", "idempotency_key",
+          "request_digest"})
+    if logical["principal_type"] not in PRINCIPAL_TYPE_BYTE:
+        raise Invalid("invocation: unknown principal_type")
+    graph = logical["graph_id"]
+    if not isinstance(graph, str) or not GRAPH_ID_RE.fullmatch(graph):
+        raise Invalid("invocation: graph_id")
+    out = bytearray(INVOCATION_HEADER)
+    out += field(token("tenant_id", logical["tenant_id"]))
+    out.append(PRINCIPAL_TYPE_BYTE[logical["principal_type"]])
+    out += field(token("principal_id", logical["principal_id"]))
+    delegated = logical.get("on_behalf_of")
+    out += opt(None if delegated is None else token("on_behalf_of", delegated))
+    out += field(graph)
+    out += field("validate")
+    out += field(token("idempotency_key", logical["idempotency_key"], MAX_INVOCATION_KEY_BYTES))
+    out += field(content_id("request_digest", logical["request_digest"]))
+    return bytes(out)
+
+
 def sha(data: bytes) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
@@ -241,6 +270,8 @@ def encode(path: pathlib.Path) -> bytes:
         return encode_environment(logical)
     if path.name.startswith("record-"):
         return encode_record(logical)
+    if path.name.startswith("invocation-"):
+        return encode_invocation(logical)
     raise Invalid(f"unknown fixture kind {path.name}")
 
 

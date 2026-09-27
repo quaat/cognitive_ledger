@@ -12,12 +12,15 @@ Virtual A-Box hydration; the ledger owns the candidate, the records and the acce
 `POST <LEDGER_VALIDATOR_URL>` (one configured endpoint), `Content-Type: application/json`,
 `Accept: application/json`, `Authorization: Bearer <credential>` when the ledger is
 configured with `LEDGER_VALIDATOR_TOKEN_FILE` (workload identity token or API key; the
-ledger never logs it), `X-Correlation-Id` for tracing. Synchronous; one candidate per call.
+ledger never logs it), `Idempotency-Key: <invocation_id>` (the logical invocation identity,
+see "Idempotency" below), `X-Correlation-Id` for tracing only. Synchronous; one candidate per
+call.
 
 ### Request (`sculpin-validation-request/v1`)
 ```json
 {
   "protocol": "sculpin-validation-request/v1",
+  "invocation_id": "sha256:…sculpin-validation-invocation/v1 id; equals the Idempotency-Key header…",
   "candidate": {
     "graph_id": "0b0a2a1c-2e3d-4f50-8a61-72b384c5d6e7",
     "knowledge_base_id": "urn:exodus:kb:material-science",
@@ -84,7 +87,8 @@ ledger never logs it), `X-Correlation-Id` for tracing. Synchronous; one candidat
   non-empty) — it must change whenever the versions Sculpin would hydrate change; it is the candidate-independent freshness key for
   external data, while `virtual_contexts` record what this run actually hydrated. `virtual_contexts` identify external state
   only — never A-Box triples. The ledger adds `validator.service_id` from its own
-  configuration (`LEDGER_VALIDATOR_SERVICE_ID`); a response cannot claim a service identity.
+  configuration (`LEDGER_VALIDATOR_SERVICE_ID`, the deployment's validator trust anchor);
+  a response cannot claim a service identity.
 - `outcome.kind` is Sculpin's verdict (`conforms` | `violations`). `violation_count` is the
   number of results reported (any severity; a conforming verdict may report warnings);
   `violations` is a bounded summary (severity ≤ 64 bytes, code ≤ 512 bytes). The ledger
@@ -139,10 +143,46 @@ candidate, and acceptance names it (ADR-0019): a validation from another environ
   retryable, nothing recorded); 3xx (never followed), other 4xx, a non-JSON content type,
   an oversized or malformed body, or a response naming another candidate/state →
   `VALIDATOR_ERROR` (502, nothing recorded).
-- Idempotency is the ledger's: a client retries `POST …/validations` with the same
-  `Idempotency-Key` and receives the recorded result without a second validator call. The
-  validator should nevertheless be safe to call twice for the same request (it may be,
-  after a ledger crash between the call and the record).
+- Once the ledger has recorded a validation, a client retry of `POST …/validations` with the
+  same `Idempotency-Key` replays the record without calling the validator.
+
+## Idempotency: at-least-once delivery, exactly-once logical validation
+The ledger never holds a database transaction, connection or lock across the validator
+call (ADR-0019), so the same logical ledger request can reach Sculpin more than once:
+two identical requests racing under one `Idempotency-Key` both miss the replay lookup, and a
+client retry after a lost response or a ledger crash between Sculpin's answer and the
+ledger's record calls again. Every such delivery carries the same **invocation identity**:
+
+- `invocation_id` in the body and the `Idempotency-Key` header carry one value, the
+  `sculpin-validation-invocation/v1` id: `sha256:` + hex SHA-256 over the domain-separated
+  encoding of the caller's authenticated idempotency scope (tenant, principal type and id,
+  delegation, graph, operation `validate`, the ledger `Idempotency-Key`) and the canonical
+  `sculpin-ledger-request/v2` digest of the validate request (candidate and hints).
+  Correlation ids, clocks, arrival order and ledger instance never enter it. Layout in
+  [`validation-protocol.md`](validation-protocol.md); reference encoder
+  `scripts/golden/validation_v1_reference.py` (`encode_invocation`), vectors
+  `fixtures/golden/validation/invocation-v1-*`.
+- Another ledger key, principal, graph, candidate or hint set is another invocation. The
+  same key with another body is refused by the ledger (`IDEMPOTENCY_CONFLICT`); at most one of
+  two such racing requests is ever recorded.
+- **Contract (required):** repeated or concurrent validation calls carrying the same
+  invocation identity represent the same logical validation operation and must resolve to
+  the same logical effective semantic context and validation result. Sculpin keeps the
+  result of an invocation (at least for longer than the ledger's retry horizon) and answers a
+  repeated delivery with it; a delivery arriving while the first is still running waits for
+  it (single flight) rather than validating again in whatever environment is then current.
+  A failed invocation (4xx/5xx/timeout) may be computed afresh on retry, because nothing was
+  recorded by the ledger.
+- The id is opaque to Sculpin: it must not be parsed, and it carries no semantic meaning. It
+  is not part of any context, environment or validation identity, and it is not stored by
+  the ledger.
+
+Without this, the environment a durable record names would depend on timing: whichever of
+two deliveries recorded first would win, possibly under a newer base KB, ontology, shapes,
+reasoning configuration or source-catalog revision. The ledger's fake validator in
+`crates/ledger-api/tests/pg_validation_api.rs` implements the contract for the ledger's own
+tests; that proves the ledger's side (same identity on every delivery, one record, one
+idempotency result), not Sculpin's.
 
 ## Transport security
 https is required whenever the ledger runs with production authentication; plain http is

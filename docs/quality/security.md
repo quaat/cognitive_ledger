@@ -66,6 +66,17 @@ Preserve object digest verification and atomic ref updates. Never commit secrets
   same candidate whose semantic environment is the one the reviewer names; the verdict and
   environment are read from the hash-verified canonical bytes (`VALIDATION_REJECTED`,
   `VALIDATION_STALE`, `LINEAGE_MISMATCH` otherwise; nothing moves).
+- Validator trust is fail-closed and independent of reachability (ADR-0019 amendment):
+  `LEDGER_VALIDATOR_SERVICE_ID` is the one trusted service; only its records satisfy
+  acceptance. `LEDGER_VALIDATOR_URL` merely makes it callable — without it `validate` is
+  `VALIDATOR_UNAVAILABLE` while earlier trusted records remain acceptable. A URL without a
+  service id, a token file without a URL, and production authentication without a service
+  id are refused at startup; a development server without a trust anchor refuses every
+  validated acceptance. A missing or partial setting never broadens trust.
+- Every outbound call carries the `sculpin-validation-invocation/v1` id (body
+  `invocation_id` and `Idempotency-Key` header): a hash of the authenticated idempotency
+  scope and request digest — opaque, not reversible to tenant or principal ids without
+  guessing them, and never containing the bearer credential or correlation id.
 - The outbound client (`HttpValidationClient`) meets the JWKS-fetch standard: one configured
   https endpoint (plain http to loopback only with development auth), no redirects, no
   environment proxy, total timeout, streamed size cap, `application/json` only, strict
@@ -158,10 +169,12 @@ integrity rules against real PostgreSQL, including a non-superuser owner.
   and 16+ membership semantics both handled); every FOREIGN KEY, PRIMARY KEY and UNIQUE constraint of
   the migrations by shape (key columns, referenced `public` table and columns, at least one
   validated non-deferrable match, `NULLS NOT DISTINCT` where defined), the unique indexes
-  with their predicates, and all 32 named CHECKs — definitions compared by deparse at
+  with their predicates, the NOT NULL declaration of every column the migrations make
+  NOT NULL (composite foreign keys are `MATCH SIMPLE`, so a nullable key column would let a
+  row skip them), and all 56 named CHECKs — definitions compared by deparse at
   start-up against the values the migrations produce (identical on PostgreSQL 15 and 17)
-  and by expression fingerprint on readiness; the content-address CHECK additionally by a
-  rolled-back semantic probe at start-up; the runtime role's exact per-column INSERT/UPDATE
+  and by expression fingerprint on readiness; the three content-address CHECKs (objects,
+  contexts, records) additionally by rolled-back semantic probes at start-up; the runtime role's exact per-column INSERT/UPDATE
   grants, absence of table-level writes, DELETE/TRUNCATE/TRIGGER/REFERENCES, and USAGE on
   exactly the audit sequences. ASan fuzzing passes on the hosted runner (`ci-fuzz` matrix `none`/`address`, pinned
   nightly, explicit target triple; the local host's ASan start-up crash is host-specific);

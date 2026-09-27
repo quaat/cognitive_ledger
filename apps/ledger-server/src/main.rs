@@ -4,7 +4,10 @@ use ledger_api::{
         Capability, ClaimsPolicy, DevHs256Authenticator, OidcAuthenticator, SharedAuthenticator,
     },
 };
-use ledger_store::{DbSessionLimits, Ledger, PostgresLedgerStore, ReconstructionLimits, V1Binding};
+use ledger_store::{
+    DbSessionLimits, Ledger, PostgresLedgerStore, ReconstructionLimits, V1Binding,
+    ValidationTrustPolicy,
+};
 use std::{
     collections::BTreeSet,
     env,
@@ -384,29 +387,84 @@ fn limits() -> Result<ApiLimits, String> {
     })
 }
 
-/// The semantic validation service (ADR-0014): `LEDGER_VALIDATOR_URL` (https; plain http to a
-/// loopback host only with development authentication), `LEDGER_VALIDATOR_SERVICE_ID`
-/// (required with a URL: the identity recorded in every context), optional
-/// `LEDGER_VALIDATOR_TOKEN_FILE` (bearer credential, read once, never logged). Unset URL →
-/// no validator: `validate` answers VALIDATOR_UNAVAILABLE and acceptance stays fail-closed.
+/// Validator trust and reachability, decided from configuration alone (ADR-0019).
+#[derive(Debug, PartialEq, Eq)]
+struct ValidatorSettings {
+    /// `LEDGER_VALIDATOR_SERVICE_ID`: the one service whose records validated acceptance
+    /// trusts. Required with production authentication.
+    trust: Option<ValidationTrustPolicy>,
+    /// `LEDGER_VALIDATOR_URL`: only the ability to call the trusted service.
+    endpoint: Option<String>,
+    token_file: Option<String>,
+}
+
+/// The trust anchor is `LEDGER_VALIDATOR_SERVICE_ID`; `LEDGER_VALIDATOR_URL` only makes it
+/// callable. A URL without a service id, a token file without a URL, and production
+/// authentication without a service id are refused: a missing or partial configuration never
+/// broadens which validations acceptance trusts.
+fn validator_settings(
+    production_auth: bool,
+    url: Option<&str>,
+    service_id: Option<&str>,
+    token_file: Option<&str>,
+) -> Result<ValidatorSettings, String> {
+    let non_empty = |v: Option<&str>| v.filter(|v| !v.is_empty()).map(str::to_owned);
+    let (url, service_id, token_file) =
+        (non_empty(url), non_empty(service_id), non_empty(token_file));
+    let trust = match service_id {
+        Some(id) => Some(
+            ValidationTrustPolicy::single(id)
+                .map_err(|_| "LEDGER_VALIDATOR_SERVICE_ID must be a bounded token".to_owned())?,
+        ),
+        None if url.is_some() => {
+            return Err("LEDGER_VALIDATOR_SERVICE_ID is required with LEDGER_VALIDATOR_URL".into());
+        }
+        None if production_auth => {
+            return Err(
+                "LEDGER_VALIDATOR_SERVICE_ID is required with production authentication: it \
+                 names the validation service whose records acceptance trusts"
+                    .into(),
+            );
+        }
+        None => None,
+    };
+    if token_file.is_some() && url.is_none() {
+        return Err("LEDGER_VALIDATOR_TOKEN_FILE requires LEDGER_VALIDATOR_URL".into());
+    }
+    Ok(ValidatorSettings {
+        trust,
+        endpoint: url,
+        token_file,
+    })
+}
+
+/// The semantic validation service (ADR-0014, ADR-0019): trust from
+/// `LEDGER_VALIDATOR_SERVICE_ID`, and — when `LEDGER_VALIDATOR_URL` is set (https; plain http
+/// to a loopback host only with development authentication) — a client for it with optional
+/// `LEDGER_VALIDATOR_TOKEN_FILE` (bearer credential, read once, never logged). Trust without a
+/// URL: `validate` answers VALIDATOR_UNAVAILABLE and earlier records of the trusted service
+/// still satisfy acceptance. No trust (development only): validated acceptance fails closed.
 fn validation_service(
     production_auth: bool,
     limits: &ApiLimits,
-) -> Result<Option<ledger_api::ValidationService>, String> {
-    let Some(url) = env_optional("LEDGER_VALIDATOR_URL")?.filter(|u| !u.is_empty()) else {
-        return Ok(None);
+) -> Result<
+    (
+        Option<ValidationTrustPolicy>,
+        Option<ledger_api::ValidationService>,
+    ),
+    String,
+> {
+    let settings = validator_settings(
+        production_auth,
+        env_optional("LEDGER_VALIDATOR_URL")?.as_deref(),
+        env_optional("LEDGER_VALIDATOR_SERVICE_ID")?.as_deref(),
+        env_optional("LEDGER_VALIDATOR_TOKEN_FILE")?.as_deref(),
+    )?;
+    let (Some(trust), Some(url)) = (settings.trust.clone(), settings.endpoint) else {
+        return Ok((settings.trust, None));
     };
-    let service_id = env_optional("LEDGER_VALIDATOR_SERVICE_ID")?
-        .filter(|s| !s.is_empty())
-        .ok_or("LEDGER_VALIDATOR_SERVICE_ID is required with LEDGER_VALIDATOR_URL")?;
-    ledger_core::validate_token(
-        "LEDGER_VALIDATOR_SERVICE_ID",
-        &service_id,
-        ledger_core::MAX_IDENTIFIER_BYTES,
-    )
-    .map_err(|e| e.to_string())?;
-    let bearer_token = match env_optional("LEDGER_VALIDATOR_TOKEN_FILE")? {
-        Some(path) if !path.is_empty() => Some(
+    let bearer_token = match settings.token_file {
+        Some(path) => Some(
             std::fs::read_to_string(&path)
                 .map_err(|_| {
                     "LEDGER_VALIDATOR_TOKEN_FILE cannot be read (path not shown)".to_owned()
@@ -414,7 +472,7 @@ fn validation_service(
                 .trim()
                 .to_owned(),
         ),
-        _ => None,
+        None => None,
     };
     if limits.validator_timeout >= limits.request_timeout {
         return Err(
@@ -431,10 +489,11 @@ fn validation_service(
         },
     )
     .map_err(|e| e.to_string())?;
-    Ok(Some(ledger_api::ValidationService {
+    let service = ledger_api::ValidationService {
         client: Arc::new(client),
-        service_id,
-    }))
+        service_id: trust.required_service_id().to_owned(),
+    };
+    Ok((Some(trust), Some(service)))
 }
 
 #[tokio::main]
@@ -497,19 +556,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "shared PostgreSQL topology: refs, objects and workflow in one database; v1 \
                  writes rejected"
             );
-            let validation = validation_service(authenticator.is_production_grade(), &limits)?;
+            let (trust, validation) =
+                validation_service(authenticator.is_production_grade(), &limits)?;
             let mut state = AppState::new(store, authenticator, limits, acceptance);
+            match &trust {
+                Some(trust) => {
+                    info!(
+                        service_id = %trust.required_service_id(),
+                        "validated acceptance trusts this validation service"
+                    );
+                    state = state.with_validation_trust(trust.clone());
+                }
+                None => warn!(
+                    "no trusted validation service (LEDGER_VALIDATOR_SERVICE_ID unset; \
+                     development only): validated acceptance is refused"
+                ),
+            }
             match validation {
                 Some(service) => {
-                    info!(
-                        service_id = %service.service_id,
-                        "semantic validation service configured (endpoint not logged)"
-                    );
+                    info!("semantic validation endpoint configured (endpoint not logged)");
                     state = state.with_validation(service);
                 }
                 None => warn!(
-                    "no semantic validation service configured (LEDGER_VALIDATOR_URL unset): \
-                     validations answer VALIDATOR_UNAVAILABLE and acceptance stays fail-closed"
+                    "no semantic validation endpoint configured (LEDGER_VALIDATOR_URL unset): \
+                     validations answer VALIDATOR_UNAVAILABLE"
                 ),
             }
             ledger_api::router(state)
@@ -680,6 +750,45 @@ mod tests {
             acceptance_policy(Some(UNVALIDATED_ACCEPTANCE_SWITCH)).unwrap(),
             AcceptancePolicy::AllowUnvalidatedDevelopmentOnly
         );
+    }
+
+    #[test]
+    fn validator_trust_is_the_service_id_and_never_the_endpoint() {
+        const S1: &str = "urn:sculpin:service:s1";
+        let trusted = |id: &str| Some(ValidationTrustPolicy::single(id).unwrap());
+        // service id + URL: trust and a client
+        let both = validator_settings(true, Some("https://v/validate"), Some(S1), None).unwrap();
+        assert_eq!(both.trust, trusted(S1));
+        assert_eq!(both.endpoint.as_deref(), Some("https://v/validate"));
+        // service id without URL: trust stays, no client (validator outage / not deployed)
+        for production in [true, false] {
+            let outage = validator_settings(production, None, Some(S1), None).unwrap();
+            assert_eq!(outage.trust, trusted(S1));
+            assert_eq!(outage.endpoint, None);
+            let empty_url = validator_settings(production, Some(""), Some(S1), None).unwrap();
+            assert_eq!(empty_url, outage, "an empty URL is an absent URL");
+        }
+        // URL without service id: refused in every mode (never "trust whoever answers")
+        for production in [true, false] {
+            for id in [None, Some("")] {
+                let e = validator_settings(production, Some("https://v/validate"), id, None)
+                    .unwrap_err();
+                assert!(e.contains("LEDGER_VALIDATOR_SERVICE_ID is required"), "{e}");
+            }
+        }
+        // production authentication without a trust anchor: refused at startup
+        let e = validator_settings(true, None, None, None).unwrap_err();
+        assert!(e.contains("production authentication"), "{e}");
+        // development without anything: no trust (validated acceptance then fails closed)
+        let none = validator_settings(false, None, None, None).unwrap();
+        assert_eq!(none.trust, None);
+        assert_eq!(none.endpoint, None);
+        // malformed ids and orphan token files are refused
+        assert!(validator_settings(false, None, Some("bad\nid"), None).is_err());
+        let oversized = "s".repeat(ledger_core::MAX_IDENTIFIER_BYTES + 1);
+        assert!(validator_settings(false, None, Some(&oversized), None).is_err());
+        let e = validator_settings(false, None, Some(S1), Some("/run/token")).unwrap_err();
+        assert!(e.contains("LEDGER_VALIDATOR_TOKEN_FILE requires"), "{e}");
     }
 
     #[test]

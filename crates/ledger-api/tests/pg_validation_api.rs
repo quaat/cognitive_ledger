@@ -14,7 +14,9 @@ use ledger_api::{
     auth::{ClaimsPolicy, DevHs256Authenticator, SharedAuthenticator},
 };
 use ledger_core::{ContentId, GraphId, TenantId};
-use ledger_store::{DbSessionLimits, GraphStatus, NewGraph, PostgresLedgerStore, V1Binding};
+use ledger_store::{
+    DbSessionLimits, GraphStatus, NewGraph, PostgresLedgerStore, V1Binding, ValidationTrustPolicy,
+};
 use ledger_validation_protocol::{
     BaseKb, EffectiveContext, Ontology, OutcomeKind, Reasoning, ReportReference,
     SemanticEnvironment, SemanticExecutionContext, ShapeSet, VALIDATION_RESPONSE_PROTOCOL,
@@ -87,9 +89,27 @@ enum Mode {
     Blocked(Arc<tokio::sync::Notify>),
 }
 
+/// One logical validation per invocation id (the Sculpin contract): the first delivery
+/// computes, every other delivery with the same id waits for and shares its result.
+type Inflight = Arc<tokio::sync::OnceCell<ValidatorResponse>>;
+
 struct FakeValidator {
     mode: Mutex<Mode>,
+    /// Physical deliveries.
     calls: AtomicUsize,
+    /// Logical validations actually computed.
+    logical: AtomicUsize,
+    /// The invocation id of every physical delivery, in arrival order.
+    invocations: Mutex<Vec<String>>,
+    /// The validator's live base-KB revision: its environment may move between calls.
+    kb_revision: Mutex<String>,
+    /// `Some` = honour the invocation identity (deduplicate); `None` = every delivery computes.
+    dedup: Mutex<Option<std::collections::HashMap<String, Inflight>>>,
+    /// Held by the next logical validation (after it snapshotted its environment).
+    gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    /// Compute (and remember) the next result, then never answer: the ledger request that
+    /// is waiting dies before it can record anything.
+    crash_after_answer: std::sync::atomic::AtomicBool,
 }
 
 impl FakeValidator {
@@ -97,6 +117,12 @@ impl FakeValidator {
         Arc::new(Self {
             mode: Mutex::new(Mode::Normal),
             calls: AtomicUsize::new(0),
+            logical: AtomicUsize::new(0),
+            invocations: Mutex::new(Vec::new()),
+            kb_revision: Mutex::new("kbrev-7".into()),
+            dedup: Mutex::new(None),
+            gate: Mutex::new(None),
+            crash_after_answer: std::sync::atomic::AtomicBool::new(false),
         })
     }
     fn set(&self, mode: Mode) {
@@ -104,6 +130,49 @@ impl FakeValidator {
     }
     fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+    fn logical(&self) -> usize {
+        self.logical.load(Ordering::SeqCst)
+    }
+    fn invocations(&self) -> Vec<String> {
+        self.invocations.lock().unwrap().clone()
+    }
+    fn honour_invocation_identity(&self) {
+        *self.dedup.lock().unwrap() = Some(std::collections::HashMap::new());
+    }
+    fn set_kb_revision(&self, revision: &str) {
+        *self.kb_revision.lock().unwrap() = revision.into();
+    }
+    fn hold_next_validation(&self) -> Arc<tokio::sync::Notify> {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        *self.gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+    fn crash_after_next_answer(&self) {
+        self.crash_after_answer.store(true, Ordering::SeqCst);
+    }
+    /// Wait (bounded) until `n` physical deliveries have arrived.
+    async fn wait_for_calls(&self, n: usize) {
+        for _ in 0..1000 {
+            if self.calls() >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the validator saw {} of {n} expected calls", self.calls());
+    }
+    /// Wait (bounded) until `n` logical validations have snapshotted their environment.
+    async fn wait_for_logical(&self, n: usize) {
+        for _ in 0..1000 {
+            if self.logical() >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "the validator started {} of {n} logical validations",
+            self.logical()
+        );
     }
 }
 
@@ -125,7 +194,45 @@ impl ValidationClient for FakeValidator {
         &self,
         request: &ValidationRequest,
     ) -> Result<ValidatorResponse, ValidationClientError> {
+        self.invocations
+            .lock()
+            .unwrap()
+            .push(request.invocation_id.to_string());
         self.calls.fetch_add(1, Ordering::SeqCst);
+        let inflight = self.dedup.lock().unwrap().as_mut().map(|seen| {
+            seen.entry(request.invocation_id.to_string())
+                .or_default()
+                .clone()
+        });
+        let result = match inflight {
+            Some(cell) => cell
+                .get_or_try_init(|| self.validate_once(request))
+                .await
+                .cloned(),
+            None => self.validate_once(request).await,
+        };
+        if self.crash_after_answer.swap(false, Ordering::SeqCst) {
+            std::future::pending::<()>().await;
+        }
+        result
+    }
+    fn describe(&self) -> String {
+        "deterministic fake validator".into()
+    }
+}
+
+impl FakeValidator {
+    /// One logical validation: snapshots the live environment when it starts.
+    async fn validate_once(
+        &self,
+        request: &ValidationRequest,
+    ) -> Result<ValidatorResponse, ValidationClientError> {
+        let kb_revision = self.kb_revision.lock().unwrap().clone();
+        self.logical.fetch_add(1, Ordering::SeqCst);
+        let gate = self.gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.notified().await;
+        }
         let mode = self.mode.lock().unwrap().clone();
         match mode {
             Mode::Normal | Mode::WrongCandidate | Mode::WrongRevision => {}
@@ -201,7 +308,7 @@ impl ValidationClient for FakeValidator {
             context: EffectiveContext {
                 base_kb: BaseKb {
                     kb_id: "urn:exodus:kb:material-science".into(),
-                    revision: "kbrev-7".into(),
+                    revision: kb_revision,
                 },
                 ontology: Some(Ontology {
                     id: "urn:sculpin:ontology:core".into(),
@@ -238,9 +345,6 @@ impl ValidationClient for FakeValidator {
             },
         })
     }
-    fn describe(&self) -> String {
-        "deterministic fake validator".into()
-    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -250,6 +354,8 @@ struct Harness {
     owner: PostgresLedgerStore,
     app: Router,
     validator: Arc<FakeValidator>,
+    runtime_url: String,
+    limits: ApiLimits,
 }
 
 type Reply = (StatusCode, Value);
@@ -285,8 +391,30 @@ async fn harness_with(limits: ApiLimits, with_validator: bool) -> Harness {
         let (_, host_part) = rest.rsplit_once('@').unwrap();
         format!("{scheme}://ledger_rt_api:rt-api-test-secret@{host_part}")
     };
+    let validator = FakeValidator::new();
+    let service = with_validator.then_some(SERVICE_ID);
+    let app = app_for(&runtime_url, limits, &validator, service, service).await;
+    Harness {
+        owner,
+        app,
+        validator,
+        runtime_url,
+        limits,
+    }
+}
+
+/// A router over the runtime identity with an explicit validator configuration: `trust` is
+/// the trusted service id (`LEDGER_VALIDATOR_SERVICE_ID`), `client` the service the
+/// configured endpoint belongs to (`LEDGER_VALIDATOR_URL`), both optional and independent.
+async fn app_for(
+    runtime_url: &str,
+    limits: ApiLimits,
+    validator: &Arc<FakeValidator>,
+    trust: Option<&str>,
+    client: Option<&str>,
+) -> Router {
     let store = PostgresLedgerStore::connect_with(
-        &runtime_url,
+        runtime_url,
         V1Binding::Reject,
         DbSessionLimits::default(),
     )
@@ -301,19 +429,17 @@ async fn harness_with(limits: ApiLimits, with_validator: bool) -> Harness {
         )
         .unwrap(),
     );
-    let validator = FakeValidator::new();
     let mut state = AppState::new(store, auth, limits, AcceptancePolicy::RequireValidation);
-    if with_validator {
+    if let Some(trust) = trust {
+        state = state.with_validation_trust(ValidationTrustPolicy::single(trust).unwrap());
+    }
+    if let Some(service_id) = client {
         state = state.with_validation(ValidationService {
             client: validator.clone(),
-            service_id: SERVICE_ID.into(),
+            service_id: service_id.into(),
         });
     }
-    Harness {
-        owner,
-        app: ledger_api::router(state),
-        validator,
-    }
+    ledger_api::router(state)
 }
 
 async fn harness() -> Harness {
@@ -321,6 +447,25 @@ async fn harness() -> Harness {
 }
 
 impl Harness {
+    /// The same database and fake validator behind a freshly started server with another
+    /// validator configuration (a restart / redeploy).
+    async fn restarted(&self, trust: Option<&str>, client: Option<&str>) -> Harness {
+        Harness {
+            owner: self.owner.clone(),
+            app: app_for(
+                &self.runtime_url,
+                self.limits,
+                &self.validator,
+                trust,
+                client,
+            )
+            .await,
+            validator: self.validator.clone(),
+            runtime_url: self.runtime_url.clone(),
+            limits: self.limits,
+        }
+    }
+
     async fn graph(&self, tenant: &str) -> GraphId {
         let id = GraphId::new(unique("val-api")).unwrap();
         self.owner
@@ -885,6 +1030,92 @@ async fn validator_outage_keeps_the_ledger_operable_and_acceptance_fail_closed()
     assert_eq!(h.footprint(&g).await, before);
 }
 
+/// ADR-0019 trust anchor across restarts: trust is `LEDGER_VALIDATOR_SERVICE_ID`, never the
+/// presence of an endpoint. S1-trusted records keep satisfying acceptance through a validator
+/// outage; a server trusting S2 or trusting nothing refuses them; nothing moves on refusal.
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn validator_trust_is_independent_of_the_endpoint_and_fails_closed() {
+    const S2: &str = "urn:sculpin:service:another-validator";
+    let h = harness().await; // trusts S1 and can call it
+    let g = h.graph("tenant-v").await;
+    let t = token("tenant-v", "orchestrator", &ROLES);
+    let c = h
+        .prepare(&g, &t, None, "<urn:material:a> <urn:label> \"A\" .")
+        .await;
+    let (status, v) = h.validate(&g, &t, &c, "v1", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{v}");
+    let cited = (&v["validation_id"], &v["semantic_environment_id"]);
+
+    // Restart trusting S1 with no endpoint (outage / endpoint removed).
+    let outage = h.restarted(Some(SERVICE_ID), None).await;
+    let c2 = outage
+        .prepare(&g, &t, None, "<urn:material:b> <urn:label> \"B\" .")
+        .await;
+    let before = outage.footprint(&g).await;
+    let calls = h.validator.calls();
+    let down = outage.validate(&g, &t, &c2, "v2", json!({})).await;
+    assert_code(
+        &down,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "VALIDATOR_UNAVAILABLE",
+    );
+    assert_eq!(h.validator.calls(), calls, "no endpoint: never called");
+    assert_eq!(outage.footprint(&g).await, before, "nothing recorded");
+    // The completed validation still replays without an endpoint.
+    let (status, replay) = outage.validate(&g, &t, &c, "v1", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{replay}");
+    assert_eq!(replay["validation_id"], v["validation_id"]);
+
+    // A server trusting S2 (and able to call S2) refuses the S1 record: stale/untrusted.
+    let other = h.restarted(Some(S2), Some(S2)).await;
+    let refused = other.accept(&g, &t, &c, None, "a-s2", Some(cited)).await;
+    assert_code(&refused, StatusCode::CONFLICT, "VALIDATION_STALE");
+    // A development server with no trust anchor refuses every validated acceptance.
+    let untrusting = h.restarted(None, None).await;
+    let refused = untrusting
+        .accept(&g, &t, &c, None, "a-none", Some(cited))
+        .await;
+    assert_code(&refused, StatusCode::CONFLICT, "VALIDATION_STALE");
+    // Neither refusal disclosed anything about the record, and nothing moved.
+    assert!(!refused.1.to_string().contains(SERVICE_ID), "{}", refused.1);
+    assert_eq!(outage.footprint(&g).await, before);
+    assert_eq!(h.head(&g).await, None);
+
+    // Records of S2 are never accepted by the S1-trusting outage server.
+    let c3 = other
+        .prepare(&g, &t, None, "<urn:material:c> <urn:label> \"C\" .")
+        .await;
+    let (status, v2) = other.validate(&g, &t, &c3, "v3", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{v2}");
+    assert_eq!(v2["record"]["validator"]["service_id"], S2);
+    let refused = outage
+        .accept(
+            &g,
+            &t,
+            &c3,
+            None,
+            "a-c3",
+            Some((&v2["validation_id"], &v2["semantic_environment_id"])),
+        )
+        .await;
+    assert_code(&refused, StatusCode::CONFLICT, "VALIDATION_STALE");
+
+    // A foreign tenant cannot learn the record exists, whatever the trust configuration.
+    let foreign = token("tenant-other", "orchestrator", &ROLES);
+    for server in [&outage, &untrusting] {
+        let hidden = server
+            .accept(&g, &foreign, &c, None, "a-foreign", Some(cited))
+            .await;
+        assert_code(&hidden, StatusCode::NOT_FOUND, "NOT_FOUND");
+    }
+
+    // The S1-trusting outage server accepts the earlier S1 record: the ref moves.
+    let (status, accepted) = outage.accept(&g, &t, &c, None, "a1", Some(cited)).await;
+    assert_eq!(status, StatusCode::OK, "{accepted}");
+    assert_eq!(h.head(&g).await, Some((c.clone(), 1)));
+}
+
 // ---------------------------------------------------------------------------------------
 // Idempotency, security and limits
 
@@ -940,6 +1171,193 @@ async fn validation_retries_replay_and_conflicting_reuse_of_a_key_is_refused() {
         )
         .await;
     assert_code(&conflict, StatusCode::CONFLICT, "IDEMPOTENCY_CONFLICT");
+}
+
+/// Two identical ledger requests racing under one `Idempotency-Key` both reach the validator
+/// (neither is recorded while the first is in flight), carry the same invocation identity,
+/// and — because the validator honours it — resolve to one logical validation in the
+/// environment in force when it started, even though the validator's environment moved in
+/// between. One idempotency result and one record are stored; both responses name it.
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn concurrent_same_key_validations_are_one_logical_invocation() {
+    let h = harness().await;
+    h.validator.honour_invocation_identity();
+    let g = h.graph("tenant-v").await;
+    let t = token("tenant-v", "orchestrator", &ROLES);
+    let c = h
+        .prepare(&g, &t, None, "<urn:material:a> <urn:label> \"A\" .")
+        .await;
+    let gate = h.validator.hold_next_validation();
+    let (calls, logical) = (h.validator.calls(), h.validator.logical());
+    let first = h.validate(&g, &t, &c, "v-same", json!({}));
+    let second = async {
+        h.validator.wait_for_logical(logical + 1).await;
+        // The validator's live environment moves while the first validation is in flight.
+        h.validator.set_kb_revision("kbrev-8");
+        h.validate(&g, &t, &c, "v-same", json!({})).await
+    };
+    let release = async {
+        h.validator.wait_for_calls(calls + 2).await;
+        gate.notify_one();
+    };
+    let ((s1, r1), (s2, r2), ()) = tokio::join!(first, second, release);
+    let mut statuses = [s1, s2];
+    statuses.sort();
+    assert_eq!(
+        statuses,
+        [StatusCode::OK, StatusCode::CREATED],
+        "{r1} / {r2}"
+    );
+    let invocations = h.validator.invocations();
+    let sent = &invocations[calls..];
+    assert_eq!(sent.len(), 2, "both requests reached the validator");
+    assert_eq!(
+        sent[0], sent[1],
+        "same logical request, same invocation identity"
+    );
+    assert_eq!(h.validator.logical(), logical + 1, "one logical validation");
+    for field in [
+        "validation_id",
+        "semantic_environment_id",
+        "semantic_context_id",
+        "record",
+    ] {
+        assert_eq!(r1[field], r2[field], "{field}");
+    }
+    assert_eq!(
+        r1["context"]["base_kb"]["revision"], "kbrev-7",
+        "the environment in force when the logical validation started wins, not arrival order"
+    );
+    assert_eq!(
+        h.count(
+            "SELECT count(*) FROM idempotency WHERE graph_id = $1 AND idempotency_key = 'v-same'",
+            &g
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        h.count(
+            "SELECT count(*) FROM validation_records WHERE graph_id = $1",
+            &g
+        )
+        .await,
+        1
+    );
+    // Control: the environment really moved — another logical request (another key) sees it
+    // under another invocation identity.
+    let (status, other) = h.validate(&g, &t, &c, "v-other", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{other}");
+    assert_eq!(other["context"]["base_kb"]["revision"], "kbrev-8");
+    assert_ne!(h.validator.invocations().last(), Some(&sent[0]));
+    assert_ne!(
+        other["semantic_environment_id"],
+        r1["semantic_environment_id"]
+    );
+}
+
+/// The validator answered but the ledger request died before recording (the waiting request
+/// is dropped: server crash / client gone). Nothing was recorded. The retry — on a restarted
+/// server, same key and body — carries the same invocation identity, so the validator
+/// returns the same logical result even though its environment has moved since.
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn a_retry_after_a_crash_between_answer_and_record_reuses_the_invocation() {
+    let h = harness().await;
+    h.validator.honour_invocation_identity();
+    let g = h.graph("tenant-v").await;
+    let t = token("tenant-v", "orchestrator", &ROLES);
+    let c = h
+        .prepare(&g, &t, None, "<urn:material:a> <urn:label> \"A\" .")
+        .await;
+    let before = h.footprint(&g).await;
+    let (calls, logical) = (h.validator.calls(), h.validator.logical());
+    h.validator.crash_after_next_answer();
+    let crashed = tokio::time::timeout(
+        Duration::from_millis(500),
+        h.validate(&g, &t, &c, "v-crash", json!({})),
+    )
+    .await;
+    assert!(crashed.is_err(), "the request died before it could record");
+    assert_eq!(
+        h.validator.logical(),
+        logical + 1,
+        "the validator did validate"
+    );
+    assert_eq!(h.footprint(&g).await, before, "nothing recorded");
+    h.validator.set_kb_revision("kbrev-9");
+    let restarted = h.restarted(Some(SERVICE_ID), Some(SERVICE_ID)).await;
+    let (status, v) = restarted.validate(&g, &t, &c, "v-crash", json!({})).await;
+    assert_eq!(status, StatusCode::CREATED, "{v}");
+    let invocations = h.validator.invocations();
+    assert_eq!(invocations.len(), calls + 2);
+    assert_eq!(
+        invocations[calls],
+        invocations[calls + 1],
+        "retry reuses the identity"
+    );
+    assert_eq!(
+        h.validator.logical(),
+        logical + 1,
+        "no second logical validation"
+    );
+    assert_eq!(v["context"]["base_kb"]["revision"], "kbrev-7");
+    // It is now durable: a further retry replays without calling the validator.
+    let (status, replay) = restarted.validate(&g, &t, &c, "v-crash", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{replay}");
+    assert_eq!(replay["validation_id"], v["validation_id"]);
+    assert_eq!(h.validator.calls(), calls + 2);
+}
+
+/// The same key with different hints is a different invocation; racing them, the request
+/// that records first wins and the other is `IDEMPOTENCY_CONFLICT` — never a second result.
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn same_key_with_other_hints_is_another_invocation_and_conflicts() {
+    let h = harness().await;
+    h.validator.honour_invocation_identity();
+    let g = h.graph("tenant-v").await;
+    let t = token("tenant-v", "orchestrator", &ROLES);
+    let c = h
+        .prepare(&g, &t, None, "<urn:material:a> <urn:label> \"A\" .")
+        .await;
+    let gate = h.validator.hold_next_validation();
+    let (calls, logical) = (h.validator.calls(), h.validator.logical());
+    let held = h.validate(&g, &t, &c, "v-k", json!({}));
+    let other_then_release = async {
+        h.validator.wait_for_logical(logical + 1).await;
+        let reply = h
+            .validate(&g, &t, &c, "v-k", json!({"reasoning_profile": "rdfs"}))
+            .await;
+        gate.notify_one();
+        reply
+    };
+    let (held, other) = tokio::join!(held, other_then_release);
+    assert_eq!(other.0, StatusCode::CREATED, "{}", other.1);
+    assert_code(&held, StatusCode::CONFLICT, "IDEMPOTENCY_CONFLICT");
+    let invocations = h.validator.invocations();
+    assert_ne!(
+        invocations[calls],
+        invocations[calls + 1],
+        "other body, other invocation"
+    );
+    assert_eq!(
+        h.count(
+            "SELECT count(*) FROM idempotency WHERE graph_id = $1 AND idempotency_key = 'v-k'",
+            &g
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        h.count(
+            "SELECT count(*) FROM validation_records WHERE graph_id = $1",
+            &g
+        )
+        .await,
+        1
+    );
 }
 
 #[tokio::test]

@@ -2,7 +2,7 @@
 //!
 //! This crate is infrastructure-free protocol: the versioned `SemanticExecutionContext`
 //! and `ValidationRecord` with their frozen canonical encodings and content identities, the
-//! validator request/response wire types, and the `ValidationClient` boundary the ledger
+//! logical validation invocation identity, the validator request/response wire types, and the `ValidationClient` boundary the ledger
 //! calls a validation service through. It contains no SHACL, reasoning, ontology or
 //! Virtual A-Box logic and no HTTP or database code: Sculpin owns semantic interpretation,
 //! the ledger owns immutable candidates, validation provenance, acceptance policy,
@@ -15,6 +15,7 @@
 mod client;
 mod context;
 mod encoding;
+mod invocation;
 mod record;
 
 pub use client::{
@@ -26,6 +27,10 @@ pub use context::{
     BaseKb, MAX_OBJECT_REFS, MAX_VIRTUAL_CONTEXTS, Ontology, Reasoning, SEMANTIC_CONTEXT_V1_HEADER,
     SEMANTIC_ENVIRONMENT_V1_HEADER, SemanticContextId, SemanticEnvironment, SemanticEnvironmentId,
     SemanticExecutionContext, ShapeSet, ValidatorIdentity, VirtualContextRef,
+};
+pub use invocation::{
+    MAX_INVOCATION_KEY_BYTES, VALIDATION_INVOCATION_OPERATION, VALIDATION_INVOCATION_V1_HEADER,
+    ValidationInvocation, ValidationInvocationId,
 };
 pub use record::{
     MAX_REPORT_REFERENCE_BYTES, MAX_SEVERITY_BYTES, MAX_VIOLATION_MESSAGE_BYTES,

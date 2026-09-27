@@ -155,9 +155,41 @@ pub struct WorkflowRepository {
     immutable: PostgresImmutableStore,
     failpoint: Option<FailPoint>,
     limits: crate::ReconstructionLimits,
-    /// The validation service this deployment is configured to call (ADR-0019): when set,
-    /// acceptance refuses a record produced by any other service as `VALIDATION_STALE`.
-    required_validator: Option<String>,
+    /// The validation service this deployment trusts (ADR-0019). Independent of whether a
+    /// validator endpoint is configured; without it, validated acceptance fails closed.
+    trust: Option<ValidationTrustPolicy>,
+}
+
+/// Which validation service's records may satisfy validated acceptance (ADR-0019). This is
+/// the deployment's trust anchor (`LEDGER_VALIDATOR_SERVICE_ID`), deliberately separate from
+/// the ability to call that service (`LEDGER_VALIDATOR_URL`): a missing endpoint never
+/// broadens trust, and no trust anchor means no validation is ever accepted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidationTrustPolicy {
+    required_service_id: String,
+}
+
+impl ValidationTrustPolicy {
+    /// Trust exactly one validation service identity (a bounded opaque token).
+    pub fn single(service_id: impl Into<String>) -> Result<Self, LedgerError> {
+        let required_service_id = service_id.into();
+        ledger_core::validate_token(
+            "validator service id",
+            &required_service_id,
+            ledger_core::MAX_IDENTIFIER_BYTES,
+        )?;
+        Ok(Self {
+            required_service_id,
+        })
+    }
+
+    pub fn required_service_id(&self) -> &str {
+        &self.required_service_id
+    }
+
+    fn trusts(&self, service_id: &str) -> bool {
+        self.required_service_id == service_id
+    }
 }
 
 /// Composition root: one pool shared by the immutable store, the graph authority and the
@@ -287,9 +319,9 @@ impl PostgresLedgerStore {
         self
     }
 
-    /// Bind acceptance to validations produced by the configured validation service.
-    pub fn with_required_validator(mut self, service_id: impl Into<String>) -> Self {
-        self.workflows = self.workflows.with_required_validator(service_id);
+    /// Bind validated acceptance to records of the trusted validation service.
+    pub fn with_validation_trust(mut self, trust: ValidationTrustPolicy) -> Self {
+        self.workflows = self.workflows.with_validation_trust(trust);
         self
     }
 
@@ -489,14 +521,15 @@ impl WorkflowRepository {
             immutable,
             failpoint: None,
             limits: crate::ReconstructionLimits::DEVELOPMENT,
-            required_validator: None,
+            trust: None,
         }
     }
 
-    /// Require cited validations to come from this validation service (deployment
-    /// configuration; a ledger policy on opaque identity, not semantics).
-    pub fn with_required_validator(mut self, service_id: impl Into<String>) -> Self {
-        self.required_validator = Some(service_id.into());
+    /// Accept only validations produced by the trusted service (deployment configuration;
+    /// a ledger policy on opaque identity, not semantics). Without it, every validated
+    /// acceptance is refused.
+    pub fn with_validation_trust(mut self, trust: ValidationTrustPolicy) -> Self {
+        self.trust = Some(trust);
         self
     }
 
@@ -1185,13 +1218,14 @@ impl WorkflowRepository {
                 if !cited.conforms {
                     return Err(LedgerError::ValidationRejected);
                 }
-                if self
-                    .required_validator
+                if !self
+                    .trust
                     .as_ref()
-                    .is_some_and(|required| required != &cited.validator_service_id)
+                    .is_some_and(|trust| trust.trusts(&cited.validator_service_id))
                 {
                     return Err(LedgerError::ValidationStale(format!(
-                        "validation {validation_id} was produced by another validation service"
+                        "validation {validation_id} was not produced by a validation service this \
+                         deployment trusts"
                     )));
                 }
                 if &cited.environment_id != semantic_environment_id {

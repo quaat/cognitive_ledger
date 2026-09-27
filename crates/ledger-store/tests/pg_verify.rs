@@ -382,7 +382,10 @@ async fn each_phase2_check_detects_exactly_its_own_tampering() {
         })
         .await
         .unwrap();
-    let store = PostgresLedgerStore::from_pool_migrated(pool.clone(), V1Binding::Reject);
+    let store = PostgresLedgerStore::from_pool_migrated(pool.clone(), V1Binding::Reject)
+        .with_validation_trust(
+            ledger_store::ValidationTrustPolicy::single("urn:sculpin:service:validator").unwrap(),
+        );
     let wf = store.workflows();
     let prepare = |key: &'static str, head: Option<ledger_core::CommitId>, v: &'static str| {
         let wf = wf.clone();
@@ -533,7 +536,7 @@ async fn each_phase2_check_detects_exactly_its_own_tampering() {
             "ALTER TABLE idempotency DISABLE TRIGGER idempotency_write_once".into(),
             format!("DELETE FROM idempotency WHERE operation = 'validate' AND result_validation_id = '{bad_id}'"),
         ],
-        "every validation record was produced by exactly one validate request",
+        "every validation record was produced by at least one validate request (identical records are shared across keys)",
     )
     .await;
     bypass(
@@ -707,6 +710,59 @@ async fn each_phase2_check_detects_exactly_its_own_tampering() {
             "UPDATE validation_records SET outcome = 'violations' WHERE validation_id = '{bad2_id}'"
         ),
         "ALTER TABLE validation_records ENABLE TRIGGER validation_records_write_once".into(),
+    ])
+    .await;
+    let restored = verify::run(&pool).await.unwrap();
+    assert!(restored.is_clean(), "{:?}", failing(&restored));
+
+    // Detail rows are compared element by element with the decoded bytes: a forged summary
+    // message or a forged hydrated source version is seen by exactly the byte check.
+    let message: String = sqlx::query_scalar(
+        "SELECT message FROM validation_violations WHERE validation_id = $1 AND position = 0",
+    )
+    .bind(&bad2_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the violating record has a summary");
+    committed(vec![
+        "ALTER TABLE validation_violations DISABLE TRIGGER validation_violations_write_once".into(),
+        format!("UPDATE validation_violations SET message = 'forged' WHERE validation_id = '{bad2_id}' AND position = 0"),
+        "ALTER TABLE validation_violations ENABLE TRIGGER validation_violations_write_once".into(),
+    ])
+    .await;
+    let report = verify::run(&pool).await.unwrap();
+    assert_eq!(failing(&report), vec![RECORD_BYTES]);
+    committed(vec![
+        "ALTER TABLE validation_violations DISABLE TRIGGER validation_violations_write_once".into(),
+        format!(
+            "UPDATE validation_violations SET message = '{}' WHERE validation_id = '{bad2_id}' AND position = 0",
+            message.replace('\'', "''")
+        ),
+        "ALTER TABLE validation_violations ENABLE TRIGGER validation_violations_write_once".into(),
+    ])
+    .await;
+    let version: String = sqlx::query_scalar(
+        "SELECT source_version FROM semantic_virtual_contexts WHERE context_id = $1 AND position = 0",
+    )
+    .bind(&bad_ctx)
+    .fetch_one(&pool)
+    .await
+    .expect("the context hydrated a virtual context");
+    committed(vec![
+        "ALTER TABLE semantic_virtual_contexts DISABLE TRIGGER semantic_virtual_contexts_write_once".into(),
+        format!("UPDATE semantic_virtual_contexts SET source_version = 'forged' WHERE context_id = '{bad_ctx}' AND position = 0"),
+        "ALTER TABLE semantic_virtual_contexts ENABLE TRIGGER semantic_virtual_contexts_write_once".into(),
+    ])
+    .await;
+    let report = verify::run(&pool).await.unwrap();
+    assert_eq!(failing(&report), vec![CONTEXT_BYTES]);
+    committed(vec![
+        "ALTER TABLE semantic_virtual_contexts DISABLE TRIGGER semantic_virtual_contexts_write_once".into(),
+        format!(
+            "UPDATE semantic_virtual_contexts SET source_version = '{}' WHERE context_id = '{bad_ctx}' AND position = 0",
+            version.replace('\'', "''")
+        ),
+        "ALTER TABLE semantic_virtual_contexts ENABLE TRIGGER semantic_virtual_contexts_write_once".into(),
     ])
     .await;
     let restored = verify::run(&pool).await.unwrap();

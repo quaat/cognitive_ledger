@@ -23,11 +23,13 @@ use ledger_rdf::{Operation, OperationKind, Patch, Quad};
 use ledger_store::{
     AcceptRequest, Ledger, MAX_BRANCH_BYTES, MAX_CORRELATION_BYTES, MAX_IDEMPOTENCY_KEY_BYTES,
     MAX_REASON_BYTES, PostgresLedgerStore, PrepareRequest, ReconstructionLimits, RejectRequest,
-    RequestScope, ValidateRequest, ValidationBegin, ValidationPolicy, ValidatorOutcome,
+    RequestScope, ValidateRequest, ValidationBegin, ValidationPolicy, ValidationTrustPolicy,
+    ValidatorOutcome,
 };
 use ledger_validation_protocol::{
     CandidateDescriptor, RequestedContext, SemanticContextId, SemanticEnvironmentId,
-    SemanticExecutionContext, ValidationClient, ValidationId, ValidationRecord, ValidationRequest,
+    SemanticExecutionContext, ValidationClient, ValidationId, ValidationInvocation,
+    ValidationRecord, ValidationRequest,
 };
 use request_identity::CanonicalRequest;
 use serde::{Deserialize, Serialize};
@@ -117,6 +119,9 @@ struct Shared {
     expensive: tokio::sync::Semaphore,
     validations: tokio::sync::Semaphore,
     validation: Option<ValidationService>,
+    /// The trusted validation service (ADR-0019); independent of `validation`, which is
+    /// only the ability to call it.
+    trust: Option<ValidationTrustPolicy>,
     correlation_counter: Arc<AtomicU64>,
 }
 
@@ -143,6 +148,7 @@ impl AppState {
             expensive: tokio::sync::Semaphore::new(limits.max_concurrent_expensive),
             validations: tokio::sync::Semaphore::new(limits.max_concurrent_validations),
             validation: None,
+            trust: None,
             store,
             authenticator,
             limits,
@@ -151,24 +157,39 @@ impl AppState {
         }))
     }
 
-    /// Attach the validation service. Construction-time only (before the state is shared).
-    pub fn with_validation(self, service: ValidationService) -> Self {
+    /// Trust records of exactly this validation service for validated acceptance
+    /// (`LEDGER_VALIDATOR_SERVICE_ID`). Independent of an endpoint: with trust but no client,
+    /// `validate` answers `VALIDATOR_UNAVAILABLE` while earlier records of the trusted
+    /// service still satisfy acceptance. Without trust, validated acceptance fails closed.
+    /// Construction-time only (before the state is shared).
+    pub fn with_validation_trust(self, trust: ValidationTrustPolicy) -> Self {
         let mut shared = Arc::try_unwrap(self.0).unwrap_or_else(|_| {
+            panic!("with_validation_trust must be called before the state is shared")
+        });
+        if shared.trust.as_ref().is_some_and(|t| t != &trust) {
+            panic!("the validation trust policy is set once");
+        }
+        shared.store = shared.store.clone().with_validation_trust(trust.clone());
+        shared.trust = Some(trust);
+        Self(Arc::new(shared))
+    }
+
+    /// Attach the client for the validation service. The service must be the trusted one:
+    /// without an explicit trust policy it becomes the trust anchor; a client for any other
+    /// service is a configuration error. Construction-time only.
+    pub fn with_validation(self, service: ValidationService) -> Self {
+        let trust = ValidationTrustPolicy::single(service.service_id.clone())
+            .unwrap_or_else(|_| panic!("validator service id must be a bounded token"));
+        let state = match &self.0.trust {
+            Some(existing) if existing != &trust => {
+                panic!("the validation client must be for the trusted validation service")
+            }
+            Some(_) => self,
+            None => self.with_validation_trust(trust),
+        };
+        let mut shared = Arc::try_unwrap(state.0).unwrap_or_else(|_| {
             panic!("with_validation must be called before the state is shared")
         });
-        if ledger_core::validate_token(
-            "validator service id",
-            &service.service_id,
-            ledger_core::MAX_IDENTIFIER_BYTES,
-        )
-        .is_err()
-        {
-            panic!("validator service id must be a bounded token");
-        }
-        shared.store = shared
-            .store
-            .clone()
-            .with_required_validator(service.service_id.clone());
         shared.validation = Some(service);
         Self(Arc::new(shared))
     }
@@ -1479,7 +1500,19 @@ async fn validate(
         }
         quads.push(line);
     }
+    // One logical invocation per (authenticated scope, key, canonical request): concurrent
+    // duplicates and retries after a lost response or crash carry the same id, so the
+    // validator resolves them to one validation in one environment (ADR-0019 amendment).
+    let invocation_id = ValidationInvocation::for_request(
+        &request.scope.principal,
+        &request.scope.graph,
+        &request.scope.idempotency_key,
+        &request.scope.request_digest,
+    )
+    .id()
+    .map_err(|e| ApiError::from_ledger(e.into(), &correlation))?;
     let mut outbound = ValidationRequest::new(
+        invocation_id,
         CandidateDescriptor {
             graph_id: graph.clone(),
             knowledge_base_id: ticket.knowledge_base_id().map(str::to_owned),

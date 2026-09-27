@@ -2245,7 +2245,10 @@ async fn validation_persistence_runs_under_the_runtime_identity_and_its_controls
         .unwrap();
     let running = PostgresLedgerStore::connect(&fx.runtime_db_url, V1Binding::Reject)
         .await
-        .unwrap();
+        .unwrap()
+        .with_validation_trust(
+            ledger_store::ValidationTrustPolicy::single("urn:sculpin:service:validator").unwrap(),
+        );
     let wf = running.workflows();
     let prepared = wf
         .prepare(&PrepareRequest {
@@ -2504,6 +2507,46 @@ async fn assert_vacuous_check_refused(
         .ready()
         .await
         .unwrap_or_else(|e| panic!("{name} restored: readiness again: {e}"));
+}
+
+/// Composite foreign keys are `MATCH SIMPLE`: a key column that became nullable lets a row
+/// skip the foreign key entirely (e.g. a `decision_validations` link with NULL graph and
+/// candidate). Nullability is therefore verified structurally, at start-up and readiness.
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn nullable_key_columns_are_refused_at_startup_and_readiness() {
+    let fx = fixture("lp_not_null").await;
+    fx.migrate_and_grant().await;
+    let running = PostgresLedgerStore::connect(&fx.runtime_db_url, V1Binding::Reject)
+        .await
+        .expect("healthy database serves");
+    assert_healthy(&fx, "fresh migration").await;
+    for (table, column) in [
+        ("decision_validations", "graph_id"),
+        ("decision_validations", "candidate_commit"),
+        ("validation_records", "candidate_commit"),
+        ("semantic_execution_contexts", "candidate_state_digest"),
+        ("idempotency", "graph_id"),
+    ] {
+        owner_exec(
+            &fx,
+            &format!("ALTER TABLE {table} ALTER COLUMN {column} DROP NOT NULL"),
+        )
+        .await;
+        let m =
+            assert_refused_by_schema(&fx, &running, &format!("{table}.{column} nullable")).await;
+        assert!(
+            m.contains(&format!("{table}.{column} must be NOT NULL")),
+            "{m}"
+        );
+        owner_exec(
+            &fx,
+            &format!("ALTER TABLE {table} ALTER COLUMN {column} SET NOT NULL"),
+        )
+        .await;
+        assert_healthy(&fx, &format!("{table}.{column} restored")).await;
+        running.ready().await.expect("readiness after restore");
+    }
 }
 
 #[tokio::test]

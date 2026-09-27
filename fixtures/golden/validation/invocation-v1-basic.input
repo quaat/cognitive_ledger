@@ -1,0 +1,8 @@
+{
+  "tenant_id": "11111111-2222-4333-8444-555555555555",
+  "principal_type": "service",
+  "principal_id": "urn:sculpin:service:orchestrator",
+  "graph_id": "0b0a2a1c-2e3d-4f50-8a61-72b384c5d6e7",
+  "idempotency_key": "validate-7f3c2a",
+  "request_digest": "sha256:c2345d073810e6ab8cedda85e8c3e3ced4d036d05f818ef3263ce9d1c9f39cf1"
+}

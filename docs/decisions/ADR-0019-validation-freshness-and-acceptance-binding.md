@@ -1,7 +1,7 @@
 # Validation freshness and the binding of acceptance to a validation record
 
 ## Status
-Accepted (2026-09-27, Plan 0006 / Phase 2 slices P2.2 and P2.5). Affects persistent
+Accepted (2026-09-27, Plan 0006 / Phase 2 slices P2.2 and P2.5); amended before release (validator trust anchor, validation invocation identity). Affects persistent
 atomicity: the acceptance transaction (ADR-0013) gains validation predicates and a new
 enforced relation.
 
@@ -39,11 +39,10 @@ idempotent-replay lookup and before any write, the repository verifies:
 5. the environment of its context equals the `semantic_environment_id` the request names
    (`VALIDATION_STALE` otherwise).
 
-When the deployment configures a validation service (`LEDGER_VALIDATOR_SERVICE_ID`), the
-record must also have been produced by that service (`VALIDATION_STALE` otherwise): the
-environment deliberately omits the ledger-side service identity, so this is a separate,
-opaque ledger policy. Without a configured service no validation can be requested, but
-records written earlier (by any service) remain acceptable under the environment rule.
+6. the record was produced by the validation service the deployment **trusts**
+   (`VALIDATION_STALE` otherwise). The environment deliberately omits the ledger-side
+   service identity, so this is a separate, opaque ledger policy (see "Amendment: validator
+   trust anchor" below). Without a trust anchor every validated acceptance is refused.
 
 Predicates 2–5 are evaluated on the verified canonical bytes of the record and its context
 (hash checked, strictly decoded), never on the relational projection columns.
@@ -90,6 +89,53 @@ violation summary and the idempotency result. Validator outage is `VALIDATOR_UNA
 (nothing persisted). The ledger remains fully operable without the validator: prepare,
 reads and rejection work, acceptance stays fail-closed (`VALIDATION_REQUIRED`).
 
+## Amendment: validator trust anchor (2026-09-27, before release)
+The first implementation derived the trusted service from the configured endpoint: with
+`LEDGER_VALIDATOR_URL` unset no service was required, so a conforming historical record of
+*any* service satisfied acceptance — a missing runtime setting broadened trust. Trust and
+reachability are now separate:
+
+- `LEDGER_VALIDATOR_SERVICE_ID` is the trust anchor (`ValidationTrustPolicy`, one service
+  for this version). `LEDGER_VALIDATOR_URL` is only the ability to call that service; the
+  client always records under the trusted id.
+- Service id + URL: new validations run; records of that service are acceptable.
+- Service id, no URL (outage, endpoint withdrawn): `validate` answers
+  `VALIDATOR_UNAVAILABLE`; earlier records of the trusted service still satisfy
+  acceptance; completed validations still replay.
+- URL without service id: startup is refused. Production authentication without a service
+  id: startup is refused (production acceptance always requires validation). Development
+  without either: validated acceptance fails closed (`VALIDATION_STALE`); unvalidated
+  acceptance stays behind its separate, conspicuous development-only switch.
+- Predicate 1 is evaluated before predicate 6, so a foreign or nonexistent validation is
+  `VALIDATION_NOT_FOUND` under every trust configuration; a refusal never names the
+  service that produced a record.
+
+## Amendment: validation invocation identity (2026-09-27, before release)
+Keeping the validator call outside any database transaction (above) means two identical
+concurrent ledger requests under one `Idempotency-Key` can both pass the replay lookup and
+both call the validator; so can a retry after a crash between the validator's answer and the
+record. If the validator's environment moved in between, the durable record would name
+whichever environment happened to record first. The fix is at the protocol boundary, not a
+lock held across the call:
+
+- Every outbound call carries `sculpin-validation-invocation/v1` — a deterministic id over
+  the authenticated idempotency scope (tenant, principal type/id, delegation, graph,
+  operation `validate`, key) and the canonical request-v2 digest, with its own header for
+  domain separation (layout: [`validation-protocol.md`](../design/validation-protocol.md)). It is
+  sent as `invocation_id` and as the `Idempotency-Key` header: one identifier, two
+  representations. Correlation ids, time, arrival order and instance never enter it.
+- The Sculpin contract requires that repeated or concurrent calls with the same invocation
+  identity resolve to the same logical effective semantic context and validation result
+  (at-least-once delivery, exactly-once logical validation;
+  [`sculpin-validation-service.md`](../design/sculpin-validation-service.md)).
+- It is not semantic identity: it is never part of `CommitId`, `SemanticContextId`,
+  `SemanticEnvironmentId` or `ValidationId`, and it is not stored. The ledger's own
+  idempotency is unchanged: phase B records under the idempotency lock, a concurrent loser
+  replays the winner's record, the same key with another body is `IDEMPOTENCY_CONFLICT`.
+- Golden vectors (`fixtures/golden/validation/invocation-v1-*`) are produced by the
+  independent Python reference and checked by Rust; `sculpin-validation-request/v1` gains
+  the required `invocation_id` field (unreleased, amended in place).
+
 ## Alternatives considered
 - **Accept with `validation_id` only; the ledger picks "current" context.** Requires the
   ledger to know Sculpin's current ontology/shapes/KB revision; rejected (boundary).
@@ -102,6 +148,12 @@ reads and rejection work, acceptance stays fail-closed (`VALIDATION_REQUIRED`).
   larger; the id is sufficient because the layout is frozen and independently computable.
 - **Synchronous validate-then-accept in one request.** Rejected by ADR-0014; a convenience
   orchestration may be layered above later.
+- **Hold a lock (or an in-flight row) across the validator call.** Rejected: an external
+  call must never pin a database connection, transaction or advisory lock, and an in-flight
+  marker still needs the validator's cooperation after a ledger crash. The invocation
+  identity gives the validator what it needs without either.
+- **Trust whichever service the endpoint belongs to.** Rejected by the trust-anchor
+  amendment: reachability is not trust.
 
 ## Revision (review round 1, 2026-09-27)
 The first draft bound acceptance to the context id; see the rejected alternative above. The
