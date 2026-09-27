@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Independent reference encoder for `sculpin-semantic-context/v1` and
-`sculpin-validation-record/v1` (ADR-0018). Written from the ADR's layout, not from the Rust
+"""Independent reference encoder for `sculpin-semantic-context/v1`,
+`sculpin-semantic-environment/v1` and `sculpin-validation-record/v1` (ADR-0018). Written from the ADR's layout, not from the Rust
 encoder, so the vectors under `fixtures/golden/validation/` are pinned by two implementations.
 
-    generate   write <name>.hex/.sha256 for every context-*/record-*.input without them
+    generate   write <name>.hex/.sha256 for every context-*/environment-*/record-*.input
+               without them
     check      recompute every vector (positive and negative) and fail on any difference
     negatives  write the *-invalid-*.hex fixtures (bytes the decoders MUST reject)
 
@@ -25,6 +26,7 @@ from commit_v2_reference import normalize_time  # noqa: E402  (same timestamp ru
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / "fixtures" / "golden" / "validation"
 CONTEXT_HEADER = b"sculpin-semantic-context-v1\0"
+ENVIRONMENT_HEADER = b"sculpin-semantic-environment-v1\0"
 RECORD_HEADER = b"sculpin-validation-record-v1\0"
 MAX_IDENTIFIER_BYTES = 512
 MAX_SET = 64
@@ -46,6 +48,23 @@ def token(name: str, value: str, max_bytes: int = MAX_IDENTIFIER_BYTES) -> str:
         raise Invalid(f"{name}: exceeds {max_bytes} bytes")
     if any(unicodedata.category(c) == "Cc" for c in value):
         raise Invalid(f"{name}: control character")
+    return value
+
+
+def keys(name: str, value: dict, allowed: set[str], required: set[str] | None = None) -> dict:
+    if not isinstance(value, dict):
+        raise Invalid(f"{name}: must be an object")
+    if set(value) - allowed:
+        raise Invalid(f"{name}: unknown fields {sorted(set(value) - allowed)}")
+    missing = (allowed if required is None else required) - set(value)
+    if missing:
+        raise Invalid(f"{name}: missing fields {sorted(missing)}")
+    return value
+
+
+def u32(name: str, value) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or not 0 <= value <= 0xFFFFFFFF:
+        raise Invalid(f"{name}: must be an integer in u32 range")
     return value
 
 
@@ -76,9 +95,8 @@ def counted_set(elements: list[bytes], name: str) -> bytes:
 
 
 def virtual_context(vc: dict) -> bytes:
-    allowed = {"dataset_id", "source_version", "object_refs", "query_spec_digest", "hydration_plan_digest"}
-    if set(vc) - allowed:
-        raise Invalid(f"unknown virtual context fields {sorted(set(vc) - allowed)}")
+    keys("virtual_context", vc, {"dataset_id", "source_version", "object_refs", "query_spec_digest", "hydration_plan_digest"},
+         {"dataset_id", "source_version", "query_spec_digest", "hydration_plan_digest"})
     out = field(token("dataset_id", vc["dataset_id"])) + field(token("source_version", vc["source_version"]))
     refs = [field(token("object_ref", r)) for r in vc.get("object_refs", [])]
     out += counted_set(refs, "object references")
@@ -87,42 +105,80 @@ def virtual_context(vc: dict) -> bytes:
     return out
 
 
+def semantics(logical: dict) -> bytes:
+    """base_kb · ontology tag · shapes · reasoning tag — shared by context and environment."""
+    kb = keys("base_kb", logical["base_kb"], {"kb_id", "revision"})
+    out = field(token("base_kb.kb_id", kb["kb_id"])) + field(token("base_kb.revision", kb["revision"]))
+    ontology = logical.get("ontology")
+    if ontology is None:
+        out += b"\x00"
+    else:
+        keys("ontology", ontology, {"id", "version"})
+        out += b"\x01" + field(token("ontology.id", ontology["id"])) + field(token("ontology.version", ontology["version"]))
+    shapes = keys("shapes", logical["shapes"], {"id", "version"})
+    out += field(token("shapes.id", shapes["id"])) + field(token("shapes.version", shapes["version"]))
+    reasoning = logical.get("reasoning")
+    if reasoning is None:
+        out += b"\x00"
+    else:
+        keys("reasoning", reasoning, {"profile", "implementation", "version"})
+        out += b"\x01" + field(token("reasoning.profile", reasoning["profile"])) \
+            + field(token("reasoning.implementation", reasoning["implementation"])) \
+            + field(token("reasoning.version", reasoning["version"]))
+    return out
+
+
+def source_pin(pin: dict) -> bytes:
+    keys("source_pin", pin, {"dataset_id", "source_version"})
+    return field(token("dataset_id", pin["dataset_id"])) + field(token("source_version", pin["source_version"]))
+
+
 def encode_context(logical: dict) -> bytes:
-    allowed = {"graph_id", "candidate_commit", "candidate_state_digest", "base_kb", "ontology",
-               "shapes", "reasoning", "virtual_contexts", "validator"}
-    if set(logical) - allowed:
-        raise Invalid(f"unknown context fields {sorted(set(logical) - allowed)}")
+    keys("context", logical, {"graph_id", "candidate_commit", "candidate_state_digest", "base_kb", "ontology",
+                              "shapes", "reasoning", "virtual_contexts", "validator"},
+         {"graph_id", "candidate_commit", "candidate_state_digest", "base_kb", "shapes", "validator"})
     if not GRAPH_ID_RE.fullmatch(logical["graph_id"]):
         raise Invalid("graph_id")
     out = bytearray(CONTEXT_HEADER)
     out += field(logical["graph_id"])
     out += field(content_id("candidate_commit", logical["candidate_commit"]))
     out += field(content_id("candidate_state_digest", logical["candidate_state_digest"]))
-    kb = logical["base_kb"]
-    out += field(token("base_kb.kb_id", kb["kb_id"])) + field(token("base_kb.revision", kb["revision"]))
-    ontology = logical.get("ontology")
-    if ontology is None:
-        out += b"\x00"
-    else:
-        out += b"\x01" + field(token("ontology.id", ontology["id"])) + field(token("ontology.version", ontology["version"]))
-    shapes = logical["shapes"]
-    out += field(token("shapes.id", shapes["id"])) + field(token("shapes.version", shapes["version"]))
-    reasoning = logical["reasoning"]
-    out += field(token("reasoning.profile", reasoning["profile"]))
-    out += field(token("reasoning.implementation", reasoning["implementation"]))
-    out += field(token("reasoning.version", reasoning["version"]))
+    out += semantics(logical)
     out += counted_set([virtual_context(vc) for vc in logical.get("virtual_contexts", [])], "virtual contexts")
-    validator = logical["validator"]
+    validator = keys("validator", logical["validator"], {"service_id", "service_version", "configuration_version"})
     out += field(token("validator.service_id", validator["service_id"]))
     out += field(token("validator.service_version", validator["service_version"]))
     out += field(token("validator.configuration_version", validator["configuration_version"]))
     return bytes(out)
 
 
+def encode_environment(logical: dict) -> bytes:
+    keys("environment", logical, {"base_kb", "ontology", "shapes", "reasoning", "source_pins",
+                                  "validator_service_version", "validator_configuration_version"},
+         {"base_kb", "shapes", "validator_service_version", "validator_configuration_version"})
+    out = bytearray(ENVIRONMENT_HEADER)
+    out += semantics(logical)
+    out += counted_set([source_pin(p) for p in logical.get("source_pins", [])], "source pins")
+    out += field(token("validator.service_version", logical["validator_service_version"]))
+    out += field(token("validator.configuration_version", logical["validator_configuration_version"]))
+    return bytes(out)
+
+
+def environment_of(context: dict) -> dict:
+    """The candidate-independent projection of a context (ADR-0018/0019)."""
+    env = {k: context[k] for k in ("base_kb", "shapes") }
+    for k in ("ontology", "reasoning"):
+        if context.get(k) is not None:
+            env[k] = context[k]
+    env["source_pins"] = [{"dataset_id": vc["dataset_id"], "source_version": vc["source_version"]}
+                          for vc in context.get("virtual_contexts", [])]
+    env["validator_service_version"] = context["validator"]["service_version"]
+    env["validator_configuration_version"] = context["validator"]["configuration_version"]
+    return env
+
+
 def violation(v: dict) -> bytes:
-    allowed = {"severity", "code", "message"}
-    if set(v) - allowed:
-        raise Invalid(f"unknown violation fields {sorted(set(v) - allowed)}")
+    keys("violation", v, {"severity", "code", "message"}, {"severity", "code"})
     message = v.get("message", "")
     if len(message.encode("utf-8")) > MAX_MESSAGE_BYTES or any(unicodedata.category(c) == "Cc" for c in message):
         raise Invalid("violation.message")
@@ -131,10 +187,10 @@ def violation(v: dict) -> bytes:
 
 def encode_record(logical: dict, *, summary_override: list[bytes] | None = None,
                   raw_recorded_at: str | None = None) -> bytes:
-    allowed = {"graph_id", "candidate_commit", "candidate_state_digest", "semantic_execution_context_id",
-               "validator", "outcome", "recorded_at", "report_digest", "report_reference"}
-    if set(logical) - allowed:
-        raise Invalid(f"unknown record fields {sorted(set(logical) - allowed)}")
+    keys("record", logical, {"graph_id", "candidate_commit", "candidate_state_digest", "semantic_execution_context_id",
+                             "validator", "outcome", "recorded_at", "report_digest", "report_reference"},
+         {"graph_id", "candidate_commit", "candidate_state_digest", "semantic_execution_context_id",
+          "validator", "outcome", "recorded_at", "report_digest"})
     if not GRAPH_ID_RE.fullmatch(logical["graph_id"]):
         raise Invalid("graph_id")
     out = bytearray(RECORD_HEADER)
@@ -142,17 +198,16 @@ def encode_record(logical: dict, *, summary_override: list[bytes] | None = None,
     out += field(content_id("candidate_commit", logical["candidate_commit"]))
     out += field(content_id("candidate_state_digest", logical["candidate_state_digest"]))
     out += field(content_id("semantic_execution_context_id", logical["semantic_execution_context_id"]))
-    validator = logical["validator"]
+    validator = keys("validator", logical["validator"], {"service_id", "service_version", "configuration_version"})
     out += field(token("validator.service_id", validator["service_id"]))
     out += field(token("validator.service_version", validator["service_version"]))
     out += field(token("validator.configuration_version", validator["configuration_version"]))
-    outcome = logical["outcome"]
+    outcome = keys("outcome", logical["outcome"], {"kind", "violation_count", "violations"}, {"kind"})
     kind = outcome["kind"]
-    count = int(outcome.get("violation_count", 0))
+    count = u32("violation_count", outcome.get("violation_count", 0))
     summary = sorted({violation(v) for v in outcome.get("violations", [])})
     if kind == "conforms":
-        if count != 0 or summary:
-            raise Invalid("conforming outcome with violations")
+        # A conforming verdict may carry non-blocking results (e.g. warnings).
         out += b"\x00"
     elif kind == "violations":
         if count < 1:
@@ -186,6 +241,8 @@ def encode(path: pathlib.Path) -> bytes:
     logical = json.loads(path.read_text())
     if path.name.startswith("context-"):
         return encode_context(logical)
+    if path.name.startswith("environment-"):
+        return encode_environment(logical)
     if path.name.startswith("record-"):
         return encode_record(logical)
     raise Invalid(f"unknown fixture kind {path.name}")
@@ -202,33 +259,46 @@ def negative_cases() -> dict[str, bytes]:
     summary = sorted({violation(v) for v in record["outcome"]["violations"]})
     cases["record-v1-invalid-unsorted-summary"] = encode_record(record, summary_override=list(reversed(summary)))
     cases["record-v1-invalid-duplicate-summary"] = encode_record(record, summary_override=[summary[0], summary[0]])
-    cases["record-v1-invalid-noncanonical-time"] = encode_record(record, raw_recorded_at=record["recorded_at"].replace(".000000Z", "Z") if ".000000Z" in record["recorded_at"] else "2026-09-27T12:00:00Z")
+    cases["record-v1-invalid-noncanonical-time"] = encode_record(record, raw_recorded_at="2026-09-27T14:03:07.25Z")
     good = encode_record(record)
     cases["record-v1-invalid-trailing-bytes"] = good + b"\x00"
-    # outcome byte 0 (conforms) with a nonzero count: the count follows the byte directly.
-    conforms_count = bytearray(good)
     marker = field(record["validator"]["configuration_version"])
     at = good.find(marker) + len(marker)
-    assert conforms_count[at] == 1
-    conforms_count[at] = 0
-    cases["record-v1-invalid-conforms-with-violations"] = bytes(conforms_count)
+    assert good[at] == 1 and good[at + 1:at + 5] == struct.pack(">I", 3)
+    # the summary (2 entries) exceeds a declared count of 1
+    cases["record-v1-invalid-summary-exceeds-count"] = good[:at + 1] + struct.pack(">I", 1) + good[at + 5:]
+    # violations outcome with count 0 and no summary
+    conforming = encode_record(json.loads((FIXTURES / "record-v1-conforms.input").read_text()))
+    cat = conforming.find(marker) + len(marker)
+    assert conforming[cat] == 0
+    cases["record-v1-invalid-violations-without-count"] = conforming[:cat] + b"\x01" + conforming[cat + 1:]
+    cases["record-v1-invalid-outcome-byte"] = conforming[:cat] + b"\x02" + conforming[cat + 1:]
     ctx = encode_context(context)
     cases["context-v1-invalid-trailing-bytes"] = ctx + b"\x00"
     cases["context-v1-invalid-unknown-version"] = b"sculpin-semantic-context-v2\0" + ctx[len(CONTEXT_HEADER):]
-    # virtual contexts out of order on the wire
     encoded = sorted({virtual_context(vc) for vc in context["virtual_contexts"]})
     assert len(encoded) >= 2
     joined = b"".join(encoded)
     at = ctx.find(joined)
     assert at > 0
     cases["context-v1-invalid-unsorted-virtual-contexts"] = ctx[:at] + b"".join(reversed(encoded)) + ctx[at + len(joined):]
-    # ontology present-but-empty id
+    cases["context-v1-invalid-duplicate-virtual-contexts"] = ctx[:at - 4] + struct.pack(">I", len(encoded) + 1) + encoded[0] + joined + ctx[at + len(joined):]
+    # object refs within one element in raw-string (not encoding) order
+    lab_b = next(vc for vc in context["virtual_contexts"] if len(vc["object_refs"]) >= 2)
+    refs = sorted({field(r) for r in lab_b["object_refs"]})
+    refs_joined = b"".join(refs)
+    rat = ctx.find(refs_joined)
+    assert rat > 0
+    cases["context-v1-invalid-unsorted-object-refs"] = ctx[:rat] + b"".join(reversed(refs)) + ctx[rat + len(refs_joined):]
     no_ontology = dict(context, ontology=None)
     absent = encode_context(no_ontology)
     prefix = len(CONTEXT_HEADER) + len(field(context["graph_id"])) + len(field(context["candidate_commit"])) \
         + len(field(context["candidate_state_digest"])) + len(field(context["base_kb"]["kb_id"])) + len(field(context["base_kb"]["revision"]))
     assert absent[prefix] == 0
     cases["context-v1-invalid-empty-ontology"] = absent[:prefix] + b"\x01" + field("") + field("1") + absent[prefix + 1:]
+    cases["context-v1-invalid-ontology-tag"] = absent[:prefix] + b"\x02" + absent[prefix + 1:]
+    env = encode_environment(environment_of(context))
+    cases["environment-v1-invalid-trailing-bytes"] = env + b"\x00"
     return cases
 
 

@@ -4,9 +4,10 @@
 //! and digests; the ledger only ships the immutable candidate it owns.
 
 use crate::{
-    BaseKb, MAX_VIRTUAL_CONTEXTS, Ontology, ProtocolError, Reasoning, SemanticExecutionContext,
-    ShapeSet, ValidationOutcome, ValidatorIdentity, VirtualContextRef,
-    encoding::{TAG_ABSENT, TAG_PRESENT, canonical_set, field, opt, u32be},
+    BaseKb, Ontology, ProtocolError, Reasoning, SemanticExecutionContext, ShapeSet, SourcePin,
+    ValidationOutcome, ValidatorIdentity, VirtualContextRef,
+    context::canonical_pins,
+    encoding::{TAG_ABSENT, TAG_PRESENT, field, opt, u32be},
 };
 use ledger_core::{CommitId, ContentId, GraphId, MAX_IDENTIFIER_BYTES, validate_token};
 use serde::{Deserialize, Serialize};
@@ -35,8 +36,9 @@ pub struct RequestedContext {
     pub shapes: Option<ShapeSet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_profile: Option<String>,
+    /// External source versions the validation must use (a set).
     #[serde(default)]
-    pub virtual_contexts: Vec<VirtualContextRef>,
+    pub source_pins: Vec<SourcePin>,
 }
 
 impl RequestedContext {
@@ -56,29 +58,18 @@ impl RequestedContext {
         if let Some(profile) = &self.reasoning_profile {
             token("reasoning_profile", profile)?;
         }
-        for context in &self.virtual_contexts {
-            context.validate()?;
-        }
-        if self.canonical_virtual_contexts()?.len() > MAX_VIRTUAL_CONTEXTS {
-            return Err(ProtocolError::Invalid(format!(
-                "more than {MAX_VIRTUAL_CONTEXTS} distinct virtual contexts"
-            )));
-        }
+        canonical_pins(&self.source_pins)?;
         Ok(())
     }
 
-    pub fn canonical_virtual_contexts(&self) -> Result<Vec<Vec<u8>>, ProtocolError> {
-        let encoded = self
-            .virtual_contexts
-            .iter()
-            .map(VirtualContextRef::canonical_bytes)
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(canonical_set(encoded))
+    /// The source-pin set as it enters request identity: element encodings sorted, unique.
+    pub fn canonical_source_pins(&self) -> Result<Vec<Vec<u8>>, ProtocolError> {
+        canonical_pins(&self.source_pins)
     }
 
     /// Append the hint encoding used by request identity v2 (ADR-0015 amendment):
     /// tagged pairs for base KB, ontology and shapes, `opt` reasoning profile, then the
-    /// virtual-context set exactly as in `sculpin-semantic-context/v1`.
+    /// source-pin set exactly as in `sculpin-semantic-environment/v1`.
     pub fn encode_into(&self, out: &mut Vec<u8>) -> Result<(), ProtocolError> {
         self.validate()?;
         let pair = |a: Option<(&str, &str)>, out: &mut Vec<u8>| -> Result<(), ProtocolError> {
@@ -111,9 +102,9 @@ impl RequestedContext {
             out,
         )?;
         opt(out, self.reasoning_profile.as_deref())?;
-        let contexts = self.canonical_virtual_contexts()?;
-        u32be(out, contexts.len())?;
-        for element in &contexts {
+        let pins = self.canonical_source_pins()?;
+        u32be(out, pins.len())?;
+        for element in &pins {
             out.extend_from_slice(element);
         }
         Ok(())
@@ -179,7 +170,9 @@ pub struct EffectiveContext {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ontology: Option<Ontology>,
     pub shapes: ShapeSet,
-    pub reasoning: Reasoning,
+    /// Absent when no reasoning ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<Reasoning>,
     #[serde(default)]
     pub virtual_contexts: Vec<VirtualContextRef>,
     pub validator: ValidatorVersions,
@@ -318,11 +311,7 @@ mod tests {
                     id: "shapes".into(),
                     version: "1".into(),
                 },
-                reasoning: Reasoning {
-                    profile: "none".into(),
-                    implementation: "pyshacl".into(),
-                    version: "0.26".into(),
-                },
+                reasoning: None,
                 virtual_contexts: vec![],
                 validator: ValidatorVersions {
                     service_version: "1".into(),
@@ -366,15 +355,12 @@ mod tests {
     fn requested_context_hints_encode_deterministically() {
         let mut a = RequestedContext::default();
         let mut b = RequestedContext::default();
-        let vc = |v: &str| VirtualContextRef {
+        let pin = |v: &str| SourcePin {
             dataset_id: "ds".into(),
             source_version: v.into(),
-            object_refs: vec![],
-            query_spec_digest: digest("q"),
-            hydration_plan_digest: digest("h"),
         };
-        a.virtual_contexts = vec![vc("2"), vc("1")];
-        b.virtual_contexts = vec![vc("1"), vc("2"), vc("1")];
+        a.source_pins = vec![pin("22"), pin("1")];
+        b.source_pins = vec![pin("1"), pin("22"), pin("1")];
         let mut ea = Vec::new();
         let mut eb = Vec::new();
         a.encode_into(&mut ea).unwrap();

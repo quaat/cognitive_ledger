@@ -20,7 +20,7 @@
       {
         "severity": "Violation",
         "code": "sh:MinCountConstraintComponent",
-        "message": "urn:material:a lacks rdfs:label"
+        "message": "urn:material:a lacks rdfs:label — ünïcode"
       },
       {
         "severity": "Violation",

@@ -24,7 +24,8 @@ pub use client::{
 };
 pub use context::{
     BaseKb, MAX_OBJECT_REFS, MAX_VIRTUAL_CONTEXTS, Ontology, Reasoning, SEMANTIC_CONTEXT_V1_HEADER,
-    SemanticContextId, SemanticExecutionContext, ShapeSet, ValidatorIdentity, VirtualContextRef,
+    SEMANTIC_ENVIRONMENT_V1_HEADER, SemanticContextId, SemanticEnvironment, SemanticEnvironmentId,
+    SemanticExecutionContext, ShapeSet, SourcePin, ValidatorIdentity, VirtualContextRef,
 };
 pub use record::{
     MAX_REPORT_REFERENCE_BYTES, MAX_SEVERITY_BYTES, MAX_VIOLATION_MESSAGE_BYTES,

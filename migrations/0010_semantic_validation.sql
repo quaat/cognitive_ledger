@@ -36,7 +36,7 @@ END
 $$;
 
 -- ---- semantic_execution_contexts -----------------------------------------------------
-CREATE TABLE IF NOT EXISTS semantic_execution_contexts (
+CREATE TABLE semantic_execution_contexts (
     context_id                      TEXT        PRIMARY KEY,
     graph_id                        TEXT        NOT NULL,
     tenant_id                       TEXT        NOT NULL,
@@ -48,9 +48,10 @@ CREATE TABLE IF NOT EXISTS semantic_execution_contexts (
     ontology_version                TEXT        NULL,
     shapes_id                       TEXT        NOT NULL,
     shapes_version                  TEXT        NOT NULL,
-    reasoning_profile               TEXT        NOT NULL,
-    reasoning_implementation        TEXT        NOT NULL,
-    reasoning_version               TEXT        NOT NULL,
+    -- NULL together when no reasoning ran (the one spelling of "no reasoning").
+    reasoning_profile               TEXT        NULL,
+    reasoning_implementation        TEXT        NULL,
+    reasoning_version               TEXT        NULL,
     validator_service_id            TEXT        NOT NULL,
     validator_service_version       TEXT        NOT NULL,
     validator_configuration_version TEXT        NOT NULL,
@@ -60,6 +61,10 @@ CREATE TABLE IF NOT EXISTS semantic_execution_contexts (
     CONSTRAINT sec_context_id_format CHECK (context_id ~ '^sha256:[0-9a-f]{64}$'),
     CONSTRAINT sec_state_digest_format CHECK (candidate_state_digest ~ '^sha256:[0-9a-f]{64}$'),
     CONSTRAINT sec_content_addressed CHECK (context_id = 'sha256:' || encode(sha256(canonical_bytes), 'hex')),
+    CONSTRAINT sec_reasoning_shape CHECK (
+        (reasoning_profile IS NULL AND reasoning_implementation IS NULL AND reasoning_version IS NULL)
+        OR (reasoning_profile IS NOT NULL AND reasoning_implementation IS NOT NULL AND reasoning_version IS NOT NULL)
+    ),
     CONSTRAINT sec_ontology_shape CHECK (
         (ontology_id IS NULL AND ontology_version IS NULL)
         OR (ontology_id IS NOT NULL AND ontology_version IS NOT NULL)
@@ -69,9 +74,9 @@ CREATE TABLE IF NOT EXISTS semantic_execution_contexts (
         AND (ontology_id IS NULL OR octet_length(ontology_id) BETWEEN 1 AND 512)
         AND (ontology_version IS NULL OR octet_length(ontology_version) BETWEEN 1 AND 512)
         AND octet_length(shapes_id) BETWEEN 1 AND 512 AND octet_length(shapes_version) BETWEEN 1 AND 512
-        AND octet_length(reasoning_profile) BETWEEN 1 AND 512
-        AND octet_length(reasoning_implementation) BETWEEN 1 AND 512
-        AND octet_length(reasoning_version) BETWEEN 1 AND 512
+        AND (reasoning_profile IS NULL OR octet_length(reasoning_profile) BETWEEN 1 AND 512)
+        AND (reasoning_implementation IS NULL OR octet_length(reasoning_implementation) BETWEEN 1 AND 512)
+        AND (reasoning_version IS NULL OR octet_length(reasoning_version) BETWEEN 1 AND 512)
         AND octet_length(validator_service_id) BETWEEN 1 AND 512
         AND octet_length(validator_service_version) BETWEEN 1 AND 512
         AND octet_length(validator_configuration_version) BETWEEN 1 AND 512
@@ -81,12 +86,13 @@ CREATE TABLE IF NOT EXISTS semantic_execution_contexts (
         REFERENCES commit_index (graph_id, id),
     CONSTRAINT sec_graph_tenant_fk FOREIGN KEY (graph_id, tenant_id)
         REFERENCES graphs (graph_id, tenant_id),
-    -- FK target: a record's (context, graph, candidate, state digest) must agree.
-    CONSTRAINT sec_identity UNIQUE (context_id, graph_id, candidate_commit, candidate_state_digest)
+    -- FK target: a record's (context, graph, candidate, state digest, validator) must agree.
+    CONSTRAINT sec_identity UNIQUE (context_id, graph_id, candidate_commit, candidate_state_digest,
+        validator_service_id, validator_service_version, validator_configuration_version)
 );
 CREATE INDEX IF NOT EXISTS sec_by_candidate ON semantic_execution_contexts (graph_id, candidate_commit);
 
-CREATE TABLE IF NOT EXISTS semantic_virtual_contexts (
+CREATE TABLE semantic_virtual_contexts (
     context_id            TEXT    NOT NULL REFERENCES semantic_execution_contexts (context_id),
     position              INTEGER NOT NULL,
     dataset_id            TEXT    NOT NULL,
@@ -106,7 +112,7 @@ CREATE TABLE IF NOT EXISTS semantic_virtual_contexts (
 );
 
 -- ---- validation_records ----------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS validation_records (
+CREATE TABLE validation_records (
     validation_id                   TEXT        PRIMARY KEY,
     graph_id                        TEXT        NOT NULL,
     tenant_id                       TEXT        NOT NULL,
@@ -134,7 +140,7 @@ CREATE TABLE IF NOT EXISTS validation_records (
     CONSTRAINT vr_content_addressed CHECK (validation_id = 'sha256:' || encode(sha256(canonical_bytes), 'hex')),
     CONSTRAINT vr_outcome_kind CHECK (outcome IN ('conforms', 'violations')),
     CONSTRAINT vr_outcome_shape CHECK (
-        (outcome = 'conforms' AND violation_count = 0) OR (outcome = 'violations' AND violation_count >= 1)
+        (outcome = 'conforms' AND violation_count >= 0) OR (outcome = 'violations' AND violation_count >= 1)
     ),
     CONSTRAINT vr_report_digest_format CHECK (report_digest ~ '^sha256:[0-9a-f]{64}$'),
     CONSTRAINT vr_report_reference_bounds CHECK (report_reference IS NULL OR octet_length(report_reference) BETWEEN 1 AND 2048),
@@ -145,9 +151,11 @@ CREATE TABLE IF NOT EXISTS validation_records (
         AND octet_length(validator_service_version) BETWEEN 1 AND 512
         AND octet_length(validator_configuration_version) BETWEEN 1 AND 512
     ),
-    -- The record's context is a stored context of exactly this candidate and state.
-    CONSTRAINT vr_context_fk FOREIGN KEY (context_id, graph_id, candidate_commit, candidate_state_digest)
-        REFERENCES semantic_execution_contexts (context_id, graph_id, candidate_commit, candidate_state_digest),
+    -- The record's context is a stored context of exactly this candidate, state and validator.
+    CONSTRAINT vr_context_fk FOREIGN KEY (context_id, graph_id, candidate_commit, candidate_state_digest,
+            validator_service_id, validator_service_version, validator_configuration_version)
+        REFERENCES semantic_execution_contexts (context_id, graph_id, candidate_commit, candidate_state_digest,
+            validator_service_id, validator_service_version, validator_configuration_version),
     CONSTRAINT vr_candidate_fk FOREIGN KEY (graph_id, candidate_commit)
         REFERENCES commit_index (graph_id, id),
     CONSTRAINT vr_graph_tenant_fk FOREIGN KEY (graph_id, tenant_id)
@@ -157,7 +165,7 @@ CREATE TABLE IF NOT EXISTS validation_records (
 );
 CREATE INDEX IF NOT EXISTS vr_by_candidate ON validation_records (graph_id, candidate_commit, created_at);
 
-CREATE TABLE IF NOT EXISTS validation_violations (
+CREATE TABLE validation_violations (
     validation_id TEXT    NOT NULL REFERENCES validation_records (validation_id),
     position      INTEGER NOT NULL,
     severity      TEXT    NOT NULL,
@@ -174,7 +182,7 @@ CREATE TABLE IF NOT EXISTS validation_violations (
 -- ---- decision_validations --------------------------------------------------------------
 ALTER TABLE decisions ADD CONSTRAINT decisions_identity UNIQUE (decision_id, graph_id, candidate_commit);
 
-CREATE TABLE IF NOT EXISTS decision_validations (
+CREATE TABLE decision_validations (
     decision_id      BIGINT NOT NULL,
     validation_id    TEXT   NOT NULL,
     graph_id         TEXT   NOT NULL,
@@ -193,7 +201,17 @@ ALTER TABLE idempotency ADD CONSTRAINT idempotency_operation
 ALTER TABLE idempotency DROP CONSTRAINT idempotency_result_kind;
 ALTER TABLE idempotency ADD CONSTRAINT idempotency_result_kind
     CHECK (result_kind IN ('prepared', 'accepted', 'rejected', 'validated'));
-ALTER TABLE idempotency ADD COLUMN result_validation_id TEXT NULL REFERENCES validation_records (validation_id);
+ALTER TABLE idempotency ADD COLUMN result_validation_id TEXT NULL;
+-- A `validated` result names a record of the same graph and candidate (all three columns are
+-- NOT NULL for such rows by the shape CHECK, so MATCH SIMPLE cannot be bypassed).
+ALTER TABLE idempotency ADD CONSTRAINT idempotency_validation_fk
+    FOREIGN KEY (result_validation_id, graph_id, result_commit)
+    REFERENCES validation_records (validation_id, graph_id, candidate_commit);
+ALTER TABLE idempotency ADD CONSTRAINT idempotency_validation_shape CHECK (
+    ((operation = 'validate') = (result_kind = 'validated'))
+    AND ((result_kind = 'validated') = (result_validation_id IS NOT NULL))
+    AND (result_kind <> 'validated' OR result_commit IS NOT NULL)
+);
 
 -- ---- write-once guards -------------------------------------------------------------------
 DROP TRIGGER IF EXISTS semantic_execution_contexts_write_once ON semantic_execution_contexts;

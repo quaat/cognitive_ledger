@@ -2134,7 +2134,7 @@ async fn validation_persistence_runs_under_the_runtime_identity_and_its_controls
     let context = SemanticExecutionContext {
         graph_id: g.clone(),
         candidate_commit: prepared.candidate.clone(),
-        candidate_state_digest: ticket.state_digest.clone(),
+        candidate_state_digest: ticket.state_digest().clone(),
         base_kb: BaseKb {
             kb_id: "kb".into(),
             revision: "r1".into(),
@@ -2144,11 +2144,11 @@ async fn validation_persistence_runs_under_the_runtime_identity_and_its_controls
             id: "shapes".into(),
             version: "1".into(),
         },
-        reasoning: Reasoning {
+        reasoning: Some(Reasoning {
             profile: "none".into(),
             implementation: "pyshacl".into(),
             version: "0.26".into(),
-        },
+        }),
         virtual_contexts: vec![],
         validator: ValidatorIdentity {
             service_id: "urn:sculpin:service:validator".into(),
@@ -2179,7 +2179,7 @@ async fn validation_persistence_runs_under_the_runtime_identity_and_its_controls
             reason: None,
             validation: ValidationPolicy::Validated {
                 validation_id: recorded.validation_id.clone(),
-                semantic_context_id: recorded.context_id.clone(),
+                semantic_environment_id: recorded.environment_id.clone(),
             },
         })
         .await
@@ -2211,7 +2211,7 @@ async fn validation_persistence_runs_under_the_runtime_identity_and_its_controls
     .await;
     let m = assert_refused_by_schema(&fx, &running, "record→context FK dropped").await;
     assert!(m.contains("validation_records FOREIGN KEY"), "{m}");
-    owner_exec(&fx, "ALTER TABLE validation_records ADD CONSTRAINT vr_context_fk FOREIGN KEY (context_id, graph_id, candidate_commit, candidate_state_digest) REFERENCES semantic_execution_contexts (context_id, graph_id, candidate_commit, candidate_state_digest)").await;
+    owner_exec(&fx, "ALTER TABLE validation_records ADD CONSTRAINT vr_context_fk FOREIGN KEY (context_id, graph_id, candidate_commit, candidate_state_digest, validator_service_id, validator_service_version, validator_configuration_version) REFERENCES semantic_execution_contexts (context_id, graph_id, candidate_commit, candidate_state_digest, validator_service_id, validator_service_version, validator_configuration_version)").await;
     assert_healthy(&fx, "FK restored").await;
     owner_exec(
         &fx,

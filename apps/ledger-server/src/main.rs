@@ -223,10 +223,11 @@ fn parse_role_map(map: &str) -> Result<std::collections::BTreeMap<String, Capabi
             "read" => Capability::Read,
             "propose" => Capability::Propose,
             "review" => Capability::Review,
+            "validate" => Capability::Validate,
             "admin" => Capability::Admin,
             other => {
                 return Err(format!(
-                    "LEDGER_AUTH_ROLE_MAP capability must be read|propose|review|admin, got {other:?}"
+                    "LEDGER_AUTH_ROLE_MAP capability must be read|propose|review|validate|admin, got {other:?}"
                 ));
             }
         };
@@ -360,7 +361,82 @@ fn limits() -> Result<ApiLimits, String> {
             "LEDGER_LIMIT_CONCURRENT_EXPENSIVE",
             d.max_concurrent_expensive,
         )?,
+        max_concurrent_validations: env_usize(
+            "LEDGER_LIMIT_CONCURRENT_VALIDATIONS",
+            d.max_concurrent_validations,
+        )?,
+        validator_timeout: Duration::from_secs(env_usize(
+            "LEDGER_LIMIT_VALIDATOR_SECONDS",
+            d.validator_timeout.as_secs() as usize,
+        )? as u64),
+        validator_response_bytes: env_usize(
+            "LEDGER_LIMIT_VALIDATOR_RESPONSE_BYTES",
+            d.validator_response_bytes,
+        )?,
+        max_validation_state_bytes: env_usize(
+            "LEDGER_LIMIT_VALIDATION_STATE_BYTES",
+            d.max_validation_state_bytes,
+        )?,
+        max_virtual_contexts: env_usize("LEDGER_LIMIT_SOURCE_PINS", d.max_virtual_contexts)?
+            .min(ledger_validation_protocol::MAX_VIRTUAL_CONTEXTS),
+        max_validation_metadata_bytes: env_usize(
+            "LEDGER_LIMIT_VALIDATION_METADATA_BYTES",
+            d.max_validation_metadata_bytes,
+        )?,
     })
+}
+
+/// The semantic validation service (ADR-0014): `LEDGER_VALIDATOR_URL` (https; plain http to a
+/// loopback host only with development authentication), `LEDGER_VALIDATOR_SERVICE_ID`
+/// (required with a URL: the identity recorded in every context), optional
+/// `LEDGER_VALIDATOR_TOKEN_FILE` (bearer credential, read once, never logged). Unset URL →
+/// no validator: `validate` answers VALIDATOR_UNAVAILABLE and acceptance stays fail-closed.
+fn validation_service(
+    production_auth: bool,
+    limits: &ApiLimits,
+) -> Result<Option<ledger_api::ValidationService>, String> {
+    let Some(url) = env_optional("LEDGER_VALIDATOR_URL")?.filter(|u| !u.is_empty()) else {
+        return Ok(None);
+    };
+    let service_id = env_optional("LEDGER_VALIDATOR_SERVICE_ID")?
+        .filter(|s| !s.is_empty())
+        .ok_or("LEDGER_VALIDATOR_SERVICE_ID is required with LEDGER_VALIDATOR_URL")?;
+    ledger_core::validate_token(
+        "LEDGER_VALIDATOR_SERVICE_ID",
+        &service_id,
+        ledger_core::MAX_IDENTIFIER_BYTES,
+    )
+    .map_err(|e| e.to_string())?;
+    let bearer_token = match env_optional("LEDGER_VALIDATOR_TOKEN_FILE")? {
+        Some(path) if !path.is_empty() => Some(
+            std::fs::read_to_string(&path)
+                .map_err(|_| {
+                    "LEDGER_VALIDATOR_TOKEN_FILE cannot be read (path not shown)".to_owned()
+                })?
+                .trim()
+                .to_owned(),
+        ),
+        _ => None,
+    };
+    if limits.validator_timeout >= limits.request_timeout {
+        return Err(
+            "LEDGER_LIMIT_VALIDATOR_SECONDS must be below LEDGER_LIMIT_REQUEST_SECONDS".into(),
+        );
+    }
+    let client = ledger_api::validator::HttpValidationClient::new(
+        ledger_api::validator::HttpValidatorConfig {
+            endpoint: url,
+            bearer_token,
+            timeout: limits.validator_timeout,
+            max_response_bytes: limits.validator_response_bytes,
+            allow_insecure_loopback: !production_auth,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(Some(ledger_api::ValidationService {
+        client: Arc::new(client),
+        service_id,
+    }))
 }
 
 #[tokio::main]
@@ -423,7 +499,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "shared PostgreSQL topology: refs, objects and workflow in one database; v1 \
                  writes rejected"
             );
-            ledger_api::router(AppState::new(store, authenticator, limits, acceptance))
+            let validation = validation_service(authenticator.is_production_grade(), &limits)?;
+            let mut state = AppState::new(store, authenticator, limits, acceptance);
+            match validation {
+                Some(service) => {
+                    info!(
+                        service_id = %service.service_id,
+                        "semantic validation service configured (endpoint not logged)"
+                    );
+                    state = state.with_validation(service);
+                }
+                None => warn!(
+                    "no semantic validation service configured (LEDGER_VALIDATOR_URL unset): \
+                     validations answer VALIDATOR_UNAVAILABLE and acceptance stays fail-closed"
+                ),
+            }
+            ledger_api::router(state)
         }
     };
 

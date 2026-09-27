@@ -174,10 +174,20 @@ const CHECKS: &[(&str, &str)] = &[
          WHERE c.virtual_context_count <> (SELECT count(*) FROM semantic_virtual_contexts v WHERE v.context_id = c.context_id)",
     ),
     (
-        "violation summaries are bounded by the record's count and absent when conforming",
+        "result summaries are bounded by the record's reported count",
         "SELECT r.validation_id FROM validation_records r \
-         WHERE (SELECT count(*) FROM validation_violations v WHERE v.validation_id = r.validation_id) > r.violation_count \
-            OR (r.outcome = 'conforms' AND EXISTS (SELECT 1 FROM validation_violations v WHERE v.validation_id = r.validation_id))",
+         WHERE (SELECT count(*) FROM validation_violations v WHERE v.validation_id = r.validation_id) > r.violation_count",
+    ),
+    (
+        "validation records agree with their context's validator",
+        "SELECT r.validation_id FROM validation_records r JOIN semantic_execution_contexts c ON c.context_id = r.context_id \
+         WHERE c.validator_service_id <> r.validator_service_id OR c.validator_service_version <> r.validator_service_version \
+            OR c.validator_configuration_version <> r.validator_configuration_version",
+    ),
+    (
+        "every validation record was produced by exactly one validate request",
+        "SELECT r.validation_id FROM validation_records r \
+         WHERE (SELECT count(*) FROM idempotency i WHERE i.result_validation_id = r.validation_id AND i.operation = 'validate') < 1",
     ),
     (
         "accepted decisions cite only conforming validations",
@@ -256,6 +266,7 @@ pub async fn run(pool: &PgPool) -> Result<Report, LedgerError> {
             sample,
         });
     }
+    report.checks.extend(verify_validation_bytes(pool).await?);
     for table in COUNTED {
         let n: i64 = sqlx::query(&format!("SELECT count(*) AS n FROM {table}"))
             .fetch_one(pool)
@@ -266,4 +277,113 @@ pub async fn run(pool: &PgPool) -> Result<Report, LedgerError> {
         report.counts.push((table, n));
     }
     Ok(report)
+}
+
+/// Rust-side checks the SQL cannot express: every validation record and context decodes from
+/// its hashed canonical bytes, and every relational projection column agrees with the bytes
+/// (acceptance decides on the bytes; the columns are for queries and audit).
+async fn verify_validation_bytes(pool: &PgPool) -> Result<Vec<CheckResult>, LedgerError> {
+    use ledger_validation_protocol::{SemanticExecutionContext, ValidationId};
+    let mut record_bad = Vec::new();
+    let rows = sqlx::query(
+        "SELECT r.validation_id, r.graph_id, r.candidate_commit, r.candidate_state_digest, r.context_id, \
+                r.validator_service_id, r.validator_service_version, r.validator_configuration_version, \
+                r.outcome, r.violation_count, r.report_digest, r.report_reference, \
+                r.canonical_bytes AS record_bytes, c.canonical_bytes AS context_bytes, \
+                (SELECT count(*) FROM validation_violations v WHERE v.validation_id = r.validation_id) AS summaries \
+         FROM validation_records r JOIN semantic_execution_contexts c ON c.context_id = r.context_id",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(db_error)?;
+    for row in &rows {
+        let id: String = row.try_get("validation_id").map_err(db_error)?;
+        let agree = (|| -> Result<bool, LedgerError> {
+            let vid: ValidationId = id.parse()?;
+            let record_bytes: Vec<u8> = row.try_get("record_bytes").map_err(db_error)?;
+            let context_bytes: Vec<u8> = row.try_get("context_bytes").map_err(db_error)?;
+            let (record, _) =
+                crate::postgres_validation::decode_stored(&vid, &record_bytes, &context_bytes)?;
+            let s = |c: &str| row.try_get::<String, _>(c).map_err(db_error);
+            Ok(record.graph_id.as_str() == s("graph_id")?
+                && record.candidate_commit.to_string() == s("candidate_commit")?
+                && record.candidate_state_digest.to_string() == s("candidate_state_digest")?
+                && record.semantic_execution_context_id.to_string() == s("context_id")?
+                && record.validator.service_id == s("validator_service_id")?
+                && record.validator.service_version == s("validator_service_version")?
+                && record.validator.configuration_version == s("validator_configuration_version")?
+                && record.outcome.kind.as_str() == s("outcome")?
+                && i64::from(record.outcome.violation_count)
+                    == i64::from(row.try_get::<i32, _>("violation_count").map_err(db_error)?)
+                && record.report_digest.to_string() == s("report_digest")?
+                && record.report_reference
+                    == row
+                        .try_get::<Option<String>, _>("report_reference")
+                        .map_err(db_error)?
+                && record.outcome.violations.len() as i64
+                    == row.try_get::<i64, _>("summaries").map_err(db_error)?)
+        })();
+        if !matches!(agree, Ok(true)) {
+            record_bad.push(id);
+        }
+    }
+    let mut context_bad = Vec::new();
+    let rows = sqlx::query(
+        "SELECT context_id, graph_id, candidate_commit, candidate_state_digest, base_kb_id, base_kb_revision, \
+                ontology_id, ontology_version, shapes_id, shapes_version, reasoning_profile, \
+                reasoning_implementation, reasoning_version, validator_service_id, virtual_context_count, \
+                canonical_bytes FROM semantic_execution_contexts",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(db_error)?;
+    for row in &rows {
+        let id: String = row.try_get("context_id").map_err(db_error)?;
+        let agree = (|| -> Result<bool, LedgerError> {
+            let bytes: Vec<u8> = row.try_get("canonical_bytes").map_err(db_error)?;
+            if ledger_core::ContentId::for_bytes(&bytes).to_string() != id {
+                return Ok(false);
+            }
+            let c = SemanticExecutionContext::from_canonical_bytes(&bytes)?;
+            let s = |col: &str| row.try_get::<String, _>(col).map_err(db_error);
+            let o = |col: &str| row.try_get::<Option<String>, _>(col).map_err(db_error);
+            Ok(c.graph_id.as_str() == s("graph_id")?
+                && c.candidate_commit.to_string() == s("candidate_commit")?
+                && c.candidate_state_digest.to_string() == s("candidate_state_digest")?
+                && c.base_kb.kb_id == s("base_kb_id")?
+                && c.base_kb.revision == s("base_kb_revision")?
+                && c.ontology.as_ref().map(|x| x.id.clone()) == o("ontology_id")?
+                && c.ontology.as_ref().map(|x| x.version.clone()) == o("ontology_version")?
+                && c.shapes.id == s("shapes_id")?
+                && c.shapes.version == s("shapes_version")?
+                && c.reasoning.as_ref().map(|x| x.profile.clone()) == o("reasoning_profile")?
+                && c.reasoning.as_ref().map(|x| x.implementation.clone())
+                    == o("reasoning_implementation")?
+                && c.reasoning.as_ref().map(|x| x.version.clone()) == o("reasoning_version")?
+                && c.validator.service_id == s("validator_service_id")?
+                && c.virtual_contexts.len() as i64
+                    == i64::from(
+                        row.try_get::<i32, _>("virtual_context_count")
+                            .map_err(db_error)?,
+                    ))
+        })();
+        if !matches!(agree, Ok(true)) {
+            context_bad.push(id);
+        }
+    }
+    let result = |name: &'static str, bad: Vec<String>| CheckResult {
+        name,
+        violations: bad.len() as i64,
+        sample: bad.into_iter().take(3).collect(),
+    };
+    Ok(vec![
+        result(
+            "validation records decode from their bytes and their columns agree with them",
+            record_bad,
+        ),
+        result(
+            "semantic contexts decode from their bytes and their columns agree with them",
+            context_bad,
+        ),
+    ])
 }

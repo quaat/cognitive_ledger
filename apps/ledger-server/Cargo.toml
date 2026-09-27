@@ -11,6 +11,7 @@ axum.workspace = true
 ledger-api = { path = "../../crates/ledger-api" }
 ledger-core = { path = "../../crates/ledger-core" }
 ledger-store = { path = "../../crates/ledger-store", features = ["postgres"] }
+ledger-validation-protocol = { path = "../../crates/ledger-validation-protocol" }
 reqwest.workspace = true
 url = "2"
 serde_json.workspace = true

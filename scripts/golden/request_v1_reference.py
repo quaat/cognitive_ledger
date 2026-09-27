@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Independent reference encoder for `sculpin-ledger-request/v1` (canonical HTTP request
-identity that scopes idempotency). Second implementation of the layout documented in
+"""Independent reference encoder for `sculpin-ledger-request/v1` and `/v2` (canonical HTTP
+request identity that scopes idempotency; v2 per the ADR-0015 amendment of Plan 0006). Second implementation of the layout documented in
 `crates/ledger-api/src/request_identity.rs`; vectors in `fixtures/golden/requests/`.
 
     generate   write <name>.hex/.sha256 for every request-*.input without them
@@ -16,10 +16,12 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from commit_v2_reference import normalize_time  # noqa: E402  (same timestamp rules)
+from validation_v1_reference import counted_set, source_pin, token  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / "fixtures" / "golden" / "requests"
 HEADER = b"sculpin-ledger-request/v1\0"
+HEADER_V2 = b"sculpin-ledger-request/v2\0"
 
 
 def field(value: str) -> bytes:
@@ -42,9 +44,51 @@ def patch_id(operations: list[dict]) -> str:
     return "sha256:" + hashlib.sha256(body.encode()).hexdigest()
 
 
-def encode(req: dict) -> bytes:
-    out = bytearray(HEADER)
+def pair(value: dict | None, a: str, b: str) -> bytes:
+    if value is None:
+        return b"\x00"
+    return b"\x01" + field(token(a, value[a])) + field(token(b, value[b]))
+
+
+def encode_v2(req: dict) -> bytes:
+    out = bytearray(HEADER_V2)
     op = req["operation"]
+    out += field(op)
+    out += field(req["graph_id"])
+    if op == "accept":
+        out += field(req["branch"])
+        out += optional(req.get("expected_head"))
+        out += field(req["candidate"])
+        out += optional(req.get("reason"))
+        out += field("validated")
+        out += field(req["validation_id"])
+        out += field(req["semantic_environment_id"])
+    elif op == "reject":
+        out += field(req["branch"])
+        out += field(req["candidate"])
+        out += field(req["reason"])
+        out += field(req["validation_id"])
+    elif op == "validate":
+        out += field(req["candidate"])
+        hints = req.get("requested", {})
+        out += pair(hints.get("base_kb"), "kb_id", "revision")
+        out += pair(hints.get("ontology"), "id", "version")
+        out += pair(hints.get("shapes"), "id", "version")
+        profile = hints.get("reasoning_profile")
+        if profile == "":
+            raise ValueError("reasoning_profile present but empty")
+        out += optional(None if profile is None else token("reasoning_profile", profile))
+        out += counted_set([source_pin(p) for p in hints.get("source_pins", [])], "source pins")
+    else:
+        raise ValueError(op)
+    return bytes(out)
+
+
+def encode(req: dict) -> bytes:
+    op = req["operation"]
+    if op == "validate" or (op in ("accept", "reject") and "validation_id" in req):
+        return encode_v2(req)
+    out = bytearray(HEADER)
     out += field(op)
     out += field(req["graph_id"])
     out += field(req["branch"])

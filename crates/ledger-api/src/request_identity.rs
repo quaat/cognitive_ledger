@@ -30,13 +30,29 @@
 //! field  reason
 //! ```
 //! Frozen by ADR-0015.
+//!
+//! `sculpin-ledger-request/v2` (ADR-0015 amendment, Plan 0006) covers the validation-aware
+//! operations and is selected by request shape: `validate`, and `accept`/`reject` that name
+//! a `validation_id`. Legacy accept/reject shapes keep their v1 bytes.
+//!
+//! ```text
+//! "sculpin-ledger-request/v2\0"
+//! field operation · field graph_id
+//! -- accept --   field branch · opt expected_head · field candidate · opt reason
+//!                field "validated" · field validation_id · field semantic_environment_id
+//! -- reject --   field branch · field candidate · field reason · field validation_id
+//! -- validate -- field candidate · RequestedContext hints (tagged base_kb / ontology /
+//!                shapes pairs, opt reasoning_profile, source-pin set)
+//! ```
 //! `field` = u32 big-endian length + UTF-8 bytes; `opt` = 0x00 absent-or-empty | 0x01 + non-empty
 //! field. Vectors live in `fixtures/golden/requests/` and are cross-checked by
 //! `scripts/golden/request_v1_reference.py`.
 
 use ledger_core::{CommitId, ContentId, GraphId, LedgerTimestamp, PatchId};
+use ledger_validation_protocol::{RequestedContext, SemanticEnvironmentId, ValidationId};
 
 pub const REQUEST_IDENTITY_HEADER: &[u8] = b"sculpin-ledger-request/v1\0";
+pub const REQUEST_IDENTITY_V2_HEADER: &[u8] = b"sculpin-ledger-request/v2\0";
 
 /// The normalized, typed content of a mutation request — everything the digest covers.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,6 +82,30 @@ pub enum CanonicalRequest {
         candidate: CommitId,
         reason: String,
     },
+    /// v2: acceptance under a named validation and semantic context (ADR-0019).
+    AcceptValidated {
+        graph: GraphId,
+        branch: String,
+        expected_head: Option<CommitId>,
+        candidate: CommitId,
+        reason: Option<String>,
+        validation_id: ValidationId,
+        semantic_environment_id: SemanticEnvironmentId,
+    },
+    /// v2: rejection citing a validation record.
+    RejectValidated {
+        graph: GraphId,
+        branch: String,
+        candidate: CommitId,
+        reason: String,
+        validation_id: ValidationId,
+    },
+    /// v2: request a validation of a prepared candidate.
+    Validate {
+        graph: GraphId,
+        candidate: CommitId,
+        requested: RequestedContext,
+    },
 }
 
 fn field(out: &mut Vec<u8>, value: &str) {
@@ -92,7 +132,14 @@ fn opt(out: &mut Vec<u8>, value: Option<&str>) {
 
 impl CanonicalRequest {
     pub fn canonical_bytes(&self) -> Vec<u8> {
-        let mut out = REQUEST_IDENTITY_HEADER.to_vec();
+        let mut out = match self {
+            Self::Prepare { .. } | Self::Accept { .. } | Self::Reject { .. } => {
+                REQUEST_IDENTITY_HEADER.to_vec()
+            }
+            Self::AcceptValidated { .. } | Self::RejectValidated { .. } | Self::Validate { .. } => {
+                REQUEST_IDENTITY_V2_HEADER.to_vec()
+            }
+        };
         match self {
             Self::Prepare {
                 graph,
@@ -159,6 +206,56 @@ impl CanonicalRequest {
                 field(&mut out, branch);
                 field(&mut out, &candidate.to_string());
                 field(&mut out, reason);
+            }
+            Self::AcceptValidated {
+                graph,
+                branch,
+                expected_head,
+                candidate,
+                reason,
+                validation_id,
+                semantic_environment_id,
+            } => {
+                field(&mut out, "accept");
+                field(&mut out, graph.as_str());
+                field(&mut out, branch);
+                opt(
+                    &mut out,
+                    expected_head.as_ref().map(ToString::to_string).as_deref(),
+                );
+                field(&mut out, &candidate.to_string());
+                opt(&mut out, reason.as_deref());
+                field(&mut out, "validated");
+                field(&mut out, &validation_id.to_string());
+                field(&mut out, &semantic_environment_id.to_string());
+            }
+            Self::RejectValidated {
+                graph,
+                branch,
+                candidate,
+                reason,
+                validation_id,
+            } => {
+                field(&mut out, "reject");
+                field(&mut out, graph.as_str());
+                field(&mut out, branch);
+                field(&mut out, &candidate.to_string());
+                field(&mut out, reason);
+                field(&mut out, &validation_id.to_string());
+            }
+            Self::Validate {
+                graph,
+                candidate,
+                requested,
+            } => {
+                field(&mut out, "validate");
+                field(&mut out, graph.as_str());
+                field(&mut out, &candidate.to_string());
+                // Validated by the handler before the digest is computed; the encoder is
+                // total over valid hints.
+                requested
+                    .encode_into(&mut out)
+                    .expect("requested context was validated by the handler");
             }
         }
         out

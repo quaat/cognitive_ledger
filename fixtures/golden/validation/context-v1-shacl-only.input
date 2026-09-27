@@ -4,16 +4,11 @@
   "candidate_state_digest": "sha256:4df1d2fb91c7aaba8d6d567034e26c17225d8b4d5b441b957ab5477cd568df67",
   "base_kb": {
     "kb_id": "urn:exodus:kb:material-science",
-    "revision": "kbrev:sha256:9f2c…composed-by-sculpin"
+    "revision": "kbrev:sha256:9f2c-composed-by-sculpin"
   },
   "shapes": {
     "id": "urn:sculpin:shapes:material",
     "version": "12+shapes_hash:4b7e"
-  },
-  "reasoning": {
-    "profile": "none",
-    "implementation": "pyshacl",
-    "version": "0.26.0"
   },
   "virtual_contexts": [],
   "validator": {

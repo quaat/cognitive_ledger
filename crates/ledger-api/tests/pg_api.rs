@@ -1285,6 +1285,7 @@ async fn resource_limits_are_enforced_with_a_stable_code() {
         max_state_export_bytes: 1024 * 1024,
         request_timeout: Duration::from_secs(30),
         max_concurrent_expensive: 4,
+        ..ApiLimits::default()
     };
     let h = harness(dev(), limits).await;
     let g = h.graph("tenant-a").await;

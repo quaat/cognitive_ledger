@@ -114,8 +114,12 @@ impl ViolationSummary {
     }
 }
 
-/// `conforms` carries no violations; `violations` carries the validator's total count and
-/// a bounded summary set (`violations.len() <= violation_count`).
+/// The validator's verdict plus a bounded summary of the results it reported.
+/// `violation_count` is the total number of results the validator reported (any severity);
+/// `violations` is a bounded, summarized subset (`violations.len() <= violation_count`).
+/// `conforms` may carry non-blocking results (e.g. SHACL warnings under `allow_warnings`):
+/// the kind is the validator's verdict, the ledger never evaluates severities. A
+/// `violations` outcome reports at least one result.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ValidationOutcome {
@@ -140,30 +144,19 @@ impl ValidationOutcome {
             violation.validate()?;
         }
         let summary = self.canonical_violations()?;
-        match self.kind {
-            OutcomeKind::Conforms => {
-                if self.violation_count != 0 || !summary.is_empty() {
-                    return Err(ProtocolError::Invalid(
-                        "a conforming outcome carries no violations".into(),
-                    ));
-                }
-            }
-            OutcomeKind::Violations => {
-                if self.violation_count == 0 {
-                    return Err(ProtocolError::Invalid(
-                        "a violations outcome needs violation_count >= 1".into(),
-                    ));
-                }
-            }
+        if self.kind == OutcomeKind::Violations && self.violation_count == 0 {
+            return Err(ProtocolError::Invalid(
+                "a violations outcome needs violation_count >= 1".into(),
+            ));
         }
         if summary.len() > MAX_VIOLATION_SUMMARY {
             return Err(ProtocolError::Invalid(format!(
-                "more than {MAX_VIOLATION_SUMMARY} distinct summarized violations"
+                "more than {MAX_VIOLATION_SUMMARY} distinct summarized results"
             )));
         }
         if summary.len() > self.violation_count as usize {
             return Err(ProtocolError::Invalid(
-                "summarized violations exceed violation_count".into(),
+                "summarized results exceed violation_count".into(),
             ));
         }
         Ok(())
@@ -386,8 +379,19 @@ mod tests {
             ValidationRecord::from_canonical_bytes(&bytes).unwrap(),
             record
         );
+        // A conforming outcome may report non-blocking results (warnings)...
+        let mut warnings = record.clone();
+        warnings.outcome.violation_count = 1;
+        warnings.outcome.violations =
+            vec![violation("Warning", "sh:PatternConstraintComponent", "")];
+        let bytes = warnings.canonical_bytes().unwrap();
+        assert_eq!(
+            ValidationRecord::from_canonical_bytes(&bytes).unwrap(),
+            warnings
+        );
+        // ...but never more summaries than reported results.
         let mut bad = record.clone();
-        bad.outcome.violation_count = 1;
+        bad.outcome.violations = vec![violation("Warning", "x", "")];
         assert!(bad.canonical_bytes().is_err());
         let mut summary_exceeds = sample();
         summary_exceeds.outcome.violation_count = 1;

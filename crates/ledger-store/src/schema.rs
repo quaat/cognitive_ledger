@@ -944,6 +944,9 @@ const EXPECTED_CONSTRAINTS: &[ExpectedConstraint] = &[
             "graph_id",
             "candidate_commit",
             "candidate_state_digest",
+            "validator_service_id",
+            "validator_service_version",
+            "validator_configuration_version",
         ],
     ),
     pk("semantic_virtual_contexts", &["context_id", "position"]),
@@ -961,6 +964,9 @@ const EXPECTED_CONSTRAINTS: &[ExpectedConstraint] = &[
             "graph_id",
             "candidate_commit",
             "candidate_state_digest",
+            "validator_service_id",
+            "validator_service_version",
+            "validator_configuration_version",
         ],
         "semantic_execution_contexts",
         &[
@@ -968,6 +974,9 @@ const EXPECTED_CONSTRAINTS: &[ExpectedConstraint] = &[
             "graph_id",
             "candidate_commit",
             "candidate_state_digest",
+            "validator_service_id",
+            "validator_service_version",
+            "validator_configuration_version",
         ],
     ),
     fk(
@@ -1012,9 +1021,9 @@ const EXPECTED_CONSTRAINTS: &[ExpectedConstraint] = &[
     ),
     fk(
         "idempotency",
-        &["result_validation_id"],
+        &["result_validation_id", "graph_id", "result_commit"],
         "validation_records",
-        &["validation_id"],
+        &["validation_id", "graph_id", "candidate_commit"],
     ),
 ];
 
@@ -1139,6 +1148,11 @@ const EXPECTED_CHECKS: &[(&str, &str, &str)] = &[
     ),
     (
         "idempotency",
+        "idempotency_validation_shape",
+        "CHECK((((operation='validate')=(result_kind='validated'))AND((result_kind='validated')=(result_validation_idISNOTNULL))AND((result_kind<>'validated')OR(result_commitISNOTNULL))))",
+    ),
+    (
+        "idempotency",
         "idempotency_result_kind",
         "CHECK((result_kind=ANY(ARRAY['prepared','accepted','rejected','validated'])))",
     ),
@@ -1221,13 +1235,18 @@ const EXPECTED_CHECKS: &[(&str, &str, &str)] = &[
     ),
     (
         "semantic_execution_contexts",
+        "sec_reasoning_shape",
+        "CHECK((((reasoning_profileISNULL)AND(reasoning_implementationISNULL)AND(reasoning_versionISNULL))OR((reasoning_profileISNOTNULL)AND(reasoning_implementationISNOTNULL)AND(reasoning_versionISNOTNULL))))",
+    ),
+    (
+        "semantic_execution_contexts",
         "sec_state_digest_format",
         "CHECK((candidate_state_digest~'^sha256:[0-9a-f]{64}$'))",
     ),
     (
         "semantic_execution_contexts",
         "sec_token_bounds",
-        "CHECK((((octet_length(base_kb_id)>=1)AND(octet_length(base_kb_id)<=512))AND((octet_length(base_kb_revision)>=1)AND(octet_length(base_kb_revision)<=512))AND((ontology_idISNULL)OR((octet_length(ontology_id)>=1)AND(octet_length(ontology_id)<=512)))AND((ontology_versionISNULL)OR((octet_length(ontology_version)>=1)AND(octet_length(ontology_version)<=512)))AND((octet_length(shapes_id)>=1)AND(octet_length(shapes_id)<=512))AND((octet_length(shapes_version)>=1)AND(octet_length(shapes_version)<=512))AND((octet_length(reasoning_profile)>=1)AND(octet_length(reasoning_profile)<=512))AND((octet_length(reasoning_implementation)>=1)AND(octet_length(reasoning_implementation)<=512))AND((octet_length(reasoning_version)>=1)AND(octet_length(reasoning_version)<=512))AND((octet_length(validator_service_id)>=1)AND(octet_length(validator_service_id)<=512))AND((octet_length(validator_service_version)>=1)AND(octet_length(validator_service_version)<=512))AND((octet_length(validator_configuration_version)>=1)AND(octet_length(validator_configuration_version)<=512))))",
+        "CHECK((((octet_length(base_kb_id)>=1)AND(octet_length(base_kb_id)<=512))AND((octet_length(base_kb_revision)>=1)AND(octet_length(base_kb_revision)<=512))AND((ontology_idISNULL)OR((octet_length(ontology_id)>=1)AND(octet_length(ontology_id)<=512)))AND((ontology_versionISNULL)OR((octet_length(ontology_version)>=1)AND(octet_length(ontology_version)<=512)))AND((octet_length(shapes_id)>=1)AND(octet_length(shapes_id)<=512))AND((octet_length(shapes_version)>=1)AND(octet_length(shapes_version)<=512))AND((reasoning_profileISNULL)OR((octet_length(reasoning_profile)>=1)AND(octet_length(reasoning_profile)<=512)))AND((reasoning_implementationISNULL)OR((octet_length(reasoning_implementation)>=1)AND(octet_length(reasoning_implementation)<=512)))AND((reasoning_versionISNULL)OR((octet_length(reasoning_version)>=1)AND(octet_length(reasoning_version)<=512)))AND((octet_length(validator_service_id)>=1)AND(octet_length(validator_service_id)<=512))AND((octet_length(validator_service_version)>=1)AND(octet_length(validator_service_version)<=512))AND((octet_length(validator_configuration_version)>=1)AND(octet_length(validator_configuration_version)<=512))))",
     ),
     (
         "semantic_execution_contexts",
@@ -1272,7 +1291,7 @@ const EXPECTED_CHECKS: &[(&str, &str, &str)] = &[
     (
         "validation_records",
         "vr_outcome_shape",
-        "CHECK((((outcome='conforms')AND(violation_count=0))OR((outcome='violations')AND(violation_count>=1))))",
+        "CHECK((((outcome='conforms')AND(violation_count>=0))OR((outcome='violations')AND(violation_count>=1))))",
     ),
     (
         "validation_records",
@@ -1602,7 +1621,12 @@ pub async fn probe_content_address_check(pool: &PgPool) -> Result<(), LedgerErro
         .await;
     tx.rollback().await.map_err(db_error)?;
     match probe {
-        Err(sqlx::Error::Database(d)) if d.code().as_deref() == Some("23514") => Ok(()),
+        Err(sqlx::Error::Database(d))
+            if d.code().as_deref() == Some("23514")
+                && d.constraint() == Some(CONTENT_ADDRESS_CHECK) =>
+        {
+            Ok(())
+        }
         Err(sqlx::Error::Database(d)) if d.code().as_deref() == Some("42501") => {
             Err(LedgerError::RuntimeIdentity(
                 "the connected role cannot probe immutable_objects (no INSERT (id, bytes) \
@@ -1654,7 +1678,8 @@ pub async fn probe_validation_content_address_checks(pool: &PgPool) -> Result<()
             .await;
         tx.rollback().await.map_err(db_error)?;
         match probe {
-            Err(sqlx::Error::Database(d)) if d.code().as_deref() == Some("23514") => {}
+            Err(sqlx::Error::Database(d))
+                if d.code().as_deref() == Some("23514") && d.constraint() == Some(name) => {}
             Err(sqlx::Error::Database(d)) if d.code().as_deref() == Some("42501") => {
                 return Err(LedgerError::RuntimeIdentity(format!(
                     "the connected role cannot probe {name} (no INSERT grant on the validation \
@@ -2331,7 +2356,7 @@ mod tests {
             .2;
         assert_eq!(normalize_constraint_def(pg17), expected);
         assert_ne!(normalize_constraint_def("CHECK (true)"), expected);
-        assert_eq!(EXPECTED_CHECKS.len(), 53);
+        assert_eq!(EXPECTED_CHECKS.len(), 55);
     }
 
     #[test]

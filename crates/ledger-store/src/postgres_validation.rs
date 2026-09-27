@@ -6,29 +6,28 @@
 //! 1. [`ValidationRepository::begin`] — one read-only transaction: idempotency lookup
 //!    (replay a completed identical request, refuse a different request under the same
 //!    key), tenant/graph/candidate binding, bounded reconstruction of the candidate state and
-//!    its `sculpin-rdf-state/v1` digest. Returns a ticket the caller hands to the validator
-//!    client together with the request.
+//!    its `sculpin-rdf-state/v1` digest. Returns a ticket only this module can construct.
 //! 2. the caller calls the validator (HTTP adapter or a test fake) with the ticket's state;
 //! 3. [`ValidationRepository::record`] — one write transaction under the idempotency lock:
 //!    replay if a concurrent identical request finished first, verify the validator's
 //!    context against the ticket (same graph, candidate and state digest), then insert the
-//!    content-addressed context (idempotent, read back and compared), its virtual-context
-//!    projection, the immutable record with its bounded violation summary, and the
-//!    idempotency result. `recorded_at` is assigned here.
+//!    content-addressed context and record (each idempotent: insert-or-nothing, read back,
+//!    compare bytes), the context's virtual-context projection, the bounded result summary
+//!    and the idempotency result. `recorded_at` is assigned here.
 //!
-//! Nothing here interprets semantics: identifiers are bounded and stored, outcomes are
-//! stored, digests are compared. The repository shares the application pool so acceptance
-//! (`WorkflowRepository::accept`) can verify a record inside its own transaction.
+//! Nothing here interprets semantics: identifiers are bounded and stored, verdicts are
+//! stored, digests are compared. Acceptance decisions read the hashed canonical bytes, never
+//! the relational projection columns.
 
 use crate::{
-    db_error,
+    FailPoint, db_error,
     postgres_workflow::{Operation, RequestScope, StoredResult, WorkflowRepository},
 };
 use ledger_core::{CommitId, ContentId, GraphId, LedgerError, LedgerTimestamp, TenantId};
 use ledger_rdf::{Quad, state_digest};
 use ledger_validation_protocol::{
-    RequestedContext, SemanticContextId, SemanticExecutionContext, ValidationId, ValidationOutcome,
-    ValidationRecord, ValidatorIdentity, VirtualContextRef,
+    RequestedContext, SemanticContextId, SemanticEnvironmentId, SemanticExecutionContext,
+    ValidationId, ValidationOutcome, ValidationRecord, ValidatorIdentity,
 };
 use sqlx::{PgConnection, PgPool, Row};
 use std::collections::BTreeSet;
@@ -43,14 +42,33 @@ pub struct ValidateRequest {
     pub requested: RequestedContext,
 }
 
-/// What `begin` established about the candidate before the validator is called.
+/// What `begin` established about the candidate before the validator is called. Only this
+/// module constructs tickets, so `record` can trust the state digest it carries.
 #[derive(Clone, Debug)]
 pub struct ValidationTicket {
-    pub graph: GraphId,
-    pub knowledge_base_id: Option<String>,
-    pub candidate: CommitId,
-    pub state: BTreeSet<Quad>,
-    pub state_digest: ContentId,
+    graph: GraphId,
+    knowledge_base_id: Option<String>,
+    candidate: CommitId,
+    state: BTreeSet<Quad>,
+    state_digest: ContentId,
+}
+
+impl ValidationTicket {
+    pub fn graph(&self) -> &GraphId {
+        &self.graph
+    }
+    pub fn knowledge_base_id(&self) -> Option<&str> {
+        self.knowledge_base_id.as_deref()
+    }
+    pub fn candidate(&self) -> &CommitId {
+        &self.candidate
+    }
+    pub fn state(&self) -> &BTreeSet<Quad> {
+        &self.state
+    }
+    pub fn state_digest(&self) -> &ContentId {
+        &self.state_digest
+    }
 }
 
 /// A recorded (or replayed) validation.
@@ -58,6 +76,9 @@ pub struct ValidationTicket {
 pub struct RecordedValidation {
     pub validation_id: ValidationId,
     pub context_id: SemanticContextId,
+    /// The candidate-independent environment the validation ran in (ADR-0019): what an
+    /// accepting party names.
+    pub environment_id: SemanticEnvironmentId,
     pub record: ValidationRecord,
     pub replayed: bool,
 }
@@ -65,7 +86,7 @@ pub struct RecordedValidation {
 #[derive(Clone, Debug)]
 pub enum ValidationBegin {
     /// An identical earlier request already completed; its record is returned.
-    Replayed(RecordedValidation),
+    Replayed(Box<RecordedValidation>),
     /// No result yet: call the validator with this ticket, then `record`.
     Fresh(ValidationTicket),
 }
@@ -85,6 +106,7 @@ pub struct ValidatorOutcome {
 pub struct ValidationRepository {
     pool: PgPool,
     limits: crate::ReconstructionLimits,
+    failpoint: Option<FailPoint>,
 }
 
 fn now() -> Result<LedgerTimestamp, LedgerError> {
@@ -96,12 +118,30 @@ impl ValidationRepository {
         Self {
             pool,
             limits: crate::ReconstructionLimits::DEVELOPMENT,
+            failpoint: None,
         }
     }
 
     pub fn with_limits(mut self, limits: crate::ReconstructionLimits) -> Self {
         self.limits = limits;
         self
+    }
+
+    /// Abort `record`'s transaction at `point` (tests only): `AfterLineageValidation` after
+    /// the context insert, `AfterDecision` after the record insert, `BeforeCommit` after the
+    /// idempotency result.
+    pub fn with_failpoint(mut self, point: FailPoint) -> Self {
+        self.failpoint = Some(point);
+        self
+    }
+
+    fn fail_at(&self, point: FailPoint) -> Result<(), LedgerError> {
+        if self.failpoint == Some(point) {
+            return Err(LedgerError::Storage(format!(
+                "injected failure at {point:?}"
+            )));
+        }
+        Ok(())
     }
 
     /// Step 1 (read-only transaction). The candidate must be a prepared candidate of the
@@ -122,7 +162,7 @@ impl ValidationRepository {
         {
             let replayed = Self::replay(&mut tx, stored, scope).await?;
             tx.rollback().await.map_err(db_error)?;
-            return Ok(ValidationBegin::Replayed(replayed));
+            return Ok(ValidationBegin::Replayed(Box::new(replayed)));
         }
         WorkflowRepository::graph_must_be_active(&mut tx, scope).await?;
         Self::candidate_is_prepared_here(&mut tx, &scope.graph, &request.candidate).await?;
@@ -147,7 +187,8 @@ impl ValidationRepository {
 
     /// Step 3 (write transaction). Verifies the validator's context names the ticket's graph,
     /// candidate and state digest, then persists context, record, summary and the idempotency
-    /// result atomically. A concurrent identical request that finished first is replayed.
+    /// result atomically. A concurrent identical request that finished first is replayed; an
+    /// identical record produced under another key is shared, not duplicated.
     pub async fn record(
         &self,
         request: &ValidateRequest,
@@ -156,12 +197,15 @@ impl ValidationRepository {
     ) -> Result<RecordedValidation, LedgerError> {
         let scope = &request.scope;
         WorkflowRepository::validate_scope(scope)?;
+        if ticket.graph != scope.graph || ticket.candidate != request.candidate {
+            return Err(LedgerError::Storage(
+                "validation ticket does not belong to this request".into(),
+            ));
+        }
         let context = outcome.context;
         if context.graph_id != scope.graph
             || context.candidate_commit != ticket.candidate
             || context.candidate_state_digest != ticket.state_digest
-            || ticket.graph != scope.graph
-            || ticket.candidate != request.candidate
         {
             return Err(LedgerError::ValidatorError(
                 "the validator's context does not name the validated graph, candidate and state"
@@ -170,6 +214,7 @@ impl ValidationRepository {
         }
         let context_bytes = context.canonical_bytes()?;
         let context_id = context.id()?;
+        let environment_id = context.environment_id()?;
         let record = ValidationRecord {
             graph_id: scope.graph.clone(),
             candidate_commit: ticket.candidate.clone(),
@@ -195,8 +240,10 @@ impl ValidationRepository {
         }
         WorkflowRepository::graph_must_be_active(&mut tx, scope).await?;
         Self::candidate_is_prepared_here(&mut tx, &scope.graph, &ticket.candidate).await?;
-        Self::insert_context(&mut tx, scope, &context, &context_bytes, &context_id).await?;
-        Self::insert_record(&mut tx, scope, &record, &record_bytes, &validation_id).await?;
+        Self::insert_context(&mut tx, scope, &context_bytes, &context_id).await?;
+        self.fail_at(FailPoint::AfterLineageValidation)?;
+        Self::insert_record(&mut tx, scope, &record_bytes, &validation_id).await?;
+        self.fail_at(FailPoint::AfterDecision)?;
         WorkflowRepository::record_result(
             &mut tx,
             scope,
@@ -209,10 +256,12 @@ impl ValidationRepository {
             Some(&validation_id.0),
         )
         .await?;
+        self.fail_at(FailPoint::BeforeCommit)?;
         tx.commit().await.map_err(db_error)?;
         Ok(RecordedValidation {
             validation_id,
             context_id,
+            environment_id,
             record,
             replayed: false,
         })
@@ -256,7 +305,10 @@ impl ValidationRepository {
             .collect()
     }
 
-    async fn load_on(
+    /// Read and verify a record and its context from their hashed canonical bytes (never
+    /// from the relational projection). `None` when no record with that id exists for the
+    /// tenant/graph pair.
+    pub(crate) async fn load_on(
         conn: &mut PgConnection,
         tenant: &TenantId,
         graph: &GraphId,
@@ -278,33 +330,13 @@ impl ValidationRepository {
         };
         let record_bytes: Vec<u8> = row.try_get("record_bytes").map_err(db_error)?;
         let context_bytes: Vec<u8> = row.try_get("context_bytes").map_err(db_error)?;
-        // Stored bytes are verified against their ids on every read, like objects.
-        if ContentId::for_bytes(&record_bytes) != validation_id.0 {
+        let (record, context) = decode_stored(validation_id, &record_bytes, &context_bytes)?;
+        if &record.graph_id != graph {
             return Err(LedgerError::CorruptObject {
                 id: validation_id.0.clone(),
-                reason: "stored validation record bytes do not hash to the id".into(),
+                reason: "stored validation bytes name another graph than their row".into(),
             });
         }
-        let record = ValidationRecord::from_canonical_bytes(&record_bytes).map_err(|e| {
-            LedgerError::CorruptObject {
-                id: validation_id.0.clone(),
-                reason: format!("stored validation record does not decode: {e}"),
-            }
-        })?;
-        let context_id = &record.semantic_execution_context_id;
-        if ContentId::for_bytes(&context_bytes) != context_id.0 {
-            return Err(LedgerError::CorruptObject {
-                id: context_id.0.clone(),
-                reason: "stored semantic context bytes do not hash to the id".into(),
-            });
-        }
-        let context =
-            SemanticExecutionContext::from_canonical_bytes(&context_bytes).map_err(|e| {
-                LedgerError::CorruptObject {
-                    id: context_id.0.clone(),
-                    reason: format!("stored semantic context does not decode: {e}"),
-                }
-            })?;
         Ok(Some((record, context)))
     }
 
@@ -324,7 +356,7 @@ impl ValidationRepository {
             .as_deref()
             .ok_or_else(|| LedgerError::Storage("validated result without record id".into()))?
             .parse()?;
-        let (record, _) = Self::load_on(
+        let (record, context) = Self::load_on(
             conn,
             &scope.principal.tenant_id,
             &scope.graph,
@@ -334,6 +366,7 @@ impl ValidationRepository {
         .ok_or_else(|| LedgerError::Storage("validated result names a missing record".into()))?;
         Ok(RecordedValidation {
             context_id: record.semantic_execution_context_id.clone(),
+            environment_id: context.environment_id()?,
             validation_id,
             record,
             replayed: true,
@@ -377,19 +410,16 @@ impl ValidationRepository {
 
     /// Content-addressed, idempotent publication of a context: insert-or-nothing, then read
     /// back and compare (a different row under the same id is corruption, never success). The
-    /// virtual-context projection is written only by the transaction that inserted the row.
+    /// projection columns come from the decoded canonical bytes; the virtual-context
+    /// projection is written only by the transaction that inserted the row.
     async fn insert_context(
         conn: &mut PgConnection,
         scope: &RequestScope,
-        context: &SemanticExecutionContext,
         bytes: &[u8],
         id: &SemanticContextId,
     ) -> Result<(), LedgerError> {
-        let virtual_contexts: Vec<VirtualContextRef> = context
-            .canonical_virtual_contexts()?
-            .iter()
-            .map(|encoded| decode_virtual_context(encoded))
-            .collect::<Result<_, _>>()?;
+        let canonical = SemanticExecutionContext::from_canonical_bytes(bytes)?;
+        let reasoning = canonical.reasoning.as_ref();
         let inserted = sqlx::query(
             "INSERT INTO semantic_execution_contexts (context_id, graph_id, tenant_id, candidate_commit, \
              candidate_state_digest, base_kb_id, base_kb_revision, ontology_id, ontology_version, shapes_id, \
@@ -402,27 +432,27 @@ impl ValidationRepository {
         .bind(id.to_string())
         .bind(scope.graph.as_str())
         .bind(scope.principal.tenant_id.as_str())
-        .bind(context.candidate_commit.to_string())
-        .bind(context.candidate_state_digest.to_string())
-        .bind(&context.base_kb.kb_id)
-        .bind(&context.base_kb.revision)
-        .bind(context.ontology.as_ref().map(|o| o.id.clone()))
-        .bind(context.ontology.as_ref().map(|o| o.version.clone()))
-        .bind(&context.shapes.id)
-        .bind(&context.shapes.version)
-        .bind(&context.reasoning.profile)
-        .bind(&context.reasoning.implementation)
-        .bind(&context.reasoning.version)
-        .bind(&context.validator.service_id)
-        .bind(&context.validator.service_version)
-        .bind(&context.validator.configuration_version)
-        .bind(i32::try_from(virtual_contexts.len()).expect("bounded by protocol"))
+        .bind(canonical.candidate_commit.to_string())
+        .bind(canonical.candidate_state_digest.to_string())
+        .bind(&canonical.base_kb.kb_id)
+        .bind(&canonical.base_kb.revision)
+        .bind(canonical.ontology.as_ref().map(|o| o.id.clone()))
+        .bind(canonical.ontology.as_ref().map(|o| o.version.clone()))
+        .bind(&canonical.shapes.id)
+        .bind(&canonical.shapes.version)
+        .bind(reasoning.map(|r| r.profile.clone()))
+        .bind(reasoning.map(|r| r.implementation.clone()))
+        .bind(reasoning.map(|r| r.version.clone()))
+        .bind(&canonical.validator.service_id)
+        .bind(&canonical.validator.service_version)
+        .bind(&canonical.validator.configuration_version)
+        .bind(i32::try_from(canonical.virtual_contexts.len()).expect("bounded by protocol"))
         .bind(bytes)
         .execute(&mut *conn)
         .await
         .map_err(db_error)?;
         if inserted.rows_affected() == 1 {
-            for (position, vc) in virtual_contexts.iter().enumerate() {
+            for (position, vc) in canonical.virtual_contexts.iter().enumerate() {
                 sqlx::query(
                     "INSERT INTO semantic_virtual_contexts (context_id, position, dataset_id, source_version, \
                      object_refs, query_spec_digest, hydration_plan_digest) VALUES ($1, $2, $3, $4, $5, $6, $7)",
@@ -431,7 +461,7 @@ impl ValidationRepository {
                 .bind(i32::try_from(position).expect("bounded"))
                 .bind(&vc.dataset_id)
                 .bind(&vc.source_version)
-                .bind(vc.canonical_object_refs())
+                .bind(&vc.object_refs)
                 .bind(vc.query_spec_digest.to_string())
                 .bind(vc.hydration_plan_digest.to_string())
                 .execute(&mut *conn)
@@ -458,20 +488,24 @@ impl ValidationRepository {
         Ok(())
     }
 
+    /// Content-addressed, idempotent publication of a record. Two requests under different
+    /// keys that produce byte-identical records (same microsecond, same verdict) share one
+    /// row; the requester columns keep the first writer (audit), the identity is unaffected.
     async fn insert_record(
         conn: &mut PgConnection,
         scope: &RequestScope,
-        record: &ValidationRecord,
         bytes: &[u8],
         id: &ValidationId,
     ) -> Result<(), LedgerError> {
+        let record = ValidationRecord::from_canonical_bytes(bytes)?;
         let actor = scope.principal.actor();
-        sqlx::query(
+        let inserted = sqlx::query(
             "INSERT INTO validation_records (validation_id, graph_id, tenant_id, candidate_commit, \
              candidate_state_digest, context_id, validator_service_id, validator_service_version, \
              validator_configuration_version, outcome, violation_count, report_digest, report_reference, \
              recorded_at, principal_id, principal_type, on_behalf_of, correlation_id, canonical_bytes) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::timestamptz, $15, $16, $17, $18, $19)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14::timestamptz, $15, $16, $17, $18, $19) \
+             ON CONFLICT (validation_id) DO NOTHING",
         )
         .bind(id.to_string())
         .bind(scope.graph.as_str())
@@ -496,156 +530,123 @@ impl ValidationRepository {
         .bind(bytes)
         .execute(&mut *conn)
         .await
-        .map_err(|e| match &e {
-            // Same bytes, same microsecond, same everything: the record already exists (a
-            // different key produced an identical record). Not corruption.
-            sqlx::Error::Database(d) if d.is_unique_violation() => LedgerError::LineageMismatch(
-                format!("validation record {id} already exists"),
-            ),
-            _ => db_error(e),
-        })?;
-        for (position, encoded) in record.outcome.canonical_violations()?.iter().enumerate() {
-            let violation = decode_violation(encoded)?;
-            sqlx::query(
-                "INSERT INTO validation_violations (validation_id, position, severity, code, message) \
-                 VALUES ($1, $2, $3, $4, $5)",
-            )
-            .bind(id.to_string())
-            .bind(i32::try_from(position).expect("bounded"))
-            .bind(&violation.0)
-            .bind(&violation.1)
-            .bind(&violation.2)
-            .execute(&mut *conn)
-            .await
-            .map_err(db_error)?;
+        .map_err(db_error)?;
+        if inserted.rows_affected() == 1 {
+            for (position, violation) in record.outcome.violations.iter().enumerate() {
+                sqlx::query(
+                    "INSERT INTO validation_violations (validation_id, position, severity, code, message) \
+                     VALUES ($1, $2, $3, $4, $5)",
+                )
+                .bind(id.to_string())
+                .bind(i32::try_from(position).expect("bounded"))
+                .bind(&violation.severity)
+                .bind(&violation.code)
+                .bind(&violation.message)
+                .execute(&mut *conn)
+                .await
+                .map_err(db_error)?;
+            }
+            return Ok(());
+        }
+        let stored: Vec<u8> = sqlx::query_scalar(
+            "SELECT canonical_bytes FROM validation_records WHERE validation_id = $1",
+        )
+        .bind(id.to_string())
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(db_error)?;
+        if stored != bytes {
+            return Err(LedgerError::ObjectCollision(id.0.clone()));
         }
         Ok(())
     }
 }
 
-/// Decode one canonical virtual-context element (the protocol crate exposes the encoder;
-/// the relational projection needs the fields back in canonical order).
-fn decode_virtual_context(encoded: &[u8]) -> Result<VirtualContextRef, LedgerError> {
-    let mut rest = encoded;
-    let dataset_id = read_field(&mut rest)?;
-    let source_version = read_field(&mut rest)?;
-    let count = read_u32(&mut rest)? as usize;
-    let mut object_refs = Vec::with_capacity(count);
-    for _ in 0..count {
-        object_refs.push(read_field(&mut rest)?);
+/// Verify stored record/context bytes against their ids and decode them strictly.
+pub(crate) fn decode_stored(
+    validation_id: &ValidationId,
+    record_bytes: &[u8],
+    context_bytes: &[u8],
+) -> Result<(ValidationRecord, SemanticExecutionContext), LedgerError> {
+    if ContentId::for_bytes(record_bytes) != validation_id.0 {
+        return Err(LedgerError::CorruptObject {
+            id: validation_id.0.clone(),
+            reason: "stored validation record bytes do not hash to the id".into(),
+        });
     }
-    let query_spec_digest: ContentId = read_field(&mut rest)?.parse()?;
-    let hydration_plan_digest: ContentId = read_field(&mut rest)?.parse()?;
-    if !rest.is_empty() {
-        return Err(LedgerError::InvalidValidation(
-            "virtual context element has trailing bytes".into(),
-        ));
+    let record = ValidationRecord::from_canonical_bytes(record_bytes).map_err(|e| {
+        LedgerError::CorruptObject {
+            id: validation_id.0.clone(),
+            reason: format!("stored validation record does not decode: {e}"),
+        }
+    })?;
+    let context_id = &record.semantic_execution_context_id;
+    if ContentId::for_bytes(context_bytes) != context_id.0 {
+        return Err(LedgerError::CorruptObject {
+            id: context_id.0.clone(),
+            reason: "stored semantic context bytes do not hash to the id".into(),
+        });
     }
-    Ok(VirtualContextRef {
-        dataset_id,
-        source_version,
-        object_refs,
-        query_spec_digest,
-        hydration_plan_digest,
-    })
-}
-
-fn decode_violation(encoded: &[u8]) -> Result<(String, String, String), LedgerError> {
-    let mut rest = encoded;
-    let severity = read_field(&mut rest)?;
-    let code = read_field(&mut rest)?;
-    let message = read_field(&mut rest)?;
-    if !rest.is_empty() {
-        return Err(LedgerError::InvalidValidation(
-            "violation element has trailing bytes".into(),
-        ));
+    let context = SemanticExecutionContext::from_canonical_bytes(context_bytes).map_err(|e| {
+        LedgerError::CorruptObject {
+            id: context_id.0.clone(),
+            reason: format!("stored semantic context does not decode: {e}"),
+        }
+    })?;
+    if context.candidate_commit != record.candidate_commit
+        || context.candidate_state_digest != record.candidate_state_digest
+        || context.graph_id != record.graph_id
+        || context.validator != record.validator
+    {
+        return Err(LedgerError::CorruptObject {
+            id: validation_id.0.clone(),
+            reason: "validation record and its context disagree".into(),
+        });
     }
-    Ok((severity, code, message))
-}
-
-fn read_u32(rest: &mut &[u8]) -> Result<u32, LedgerError> {
-    if rest.len() < 4 {
-        return Err(LedgerError::InvalidValidation("truncated count".into()));
-    }
-    let value = u32::from_be_bytes(rest[..4].try_into().expect("four bytes"));
-    *rest = &rest[4..];
-    Ok(value)
-}
-
-fn read_field(rest: &mut &[u8]) -> Result<String, LedgerError> {
-    let len = read_u32(rest)? as usize;
-    if rest.len() < len {
-        return Err(LedgerError::InvalidValidation("truncated field".into()));
-    }
-    let value = std::str::from_utf8(&rest[..len])
-        .map_err(|_| LedgerError::InvalidValidation("non-UTF-8 field".into()))?
-        .to_owned();
-    *rest = &rest[len..];
-    Ok(value)
+    Ok((record, context))
 }
 
 /// Verified facts about a validation record, as `WorkflowRepository::accept`/`reject` need
-/// them inside their transaction (ADR-0019 predicates 1–5).
+/// them inside their transaction (ADR-0019 predicates 1–5), derived from the hashed bytes.
 pub(crate) struct CitedValidation {
     pub(crate) validation_id: ValidationId,
-    pub(crate) context_id: SemanticContextId,
+    pub(crate) environment_id: SemanticEnvironmentId,
     pub(crate) conforms: bool,
 }
 
 /// Predicates 1–3 of ADR-0019 on the caller's connection: the record exists for the caller's
 /// graph and tenant (else `VALIDATION_NOT_FOUND`), names this candidate (else
-/// `LINEAGE_MISMATCH`) and agrees with its context's state digest (else corruption).
+/// `LINEAGE_MISMATCH`) and agrees with its context (else corruption). The verdict and the
+/// environment come from the verified canonical bytes.
 pub(crate) async fn cited_validation(
     conn: &mut PgConnection,
     scope: &RequestScope,
     candidate: &CommitId,
     validation_id: &ValidationId,
 ) -> Result<CitedValidation, LedgerError> {
-    let row = sqlx::query(
-        "SELECT r.graph_id, r.tenant_id, r.candidate_commit, r.candidate_state_digest, r.context_id, r.outcome, \
-                c.candidate_state_digest AS context_digest, c.candidate_commit AS context_candidate \
-         FROM validation_records r JOIN semantic_execution_contexts c ON c.context_id = r.context_id \
-         WHERE r.validation_id = $1",
+    let Some((record, context)) = ValidationRepository::load_on(
+        conn,
+        &scope.principal.tenant_id,
+        &scope.graph,
+        validation_id,
     )
-    .bind(validation_id.to_string())
-    .fetch_optional(&mut *conn)
-    .await
-    .map_err(db_error)?;
-    let Some(row) = row else {
+    .await?
+    else {
         return Err(LedgerError::ValidationNotFound);
     };
-    let graph: String = row.try_get("graph_id").map_err(db_error)?;
-    let tenant: String = row.try_get("tenant_id").map_err(db_error)?;
-    if graph != scope.graph.as_str() || tenant != scope.principal.tenant_id.as_str() {
-        return Err(LedgerError::ValidationNotFound);
-    }
-    let record_candidate: String = row.try_get("candidate_commit").map_err(db_error)?;
-    if record_candidate != candidate.to_string() {
+    if &record.candidate_commit != candidate {
         return Err(LedgerError::LineageMismatch(format!(
             "validation {validation_id} is for another candidate"
         )));
     }
-    let digest: String = row.try_get("candidate_state_digest").map_err(db_error)?;
-    let context_digest: String = row.try_get("context_digest").map_err(db_error)?;
-    let context_candidate: String = row.try_get("context_candidate").map_err(db_error)?;
-    if digest != context_digest || context_candidate != record_candidate {
-        return Err(LedgerError::CorruptObject {
-            id: validation_id.0.clone(),
-            reason: "validation record and its context disagree on candidate or state digest"
-                .into(),
-        });
-    }
-    let context_id: String = row.try_get("context_id").map_err(db_error)?;
-    let outcome: String = row.try_get("outcome").map_err(db_error)?;
     Ok(CitedValidation {
         validation_id: validation_id.clone(),
-        context_id: context_id.parse()?,
-        conforms: outcome == "conforms",
+        environment_id: context.environment_id()?,
+        conforms: record.outcome.is_conforming(),
     })
 }
 
-/// Used by tests and tooling: the identity a record would have; exposed so fakes can predict
-/// what the ledger will store without a database.
+/// Used by tests and tooling: the validator identity a context will carry.
 pub fn validator_identity(
     service_id: &str,
     service_version: &str,

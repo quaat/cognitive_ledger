@@ -7,8 +7,8 @@
 //! is a protocol change and needs an ADR plus golden review.
 
 use ledger_api::{
-    AcceptBody, ApiLimits, PrepareBody, RejectBody, canonical_accept, canonical_prepare,
-    canonical_reject, request_identity::CanonicalRequest,
+    AcceptBody, ApiLimits, PrepareBody, RejectBody, ValidateBody, canonical_accept,
+    canonical_prepare, canonical_reject, canonical_validate, request_identity::CanonicalRequest,
 };
 use ledger_core::{CommitId, GraphId};
 use serde_json::{Value, json};
@@ -26,8 +26,9 @@ fn through_the_api(input: &Value) -> CanonicalRequest {
     let obj = body.as_object_mut().unwrap();
     let operation = obj.remove("operation").unwrap();
     obj.remove("graph_id");
-    let branch = obj.remove("branch").unwrap();
-    obj.insert("ref".into(), branch);
+    if let Some(branch) = obj.remove("branch") {
+        obj.insert("ref".into(), branch);
+    }
     let candidate = obj
         .remove("candidate")
         .map(|c| CommitId::from_str(c.as_str().unwrap()).unwrap());
@@ -43,6 +44,17 @@ fn through_the_api(input: &Value) -> CanonicalRequest {
             obj.remove("validation_policy");
             let body: AcceptBody = serde_json::from_value(body).expect("valid accept body");
             canonical_accept(&graph, &candidate.unwrap(), &body, "golden").unwrap()
+        }
+        "validate" => {
+            let body: ValidateBody = serde_json::from_value(body).expect("valid validate body");
+            canonical_validate(
+                &graph,
+                &candidate.unwrap(),
+                &body,
+                &ApiLimits::default(),
+                "golden",
+            )
+            .unwrap()
         }
         "reject" => {
             let body: RejectBody = serde_json::from_value(body).expect("valid reject body");
@@ -78,8 +90,8 @@ fn every_request_identity_vector_matches_bytes_and_digest_through_the_handlers()
         );
     }
     assert!(
-        count >= 6,
-        "expected at least 6 request vectors, found {count}"
+        count == 12,
+        "expected exactly 12 request vectors (6 v1 + 6 v2), found {count}"
     );
 }
 

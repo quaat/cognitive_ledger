@@ -33,7 +33,18 @@ fn state_digest_vectors_are_stable() {
             .unwrap()
             .lines()
             .filter(|l| !l.is_empty())
-            .map(|l| l.parse::<Quad>().unwrap())
+            .map(|l| {
+                let quad = l.parse::<Quad>().unwrap();
+                // The Python reference hashes the lines as written: fixtures must already be
+                // canonical, so both sides hash identical bytes.
+                assert_eq!(
+                    quad.to_string(),
+                    l,
+                    "{}: fixture line is not canonical",
+                    path.display()
+                );
+                quad
+            })
             .collect();
         assert_eq!(
             state_digest(&state).to_string(),

@@ -1,0 +1,8 @@
+{
+  "operation": "reject",
+  "graph_id": "0b0a2a1c-2e3d-4f50-8a61-72b384c5d6e7",
+  "branch": "main",
+  "candidate": "sha256:979f8d93bfe8d4062ff33277e90c65d1eb660b649aac0eca722ec81d968eb11d",
+  "reason": "violations reported",
+  "validation_id": "sha256:3e992f18de784b6565bc0b40d87327eae68659b912a0c4f721b4e0d8f9549029"
+}

@@ -170,11 +170,11 @@ fn context_for(
             id: "urn:sculpin:shapes:core".into(),
             version: "S1".into(),
         },
-        reasoning: Reasoning {
+        reasoning: Some(Reasoning {
             profile: "rdfs".into(),
             implementation: "sculpin-python-reasoner".into(),
             version: "0.9".into(),
-        },
+        }),
         virtual_contexts: vec![VirtualContextRef {
             dataset_id: "urn:sculpin:datasource:lab".into(),
             source_version: external_version.into(),
@@ -238,9 +238,9 @@ async fn validate_with(
 ) -> Result<ledger_store::RecordedValidation, LedgerError> {
     let request = validate_request(graph, key, candidate, hints);
     match store.validations().begin(&request).await? {
-        ValidationBegin::Replayed(recorded) => Ok(recorded),
+        ValidationBegin::Replayed(recorded) => Ok(*recorded),
         ValidationBegin::Fresh(ticket) => {
-            let produced = outcome(graph, candidate, &ticket.state_digest);
+            let produced = outcome(graph, candidate, ticket.state_digest());
             store
                 .validations()
                 .record(&request, &ticket, produced)
@@ -316,12 +316,9 @@ async fn contexts_and_records_are_content_addressed_write_once_and_many_per_cand
         .reconstruct(&c1, &ledger_store::ReconstructionLimits::DEVELOPMENT)
         .await
         .unwrap();
-    assert_eq!(ticket.state_digest, state_digest(&reconstructed));
-    assert_eq!(ticket.state, reconstructed);
-    assert_eq!(
-        ticket.knowledge_base_id.as_deref(),
-        Some("urn:exodus:kb:val")
-    );
+    assert_eq!(ticket.state_digest().clone(), state_digest(&reconstructed));
+    assert_eq!(ticket.state(), &reconstructed);
+    assert_eq!(ticket.knowledge_base_id(), Some("urn:exodus:kb:val"));
 
     // Two validations of one candidate under two contexts (external source A and B): both
     // records coexist immutably, referencing distinct contexts.
@@ -493,7 +490,7 @@ async fn validation_is_idempotent_by_scope_key_and_digest() {
             let produced = conforms(context_for(
                 &g,
                 &c2,
-                &ticket.state_digest,
+                ticket.state_digest(),
                 "O1",
                 &format!("D-{n}"),
             ));
@@ -556,7 +553,7 @@ async fn validation_refuses_unprepared_foreign_and_mismatching_candidates() {
     let ValidationBegin::Fresh(ticket) = store.validations().begin(&request).await.unwrap() else {
         panic!("fresh");
     };
-    let wrong_candidate = conforms(context_for(&g, &foreign, &ticket.state_digest, "O1", "D"));
+    let wrong_candidate = conforms(context_for(&g, &foreign, ticket.state_digest(), "O1", "D"));
     assert!(matches!(
         store
             .validations()
@@ -668,9 +665,12 @@ async fn acceptance_is_bound_to_a_conforming_validation_of_the_named_context() {
     .unwrap();
     // The context id the reviewer would name after an ontology change (O2): computed from
     // the frozen layout, exactly as Sculpin would.
+    // The environment the orchestrator names after an ontology change (O2): computed from the
+    // frozen layout without any candidate, exactly as Sculpin would publish it.
     let stale_context = context_for(&g, &c1, &good.record.candidate_state_digest, "O2", "D")
-        .id()
+        .environment_id()
         .unwrap();
+    assert_ne!(stale_context, good.environment_id);
 
     let before = snapshot(&store, &g).await;
     type Case = (&'static str, ValidationPolicy, fn(&LedgerError) -> bool);
@@ -682,7 +682,7 @@ async fn acceptance_is_bound_to_a_conforming_validation_of_the_named_context() {
             "unknown",
             ValidationPolicy::Validated {
                 validation_id: ValidationId(digest("nope")),
-                semantic_context_id: good.context_id.clone(),
+                semantic_environment_id: good.environment_id.clone(),
             },
             |e| matches!(e, LedgerError::ValidationNotFound),
         ),
@@ -690,7 +690,7 @@ async fn acceptance_is_bound_to_a_conforming_validation_of_the_named_context() {
             "foreign graph",
             ValidationPolicy::Validated {
                 validation_id: other.validation_id.clone(),
-                semantic_context_id: other.context_id.clone(),
+                semantic_environment_id: other.environment_id.clone(),
             },
             |e| matches!(e, LedgerError::ValidationNotFound),
         ),
@@ -698,7 +698,7 @@ async fn acceptance_is_bound_to_a_conforming_validation_of_the_named_context() {
             "other candidate",
             ValidationPolicy::Validated {
                 validation_id: c2_good.validation_id.clone(),
-                semantic_context_id: c2_good.context_id.clone(),
+                semantic_environment_id: c2_good.environment_id.clone(),
             },
             |e| matches!(e, LedgerError::LineageMismatch(_)),
         ),
@@ -706,7 +706,7 @@ async fn acceptance_is_bound_to_a_conforming_validation_of_the_named_context() {
             "violations",
             ValidationPolicy::Validated {
                 validation_id: bad.validation_id.clone(),
-                semantic_context_id: bad.context_id.clone(),
+                semantic_environment_id: bad.environment_id.clone(),
             },
             |e| matches!(e, LedgerError::ValidationRejected),
         ),
@@ -714,7 +714,7 @@ async fn acceptance_is_bound_to_a_conforming_validation_of_the_named_context() {
             "stale context",
             ValidationPolicy::Validated {
                 validation_id: good.validation_id.clone(),
-                semantic_context_id: stale_context,
+                semantic_environment_id: stale_context,
             },
             |e| matches!(e, LedgerError::ValidationStale(_)),
         ),
@@ -744,7 +744,7 @@ async fn acceptance_is_bound_to_a_conforming_validation_of_the_named_context() {
         &c1,
         ValidationPolicy::Validated {
             validation_id: good.validation_id.clone(),
-            semantic_context_id: good.context_id.clone(),
+            semantic_environment_id: good.environment_id.clone(),
         },
     );
     let accepted = store.workflows().accept(&request).await.unwrap();
@@ -828,7 +828,7 @@ async fn revalidation_after_rejection_and_head_race_and_rejected_decisions_cite_
         &c1,
         ValidationPolicy::Validated {
             validation_id: v1.validation_id.clone(),
-            semantic_context_id: v1.context_id.clone(),
+            semantic_environment_id: v1.environment_id.clone(),
         },
     );
     assert!(matches!(
@@ -842,7 +842,7 @@ async fn revalidation_after_rejection_and_head_race_and_rejected_decisions_cite_
         &c1,
         ValidationPolicy::Validated {
             validation_id: v2.validation_id.clone(),
-            semantic_context_id: v2.context_id.clone(),
+            semantic_environment_id: v2.environment_id.clone(),
         },
     );
     let accepted = store.workflows().accept(&with_v2).await.unwrap();
@@ -881,7 +881,7 @@ async fn revalidation_after_rejection_and_head_race_and_rejected_decisions_cite_
             &c2,
             ValidationPolicy::Validated {
                 validation_id: v_c2.validation_id.clone(),
-                semantic_context_id: v_c2.context_id.clone(),
+                semantic_environment_id: v_c2.environment_id.clone(),
             },
         ))
         .await
@@ -896,7 +896,7 @@ async fn revalidation_after_rejection_and_head_race_and_rejected_decisions_cite_
             &c3,
             ValidationPolicy::Validated {
                 validation_id: v_c3.validation_id.clone(),
-                semantic_context_id: v_c3.context_id.clone(),
+                semantic_environment_id: v_c3.environment_id.clone(),
             },
         ))
         .await;

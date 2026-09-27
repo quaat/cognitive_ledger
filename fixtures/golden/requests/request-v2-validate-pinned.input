@@ -1,0 +1,30 @@
+{
+  "operation": "validate",
+  "graph_id": "0b0a2a1c-2e3d-4f50-8a61-72b384c5d6e7",
+  "candidate": "sha256:979f8d93bfe8d4062ff33277e90c65d1eb660b649aac0eca722ec81d968eb11d",
+  "requested": {
+    "base_kb": {
+      "kb_id": "urn:exodus:kb:material-science",
+      "revision": "kbrev-7"
+    },
+    "ontology": {
+      "id": "urn:sculpin:ontology:core",
+      "version": "O2"
+    },
+    "shapes": {
+      "id": "urn:sculpin:shapes:material",
+      "version": "S1"
+    },
+    "reasoning_profile": "rdfs",
+    "source_pins": [
+      {
+        "dataset_id": "urn:sculpin:datasource:lab-b",
+        "source_version": "2026-09-20T00:00:00Z#7"
+      },
+      {
+        "dataset_id": "urn:sculpin:datasource:lab-a",
+        "source_version": "41"
+      }
+    ]
+  }
+}

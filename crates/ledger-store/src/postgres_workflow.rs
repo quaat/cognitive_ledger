@@ -29,7 +29,7 @@ use ledger_core::{
     LedgerTimestamp, PatchId,
 };
 use ledger_rdf::{DeltaPolicy, Patch, effective_delta};
-use ledger_validation_protocol::{SemanticContextId, ValidationId};
+use ledger_validation_protocol::{SemanticEnvironmentId, ValidationId};
 use sqlx::{PgConnection, PgPool, Row, postgres::PgPoolOptions};
 use std::collections::BTreeSet;
 use time::OffsetDateTime;
@@ -82,9 +82,9 @@ pub struct Prepared {
 }
 
 /// How acceptance treats semantic validation (ADR-0019). `Validated` is the production
-/// path: the reviewer names an immutable `ValidationRecord` and the semantic execution
-/// context it accepts under, and the repository verifies both inside the acceptance
-/// transaction. `Required` is what a production deployment applies to a request that names
+/// path: the reviewer names an immutable `ValidationRecord` and the semantic environment
+/// (candidate-independent; what Sculpin declares current) it accepts under, and the
+/// repository verifies both inside the acceptance transaction. `Required` is what a production deployment applies to a request that names
 /// no validation: every non-replayed accept fails with `ValidationRequired` inside the
 /// repository (the store enforces it, not only the HTTP adapter). `NoValidation` is the
 /// explicit development/CI setting. No policy ever fabricates a validation record.
@@ -94,7 +94,7 @@ pub enum ValidationPolicy {
     NoValidation,
     Validated {
         validation_id: ValidationId,
-        semantic_context_id: SemanticContextId,
+        semantic_environment_id: SemanticEnvironmentId,
     },
 }
 
@@ -1151,12 +1151,12 @@ impl WorkflowRepository {
         .await?;
 
         // ADR-0019: the cited validation must exist for this graph and tenant, name this
-        // candidate, agree with its context's state digest, conform, and be recorded under
-        // exactly the semantic context the reviewer names. Checked before any write.
+        // candidate, agree with its context, conform, and have run in exactly the semantic
+        // environment the reviewer names. Checked (on the hashed bytes) before any write.
         let cited = match &request.validation {
             ValidationPolicy::Validated {
                 validation_id,
-                semantic_context_id,
+                semantic_environment_id,
             } => {
                 let cited = crate::postgres_validation::cited_validation(
                     &mut tx,
@@ -1168,9 +1168,9 @@ impl WorkflowRepository {
                 if !cited.conforms {
                     return Err(LedgerError::ValidationRejected);
                 }
-                if &cited.context_id != semantic_context_id {
+                if &cited.environment_id != semantic_environment_id {
                     return Err(LedgerError::ValidationStale(format!(
-                        "validation {validation_id} was recorded under another semantic execution context"
+                        "validation {validation_id} was recorded under another semantic environment"
                     )));
                 }
                 Some(cited)

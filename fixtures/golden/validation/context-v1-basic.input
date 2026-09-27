@@ -4,7 +4,7 @@
   "candidate_state_digest": "sha256:4df1d2fb91c7aaba8d6d567034e26c17225d8b4d5b441b957ab5477cd568df67",
   "base_kb": {
     "kb_id": "urn:exodus:kb:material-science",
-    "revision": "kbrev:sha256:9f2c…composed-by-sculpin"
+    "revision": "kbrev:sha256:9f2c-composed-by-sculpin"
   },
   "ontology": {
     "id": "urn:sculpin:ontology:core",
@@ -24,8 +24,9 @@
       "dataset_id": "urn:sculpin:datasource:lab-b",
       "source_version": "2026-09-20T00:00:00Z#7",
       "object_refs": [
-        "s3://lab-b/run-2.parquet@v3",
-        "s3://lab-b/run-1.parquet@v3"
+        "s3://lab-b/run-10.parquet@v3",
+        "s3://lab-b/run-9.parquet@v3",
+        "s3://lab-b/run-10.parquet@v3"
       ],
       "query_spec_digest": "sha256:1cc9c80cfda258263acb104fa92852abeef087accd97982d0167ba4e2f9fdcd5",
       "hydration_plan_digest": "sha256:cb44cbb61ae362c29bf18633f05c22e316390bee9058ca88568c8ff9da203352"
