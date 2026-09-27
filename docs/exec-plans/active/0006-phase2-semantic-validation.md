@@ -218,7 +218,7 @@ ci-security / ci-fuzz stay green; no existing golden vector changes.
 | PostgreSQL 17.2 and 15.19 on the round-3 content: `pg_validation` 9, `pg_verify` 2, `pg_workflow` 14, `pg_least_privilege` 16, `pg_validation_api` 12, `pg_api` 13 (`pg_graphs_migration` 7 on `2650156`) | all passed on both |
 | `validator_http` (local server) 5 | passed |
 | `scripts/fuzz.sh 120 validation_decode` (sanitizer none) | 10.7 M executions, cov 1131, no crash |
-| `./scripts/test-integration.sh` (compose PostgreSQL 17.2, distroless image, all 10 PostgreSQL suites incl. `pg_validation` and `pg_validation_api`, end-to-end container scenario, `ledger-admin verify`) | exit 0, `INTEGRATION OK`, `VERIFY OK` (on `2650156`; re-run after round 3 below) |
+| `./scripts/test-integration.sh` (compose PostgreSQL 17.2, distroless image, all 10 PostgreSQL suites incl. `pg_validation` and `pg_validation_api`, end-to-end container scenario, `ledger-admin verify`) | exit 0, `INTEGRATION OK`, `VERIFY OK` on `2650156` and again on the round-3 content `cbaedf9` |
 
 ### ADR-0014 scenarios (executable, passing; `pg_validation_api`, deterministic fake validator)
 valid candidate → accepted; invalid SHACL → `VALIDATION_REJECTED`, ref unchanged, rejection
