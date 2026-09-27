@@ -125,6 +125,8 @@ def semantics(logical: dict) -> bytes:
         out += b"\x01" + field(token("reasoning.profile", reasoning["profile"])) \
             + field(token("reasoning.implementation", reasoning["implementation"])) \
             + field(token("reasoning.version", reasoning["version"]))
+    revision = logical.get("sources_revision")
+    out += opt(None if revision is None else token("sources_revision", revision))
     return out
 
 
@@ -135,7 +137,7 @@ def source_pin(pin: dict) -> bytes:
 
 def encode_context(logical: dict) -> bytes:
     keys("context", logical, {"graph_id", "candidate_commit", "candidate_state_digest", "base_kb", "ontology",
-                              "shapes", "reasoning", "virtual_contexts", "validator"},
+                              "shapes", "reasoning", "sources_revision", "virtual_contexts", "validator"},
          {"graph_id", "candidate_commit", "candidate_state_digest", "base_kb", "shapes", "validator"})
     if not GRAPH_ID_RE.fullmatch(logical["graph_id"]):
         raise Invalid("graph_id")
@@ -153,12 +155,11 @@ def encode_context(logical: dict) -> bytes:
 
 
 def encode_environment(logical: dict) -> bytes:
-    keys("environment", logical, {"base_kb", "ontology", "shapes", "reasoning", "source_pins",
+    keys("environment", logical, {"base_kb", "ontology", "shapes", "reasoning", "sources_revision",
                                   "validator_service_version", "validator_configuration_version"},
          {"base_kb", "shapes", "validator_service_version", "validator_configuration_version"})
     out = bytearray(ENVIRONMENT_HEADER)
     out += semantics(logical)
-    out += counted_set([source_pin(p) for p in logical.get("source_pins", [])], "source pins")
     out += field(token("validator.service_version", logical["validator_service_version"]))
     out += field(token("validator.configuration_version", logical["validator_configuration_version"]))
     return bytes(out)
@@ -167,11 +168,9 @@ def encode_environment(logical: dict) -> bytes:
 def environment_of(context: dict) -> dict:
     """The candidate-independent projection of a context (ADR-0018/0019)."""
     env = {k: context[k] for k in ("base_kb", "shapes") }
-    for k in ("ontology", "reasoning"):
+    for k in ("ontology", "reasoning", "sources_revision"):
         if context.get(k) is not None:
             env[k] = context[k]
-    env["source_pins"] = [{"dataset_id": vc["dataset_id"], "source_version": vc["source_version"]}
-                          for vc in context.get("virtual_contexts", [])]
     env["validator_service_version"] = context["validator"]["service_version"]
     env["validator_configuration_version"] = context["validator"]["configuration_version"]
     return env

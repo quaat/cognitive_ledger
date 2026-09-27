@@ -2,11 +2,13 @@
 //!
 //! The *context* is the reproducibility record of one validation run: exactly which
 //! candidate state was validated against which base KB, ontology, shape set, reasoning
-//! configuration, external (Virtual A-Box) sources and validator. The *environment* is its
-//! candidate-independent projection — base KB, ontology, shapes, reasoning, external source
-//! version pins and validator versions — which Sculpin can declare as "current" before any
-//! candidate exists; acceptance names an environment id (ADR-0019). Every semantic
-//! identifier is opaque to the ledger.
+//! configuration, external-source catalog revision, hydrated external (Virtual A-Box)
+//! sources and validator. The *environment* is its candidate-independent projection — base
+//! KB, ontology, shapes, reasoning, the Sculpin-declared `sources_revision` and the
+//! validator versions — which Sculpin can declare as "current" before any candidate exists;
+//! acceptance names an environment id (ADR-0019). Which datasets a run hydrates depends on
+//! the candidate, so hydrated sources are context provenance, never environment. Every
+//! semantic identifier is opaque to the ledger.
 //!
 //! ```text
 //! "sculpin-semantic-context-v1\0"
@@ -15,6 +17,7 @@
 //! u8    ontology tag  (0x00 | 0x01 field id, field version)
 //! field shapes.id · field shapes.version
 //! u8    reasoning tag (0x00 | 0x01 field profile, field implementation, field version)
+//! opt   sources_revision
 //! u32   virtual_context_count (<= 64), elements ascending by their encoding, unique:
 //!         field dataset_id · field source_version
 //!         u32 object_ref_count (<= 64), `field` × n ascending by field encoding, unique
@@ -24,9 +27,7 @@
 //!
 //! "sculpin-semantic-environment-v1\0"
 //! field base_kb.kb_id · field base_kb.revision · u8 ontology tag (…) ·
-//! field shapes.id · field shapes.version · u8 reasoning tag (…) ·
-//! u32 source_pin_count (<= 64), elements (field dataset_id, field source_version)
-//!     ascending by their encoding, unique ·
+//! field shapes.id · field shapes.version · u8 reasoning tag (…) · opt sources_revision ·
 //! field validator.service_version · field validator.configuration_version
 //! ```
 //!
@@ -35,7 +36,7 @@
 
 use crate::{
     ProtocolError,
-    encoding::{Cursor, TAG_ABSENT, TAG_PRESENT, canonical_set, field, u32be},
+    encoding::{Cursor, TAG_ABSENT, TAG_PRESENT, canonical_set, field, opt, u32be},
     typed_id,
 };
 use ledger_core::{CommitId, ContentId, GraphId, MAX_IDENTIFIER_BYTES, validate_token};
@@ -150,15 +151,6 @@ impl SourcePin {
         field(&mut out, &self.dataset_id)?;
         field(&mut out, &self.source_version)?;
         Ok(out)
-    }
-
-    pub(crate) fn decode(cursor: &mut Cursor<'_>) -> Result<Self, ProtocolError> {
-        let pin = Self {
-            dataset_id: cursor.field("dataset_id")?,
-            source_version: cursor.field("source_version")?,
-        };
-        pin.validate()?;
-        Ok(pin)
     }
 }
 
@@ -331,7 +323,11 @@ fn validate_semantics(
     ontology: Option<&Ontology>,
     shapes: &ShapeSet,
     reasoning: Option<&Reasoning>,
+    sources_revision: Option<&str>,
 ) -> Result<(), ProtocolError> {
+    if let Some(revision) = sources_revision {
+        token("sources_revision", revision)?;
+    }
     token("base_kb.kb_id", &base_kb.kb_id)?;
     token("base_kb.revision", &base_kb.revision)?;
     if let Some(ontology) = ontology {
@@ -358,8 +354,10 @@ pub struct SemanticEnvironment {
     pub shapes: ShapeSet,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<Reasoning>,
-    /// A set: canonicalized sorted + unique.
-    pub source_pins: Vec<SourcePin>,
+    /// Sculpin's revision of its external-source catalog (the source versions in force);
+    /// absent when no external source is in scope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sources_revision: Option<String>,
     pub validator_service_version: String,
     pub validator_configuration_version: String,
 }
@@ -371,8 +369,8 @@ impl SemanticEnvironment {
             self.ontology.as_ref(),
             &self.shapes,
             self.reasoning.as_ref(),
+            self.sources_revision.as_deref(),
         )?;
-        canonical_pins(&self.source_pins)?;
         token("validator.service_version", &self.validator_service_version)?;
         token(
             "validator.configuration_version",
@@ -389,11 +387,7 @@ impl SemanticEnvironment {
         field(&mut out, &self.shapes.id)?;
         field(&mut out, &self.shapes.version)?;
         encode_reasoning(&mut out, self.reasoning.as_ref())?;
-        let pins = canonical_pins(&self.source_pins)?;
-        u32be(&mut out, pins.len())?;
-        for pin in &pins {
-            out.extend_from_slice(pin);
-        }
+        opt(&mut out, self.sources_revision.as_deref())?;
         field(&mut out, &self.validator_service_version)?;
         field(&mut out, &self.validator_configuration_version)?;
         Ok(out)
@@ -421,12 +415,7 @@ impl SemanticEnvironment {
             version: cursor.field("shapes.version")?,
         };
         let reasoning = decode_reasoning(&mut cursor)?;
-        let source_pins = cursor.set(
-            "source pins",
-            MAX_VIRTUAL_CONTEXTS,
-            SourcePin::decode,
-            SourcePin::canonical_bytes,
-        )?;
+        let sources_revision = cursor.opt("sources_revision")?;
         let validator_service_version = cursor.field("validator.service_version")?;
         let validator_configuration_version = cursor.field("validator.configuration_version")?;
         cursor.finish()?;
@@ -435,7 +424,7 @@ impl SemanticEnvironment {
             ontology,
             shapes,
             reasoning,
-            source_pins,
+            sources_revision,
             validator_service_version,
             validator_configuration_version,
         };
@@ -456,7 +445,7 @@ impl<'de> Deserialize<'de> for SemanticEnvironment {
             #[serde(default)]
             reasoning: Option<Reasoning>,
             #[serde(default)]
-            source_pins: Vec<SourcePin>,
+            sources_revision: Option<String>,
             validator_service_version: String,
             validator_configuration_version: String,
         }
@@ -466,7 +455,7 @@ impl<'de> Deserialize<'de> for SemanticEnvironment {
             ontology: w.ontology,
             shapes: w.shapes,
             reasoning: w.reasoning,
-            source_pins: w.source_pins,
+            sources_revision: w.sources_revision,
             validator_service_version: w.validator_service_version,
             validator_configuration_version: w.validator_configuration_version,
         };
@@ -488,6 +477,10 @@ pub struct SemanticExecutionContext {
     pub shapes: ShapeSet,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<Reasoning>,
+    /// Sculpin's external-source catalog revision in force for this run (environment).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sources_revision: Option<String>,
+    /// The external sources this run actually hydrated (candidate-dependent provenance).
     /// A set: canonicalized sorted + unique.
     pub virtual_contexts: Vec<VirtualContextRef>,
     pub validator: ValidatorIdentity,
@@ -500,6 +493,7 @@ impl SemanticExecutionContext {
             self.ontology.as_ref(),
             &self.shapes,
             self.reasoning.as_ref(),
+            self.sources_revision.as_deref(),
         )?;
         for context in &self.virtual_contexts {
             context.validate()?;
@@ -530,11 +524,7 @@ impl SemanticExecutionContext {
             ontology: self.ontology.clone(),
             shapes: self.shapes.clone(),
             reasoning: self.reasoning.clone(),
-            source_pins: self
-                .virtual_contexts
-                .iter()
-                .map(VirtualContextRef::pin)
-                .collect(),
+            sources_revision: self.sources_revision.clone(),
             validator_service_version: self.validator.service_version.clone(),
             validator_configuration_version: self.validator.configuration_version.clone(),
         }
@@ -556,6 +546,7 @@ impl SemanticExecutionContext {
         field(&mut out, &self.shapes.id)?;
         field(&mut out, &self.shapes.version)?;
         encode_reasoning(&mut out, self.reasoning.as_ref())?;
+        opt(&mut out, self.sources_revision.as_deref())?;
         let contexts = self.canonical_virtual_contexts()?;
         u32be(&mut out, contexts.len())?;
         for element in &contexts {
@@ -589,6 +580,7 @@ impl SemanticExecutionContext {
             version: cursor.field("shapes.version")?,
         };
         let reasoning = decode_reasoning(&mut cursor)?;
+        let sources_revision = cursor.opt("sources_revision")?;
         let virtual_contexts = cursor.set(
             "virtual contexts",
             MAX_VIRTUAL_CONTEXTS,
@@ -609,6 +601,7 @@ impl SemanticExecutionContext {
             ontology,
             shapes,
             reasoning,
+            sources_revision,
             virtual_contexts,
             validator,
         };
@@ -632,6 +625,8 @@ impl<'de> Deserialize<'de> for SemanticExecutionContext {
             #[serde(default)]
             reasoning: Option<Reasoning>,
             #[serde(default)]
+            sources_revision: Option<String>,
+            #[serde(default)]
             virtual_contexts: Vec<VirtualContextRef>,
             validator: ValidatorIdentity,
         }
@@ -644,6 +639,7 @@ impl<'de> Deserialize<'de> for SemanticExecutionContext {
             ontology: wire.ontology,
             shapes: wire.shapes,
             reasoning: wire.reasoning,
+            sources_revision: wire.sources_revision,
             virtual_contexts: wire.virtual_contexts,
             validator: wire.validator,
         };
@@ -692,6 +688,7 @@ mod tests {
                 implementation: "sculpin-python-reasoner".into(),
                 version: "0.9.2".into(),
             }),
+            sources_revision: Some("catalog-41".into()),
             virtual_contexts: vec![vc("ds-b", "v1", &["o2", "o1"]), vc("ds-a", "v1", &["o1"])],
             validator: ValidatorIdentity {
                 service_id: "urn:sculpin:service:validator".into(),
@@ -745,11 +742,19 @@ mod tests {
         let a = sample();
         let mut b = sample();
         b.virtual_contexts[1] = vc("ds-a", "v2", &["o1"]);
+        b.sources_revision = Some("catalog-42".into());
         assert_ne!(a.id().unwrap(), b.id().unwrap());
         assert_ne!(a.environment_id().unwrap(), b.environment_id().unwrap());
+        // Under one declared catalog revision, which datasets a run hydrated is provenance
+        // only: another candidate hydrating fewer sources shares the environment.
+        let mut fewer = sample();
+        fewer.virtual_contexts.truncate(1);
+        assert_ne!(a.id().unwrap(), fewer.id().unwrap());
+        assert_eq!(a.environment_id().unwrap(), fewer.environment_id().unwrap());
         let mut c = sample();
         c.ontology = None;
         c.reasoning = None;
+        c.sources_revision = None;
         assert_ne!(a.id().unwrap(), c.id().unwrap());
         let c_bytes = c.canonical_bytes().unwrap();
         let decoded = SemanticExecutionContext::from_canonical_bytes(&c_bytes).unwrap();

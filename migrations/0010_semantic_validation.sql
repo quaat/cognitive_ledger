@@ -52,6 +52,8 @@ CREATE TABLE semantic_execution_contexts (
     reasoning_profile               TEXT        NULL,
     reasoning_implementation        TEXT        NULL,
     reasoning_version               TEXT        NULL,
+    -- Sculpin's external-source catalog revision in force (environment; NULL without sources).
+    sources_revision                TEXT        NULL,
     validator_service_id            TEXT        NOT NULL,
     validator_service_version       TEXT        NOT NULL,
     validator_configuration_version TEXT        NOT NULL,
@@ -81,6 +83,7 @@ CREATE TABLE semantic_execution_contexts (
         AND octet_length(validator_service_version) BETWEEN 1 AND 512
         AND octet_length(validator_configuration_version) BETWEEN 1 AND 512
     ),
+    CONSTRAINT sec_sources_revision_bounds CHECK (sources_revision IS NULL OR octet_length(sources_revision) BETWEEN 1 AND 512),
     CONSTRAINT sec_virtual_context_count CHECK (virtual_context_count BETWEEN 0 AND 64),
     CONSTRAINT sec_candidate_fk FOREIGN KEY (graph_id, candidate_commit)
         REFERENCES commit_index (graph_id, id),
@@ -290,7 +293,7 @@ BEGIN
     EXECUTE pg_catalog.format('GRANT UPDATE (head, version, updated_at) ON TABLE public.refs TO %s', r);
     EXECUTE pg_catalog.format('GRANT INSERT (context_id, graph_id, tenant_id, candidate_commit, candidate_state_digest, '
                    'base_kb_id, base_kb_revision, ontology_id, ontology_version, shapes_id, shapes_version, '
-                   'reasoning_profile, reasoning_implementation, reasoning_version, validator_service_id, '
+                   'reasoning_profile, reasoning_implementation, reasoning_version, sources_revision, validator_service_id, '
                    'validator_service_version, validator_configuration_version, virtual_context_count, canonical_bytes) '
                    'ON TABLE public.semantic_execution_contexts TO %s', r);
     EXECUTE pg_catalog.format('GRANT INSERT (context_id, position, dataset_id, source_version, object_refs, '

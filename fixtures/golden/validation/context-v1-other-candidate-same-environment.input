@@ -21,19 +21,10 @@
   },
   "virtual_contexts": [
     {
-      "dataset_id": "urn:sculpin:datasource:lab-b",
-      "source_version": "2026-09-20T00:00:00Z#7",
+      "dataset_id": "urn:sculpin:datasource:lab-c",
+      "source_version": "v7",
       "object_refs": [
-        "s3://lab-b/other.parquet@v3"
-      ],
-      "query_spec_digest": "sha256:1cc9c80cfda258263acb104fa92852abeef087accd97982d0167ba4e2f9fdcd5",
-      "hydration_plan_digest": "sha256:cb44cbb61ae362c29bf18633f05c22e316390bee9058ca88568c8ff9da203352"
-    },
-    {
-      "dataset_id": "urn:sculpin:datasource:lab-a",
-      "source_version": "v41",
-      "object_refs": [
-        "s3://lab-a/summary.parquet@v9"
+        "s3://lab-c/x.parquet@v1"
       ],
       "query_spec_digest": "sha256:1cc9c80cfda258263acb104fa92852abeef087accd97982d0167ba4e2f9fdcd5",
       "hydration_plan_digest": "sha256:cb44cbb61ae362c29bf18633f05c22e316390bee9058ca88568c8ff9da203352"
@@ -43,5 +34,6 @@
     "service_id": "urn:other",
     "service_version": "2026.09.1",
     "configuration_version": "cfg-2026-09-27"
-  }
+  },
+  "sources_revision": "urn:sculpin:source-catalog:rev-41"
 }

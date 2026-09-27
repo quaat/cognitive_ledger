@@ -1240,6 +1240,11 @@ const EXPECTED_CHECKS: &[(&str, &str, &str)] = &[
     ),
     (
         "semantic_execution_contexts",
+        "sec_sources_revision_bounds",
+        "CHECK(((sources_revisionISNULL)OR((octet_length(sources_revision)>=1)AND(octet_length(sources_revision)<=512))))",
+    ),
+    (
+        "semantic_execution_contexts",
         "sec_state_digest_format",
         "CHECK((candidate_state_digest~'^sha256:[0-9a-f]{64}$'))",
     ),
@@ -1844,6 +1849,7 @@ const RUNTIME_TABLE_MODEL: &[TablePrivileges] = &[
             "reasoning_profile",
             "reasoning_implementation",
             "reasoning_version",
+            "sources_revision",
             "validator_service_id",
             "validator_service_version",
             "validator_configuration_version",
@@ -2356,7 +2362,7 @@ mod tests {
             .2;
         assert_eq!(normalize_constraint_def(pg17), expected);
         assert_ne!(normalize_constraint_def("CHECK (true)"), expected);
-        assert_eq!(EXPECTED_CHECKS.len(), 55);
+        assert_eq!(EXPECTED_CHECKS.len(), 56);
     }
 
     #[test]

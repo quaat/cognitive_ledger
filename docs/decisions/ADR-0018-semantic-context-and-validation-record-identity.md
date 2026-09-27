@@ -54,6 +54,7 @@ u8     ontology tag   0x00 absent | 0x01 then field ontology.id, field ontology.
 field  shapes.id                        token
 field  shapes.version                   token
 u8     reasoning tag  0x00 absent | 0x01 then field profile, field implementation, field version
+opt    sources_revision                 token: Sculpin's external-source catalog revision in force
 u32    virtual_context_count (<= 64)    then per element, in bytewise ascending order of the
                                         element's own encoding, unique (a set):
          field dataset_id
@@ -86,16 +87,17 @@ field  base_kb.kb_id · field base_kb.revision
 u8     ontology tag (as in the context)
 field  shapes.id · field shapes.version
 u8     reasoning tag (as in the context)
-u32    source_pin_count (<= 64), elements (field dataset_id, field source_version),
-       ascending by their encoding, unique (a set)
+opt    sources_revision
 field  validator.service_version · field validator.configuration_version
 ```
-The environment of a context is its projection: base KB, ontology, shapes, reasoning, the
-`(dataset_id, source_version)` pin of every virtual context, and the validator's versions.
-It omits everything that depends on the candidate (graph, commit, state digest, object
-refs, query and hydration digests) and the ledger-side `validator.service_id`, so Sculpin
-can compute and publish the id of its *current* environment before any candidate exists.
-ADR-0019 binds acceptance to it.
+The environment of a context is its projection: base KB, ontology, shapes, reasoning,
+`sources_revision` and the validator's versions. It omits everything that depends on the
+candidate — graph, commit, state digest, and the virtual contexts a run actually hydrated
+(which datasets, object refs, query and hydration digests depend on the candidate's
+content) — and the ledger-side `validator.service_id`, so Sculpin can compute and publish
+the id of its *current* environment before any candidate exists. External-source drift is
+carried by `sources_revision`: Sculpin revises it whenever the source versions it would
+hydrate change. ADR-0019 binds acceptance to the environment.
 
 ### `sculpin-validation-record/v1`
 ```
@@ -142,7 +144,10 @@ context id could not serve as the freshness key because it hashes candidate-spec
 provenance. The layouts above supersede that draft: encoding-order sets everywhere, the
 environment layout, an optional reasoning group, conforming verdicts with non-blocking
 results, and the validator bound in the record→context foreign key. No data or release used
-the draft; its vectors were replaced.
+the draft; its vectors were replaced. A second review round found that per-run source pins
+still made the environment candidate-dependent (a candidate hydrating fewer datasets got
+another id); the pins were replaced by the Sculpin-declared `sources_revision` before any
+persistence, again with regenerated vectors.
 
 ## Alternatives considered
 - **JSON/JCS canonicalization.** Rejected for the same reasons as ADR-0009: the binary family

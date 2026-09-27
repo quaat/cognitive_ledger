@@ -53,5 +53,6 @@
     "service_id": "urn:sculpin:service:semantic-validator",
     "service_version": "2026.09.1",
     "configuration_version": "cfg-2026-09-27"
-  }
+  },
+  "sources_revision": "urn:sculpin:source-catalog:rev-41"
 }

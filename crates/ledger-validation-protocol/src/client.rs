@@ -36,6 +36,9 @@ pub struct RequestedContext {
     pub shapes: Option<ShapeSet>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_profile: Option<String>,
+    /// The external-source catalog revision the validation must run under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sources_revision: Option<String>,
     /// External source versions the validation must use (a set).
     #[serde(default)]
     pub source_pins: Vec<SourcePin>,
@@ -57,6 +60,9 @@ impl RequestedContext {
         }
         if let Some(profile) = &self.reasoning_profile {
             token("reasoning_profile", profile)?;
+        }
+        if let Some(revision) = &self.sources_revision {
+            token("sources_revision", revision)?;
         }
         canonical_pins(&self.source_pins)?;
         Ok(())
@@ -101,6 +107,9 @@ impl RequestedContext {
         {
             return Some("reasoning_profile");
         }
+        if self.sources_revision.is_some() && self.sources_revision != effective.sources_revision {
+            return Some("sources_revision");
+        }
         for pin in &self.source_pins {
             if effective.virtual_contexts.iter().any(|vc| {
                 vc.dataset_id == pin.dataset_id && vc.source_version != pin.source_version
@@ -112,8 +121,8 @@ impl RequestedContext {
     }
 
     /// Append the hint encoding used by request identity v2 (ADR-0015 amendment):
-    /// tagged pairs for base KB, ontology and shapes, `opt` reasoning profile, then the
-    /// source-pin set exactly as in `sculpin-semantic-environment/v1`.
+    /// tagged pairs for base KB, ontology and shapes, `opt` reasoning profile, `opt`
+    /// sources revision, then the source-pin set (ascending by element encoding, unique).
     pub fn encode_into(&self, out: &mut Vec<u8>) -> Result<(), ProtocolError> {
         self.validate()?;
         let pair = |a: Option<(&str, &str)>, out: &mut Vec<u8>| -> Result<(), ProtocolError> {
@@ -146,6 +155,7 @@ impl RequestedContext {
             out,
         )?;
         opt(out, self.reasoning_profile.as_deref())?;
+        opt(out, self.sources_revision.as_deref())?;
         let pins = self.canonical_source_pins()?;
         u32be(out, pins.len())?;
         for element in &pins {
@@ -217,6 +227,9 @@ pub struct EffectiveContext {
     /// Absent when no reasoning ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<Reasoning>,
+    /// Sculpin's external-source catalog revision in force (absent without external sources).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sources_revision: Option<String>,
     #[serde(default)]
     pub virtual_contexts: Vec<VirtualContextRef>,
     pub validator: ValidatorVersions,
@@ -317,6 +330,7 @@ impl ValidatorResponse {
             ontology: self.context.ontology.clone(),
             shapes: self.context.shapes.clone(),
             reasoning: self.context.reasoning.clone(),
+            sources_revision: self.context.sources_revision.clone(),
             virtual_contexts: self.context.virtual_contexts.clone(),
             validator: ValidatorIdentity {
                 service_id: service_id.to_owned(),
@@ -397,6 +411,7 @@ mod tests {
                     version: "1".into(),
                 },
                 reasoning: None,
+                sources_revision: None,
                 virtual_contexts: vec![],
                 validator: ValidatorVersions {
                     service_version: "1".into(),

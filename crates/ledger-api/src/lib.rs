@@ -168,6 +168,10 @@ impl AppState {
         {
             panic!("validator service id must be a bounded token");
         }
+        shared.store = shared
+            .store
+            .clone()
+            .with_required_validator(service.service_id.clone());
         shared.validation = Some(service);
         Self(Arc::new(shared))
     }

@@ -78,6 +78,10 @@ def encode_v2(req: dict) -> bytes:
         if profile == "":
             raise ValueError("reasoning_profile present but empty")
         out += optional(None if profile is None else token("reasoning_profile", profile))
+        revision = hints.get("sources_revision")
+        if revision == "":
+            raise ValueError("sources_revision present but empty")
+        out += optional(None if revision is None else token("sources_revision", revision))
         out += counted_set([source_pin(p) for p in hints.get("source_pins", [])], "source pins")
     else:
         raise ValueError(op)

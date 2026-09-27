@@ -31,6 +31,7 @@ ledger never logs it), `X-Correlation-Id` for tracing. Synchronous; one candidat
     "ontology": {"id": "urn:sculpin:ontology:core", "version": "O2"},
     "shapes": {"id": "urn:sculpin:shapes:material", "version": "12+shapes_hash:4b7e"},
     "reasoning_profile": "owl-rl",
+    "sources_revision": "urn:sculpin:source-catalog:rev-41",
     "source_pins": [{"dataset_id": "urn:sculpin:datasource:lab", "source_version": "v41"}]
   },
   "correlation_id": "…"
@@ -43,7 +44,9 @@ ledger never logs it), `X-Correlation-Id` for tracing. Synchronous; one candidat
   graph-scoped read path, relative to the ledger base URL, for a validator that prefers to
   fetch (it needs the `read` capability for the graph's tenant).
 - `requested` are hints; every field is optional. An absent hint means "your current one".
-  Sculpin may refuse a hint it cannot honour (4xx). Hints are part of the ledger's request
+  Sculpin may refuse a hint it cannot honour (4xx); a response that silently ignores a hint
+  (other base KB, ontology, shapes, reasoning profile, sources revision, or another version
+  of a pinned dataset) is refused as `VALIDATOR_ERROR`. Hints are part of the ledger's request
   identity, so they are also what an idempotent retry reproduces.
 
 ### Response (`sculpin-validation-response/v1`)
@@ -57,6 +60,7 @@ ledger never logs it), `X-Correlation-Id` for tracing. Synchronous; one candidat
     "ontology": {"id": "urn:sculpin:ontology:core", "version": "O2"},
     "shapes": {"id": "urn:sculpin:shapes:material", "version": "12+shapes_hash:4b7e"},
     "reasoning": {"profile": "owl-rl", "implementation": "sculpin-python-reasoner", "version": "0.9.2"},
+    "sources_revision": "urn:sculpin:source-catalog:rev-41",
     "virtual_contexts": [{
       "dataset_id": "urn:sculpin:datasource:lab", "source_version": "v41",
       "object_refs": ["s3://lab/run-9.parquet@v3"],
@@ -72,14 +76,23 @@ ledger never logs it), `X-Correlation-Id` for tracing. Synchronous; one candidat
   "report": {"digest": "sha256:…full report…", "reference": "urn:sculpin:validation-report:0f3a"}
 }
 ```
-- `context` is the **effective** context that was used (not the hints). `ontology` and
-  `reasoning` are omitted when none applied. `virtual_contexts` identify external state
+- `context` is the **effective** context that was used (not the hints). `ontology`,
+  `reasoning` and `sources_revision` are omitted when none applied. `sources_revision` is
+  Sculpin's revision of the external-source catalog in force — it must change whenever the
+  versions Sculpin would hydrate change; it is the candidate-independent freshness key for
+  external data, while `virtual_contexts` record what this run actually hydrated. `virtual_contexts` identify external state
   only — never A-Box triples. The ledger adds `validator.service_id` from its own
   configuration (`LEDGER_VALIDATOR_SERVICE_ID`); a response cannot claim a service identity.
 - `outcome.kind` is Sculpin's verdict (`conforms` | `violations`). `violation_count` is the
   number of results reported (any severity; a conforming verdict may report warnings);
-  `violations` is a bounded summary (≤ 64 entries, severity ≤ 64 bytes, message ≤ 1024
-  bytes). The ledger never evaluates severities or codes.
+  `violations` is a bounded summary (severity ≤ 64 bytes, code ≤ 512 bytes). The ledger
+  normalizes it deterministically before recording (control characters in messages become
+  spaces, messages are cut to 1024 bytes, duplicates collapse, the first 64 entries in
+  canonical order are kept) and never evaluates severities or codes. pySHACL mapping:
+  `sh:conforms` → `kind` (with `allow_warnings`, a conforming verdict may carry Warning/Info
+  results), `sh:resultSeverity` → severity, `sh:sourceConstraintComponent` → code,
+  `sh:resultMessage` → message; `report.digest` is over a serialization Sculpin fixes (e.g.
+  canonical N-Triples of the results graph).
 - `report.digest` is the SHA-256 of the complete report Sculpin keeps; `reference` is an
   optional immutable reference to it (≤ 2048 bytes). The report is never sent inline.
 - Unknown fields anywhere are refused (strict shape). The response must name the same
@@ -89,8 +102,8 @@ ledger never logs it), `X-Correlation-Id` for tracing. Synchronous; one candidat
 The ledger turns the response into a `sculpin-semantic-context/v1` (context id), a
 `sculpin-semantic-environment/v1` (environment id) and a `sculpin-validation-record/v1`
 (validation id, with a server-assigned `recorded_at`). The **environment** is the
-candidate-independent part: base KB, ontology, shapes, reasoning, `(dataset_id,
-source_version)` pins and the validator's two versions. Sculpin (or an orchestrator) can
+candidate-independent part: base KB, ontology, shapes, reasoning, `sources_revision` and
+the validator's two versions. Sculpin (or an orchestrator) can
 compute the environment id of "what is current now" from the frozen layout without any
 candidate, and acceptance names it (ADR-0019): a validation from another environment is
 `VALIDATION_STALE`. The reference encoder is `scripts/golden/validation_v1_reference.py`
@@ -105,7 +118,9 @@ candidate, and acceptance names it (ADR-0019): a validation from another environ
 2. **Content-identifying `ontology.version` and `shapes.version`**: two different ontologies
    or shape sets must never share `(id, version)`; append a content digest (e.g.
    `12+shapes_hash:…`) where the version counter alone is not content-derived.
-3. **Virtual A-Box identification**: stable `dataset_id`, `source_version`, object/version
+3. **An external-source catalog revision** (`sources_revision`) that changes whenever the
+   source versions in force change, plus **Virtual A-Box identification**: stable
+   `dataset_id`, `source_version`, object/version
    references (≤ 64; fold larger lists into `hydration_plan_digest`), and digests of the
    query specification and hydration plan.
 4. **An endpoint implementing this contract**, authenticated by workload identity.

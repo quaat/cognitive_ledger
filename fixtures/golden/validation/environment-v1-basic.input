@@ -16,16 +16,7 @@
     "implementation": "sculpin-python-reasoner",
     "version": "0.9.2"
   },
-  "source_pins": [
-    {
-      "dataset_id": "urn:sculpin:datasource:lab-b",
-      "source_version": "2026-09-20T00:00:00Z#7"
-    },
-    {
-      "dataset_id": "urn:sculpin:datasource:lab-a",
-      "source_version": "v41"
-    }
-  ],
+  "sources_revision": "urn:sculpin:source-catalog:rev-41",
   "validator_service_version": "2026.09.1",
   "validator_configuration_version": "cfg-2026-09-27"
 }

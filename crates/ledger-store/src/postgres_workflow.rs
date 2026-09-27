@@ -155,6 +155,9 @@ pub struct WorkflowRepository {
     immutable: PostgresImmutableStore,
     failpoint: Option<FailPoint>,
     limits: crate::ReconstructionLimits,
+    /// The validation service this deployment is configured to call (ADR-0019): when set,
+    /// acceptance refuses a record produced by any other service as `VALIDATION_STALE`.
+    required_validator: Option<String>,
 }
 
 /// Composition root: one pool shared by the immutable store, the graph authority and the
@@ -281,6 +284,12 @@ impl PostgresLedgerStore {
     pub fn with_limits(mut self, limits: crate::ReconstructionLimits) -> Self {
         self.workflows = self.workflows.with_limits(limits);
         self.validations = self.validations.with_limits(limits);
+        self
+    }
+
+    /// Bind acceptance to validations produced by the configured validation service.
+    pub fn with_required_validator(mut self, service_id: impl Into<String>) -> Self {
+        self.workflows = self.workflows.with_required_validator(service_id);
         self
     }
 
@@ -480,7 +489,15 @@ impl WorkflowRepository {
             immutable,
             failpoint: None,
             limits: crate::ReconstructionLimits::DEVELOPMENT,
+            required_validator: None,
         }
+    }
+
+    /// Require cited validations to come from this validation service (deployment
+    /// configuration; a ledger policy on opaque identity, not semantics).
+    pub fn with_required_validator(mut self, service_id: impl Into<String>) -> Self {
+        self.required_validator = Some(service_id.into());
+        self
     }
 
     /// Bound every base-state reconstruction this repository performs.
@@ -1167,6 +1184,15 @@ impl WorkflowRepository {
                 .await?;
                 if !cited.conforms {
                     return Err(LedgerError::ValidationRejected);
+                }
+                if self
+                    .required_validator
+                    .as_ref()
+                    .is_some_and(|required| required != &cited.validator_service_id)
+                {
+                    return Err(LedgerError::ValidationStale(format!(
+                        "validation {validation_id} was produced by another validation service"
+                    )));
                 }
                 if &cited.environment_id != semantic_environment_id {
                     return Err(LedgerError::ValidationStale(format!(

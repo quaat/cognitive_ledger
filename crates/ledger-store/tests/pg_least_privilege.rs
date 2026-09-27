@@ -874,6 +874,7 @@ async fn grant_function_is_owner_only_idempotent_and_refuses_unknown_roles() {
                 "reasoning_profile",
                 "reasoning_implementation",
                 "reasoning_version",
+                "sources_revision",
                 "validator_service_id",
                 "validator_service_version",
                 "validator_configuration_version",
@@ -2287,6 +2288,7 @@ async fn validation_persistence_runs_under_the_runtime_identity_and_its_controls
             implementation: "pyshacl".into(),
             version: "0.26".into(),
         }),
+        sources_revision: None,
         virtual_contexts: vec![],
         validator: ValidatorIdentity {
             service_id: "urn:sculpin:service:validator".into(),

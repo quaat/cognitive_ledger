@@ -17,9 +17,9 @@ use ledger_core::{ContentId, GraphId, TenantId};
 use ledger_store::{DbSessionLimits, GraphStatus, NewGraph, PostgresLedgerStore, V1Binding};
 use ledger_validation_protocol::{
     BaseKb, EffectiveContext, Ontology, OutcomeKind, Reasoning, ReportReference,
-    SemanticExecutionContext, ShapeSet, VALIDATION_RESPONSE_PROTOCOL, ValidationClient,
-    ValidationClientError, ValidationOutcome, ValidationRequest, ValidatorResponse,
-    ValidatorVersions, ViolationSummary, VirtualContextRef,
+    SemanticEnvironment, SemanticExecutionContext, ShapeSet, VALIDATION_RESPONSE_PROTOCOL,
+    ValidationClient, ValidationClientError, ValidationOutcome, ValidationRequest,
+    ValidatorResponse, ValidatorVersions, ViolationSummary, VirtualContextRef,
 };
 use serde_json::{Value, json};
 use sqlx::Row;
@@ -203,9 +203,16 @@ impl ValidationClient for FakeValidator {
                     version: "S1".into(),
                 },
                 reasoning,
+                // Sculpin's catalog revision follows the external version in force.
+                sources_revision: Some(format!("catalog-{external}")),
+                // Which dataset a run hydrates depends on the candidate (provenance only).
                 virtual_contexts: vec![VirtualContextRef {
-                    dataset_id: "urn:sculpin:datasource:lab".into(),
-                    source_version: external,
+                    dataset_id: if text.contains("reference-data") {
+                        "urn:sculpin:datasource:reference".into()
+                    } else {
+                        "urn:sculpin:datasource:lab".into()
+                    },
+                    source_version: external.clone(),
                     object_refs: vec!["s3://lab/run-1.parquet".into()],
                     query_spec_digest: digest("query"),
                     hydration_plan_digest: digest("plan"),
@@ -1181,4 +1188,78 @@ async fn validation_resource_limits_have_stable_codes() {
         StatusCode::CREATED,
         "the budget is released after the call"
     );
+}
+
+/// The environment an orchestrator names is computable from what Sculpin declares current,
+/// before any candidate or record exists; candidates hydrating different external datasets
+/// under the same declared environment are accepted with that one id (review round 2).
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn one_declared_environment_accepts_candidates_that_hydrate_different_sources() {
+    let h = harness().await;
+    let g = h.graph("tenant-v").await;
+    let t = token("tenant-v", "orchestrator", &ROLES);
+    let declared = SemanticEnvironment {
+        base_kb: BaseKb {
+            kb_id: "urn:exodus:kb:material-science".into(),
+            revision: "kbrev-7".into(),
+        },
+        ontology: Some(Ontology {
+            id: "urn:sculpin:ontology:core".into(),
+            version: "O1".into(),
+        }),
+        shapes: ShapeSet {
+            id: "urn:sculpin:shapes:material".into(),
+            version: "S1".into(),
+        },
+        reasoning: None,
+        sources_revision: Some("catalog-D-A".into()),
+        validator_service_version: "2026.09.1".into(),
+        validator_configuration_version: "cfg-1".into(),
+    };
+    let declared_id = json!(declared.id().unwrap().to_string());
+    let c1 = h
+        .prepare(&g, &t, None, "<urn:material:a> <urn:label> \"A\" .")
+        .await;
+    let (_, v1) = h.validate(&g, &t, &c1, "v1", json!({})).await;
+    assert_eq!(v1["semantic_environment_id"], declared_id, "{v1}");
+    let (status, _) = h
+        .accept(
+            &g,
+            &t,
+            &c1,
+            None,
+            "a1",
+            Some((&v1["validation_id"], &declared_id)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let c2 = h
+        .prepare(
+            &g,
+            &t,
+            Some(&c1),
+            "<urn:material:reference-data> <urn:label> \"R\" .",
+        )
+        .await;
+    let (_, v2) = h.validate(&g, &t, &c2, "v2", json!({})).await;
+    assert_ne!(
+        v2["context"]["virtual_contexts"][0]["dataset_id"],
+        v1["context"]["virtual_contexts"][0]["dataset_id"],
+        "the two runs hydrated different sources"
+    );
+    assert_ne!(v2["semantic_context_id"], v1["semantic_context_id"]);
+    assert_eq!(v2["semantic_environment_id"], declared_id);
+    let (status, a2) = h
+        .accept(
+            &g,
+            &t,
+            &c2,
+            Some(&c1),
+            "a2",
+            Some((&v2["validation_id"], &declared_id)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{a2}");
+    assert_eq!(h.head(&g).await, Some((c2, 2)));
 }

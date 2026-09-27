@@ -451,8 +451,8 @@ impl ValidationRepository {
              candidate_state_digest, base_kb_id, base_kb_revision, ontology_id, ontology_version, shapes_id, \
              shapes_version, reasoning_profile, reasoning_implementation, reasoning_version, \
              validator_service_id, validator_service_version, validator_configuration_version, \
-             virtual_context_count, canonical_bytes) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) \
+             virtual_context_count, canonical_bytes, sources_revision) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20) \
              ON CONFLICT (context_id) DO NOTHING",
         )
         .bind(id.to_string())
@@ -474,6 +474,7 @@ impl ValidationRepository {
         .bind(&canonical.validator.configuration_version)
         .bind(i32::try_from(canonical.virtual_contexts.len()).expect("bounded by protocol"))
         .bind(bytes)
+        .bind(canonical.sources_revision.as_deref())
         .execute(&mut *conn)
         .await
         .map_err(db_error)?;
@@ -638,6 +639,7 @@ pub(crate) struct CitedValidation {
     pub(crate) validation_id: ValidationId,
     pub(crate) environment_id: SemanticEnvironmentId,
     pub(crate) conforms: bool,
+    pub(crate) validator_service_id: String,
 }
 
 /// Predicates 1–3 of ADR-0019 on the caller's connection: the record exists for the caller's
@@ -669,6 +671,7 @@ pub(crate) async fn cited_validation(
         validation_id: validation_id.clone(),
         environment_id: context.environment_id()?,
         conforms: record.outcome.is_conforming(),
+        validator_service_id: record.validator.service_id.clone(),
     })
 }
 

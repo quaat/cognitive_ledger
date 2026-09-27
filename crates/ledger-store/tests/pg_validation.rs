@@ -175,6 +175,7 @@ fn context_for(
             implementation: "sculpin-python-reasoner".into(),
             version: "0.9".into(),
         }),
+        sources_revision: None,
         virtual_contexts: vec![VirtualContextRef {
             dataset_id: "urn:sculpin:datasource:lab".into(),
             source_version: external_version.into(),

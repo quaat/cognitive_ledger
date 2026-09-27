@@ -23,7 +23,8 @@ accept(candidate, expected_head, validation_id, semantic_environment_id, reason?
 Both identifiers are required under the production policy (`validation_policy =
 "validated"`). The reviewer or orchestrator states which environment it is accepting
 under; Sculpin — not the ledger — knows the currently applicable environment (base KB
-revision, ontology, shapes, reasoning, external source versions, validator versions) and
+revision, ontology, shapes, reasoning, external-source catalog revision, validator versions)
+and
 can compute its id from the frozen, candidate-independent layout
 `sculpin-semantic-environment/v1` (ADR-0018) before any candidate exists. Inside the single acceptance transaction, after the
 idempotent-replay lookup and before any write, the repository verifies:
@@ -38,6 +39,11 @@ idempotent-replay lookup and before any write, the repository verifies:
 5. the environment of its context equals the `semantic_environment_id` the request names
    (`VALIDATION_STALE` otherwise).
 
+When the deployment configures a validation service (`LEDGER_VALIDATOR_SERVICE_ID`), the
+record must also have been produced by that service (`VALIDATION_STALE` otherwise): the
+environment deliberately omits the ledger-side service identity, so this is a separate,
+opaque ledger policy.
+
 Predicates 2–5 are evaluated on the verified canonical bytes of the record and its context
 (hash checked, strictly decoded), never on the relational projection columns.
 
@@ -51,10 +57,9 @@ validation record remain immutable and auditable.
 exactly the one the accepting party names. The stale scenario (validated under ontology O1,
 acceptance required under O2) is expressed by the orchestrator naming O2's environment id,
 which differs from the record's → `VALIDATION_STALE`; revalidation produces a new record in
-O2's environment and acceptance with that pair succeeds if HEAD and lineage still hold. Changes
-in base-KB revision, ontology, shapes, reasoning configuration, Virtual A-Box source
-versions or validator identity/version all change the context id and are therefore all
-covered by one rule. Deployments may later add server-side pinning policies (per branch);
+O2's environment and acceptance with that pair succeeds if HEAD and lineage still hold. Changes in base-KB revision, ontology, shapes, reasoning configuration, the external-source
+catalog revision or validator versions all change the environment id and are therefore all
+covered by one rule; a change of validation service is covered by the service rule above. Deployments may later add server-side pinning policies (per branch);
 those are additive and do not weaken this rule.
 
 ### Rejection may cite validations
