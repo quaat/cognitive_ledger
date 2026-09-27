@@ -408,6 +408,13 @@ fn validator_settings(
     service_id: Option<&str>,
     token_file: Option<&str>,
 ) -> Result<ValidatorSettings, String> {
+    if production_auth && token_file == Some("") {
+        return Err(
+            "LEDGER_VALIDATOR_TOKEN_FILE is set but empty; with production authentication it \
+             must name a credential file or be unset"
+                .into(),
+        );
+    }
     let non_empty = |v: Option<&str>| v.filter(|v| !v.is_empty()).map(str::to_owned);
     let (url, service_id, token_file) =
         (non_empty(url), non_empty(service_id), non_empty(token_file));
@@ -464,14 +471,23 @@ fn validation_service(
         return Ok((settings.trust, None));
     };
     let bearer_token = match settings.token_file {
-        Some(path) => Some(
-            std::fs::read_to_string(&path)
-                .map_err(|_| {
-                    "LEDGER_VALIDATOR_TOKEN_FILE cannot be read (path not shown)".to_owned()
-                })?
-                .trim()
-                .to_owned(),
-        ),
+        Some(path) => {
+            const MAX_TOKEN_FILE_BYTES: u64 = 64 * 1024;
+            let unreadable =
+                || "LEDGER_VALIDATOR_TOKEN_FILE cannot be read (path not shown)".to_owned();
+            let size = std::fs::metadata(&path).map_err(|_| unreadable())?.len();
+            if size > MAX_TOKEN_FILE_BYTES {
+                return Err(format!(
+                    "LEDGER_VALIDATOR_TOKEN_FILE exceeds {MAX_TOKEN_FILE_BYTES} bytes"
+                ));
+            }
+            Some(
+                std::fs::read_to_string(&path)
+                    .map_err(|_| unreadable())?
+                    .trim()
+                    .to_owned(),
+            )
+        }
         None => None,
     };
     if limits.validator_timeout >= limits.request_timeout {
@@ -789,6 +805,11 @@ mod tests {
         assert!(validator_settings(false, None, Some(&oversized), None).is_err());
         let e = validator_settings(false, None, Some(S1), Some("/run/token")).unwrap_err();
         assert!(e.contains("LEDGER_VALIDATOR_TOKEN_FILE requires"), "{e}");
+        // a set-but-empty token file is a templating mistake under production authentication
+        let e =
+            validator_settings(true, Some("https://v/validate"), Some(S1), Some("")).unwrap_err();
+        assert!(e.contains("set but empty"), "{e}");
+        assert!(validator_settings(false, None, Some(S1), Some("")).is_ok());
     }
 
     #[test]

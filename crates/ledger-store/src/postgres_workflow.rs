@@ -325,6 +325,18 @@ impl PostgresLedgerStore {
         self
     }
 
+    /// Fault injection for the validation record transaction (qualification tests only, like
+    /// [`WorkflowRepository::with_failpoint`]): the write fails at `point` and rolls back.
+    pub fn with_validation_failpoint(mut self, point: FailPoint) -> Self {
+        self.validations = self.validations.with_failpoint(point);
+        self
+    }
+
+    /// The trust policy validated acceptance enforces, if any.
+    pub fn validation_trust(&self) -> Option<&ValidationTrustPolicy> {
+        self.workflows.trust.as_ref()
+    }
+
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
@@ -1215,9 +1227,8 @@ impl WorkflowRepository {
                     validation_id,
                 )
                 .await?;
-                if !cited.conforms {
-                    return Err(LedgerError::ValidationRejected);
-                }
+                // Trust first: the verdict of an untrusted service is neither acted on nor
+                // disclosed (it would otherwise surface as VALIDATION_REJECTED).
                 if !self
                     .trust
                     .as_ref()
@@ -1227,6 +1238,9 @@ impl WorkflowRepository {
                         "validation {validation_id} was not produced by a validation service this \
                          deployment trusts"
                     )));
+                }
+                if !cited.conforms {
+                    return Err(LedgerError::ValidationRejected);
                 }
                 if &cited.environment_id != semantic_environment_id {
                     return Err(LedgerError::ValidationStale(format!(

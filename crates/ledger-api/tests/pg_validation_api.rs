@@ -15,7 +15,8 @@ use ledger_api::{
 };
 use ledger_core::{ContentId, GraphId, TenantId};
 use ledger_store::{
-    DbSessionLimits, GraphStatus, NewGraph, PostgresLedgerStore, V1Binding, ValidationTrustPolicy,
+    DbSessionLimits, FailPoint, GraphStatus, NewGraph, PostgresLedgerStore, V1Binding,
+    ValidationTrustPolicy,
 };
 use ledger_validation_protocol::{
     BaseKb, EffectiveContext, Ontology, OutcomeKind, Reasoning, ReportReference,
@@ -413,13 +414,27 @@ async fn app_for(
     trust: Option<&str>,
     client: Option<&str>,
 ) -> Router {
-    let store = PostgresLedgerStore::connect_with(
+    app_with_failpoint(runtime_url, limits, validator, trust, client, None).await
+}
+
+async fn app_with_failpoint(
+    runtime_url: &str,
+    limits: ApiLimits,
+    validator: &Arc<FakeValidator>,
+    trust: Option<&str>,
+    client: Option<&str>,
+    failpoint: Option<FailPoint>,
+) -> Router {
+    let mut store = PostgresLedgerStore::connect_with(
         runtime_url,
         V1Binding::Reject,
         DbSessionLimits::default(),
     )
     .await
     .expect("runtime identity verify-only start-up");
+    if let Some(point) = failpoint {
+        store = store.with_validation_failpoint(point);
+    }
     let auth: SharedAuthenticator = Arc::new(
         DevHs256Authenticator::new(
             ISSUER.into(),
@@ -458,6 +473,26 @@ impl Harness {
                 &self.validator,
                 trust,
                 client,
+            )
+            .await,
+            validator: self.validator.clone(),
+            runtime_url: self.runtime_url.clone(),
+            limits: self.limits,
+        }
+    }
+
+    /// Like [`Harness::restarted`] with the validation record transaction failing at `point`
+    /// (the server dies after the validator answered, before the record commits).
+    async fn crashing_at(&self, point: FailPoint) -> Harness {
+        Harness {
+            owner: self.owner.clone(),
+            app: app_with_failpoint(
+                &self.runtime_url,
+                self.limits,
+                &self.validator,
+                Some(SERVICE_ID),
+                Some(SERVICE_ID),
+                Some(point),
             )
             .await,
             validator: self.validator.clone(),
@@ -1071,6 +1106,7 @@ async fn validator_trust_is_independent_of_the_endpoint_and_fails_closed() {
     let other = h.restarted(Some(S2), Some(S2)).await;
     let refused = other.accept(&g, &t, &c, None, "a-s2", Some(cited)).await;
     assert_code(&refused, StatusCode::CONFLICT, "VALIDATION_STALE");
+    assert!(!refused.1.to_string().contains(SERVICE_ID), "{}", refused.1);
     // A development server with no trust anchor refuses every validated acceptance.
     let untrusting = h.restarted(None, None).await;
     let refused = untrusting
@@ -1201,7 +1237,11 @@ async fn concurrent_same_key_validations_are_one_logical_invocation() {
         h.validator.wait_for_calls(calls + 2).await;
         gate.notify_one();
     };
-    let ((s1, r1), (s2, r2), ()) = tokio::join!(first, second, release);
+    let ((s1, r1), (s2, r2), ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(first, second, release)
+    })
+    .await
+    .expect("the race resolves promptly");
     let mut statuses = [s1, s2];
     statuses.sort();
     assert_eq!(
@@ -1257,13 +1297,13 @@ async fn concurrent_same_key_validations_are_one_logical_invocation() {
     );
 }
 
-/// The validator answered but the ledger request died before recording (the waiting request
-/// is dropped: server crash / client gone). Nothing was recorded. The retry — on a restarted
-/// server, same key and body — carries the same invocation identity, so the validator
-/// returns the same logical result even though its environment has moved since.
+/// The validator answered but the answer never reached the ledger (connection lost, client
+/// gone: the waiting request is dropped). Nothing was recorded. The retry — on a restarted
+/// server, same key and body — carries the same invocation identity, so the validator returns
+/// the same logical result even though its environment has moved since.
 #[tokio::test]
 #[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
-async fn a_retry_after_a_crash_between_answer_and_record_reuses_the_invocation() {
+async fn a_retry_after_a_lost_answer_reuses_the_invocation() {
     let h = harness().await;
     h.validator.honour_invocation_identity();
     let g = h.graph("tenant-v").await;
@@ -1274,12 +1314,14 @@ async fn a_retry_after_a_crash_between_answer_and_record_reuses_the_invocation()
     let before = h.footprint(&g).await;
     let (calls, logical) = (h.validator.calls(), h.validator.logical());
     h.validator.crash_after_next_answer();
-    let crashed = tokio::time::timeout(
-        Duration::from_millis(500),
-        h.validate(&g, &t, &c, "v-crash", json!({})),
-    )
-    .await;
-    assert!(crashed.is_err(), "the request died before it could record");
+    // Drop the request once the validator has computed its answer (the logical validation
+    // completes within the poll that counts it: no await follows the snapshot).
+    tokio::select! {
+        reply = h.validate(&g, &t, &c, "v-lost", json!({})) => {
+            panic!("the answer must never arrive: {reply:?}")
+        }
+        () = h.validator.wait_for_logical(logical + 1) => {}
+    }
     assert_eq!(
         h.validator.logical(),
         logical + 1,
@@ -1288,7 +1330,7 @@ async fn a_retry_after_a_crash_between_answer_and_record_reuses_the_invocation()
     assert_eq!(h.footprint(&g).await, before, "nothing recorded");
     h.validator.set_kb_revision("kbrev-9");
     let restarted = h.restarted(Some(SERVICE_ID), Some(SERVICE_ID)).await;
-    let (status, v) = restarted.validate(&g, &t, &c, "v-crash", json!({})).await;
+    let (status, v) = restarted.validate(&g, &t, &c, "v-lost", json!({})).await;
     assert_eq!(status, StatusCode::CREATED, "{v}");
     let invocations = h.validator.invocations();
     assert_eq!(invocations.len(), calls + 2);
@@ -1304,10 +1346,69 @@ async fn a_retry_after_a_crash_between_answer_and_record_reuses_the_invocation()
     );
     assert_eq!(v["context"]["base_kb"]["revision"], "kbrev-7");
     // It is now durable: a further retry replays without calling the validator.
-    let (status, replay) = restarted.validate(&g, &t, &c, "v-crash", json!({})).await;
+    let (status, replay) = restarted.validate(&g, &t, &c, "v-lost", json!({})).await;
     assert_eq!(status, StatusCode::OK, "{replay}");
     assert_eq!(replay["validation_id"], v["validation_id"]);
     assert_eq!(h.validator.calls(), calls + 2);
+}
+
+/// The ledger received the validator's answer and then failed inside the record transaction
+/// (every record failpoint: after the context, after the record, before commit). Nothing was
+/// recorded; the retry on a healthy server reuses the invocation identity and records the
+/// original logical result although the validator's environment moved in between.
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn a_retry_after_a_crash_between_answer_and_record_reuses_the_invocation() {
+    let h = harness().await;
+    h.validator.honour_invocation_identity();
+    let g = h.graph("tenant-v").await;
+    let t = token("tenant-v", "orchestrator", &ROLES);
+    for (n, point) in [
+        FailPoint::AfterLineageValidation, // after the context insert
+        FailPoint::AfterDecision,          // after the record insert
+        FailPoint::BeforeCommit,           // after the idempotency result
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        h.validator.set_kb_revision("kbrev-7");
+        let c = h
+            .prepare(
+                &g,
+                &t,
+                None,
+                &format!("<urn:material:{n}> <urn:label> \"X\" ."),
+            )
+            .await;
+        let key = format!("v-crash-{n}");
+        let before = h.footprint(&g).await;
+        let (calls, logical) = (h.validator.calls(), h.validator.logical());
+        let crashing = h.crashing_at(point).await;
+        let (status, failed) = crashing.validate(&g, &t, &c, &key, json!({})).await;
+        assert!(status.is_server_error(), "{point:?}: {status} {failed}");
+        assert_eq!(
+            h.validator.logical(),
+            logical + 1,
+            "{point:?}: validator answered"
+        );
+        assert_eq!(h.footprint(&g).await, before, "{point:?}: nothing recorded");
+        h.validator.set_kb_revision("kbrev-9");
+        let (status, v) = h.validate(&g, &t, &c, &key, json!({})).await;
+        assert_eq!(status, StatusCode::CREATED, "{point:?}: {v}");
+        let invocations = h.validator.invocations();
+        assert_eq!(invocations.len(), calls + 2, "{point:?}");
+        assert_eq!(
+            invocations[calls],
+            invocations[calls + 1],
+            "{point:?}: same identity"
+        );
+        assert_eq!(
+            h.validator.logical(),
+            logical + 1,
+            "{point:?}: one logical validation"
+        );
+        assert_eq!(v["context"]["base_kb"]["revision"], "kbrev-7", "{point:?}");
+    }
 }
 
 /// The same key with different hints is a different invocation; racing them, the request
@@ -1327,13 +1428,25 @@ async fn same_key_with_other_hints_is_another_invocation_and_conflicts() {
     let held = h.validate(&g, &t, &c, "v-k", json!({}));
     let other_then_release = async {
         h.validator.wait_for_logical(logical + 1).await;
-        let reply = h
-            .validate(&g, &t, &c, "v-k", json!({"reasoning_profile": "rdfs"}))
-            .await;
+        let other = h.validate(&g, &t, &c, "v-k", json!({"reasoning_profile": "rdfs"}));
+        let check = async {
+            h.validator.wait_for_calls(calls + 2).await;
+            let invocations = h.validator.invocations();
+            assert_ne!(
+                invocations[calls],
+                invocations[calls + 1],
+                "other body, other invocation (checked before the gate opens)"
+            );
+        };
+        let (reply, ()) = tokio::join!(other, check);
         gate.notify_one();
         reply
     };
-    let (held, other) = tokio::join!(held, other_then_release);
+    let (held, other) = tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::join!(held, other_then_release)
+    })
+    .await
+    .expect("the race resolves promptly");
     assert_eq!(other.0, StatusCode::CREATED, "{}", other.1);
     assert_code(&held, StatusCode::CONFLICT, "IDEMPOTENCY_CONFLICT");
     let invocations = h.validator.invocations();

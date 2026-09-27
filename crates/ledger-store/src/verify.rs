@@ -286,13 +286,21 @@ pub async fn run(pool: &PgPool) -> Result<Report, LedgerError> {
 async fn verify_validation_bytes(pool: &PgPool) -> Result<Vec<CheckResult>, LedgerError> {
     use ledger_validation_protocol::{SemanticExecutionContext, ValidationId};
     use std::collections::HashMap;
+    // One snapshot for every query below: detail rows, records and contexts are compared with
+    // each other, so a validation committed between two statements (a live server) must be
+    // seen in all of them or in none.
+    let mut tx = pool.begin().await.map_err(db_error)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
     // Detail rows, grouped by parent and ordered by position (one query per table).
     let mut summaries: HashMap<String, Vec<(i32, String, String, String)>> = HashMap::new();
     for row in sqlx::query(
         "SELECT validation_id, position, severity, code, message FROM validation_violations \
          ORDER BY validation_id, position",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(db_error)?
     {
@@ -312,7 +320,7 @@ async fn verify_validation_bytes(pool: &PgPool) -> Result<Vec<CheckResult>, Ledg
         "SELECT context_id, position, dataset_id, source_version, object_refs, query_spec_digest, \
                 hydration_plan_digest FROM semantic_virtual_contexts ORDER BY context_id, position",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(db_error)?
     {
@@ -337,7 +345,7 @@ async fn verify_validation_bytes(pool: &PgPool) -> Result<Vec<CheckResult>, Ledg
                 (SELECT count(*) FROM validation_violations v WHERE v.validation_id = r.validation_id) AS summaries \
          FROM validation_records r JOIN semantic_execution_contexts c ON c.context_id = r.context_id",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(db_error)?;
     for row in &rows {
@@ -390,7 +398,7 @@ async fn verify_validation_bytes(pool: &PgPool) -> Result<Vec<CheckResult>, Ledg
                 reasoning_implementation, reasoning_version, sources_revision, validator_service_id, virtual_context_count, \
                 canonical_bytes FROM semantic_execution_contexts",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await
     .map_err(db_error)?;
     for row in &rows {
@@ -442,6 +450,7 @@ async fn verify_validation_bytes(pool: &PgPool) -> Result<Vec<CheckResult>, Ledg
             context_bad.push(id);
         }
     }
+    tx.rollback().await.map_err(db_error)?;
     let result = |name: &'static str, bad: Vec<String>| CheckResult {
         name,
         violations: bad.len() as i64,

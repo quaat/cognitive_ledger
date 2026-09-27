@@ -751,7 +751,7 @@ const fn uq(table: &'static str, columns: &'static [&'static str]) -> ExpectedCo
 /// `MATCH SIMPLE`, so a key column that became nullable would let a row skip its foreign key
 /// entirely; the verifier therefore checks nullability structurally like every other
 /// control (a column that is additionally `NOT NULL` is harmless and accepted).
-const EXPECTED_NOT_NULL: &[(&str, &[&str])] = &[
+pub const EXPECTED_NOT_NULL: &[(&str, &[&str])] = &[
     (
         "commit_index",
         &[
@@ -1524,14 +1524,9 @@ fn index_key(name: &str) -> String {
     format!("index:{name}")
 }
 
-/// Every expected FOREIGN KEY / PRIMARY KEY / UNIQUE constraint exists (at least one validated,
-/// non-deferrable match of the expected shape, referenced tables in `public`, NULLS NOT
-/// DISTINCT where required); every named CHECK exists and is validated; every unique index
-/// exists with the expected columns and partiality. Catalog-only (attnums resolved to names,
-/// no deparse), so it is lock-free and runs on readiness. Returns the expression fingerprints
-/// of the CHECKs and partial-index predicates for readiness comparison.
 /// Refuse a database in which any column the migrations declare `NOT NULL` accepts NULL
-/// (catalog read only; runs at start-up and on readiness).
+/// (catalog read only; runs at start-up and on readiness). A `NOT VALID` not-null constraint
+/// (PostgreSQL 18+, `contype = 'n'`) does not count: existing rows may still be NULL.
 async fn verify_not_null(pool: &PgPool) -> Result<(), LedgerError> {
     let rows = sqlx::query(
         "SELECT c.relname::text AS table_name, a.attname::text AS column_name \
@@ -1539,7 +1534,9 @@ async fn verify_not_null(pool: &PgPool) -> Result<(), LedgerError> {
          JOIN pg_class c ON c.oid = a.attrelid \
          JOIN pg_namespace n ON n.oid = c.relnamespace \
          WHERE n.nspname = 'public' AND c.relkind = 'r' AND a.attnum > 0 \
-           AND NOT a.attisdropped AND a.attnotnull",
+           AND NOT a.attisdropped AND a.attnotnull \
+           AND NOT EXISTS (SELECT 1 FROM pg_constraint k WHERE k.conrelid = a.attrelid \
+                           AND k.contype = 'n' AND NOT k.convalidated AND a.attnum = ANY (k.conkey))",
     )
     .fetch_all(pool)
     .await
@@ -1562,6 +1559,12 @@ async fn verify_not_null(pool: &PgPool) -> Result<(), LedgerError> {
     Ok(())
 }
 
+/// Every expected FOREIGN KEY / PRIMARY KEY / UNIQUE constraint exists (at least one validated,
+/// non-deferrable match of the expected shape, referenced tables in `public`, NULLS NOT
+/// DISTINCT where required); every named CHECK exists and is validated; every unique index
+/// exists with the expected columns and partiality. Catalog-only (attnums resolved to names,
+/// no deparse), so it is lock-free and runs on readiness. Returns the expression fingerprints
+/// of the CHECKs and partial-index predicates for readiness comparison.
 async fn verify_constraints_and_indexes(
     pool: &PgPool,
 ) -> Result<BTreeMap<String, String>, LedgerError> {

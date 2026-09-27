@@ -144,11 +144,14 @@ impl AppState {
         // One source of truth for reconstruction bounds: the workflow's base
         // reconstruction and public state reads use the same limits.
         let store = store.with_limits(limits.reconstruction);
+        // A trust anchor already on the store is the state's: it can then only be confirmed,
+        // never silently replaced.
+        let trust = store.validation_trust().cloned();
         Self(Arc::new(Shared {
             expensive: tokio::sync::Semaphore::new(limits.max_concurrent_expensive),
             validations: tokio::sync::Semaphore::new(limits.max_concurrent_validations),
             validation: None,
-            trust: None,
+            trust,
             store,
             authenticator,
             limits,
@@ -571,8 +574,9 @@ impl ApiError {
             E::ValidationStale(_) => (
                 StatusCode::CONFLICT,
                 "VALIDATION_STALE",
-                "the named validation ran in another semantic environment; revalidate under \
-                 the required environment"
+                "the named validation does not satisfy this deployment's acceptance policy: it \
+                 ran in another semantic environment than the one named, or was not produced by \
+                 the validation service this deployment trusts"
                     .into(),
             ),
             E::ValidationNotFound => (
@@ -1417,6 +1421,17 @@ async fn validate(
         candidate: candidate.clone(),
         requested: body.requested,
     };
+    // One logical invocation per (authenticated scope, key, canonical request): concurrent
+    // duplicates and retries after a lost response or crash carry the same id, so the
+    // validator resolves them to one validation in one environment (ADR-0019 amendment).
+    let invocation_id = ValidationInvocation::for_request(
+        &request.scope.principal,
+        &request.scope.graph,
+        &request.scope.idempotency_key,
+        &request.scope.request_digest,
+    )
+    .id()
+    .map_err(|e| ApiError::from_ledger(e.into(), &correlation))?;
     let store = state.0.store.validations();
     // A completed identical request replays before any admission slot or validator check.
     let replayed = store
@@ -1500,17 +1515,6 @@ async fn validate(
         }
         quads.push(line);
     }
-    // One logical invocation per (authenticated scope, key, canonical request): concurrent
-    // duplicates and retries after a lost response or crash carry the same id, so the
-    // validator resolves them to one validation in one environment (ADR-0019 amendment).
-    let invocation_id = ValidationInvocation::for_request(
-        &request.scope.principal,
-        &request.scope.graph,
-        &request.scope.idempotency_key,
-        &request.scope.request_digest,
-    )
-    .id()
-    .map_err(|e| ApiError::from_ledger(e.into(), &correlation))?;
     let mut outbound = ValidationRequest::new(
         invocation_id,
         CandidateDescriptor {

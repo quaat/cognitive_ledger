@@ -50,6 +50,12 @@
   elements and the `canonical_bytes` columns have no `octet_length` CHECK (the protocol
   bounds them; only a compromised runtime could exceed them), and `ledger-admin verify` loads
   all records and contexts into memory. Add CHECKs in a later migration and stream in verify.
+- The trusted validator service id is an operator assertion (no response signature or key
+  binds it to the endpoint), and the invocation id is an unkeyed hash (guess-confirmable,
+  equal across deployments sharing a validator). Signed validator responses and a keyed
+  invocation id each need an ADR (and, for the id, new vectors) — security review, P2/P3.
+- `AppState::with_validation*` panic on a mismatching or malformed configuration
+  (construction time only; `main` validates first); return `Result` if embedders appear.
 - A P1.5 `ledger-admin verify` does not check the schema level and prints `VERIFY OK` against
   a 0010 database; always run the verifier from the same build as the servers.
 - Validation calls are synchronous inside the request (bounded by the validator timeout and a

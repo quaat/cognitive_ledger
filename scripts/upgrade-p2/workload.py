@@ -205,8 +205,12 @@ def phase2(out, res):
     graph, tenant, cand = pend["graph"], pend["tenant"], pend["candidate"]
     tok = mint(tenant, NEW_ROLES)
     base = f"/v1/graphs/{graph}/proposals/{cand}"
+    _, ref_before = call(tok, "GET", f"/v1/graphs/{graph}/refs?name=main")
     s, a = call(tok, "POST", f"{base}/accept", "p2-accept-unvalidated", {"ref": "main", "expected_head": pend["expected_head"], "reason": "no validation"})
-    expect(s >= 400, f"acceptance WITHOUT validation succeeded on the Phase-2 server: {s} {a}")
+    expect(s == 409 and a.get("code") == "VALIDATION_REQUIRED",
+           f"acceptance WITHOUT validation must be 409 VALIDATION_REQUIRED on the Phase-2 server: {s} {a}")
+    _, ref_after = call(tok, "GET", f"/v1/graphs/{graph}/refs?name=main")
+    expect(ref_after == ref_before, f"refused unvalidated acceptance moved the ref: {ref_before} -> {ref_after}")
     result["unvalidated_accept_refused"] = {"status": s, "code": a.get("code")}
     s, v = call(tok, "POST", f"{base}/validations", "p2-validate-pending", {"requested": requested})
     expect(s == 201 and v.get("replayed") is False and v["conforms"] is True, f"validate pre-upgrade candidate: {s} {v}")

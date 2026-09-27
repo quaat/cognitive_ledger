@@ -167,12 +167,38 @@ ledger's record calls again. Every such delivery carries the same **invocation i
   two such racing requests is ever recorded.
 - **Contract (required):** repeated or concurrent validation calls carrying the same
   invocation identity represent the same logical validation operation and must resolve to
-  the same logical effective semantic context and validation result. Sculpin keeps the
-  result of an invocation (at least for longer than the ledger's retry horizon) and answers a
-  repeated delivery with it; a delivery arriving while the first is still running waits for
-  it (single flight) rather than validating again in whatever environment is then current.
-  A failed invocation (4xx/5xx/timeout) may be computed afresh on retry, because nothing was
-  recorded by the ledger.
+  the same logical effective semantic context and validation result. Concretely:
+  - *Results.* Sculpin keeps the answer it returned for an invocation (HTTP 2xx) and answers
+    every later delivery of that id with it. The store is shared by all Sculpin replicas.
+  - *Single flight.* A delivery arriving while the first is still running waits for it
+    rather than validating again in whatever environment is then current. If the first
+    worker dies, another may take the invocation over (a lease); a waiter that outlives
+    the ledger's timeout is abandoned by the ledger, and the ledger's next retry must find
+    the finished result.
+  - *Binding.* Sculpin cannot recompute the id (it never sees tenant, principal or key), so
+    it stores `(candidate.commit, candidate.state_digest, requested)` with the id and refuses
+    (4xx) a delivery whose body differs. Stored results are scoped by the authenticated
+    caller as well as by id; the id is not a secret.
+  - *Failure* is judged from Sculpin's side: only an invocation Sculpin itself answered with
+    a non-2xx status may be computed afresh on retry. A 2xx answer the ledger refused as
+    `VALIDATOR_ERROR` (ignored hint, other candidate/state, malformed or oversized body)
+    stays bound to its invocation, so a retry under the same key fails the same way; the
+    client must use a new `Idempotency-Key`.
+  - *Retention.* The ledger's retry horizon is unbounded (idempotency results never expire,
+    and a request that failed recorded nothing). Sculpin declares a retention period `R`
+    for invocation results and keeps them at least that long; exactly-once logical
+    validation holds within `R`. After `R` a redelivery may be validated afresh in the then
+    current environment: the ledger records that honestly and acceptance still requires the
+    environment the reviewer names, so expiry (or no deduplication at all) changes which
+    environment a record names, never whether acceptance is safe. Orchestrators retry a
+    failed validation within `R` or under a new key.
+- A same-key retry repeats the original logical validation, even where an absent hint
+  means "current". To validate against the environment that is current now, use a new
+  `Idempotency-Key` (ADR-0019).
+- Because the ledger holds no lock across the call, two requests racing under one key with
+  *different* bodies both reach Sculpin (under different invocation ids); the ledger records
+  at most one of them and answers the other `IDEMPOTENCY_CONFLICT`, so Sculpin may keep an
+  invocation result the ledger never recorded.
 - The id is opaque to Sculpin: it must not be parsed, and it carries no semantic meaning. It
   is not part of any context, environment or validation identity, and it is not stored by
   the ledger.

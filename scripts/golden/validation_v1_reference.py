@@ -72,7 +72,7 @@ def u32(name: str, value) -> int:
 
 
 def content_id(name: str, value: str) -> str:
-    if not CONTENT_ID_RE.fullmatch(value):
+    if not isinstance(value, str) or not CONTENT_ID_RE.fullmatch(value):
         raise Invalid(f"{name}: not a strict content id")
     return value
 
@@ -240,7 +240,7 @@ def encode_invocation(logical: dict) -> bytes:
           "idempotency_key", "request_digest"},
          {"tenant_id", "principal_type", "principal_id", "graph_id", "idempotency_key",
           "request_digest"})
-    if logical["principal_type"] not in PRINCIPAL_TYPE_BYTE:
+    if not isinstance(logical["principal_type"], str) or logical["principal_type"] not in PRINCIPAL_TYPE_BYTE:
         raise Invalid("invocation: unknown principal_type")
     graph = logical["graph_id"]
     if not isinstance(graph, str) or not GRAPH_ID_RE.fullmatch(graph):
@@ -371,6 +371,15 @@ def check() -> int:
         if (FIXTURES / f"{name}.hex").read_text().strip() != data.hex():
             failures += 1
             print(f"MISMATCH {name}.hex", file=sys.stderr)
+    # Invocation inputs both encoders must refuse (the Rust side checks the same file).
+    for case in json.loads((FIXTURES / "invocation-v1-invalid-inputs.json").read_text()):
+        count += 1
+        try:
+            encode_invocation(case["input"])
+        except Invalid:
+            continue
+        failures += 1
+        print(f"ACCEPTED invalid invocation input: {case['why']}", file=sys.stderr)
     if failures:
         print(f"{failures} of {count} vectors differ", file=sys.stderr)
         return 1

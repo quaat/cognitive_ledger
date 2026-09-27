@@ -1469,6 +1469,34 @@ async fn acceptance_requires_the_configured_validation_service() {
     };
     let error = untrusting.accept(&missing).await.unwrap_err();
     assert!(matches!(error, LedgerError::ValidationNotFound), "{error}");
+    // An untrusted service's non-conforming verdict is not disclosed as VALIDATION_REJECTED:
+    // trust is checked before the verdict.
+    let c2 = prepare(&store, &g, "p2", None, "b").await;
+    let bad = validate_with(
+        &store,
+        &g,
+        "v2",
+        &c2,
+        RequestedContext::default(),
+        |g, c, s| violates(context_for(g, c, s, "O1", "D")),
+    )
+    .await
+    .unwrap();
+    let cite_bad = accept_request(
+        &g,
+        "a-bad",
+        None,
+        &c2,
+        ValidationPolicy::Validated {
+            validation_id: bad.validation_id.clone(),
+            semantic_environment_id: bad.environment_id.clone(),
+        },
+    );
+    let error = other_service.accept(&cite_bad).await.unwrap_err();
+    assert!(matches!(error, LedgerError::ValidationStale(_)), "{error}");
+    let error = store.workflows().accept(&cite_bad).await.unwrap_err();
+    assert!(matches!(error, LedgerError::ValidationRejected), "{error}");
+    assert_eq!(ref_head(&store, &g).await, None);
     let same_service = WorkflowRepository::new(store.pool().clone(), store.immutable().clone())
         .with_validation_trust(trust());
     let accepted = same_service.accept(&request).await.unwrap();

@@ -35,10 +35,35 @@ fuzz_target!(|data: &[u8]| {
             "urn:fuzz:validator",
             &RequestedContext::default(),
         ) {
+            // Bound to what the ledger asked about and to the ledger's service identity.
+            assert_eq!(context.graph_id, graph);
+            assert_eq!(context.candidate_commit, response.candidate_commit);
+            assert_eq!(context.candidate_state_digest, response.candidate_state_digest);
+            assert_eq!(context.validator.service_id, "urn:fuzz:validator");
             let bytes = context.canonical_bytes().expect("a converted context encodes");
             let decoded = SemanticExecutionContext::from_canonical_bytes(&bytes).unwrap();
             assert_eq!(decoded.canonical_bytes().unwrap(), bytes);
             assert_eq!(decoded.id().unwrap(), context.id().unwrap());
+            // An answer about another candidate or state is never accepted.
+            let other = ledger_core::ContentId::for_bytes(&bytes);
+            assert!(response
+                .into_context(
+                    &graph,
+                    &ledger_core::CommitId(other.clone()),
+                    &response.candidate_state_digest,
+                    "urn:fuzz:validator",
+                    &RequestedContext::default(),
+                )
+                .is_err());
+            assert!(response
+                .into_context(
+                    &graph,
+                    &response.candidate_commit,
+                    &other,
+                    "urn:fuzz:validator",
+                    &RequestedContext::default(),
+                )
+                .is_err());
         }
     }
     if let Ok(record) = ValidationRecord::from_canonical_bytes(data) {

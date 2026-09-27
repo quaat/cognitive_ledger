@@ -240,10 +240,13 @@ fn negative_vectors_are_rejected_by_the_strict_decoders_for_the_right_reason() {
     );
 }
 
-const INVOCATIONS: [&str; 3] = [
+const INVOCATIONS: [&str; 6] = [
     "invocation-v1-basic",
     "invocation-v1-delegated",
     "invocation-v1-other-key",
+    "invocation-v1-human",
+    "invocation-v1-max-key",
+    "invocation-v1-unicode-key",
 ];
 
 #[test]
@@ -264,5 +267,21 @@ fn invocation_vectors_encode_and_hash_stably_and_differ_per_scope() {
             ids.insert(id),
             "{stem}: distinct scopes share an invocation id"
         );
+    }
+}
+
+#[test]
+fn invalid_invocation_inputs_are_refused_like_the_reference_does() {
+    let cases: Vec<serde_json::Value> =
+        serde_json::from_str(&fixture("invocation-v1-invalid-inputs.json")).unwrap();
+    assert!(cases.len() >= 8);
+    for case in cases {
+        let why = case["why"].as_str().unwrap();
+        // Either the typed input is refused while parsing, or its encoding is refused.
+        let refused = match serde_json::from_value::<ValidationInvocation>(case["input"].clone()) {
+            Err(_) => true,
+            Ok(invocation) => invocation.canonical_bytes().is_err(),
+        };
+        assert!(refused, "{why}: accepted");
     }
 }

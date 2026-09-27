@@ -2521,6 +2521,28 @@ async fn nullable_key_columns_are_refused_at_startup_and_readiness() {
         .await
         .expect("healthy database serves");
     assert_healthy(&fx, "fresh migration").await;
+    // The inventory is exactly what the migrations declare: a NOT NULL column added by a
+    // future migration without extending the inventory fails here, not silently.
+    let declared: std::collections::BTreeSet<(String, String)> = sqlx::query_as(
+        "SELECT c.relname::text, a.attname::text FROM pg_attribute a \
+         JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = 'public' AND c.relkind = 'r' AND a.attnum > 0 AND NOT a.attisdropped \
+           AND a.attnotnull AND c.relname <> '_sqlx_migrations'",
+    )
+    .fetch_all(&fx.owner)
+    .await
+    .unwrap()
+    .into_iter()
+    .collect();
+    let expected: std::collections::BTreeSet<(String, String)> =
+        ledger_store::schema::EXPECTED_NOT_NULL
+            .iter()
+            .flat_map(|(t, cols)| cols.iter().map(|c| ((*t).to_owned(), (*c).to_owned())))
+            .collect();
+    assert_eq!(
+        declared, expected,
+        "EXPECTED_NOT_NULL drifted from the migrations"
+    );
     for (table, column) in [
         ("decision_validations", "graph_id"),
         ("decision_validations", "candidate_commit"),

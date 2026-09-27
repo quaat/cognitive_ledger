@@ -768,6 +768,126 @@ async fn each_phase2_check_detects_exactly_its_own_tampering() {
     let restored = verify::run(&pool).await.unwrap();
     assert!(restored.is_clean(), "{:?}", failing(&restored));
 
+    // Further detail-row forgeries, each inside a committed-then-reverted change: every one is
+    // seen by exactly its byte check (and nothing else).
+    let summary_row = format!("validation_id = '{bad2_id}' AND position = 0");
+    let virtual_row = format!("context_id = '{bad_ctx}' AND position = 0");
+    let cases: Vec<(&str, &str, String, String, &str)> = vec![
+        (
+            "validation_violations",
+            "severity",
+            summary_row.clone(),
+            "'Forged'".into(),
+            RECORD_BYTES,
+        ),
+        (
+            "validation_violations",
+            "code",
+            summary_row.clone(),
+            "'forged:code'".into(),
+            RECORD_BYTES,
+        ),
+        (
+            "validation_violations",
+            "position",
+            summary_row.clone(),
+            "7".into(),
+            RECORD_BYTES,
+        ),
+        (
+            "semantic_virtual_contexts",
+            "object_refs",
+            virtual_row.clone(),
+            "ARRAY['s3://forged']".into(),
+            CONTEXT_BYTES,
+        ),
+        (
+            "semantic_virtual_contexts",
+            "query_spec_digest",
+            virtual_row.clone(),
+            format!("'sha256:{}'", "e".repeat(64)),
+            CONTEXT_BYTES,
+        ),
+        (
+            "semantic_virtual_contexts",
+            "hydration_plan_digest",
+            virtual_row.clone(),
+            format!("'sha256:{}'", "e".repeat(64)),
+            CONTEXT_BYTES,
+        ),
+    ];
+    for (table, column, row, forged, expect) in cases {
+        let original: String = sqlx::query_scalar(&format!(
+            "SELECT quote_literal({column}::text) || '::' || pg_typeof({column})::text FROM {table} WHERE {row}"
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("{table}.{column}: {e}"));
+        let trigger = format!("{table}_write_once");
+        let set = |value: &str| {
+            vec![
+                format!("ALTER TABLE {table} DISABLE TRIGGER {trigger}"),
+                format!("UPDATE {table} SET {column} = {value} WHERE {row}"),
+                format!("ALTER TABLE {table} ENABLE TRIGGER {trigger}"),
+            ]
+        };
+        committed(set(&forged)).await;
+        let report = verify::run(&pool).await.unwrap();
+        assert_eq!(failing(&report), vec![expect], "{table}.{column}");
+        let moved_row = if column == "position" {
+            row.replace("position = 0", &format!("position = {forged}"))
+        } else {
+            row.clone()
+        };
+        committed(vec![
+            format!("ALTER TABLE {table} DISABLE TRIGGER {trigger}"),
+            format!("UPDATE {table} SET {column} = {original} WHERE {moved_row}"),
+            format!("ALTER TABLE {table} ENABLE TRIGGER {trigger}"),
+        ])
+        .await;
+        let restored = verify::run(&pool).await.unwrap();
+        assert!(
+            restored.is_clean(),
+            "{table}.{column}: {:?}",
+            failing(&restored)
+        );
+    }
+    // A missing detail row is seen too (the count check sees it as well for contexts).
+    let saved: (i32, String, String, String) = sqlx::query_as(
+        "SELECT position, severity, code, message FROM validation_violations \
+         WHERE validation_id = $1 AND position = 0",
+    )
+    .bind(&bad2_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    committed(vec![
+        "ALTER TABLE validation_violations DISABLE TRIGGER validation_violations_write_once".into(),
+        format!("DELETE FROM validation_violations WHERE {summary_row}"),
+        "ALTER TABLE validation_violations ENABLE TRIGGER validation_violations_write_once".into(),
+    ])
+    .await;
+    let report = verify::run(&pool).await.unwrap();
+    assert!(
+        failing(&report).contains(&RECORD_BYTES),
+        "{:?}",
+        failing(&report)
+    );
+    sqlx::query(
+        "INSERT INTO validation_violations (validation_id, position, severity, code, message) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(&bad2_id)
+    .bind(saved.0)
+    .bind(&saved.1)
+    .bind(&saved.2)
+    .bind(&saved.3)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let restored = verify::run(&pool).await.unwrap();
+    assert!(restored.is_clean(), "{:?}", failing(&restored));
+
     pool.close().await;
     sqlx::query(&format!("DROP DATABASE {db} WITH (FORCE)"))
         .execute(&admin)

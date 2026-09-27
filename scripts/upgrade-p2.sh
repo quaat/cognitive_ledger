@@ -55,7 +55,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 cleanup() {
   local rc=$?
   [ -n "${VAL_PID}" ] && kill "${VAL_PID}" 2>/dev/null || true
-  for c in "${OLD}" "${NEW}" "${OLD}-ahead" "${NEW}-behind"; do
+  for c in "${OLD}" "${NEW}" "${OLD}-ahead" "${NEW}-behind" "${OLD}-restored"; do
     docker logs "$c" >"${OUT}/container-${c}.log" 2>&1 || true
     docker rm -fv "$c" >/dev/null 2>&1 || true
   done
@@ -161,7 +161,21 @@ for db in restored_0009 guard_0009; do
 done
 snapshot restored_0009 restored
 same_snapshot before restored "backup restore"
-step "backup: $(du -h "${OUT}/pre-upgrade.dump" | cut -f1) custom-format dump, ${ndata} table-data entries, restored into restored_0009 and guard_0009 with identical rows"
+# The restore is a usable rollback target for the previous release: same DDL, grants and
+# ownership as the source, the previous verifier is clean on it, the previous server serves it.
+schema_and_owners() { # db label
+  docker exec "${PG}" pg_dump -U ledger --schema-only --no-owner -d "$1" | grep -vE '^(--|SET |SELECT pg_catalog|\\connect|\\restrict|\\unrestrict|$)' | sed -E 's/[[:space:]]+$//' >"${OUT}/schema-$2.sql"
+  psql_q "$1" "SELECT 'rel|'||relname||'|'||pg_get_userbyid(relowner) FROM pg_class WHERE relnamespace='public'::regnamespace UNION ALL SELECT 'fn|'||proname||'|'||pg_get_userbyid(proowner) FROM pg_proc WHERE pronamespace='public'::regnamespace UNION ALL SELECT 'schema|public|'||pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname='public' ORDER BY 1" >"${OUT}/owners-$2.txt"
+}
+schema_and_owners ledger source-0009
+schema_and_owners restored_0009 restored-0009
+diff -u "${OUT}/schema-source-0009.sql" "${OUT}/schema-restored-0009.sql" >"${OUT}/restore-schema.diff" || { head -40 "${OUT}/restore-schema.diff" >&2; fail "restored backup DDL/grants differ from the source"; }
+diff -u "${OUT}/owners-source-0009.txt" "${OUT}/owners-restored-0009.txt" >"${OUT}/restore-owners.diff" || { head -40 "${OUT}/restore-owners.diff" >&2; fail "restored backup ownership differs from the source"; }
+admin "${OLD_IMAGE}" restored_0009 verify >"${OUT}/restore-verify-previous.log" 2>&1 && grep -q "VERIFY OK" "${OUT}/restore-verify-previous.log" || { cat "${OUT}/restore-verify-previous.log"; fail "previous ledger-admin verify on the restored backup"; }
+server "${OLD}-restored" "${OLD_IMAGE}" restored_0009 "$((PORT+3))" -e LEDGER_UNVALIDATED_ACCEPTANCE=allow-unvalidated-acceptance-development-only
+wait_ready "$((PORT+3))" 60 || { docker logs "${OLD}-restored" >&2; fail "previous server does not serve the restored backup"; }
+docker rm -f "${OLD}-restored" >/dev/null
+step "backup: $(du -h "${OUT}/pre-upgrade.dump" | cut -f1) custom-format dump, ${ndata} table-data entries, restored into restored_0009 and guard_0009 with identical rows, DDL/grants/ownership identical to the source, previous verify VERIFY OK and previous server ready on it"
 
 admin "${NEW_IMAGE}" ledger migrate --runtime-role ledger_runtime >"${OUT}/upgrade-migrate.log" 2>&1 || { cat "${OUT}/upgrade-migrate.log"; fail "owner migrate to ${NEW_SCHEMA}"; }
 admin "${NEW_IMAGE}" ledger migrate --runtime-role ledger_runtime >"${OUT}/upgrade-migrate-rerun.log" 2>&1 || { cat "${OUT}/upgrade-migrate-rerun.log"; fail "re-running migrate (grant reconcile) failed"; }
@@ -278,7 +292,10 @@ psql_q guard_0009 "INSERT INTO decisions (proposal_id, graph_id, branch, candida
 if admin "${NEW_IMAGE}" guard_0009 migrate --runtime-role ledger_runtime >"${OUT}/guard-migrate.log" 2>&1; then fail "migration 0010 applied although a decision cites validation ids"; fi
 grep -q "migration 0010: 1 decision(s) cite validation ids before any validation record existed; refusing to upgrade" "${OUT}/guard-migrate.log" || { cat "${OUT}/guard-migrate.log"; fail "0010 refused for another reason than its guard"; }
 [ "$(schema_level guard_0009)" = "${PREV_SCHEMA}" ] || fail "guard database left at $(schema_level guard_0009)"
-[ "$(psql_q guard_0009 "SELECT to_regclass('public.validation_records') IS NULL AND to_regclass('public.semantic_execution_contexts') IS NULL AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='idempotency' AND column_name='result_validation_id')")" = t ] || fail "guard refusal left partial 0010 objects"
+[ "$(psql_q guard_0009 "SELECT to_regclass('public.validation_records') IS NULL AND to_regclass('public.semantic_execution_contexts') IS NULL AND to_regclass('public.semantic_virtual_contexts') IS NULL AND to_regclass('public.validation_violations') IS NULL AND to_regclass('public.decision_validations') IS NULL AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='idempotency' AND column_name='result_validation_id') AND NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname IN ('decisions_identity','idempotency_validation_fk','idempotency_validation_shape'))")" = t ] || fail "guard refusal left partial 0010 objects"
+schema_and_owners guard_0009 guard-after-refusal
+# the only difference to the restored copy is the one precondition row, not the schema
+diff -u "${OUT}/schema-restored-0009.sql" "${OUT}/schema-guard-after-refusal.sql" >"${OUT}/guard-schema.diff" || { head -40 "${OUT}/guard-schema.diff" >&2; fail "refused 0010 changed the 0009 schema"; }
 step "0010 guard: refused ('$(grep -o 'migration 0010: [^;]*' "${OUT}/guard-migrate.log" | head -1)'), database left at ${PREV_SCHEMA} with no 0010 objects"
 
 # --- 8. Schema convergence: clean 0010 install vs upgraded 0010 ---------------------------------

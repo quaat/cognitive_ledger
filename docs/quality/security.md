@@ -73,10 +73,21 @@ Preserve object digest verification and atomic ref updates. Never commit secrets
   service id, a token file without a URL, and production authentication without a service
   id are refused at startup; a development server without a trust anchor refuses every
   validated acceptance. A missing or partial setting never broadens trust.
+- The trusted service id is an **operator assertion**, not a proof: the ledger writes it into
+  every context from its own configuration, and the only binding between that id and the
+  endpoint that answered is the https connection to the configured host. Repointing
+  `LEDGER_VALIDATOR_URL` under the same id makes the new endpoint's records trusted; change
+  the URL only together with the service id, or deliberately. Signed validator responses
+  (tech debt) would turn the assertion into a proof.
 - Every outbound call carries the `sculpin-validation-invocation/v1` id (body
-  `invocation_id` and `Idempotency-Key` header): a hash of the authenticated idempotency
-  scope and request digest — opaque, not reversible to tenant or principal ids without
-  guessing them, and never containing the bearer credential or correlation id.
+  `invocation_id` and `Idempotency-Key` header): an unkeyed SHA-256 of the authenticated
+  idempotency scope and request digest. It never contains the bearer credential or
+  correlation id, but it is not secret: whoever sees it (the validator, gateways, APM) and
+  knows the request can confirm a guessed tenant/principal when idempotency keys are
+  predictable, and two ledger deployments sharing one validator produce equal ids for equal
+  scopes. Sculpin therefore scopes stored results by the authenticated caller; deployments
+  must not share a validator identity across environments. A keyed (HMAC) id would close
+  both and needs an ADR plus new vectors.
 - The outbound client (`HttpValidationClient`) meets the JWKS-fetch standard: one configured
   https endpoint (plain http to loopback only with development auth), no redirects, no
   environment proxy, total timeout, streamed size cap, `application/json` only, strict

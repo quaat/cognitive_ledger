@@ -35,16 +35,17 @@ idempotent-replay lookup and before any write, the repository verifies:
 3. its `candidate_state_digest` equals its context's digest for that candidate (enforced by
    the composite foreign key `validation_records(context_id, graph_id, candidate_commit,
    candidate_state_digest) → semantic_execution_contexts(…)`; the repository re-reads it);
-4. its outcome is `conforms` (`VALIDATION_REJECTED` otherwise);
-5. the environment of its context equals the `semantic_environment_id` the request names
-   (`VALIDATION_STALE` otherwise).
-
-6. the record was produced by the validation service the deployment **trusts**
+4. the record was produced by the validation service the deployment **trusts**
    (`VALIDATION_STALE` otherwise). The environment deliberately omits the ledger-side
    service identity, so this is a separate, opaque ledger policy (see "Amendment: validator
-   trust anchor" below). Without a trust anchor every validated acceptance is refused.
+   trust anchor" below). Without a trust anchor every validated acceptance is refused. It is
+   checked before the verdict, so an untrusted service's verdict is never acted on or
+   disclosed;
+5. its outcome is `conforms` (`VALIDATION_REJECTED` otherwise);
+6. the environment of its context equals the `semantic_environment_id` the request names
+   (`VALIDATION_STALE` otherwise).
 
-Predicates 2–5 are evaluated on the verified canonical bytes of the record and its context
+Predicates 2–6 are evaluated on the verified canonical bytes of the record and its context
 (hash checked, strictly decoded), never on the relational projection columns.
 
 Only then do the ADR-0013 lineage predicates, the ref movement, ref event, accepted decision,
@@ -106,7 +107,7 @@ reachability are now separate:
   id: startup is refused (production acceptance always requires validation). Development
   without either: validated acceptance fails closed (`VALIDATION_STALE`); unvalidated
   acceptance stays behind its separate, conspicuous development-only switch.
-- Predicate 1 is evaluated before predicate 6, so a foreign or nonexistent validation is
+- Predicate 1 is evaluated before predicate 4, so a foreign or nonexistent validation is
   `VALIDATION_NOT_FOUND` under every trust configuration; a refusal never names the
   service that produced a record.
 
@@ -132,6 +133,18 @@ lock held across the call:
   `SemanticEnvironmentId` or `ValidationId`, and it is not stored. The ledger's own
   idempotency is unchanged: phase B records under the idempotency lock, a concurrent loser
   replays the winner's record, the same key with another body is `IDEMPOTENCY_CONFLICT`.
+- A same-key retry repeats the original logical validation, even where an absent hint
+  means "current": if the validator's environment moved since, the record names the
+  original environment and an acceptance naming the new one is `VALIDATION_STALE`. To
+  validate against the current environment, use a new `Idempotency-Key`.
+- "Exactly-once logical" covers the effective context, environment and verdict, not the
+  `ValidationId`: the record hashes the server-assigned `recorded_at`, so the record a retry
+  commits has another id than the lost attempt would have had. Only one record per key is
+  ever committed, and both concurrent responses name it.
+- What this buys is determinism, not safety: without validator deduplication (or after
+  Sculpin's retention expired) a record is still an honest record of the environment it ran
+  in, and acceptance still requires the environment the reviewer names. The dependency on
+  Sculpin is recorded as external in `docs/exec-plans/tech-debt.md`.
 - Golden vectors (`fixtures/golden/validation/invocation-v1-*`) are produced by the
   independent Python reference and checked by Rust; `sculpin-validation-request/v1` gains
   the required `invocation_id` field (unreleased, amended in place).
