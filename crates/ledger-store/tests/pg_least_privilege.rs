@@ -1668,3 +1668,75 @@ async fn settable_or_inherited_memberships_in_privileged_roles_are_refused() {
     assert_healthy(&fx, "plain login role again").await;
     fx.teardown().await;
 }
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn parameter_grants_and_function_ownership_drift_are_refused() {
+    let fx = fixture("ledger_param").await;
+    fx.migrate_and_grant().await;
+    assert_healthy(&fx, "exact role").await;
+    let role = fx.role.clone();
+    // SET privilege on session_replication_role (PostgreSQL 15+): the runtime could switch to
+    // `replica` and silence every ordinary trigger.
+    owner_exec(
+        &fx,
+        &format!("GRANT SET ON PARAMETER session_replication_role TO {role}"),
+    )
+    .await;
+    let m = assert_refused_by_identity(&fx, "SET session_replication_role").await;
+    assert!(m.contains("session_replication_role"), "{m}");
+    owner_exec(
+        &fx,
+        &format!("REVOKE SET ON PARAMETER session_replication_role FROM {role}"),
+    )
+    .await;
+    assert_healthy(&fx, "parameter grant revoked").await;
+    // The same grant reached through a settable membership.
+    owner_exec(&fx, "DROP ROLE IF EXISTS ledger_param_parent").await;
+    owner_exec(&fx, "CREATE ROLE ledger_param_parent").await;
+    owner_exec(
+        &fx,
+        "GRANT SET ON PARAMETER session_replication_role TO ledger_param_parent",
+    )
+    .await;
+    owner_exec(
+        &fx,
+        &format!("GRANT ledger_param_parent TO {role} WITH INHERIT FALSE, SET TRUE"),
+    )
+    .await;
+    let m = assert_refused_by_identity(&fx, "parameter grant via settable membership").await;
+    assert!(
+        m.contains("ledger_param_parent") && m.contains("session_replication_role"),
+        "{m}"
+    );
+    owner_exec(&fx, &format!("REVOKE ledger_param_parent FROM {role}")).await;
+    owner_exec(&fx, "DROP OWNED BY ledger_param_parent").await;
+    owner_exec(&fx, "DROP ROLE ledger_param_parent").await;
+    assert_healthy(&fx, "membership revoked").await;
+    // A guard function transferred to the runtime (or to a role it can become) could be
+    // dropped with CASCADE, taking its trigger along: a schema fact, refused by verify.
+    let running = ledger_store::PostgresLedgerStore::connect(
+        &fx.runtime_db_url,
+        ledger_store::V1Binding::Reject,
+    )
+    .await
+    .unwrap();
+    owner_exec(
+        &fx,
+        &format!("ALTER FUNCTION public.refs_movement_is_audited() OWNER TO {role}"),
+    )
+    .await;
+    let m = assert_refused_by_schema(&fx, &running, "guard function owned by the runtime").await;
+    assert!(
+        m.contains("refs_movement_is_audited") && m.contains("is owned by"),
+        "{m}"
+    );
+    owner_exec(
+        &fx,
+        "ALTER FUNCTION public.refs_movement_is_audited() OWNER TO ledger",
+    )
+    .await;
+    assert_healthy(&fx, "ownership restored").await;
+    assert!(running.ready().await.is_ok());
+    fx.teardown().await;
+}

@@ -121,9 +121,11 @@ integrity rules against real PostgreSQL, including a non-superuser owner.
   `performance-baselines.md`). Start-up and readiness verify the database controls the
   privilege model depends on structurally: every guard trigger by table, function, timing,
   event set, `UPDATE OF` columns and deferral flags; every guard function's body, language,
-  return type and pinned `search_path` against the embedded migrations (no `SECURITY
-  DEFINER`); the runtime role's attributes and its transitive memberships (no settable or
-  inherited path to a superuser, table owner, CREATE holder or `pg_*` role); the content-address CHECK by presence,
+  return type, pinned `search_path` and schema-owner ownership against the embedded
+  migrations (no `SECURITY DEFINER`); `session_replication_role = origin` with no SET/ALTER
+  SYSTEM privilege on it; the runtime role's attributes and its transitive memberships (no
+  settable or inherited path to a superuser, table or function owner, CREATE holder, a role
+  allowed to set `session_replication_role`, or a `pg_*` role); the content-address CHECK by presence,
   validation, deparsed definition and a rolled-back semantic probe (start-up) and by
   expression fingerprint (readiness); the runtime role's exact per-column INSERT/UPDATE
   grants, absence of table-level writes, DELETE/TRUNCATE/TRIGGER/REFERENCES, and USAGE on

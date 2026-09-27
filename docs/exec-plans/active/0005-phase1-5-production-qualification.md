@@ -579,6 +579,22 @@ supply-chain, upgrade, backup harnesses), `docs/` (operations runbook, security)
   Tests: settable owner membership, transitive membership through an intermediate role,
   `pg_read_all_data`, `CREATEDB` — each refused at start-up; the plain role serves again.
 
+### Review round 4 (fresh Codex review of `9f22942`, 2026-09-27): two new P1s, fixed
+- **`session_replication_role`.** PostgreSQL 15+ lets an owner `GRANT SET ON PARAMETER
+  session_replication_role` to the runtime without touching any role attribute or table
+  privilege; setting it to `replica` silences every ordinary (`tgenabled = 'O'`) guard
+  trigger. Fix: `verify_runtime_identity` requires `current_setting('session_replication_role')
+  = 'origin'`, refuses SET or ALTER SYSTEM privilege on it for the runtime role, and refuses
+  any transitive membership in a role that holds the SET privilege. Tests: direct grant and
+  grant through a settable membership, each refused at start-up; healthy after revocation.
+- **Guard function ownership.** Ownership was checked for tables only; a guard function
+  transferred to the runtime (or to a role it can become) could be dropped with CASCADE,
+  removing its trigger while body and grants still verified. Fix: `verify_guard_functions`
+  requires every guard function to be owned by the ledger's schema owner (the owner of
+  `refs`), and the membership walk refuses roles that own any function in `public`. Test:
+  `ALTER FUNCTION refs_movement_is_audited() OWNER TO <runtime>` refused by `schema::verify`,
+  start-up and readiness; healthy after restoring the owner.
+
 ### Admission-control decision (§15, 2026-09-27)
 Measured: under 1,000 concurrent clients on two replicas the 12-slot expensive semaphore per
 replica refuses the excess prepares immediately (`503 RESOURCE_LIMIT`), successful prepare p99

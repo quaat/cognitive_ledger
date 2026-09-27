@@ -481,7 +481,9 @@ async fn verify_guard_functions(pool: &PgPool) -> Result<(), LedgerError> {
     for f in &expected {
         let rows = sqlx::query(
             "SELECT p.prosrc, l.lanname::text AS language, p.prosecdef, \
-                    pg_catalog.format_type(p.prorettype, NULL) AS returns, p.proconfig \
+                    pg_catalog.format_type(p.prorettype, NULL) AS returns, p.proconfig, \
+                    pg_get_userbyid(p.proowner)::text AS owner, \
+                    (SELECT tableowner::text FROM pg_tables WHERE schemaname = 'public' AND tablename = 'refs') AS table_owner \
              FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
              JOIN pg_language l ON l.oid = p.prolang \
              WHERE n.nspname = 'public' AND p.proname = $1",
@@ -510,11 +512,21 @@ async fn verify_guard_functions(pool: &PgPool) -> Result<(), LedgerError> {
         let secdef: bool = row.try_get("prosecdef").map_err(db_error)?;
         let returns: String = row.try_get("returns").map_err(db_error)?;
         let proconfig: Option<Vec<String>> = row.try_get("proconfig").map_err(db_error)?;
+        let owner: String = row.try_get("owner").map_err(db_error)?;
+        let table_owner: Option<String> = row.try_get("table_owner").map_err(db_error)?;
         let expected_config = f
             .search_path
             .as_ref()
             .map(|sp| vec![format!("search_path={sp}")]);
-        let problem = if prosrc != f.body {
+        let problem = if table_owner.as_deref() != Some(owner.as_str()) {
+            // The schema owner owns every integrity function: a function owned by anyone
+            // else (the runtime, or a role it can become) could be dropped with CASCADE,
+            // taking its trigger along.
+            Some(format!(
+                "is owned by {owner} instead of the ledger's schema owner {}",
+                table_owner.unwrap_or_else(|| "?".into())
+            ))
+        } else if prosrc != f.body {
             Some("has a different body than this build's migration defines".to_owned())
         } else if language != f.language {
             Some(format!(
@@ -922,9 +934,11 @@ pub async fn verify_runtime_identity(pool: &PgPool) -> Result<(), LedgerError> {
     verify_sequence_privileges(pool, &who).await
 }
 
-/// The runtime role must not be able to *become* anything more privileged: no role
-/// attributes beyond LOGIN, and no membership — inherited or merely settable (`SET ROLE`),
-/// direct or transitive — in a superuser, a table owner, a CREATE holder, a role with
+/// The runtime role must not be able to *become* anything more privileged or to silence the
+/// guards: no role attributes beyond LOGIN, `session_replication_role = origin` with no SET
+/// or ALTER SYSTEM privilege on it, and no membership — inherited or merely settable (`SET
+/// ROLE`), direct or transitive — in a superuser, a table or function owner, a CREATE
+/// holder, a role allowed to set `session_replication_role`, a role with
 /// CREATEROLE/CREATEDB/REPLICATION/BYPASSRLS, or any predefined `pg_*` role.
 async fn verify_role_attributes_and_memberships(
     pool: &PgPool,
@@ -950,6 +964,34 @@ async fn verify_role_attributes_and_memberships(
             )));
         }
     }
+    // `session_replication_role = replica` silences every ordinary trigger (the guards are
+    // `tgenabled = 'O'`); the runtime must run with `origin` and must not be able to change
+    // it (PostgreSQL 15+ can grant SET on a SUSET parameter) or to `ALTER SYSTEM`.
+    let params = sqlx::query(
+        "SELECT current_setting('session_replication_role') AS srr, \
+                has_parameter_privilege(current_user, 'session_replication_role', 'SET') AS can_set_srr, \
+                has_parameter_privilege(current_user, 'session_replication_role', 'ALTER SYSTEM') AS can_alter_srr",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(db_error)?;
+    let srr: String = params.try_get("srr").map_err(db_error)?;
+    if srr != "origin" {
+        return Err(identity(format!(
+            "role {who} runs with session_replication_role = {srr}; integrity triggers would not \
+             fire (ADR-0016)"
+        )));
+    }
+    if params.try_get::<bool, _>("can_set_srr").map_err(db_error)?
+        || params
+            .try_get::<bool, _>("can_alter_srr")
+            .map_err(db_error)?
+    {
+        return Err(identity(format!(
+            "role {who} may SET or ALTER SYSTEM session_replication_role; it could silence every \
+             integrity trigger (ADR-0016)"
+        )));
+    }
     let rows = sqlx::query(
         "WITH RECURSIVE m AS ( \
              SELECT am.roleid, am.inherit_option, am.set_option \
@@ -960,7 +1002,9 @@ async fn verify_role_attributes_and_memberships(
          SELECT r.rolname::text AS name, r.rolsuper, r.rolcreaterole, r.rolcreatedb, r.rolreplication, \
                 r.rolbypassrls, m.inherit_option, m.set_option, \
                 (SELECT count(*) FROM pg_tables t WHERE t.schemaname = 'public' AND t.tableowner = r.rolname) AS owned, \
-                has_schema_privilege(r.oid, 'public', 'CREATE') AS can_create \
+                (SELECT count(*) FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace AND p.proowner = r.oid) AS owned_functions, \
+                has_schema_privilege(r.oid, 'public', 'CREATE') AS can_create, \
+                has_parameter_privilege(r.oid, 'session_replication_role', 'SET') AS can_set_srr \
          FROM m JOIN pg_roles r ON r.oid = m.roleid",
     )
     .fetch_all(pool)
@@ -994,8 +1038,16 @@ async fn verify_role_attributes_and_memberships(
                 "an owner of ledger tables",
             ),
             (
+                row.try_get::<i64, _>("owned_functions").map_err(db_error)? > 0,
+                "an owner of ledger functions",
+            ),
+            (
                 row.try_get::<bool, _>("can_create").map_err(db_error)?,
                 "a CREATE holder on schema public",
+            ),
+            (
+                row.try_get::<bool, _>("can_set_srr").map_err(db_error)?,
+                "allowed to SET session_replication_role",
             ),
             (name.starts_with("pg_"), "a predefined pg_* role"),
         ];
