@@ -44,6 +44,10 @@ echo "previous release $(cat "${OUT}/previous-rev.txt") (schema $(cat "${OUT}/pr
 # --- 2. PostgreSQL only, then the OLD server against it (owner URL, migrates itself) -------
 "${COMPOSE[@]}" config --quiet
 "${COMPOSE[@]}" up -d --wait postgres
+git describe --always --dirty --long >"${OUT}/build-rev.txt" 2>/dev/null || git rev-parse HEAD >"${OUT}/build-rev.txt"
+# A Phase-1 deployment has a single identity and no runtime role: drop the development
+# role the compose init script created so the upgrade has to provision it (runbook step 1).
+docker exec "$("${COMPOSE[@]}" ps -q postgres)" psql -U ledger -d ledger -tAc "DROP ROLE IF EXISTS ledger_runtime" >/dev/null
 OWNER_IN_NET='postgres://ledger:ledger-development-only@postgres:5432/ledger?sslmode=disable'
 docker run -d --name "${OLD_NAME}" --network "${NET}" -p 127.0.0.1:8080:8080 -v "${PROJECT}_prevdata:/data" \
   -e LEDGER_ADDR=0.0.0.0:8080 -e LEDGER_DATA_DIR=/data -e LEDGER_DATABASE_URL="${OWNER_IN_NET}" \
@@ -100,13 +104,23 @@ json.dump({"ref": ref, "records": records, "states": states}, open(sys.argv[2], 
 print(f"previous release: {len(records)} commits written, head {ref['head']} version {ref['version']}")
 PY
 
-# --- 3. Upgrade: stop old server, owner migration, new image with the runtime identity ----
+# --- 3. Upgrade: stop old server, create the runtime role (operator step), owner migration
+#        with the grant, new image with the runtime identity ---------------------------------
 docker stop "${OLD_NAME}" >/dev/null
+psql_q ledger "CREATE ROLE ledger_runtime LOGIN PASSWORD 'ledger-runtime-development-only'" >/dev/null
 "${COMPOSE[@]}" up --build -d --wait ledger >"${OUT}/upgrade-up.log" 2>&1   # runs migrate first (depends_on)
 REQUIRED=$(grep -oE 'REQUIRED_SCHEMA_VERSION: i64 = [0-9]+' crates/ledger-store/src/schema.rs | grep -oE '[0-9]+$')
 [ "$(psql_q ledger 'SELECT max(version) FROM _sqlx_migrations')" = "${REQUIRED}" ] || { echo "FAIL: upgrade did not reach schema ${REQUIRED}" >&2; exit 1; }
 NEW_CHECKSUMS=$(psql_q ledger "SELECT string_agg(version||':'||encode(checksum,'hex'), ',' ORDER BY version) FROM _sqlx_migrations WHERE version <= $(cat "${OUT}/previous-schema.txt")")
 [ "${OLD_CHECKSUMS}" = "${NEW_CHECKSUMS}" ] || { echo "FAIL: checksums of previously applied migrations changed" >&2; exit 1; }
+# The recorded checksums must be the SHA-384 of the migration files as shipped by the
+# PREVIOUS release (sqlx stores sha384(file bytes)); the new release's files 0001..N must be
+# byte-identical to them, otherwise the new server's schema::verify would refuse the database.
+for f in target/upgrade/previous-src/migrations/0*.sql; do
+  v=$(basename "$f" | cut -d_ -f1 | sed 's/^0*//'); sum=$(sha384sum "$f" | cut -d' ' -f1)
+  grep -q "\b${v}:${sum}\b" <<<"${NEW_CHECKSUMS}" || { echo "FAIL: recorded checksum of migration ${v} is not sha384 of the previous release's file" >&2; exit 1; }
+  cmp -s "$f" "migrations/$(basename "$f")" || { echo "FAIL: migration $(basename "$f") differs between ${PREVIOUS} and HEAD" >&2; exit 1; }
+done
 wait_ready 8080 60
 echo "upgraded: schema $(cat "${OUT}/previous-schema.txt") -> ${REQUIRED}, previously applied migrations untouched, new server serving as the runtime identity"
 [ "$(psql_q ledger "SELECT count(*) FROM pg_stat_activity WHERE usename = 'ledger_runtime'")" -ge 1 ] || { echo "FAIL: new server is not connected as the runtime identity" >&2; exit 1; }
@@ -149,12 +163,14 @@ psql_q ledger "CREATE DATABASE clean_install" >/dev/null
 "${COMPOSE[@]}" run --rm migrate migrate --runtime-role ledger_runtime --database-url 'postgres://ledger:ledger-development-only@postgres:5432/clean_install?sslmode=disable' >"${OUT}/clean-migrate.log" 2>&1
 PG_CID=$("${COMPOSE[@]}" ps -q postgres)
 for db in ledger clean_install; do
-  docker exec "${PG_CID}" pg_dump -U ledger --schema-only --no-owner -d "${db}" | grep -vE '^(--|SET |SELECT pg_catalog|\\connect|$)' | sed -E 's/[[:space:]]+$//' >"${OUT}/schema-${db}.sql"
+  docker exec "${PG_CID}" pg_dump -U ledger --schema-only --no-owner -d "${db}" | grep -vE '^(--|SET |SELECT pg_catalog|\\connect|\\restrict|\\unrestrict|$)' | sed -E 's/[[:space:]]+$//' >"${OUT}/schema-${db}.sql"
+  # Ownership is not in a --no-owner dump: compare it separately (ADR-0016 depends on it).
+  docker exec "${PG_CID}" psql -U ledger -d "${db}" -tAc "SELECT 'rel|'||relname||'|'||pg_get_userbyid(relowner) FROM pg_class WHERE relnamespace='public'::regnamespace UNION ALL SELECT 'fn|'||proname||'|'||pg_get_userbyid(proowner) FROM pg_proc WHERE pronamespace='public'::regnamespace UNION ALL SELECT 'schema|public|'||pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname='public' ORDER BY 1" >"${OUT}/owners-${db}.txt"
 done
-if diff -u "${OUT}/schema-clean_install.sql" "${OUT}/schema-ledger.sql" >"${OUT}/schema.diff"; then
-  echo "schema convergence: clean install and upgraded database have identical schemas and privileges ($(wc -l <"${OUT}/schema-ledger.sql") lines)"
+if diff -u "${OUT}/schema-clean_install.sql" "${OUT}/schema-ledger.sql" >"${OUT}/schema.diff" && diff -u "${OUT}/owners-clean_install.txt" "${OUT}/owners-ledger.txt" >"${OUT}/owners.diff"; then
+  echo "schema convergence: clean install and upgraded database have identical DDL, grants and object ownership ($(wc -l <"${OUT}/schema-ledger.sql") DDL lines, $(wc -l <"${OUT}/owners-ledger.txt") owned objects; not covered: role attributes, database-level ACLs, sequence values, seed rows)"
 else
-  echo "FAIL: clean install and upgraded schemas differ:" >&2; head -60 "${OUT}/schema.diff" >&2; exit 1
+  echo "FAIL: clean install and upgraded schemas differ:" >&2; head -60 "${OUT}/schema.diff" "${OUT}/owners.diff" >&2; exit 1
 fi
 echo "report: ${OUT}"
 echo "UPGRADE OK"

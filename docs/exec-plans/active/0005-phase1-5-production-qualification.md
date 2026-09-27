@@ -337,56 +337,68 @@ supply-chain, upgrade, backup harnesses), `docs/` (operations runbook, security)
 - `fuzz/` (own cargo-fuzz workspace, excluded from the root; nightly only for this job) with
   seven libFuzzer targets over every untrusted-input parser and canonical encoder:
   `quad_parse` (N-Quads single quad; canonical text is a fixed point), `patch_canonical`
-  and `commit_decode` (v1 + v2; accepted bytes must re-encode identically, so one identity
-  per object), `prepare_body` / `accept_body` (strict JSON → handler normalization →
-  request identity, deterministic), `request_identity` (structured `arbitrary` bodies:
-  operation order and duplicated evidence never change the identity), `timestamp` (canonical
-  form satisfies the strict parser). Corpora seeded from the golden vectors (valid and
-  invalid commits, requests, patches) and hand-written cases, then grown and minimized by
-  libFuzzer (`cargo fuzz cmin`); committed under `fuzz/corpus/`. `scripts/fuzz.sh
-  [seconds]` runs all targets and fails on any crash; `ci-fuzz` runs 45 s per target on
-  every pull request and weekly and uploads logs and artefacts.
-- Executed (2026-09-27, `scripts/fuzz.sh 60`, sanitizer `none`): 0 crashes across
-  ≈87 M executions — quad_parse 8.4 M (cov 1621), patch_canonical 4.6 M (1720),
-  commit_decode 13.7 M (636), prepare_body 9.1 M (2620), accept_body 17.0 M (859),
-  request_identity 2.4 M (1661), timestamp 32.0 M (203). **Deferred:** the AddressSanitizer
+  (the decoder itself refuses non-canonical bytes; crash-only in practice), `commit_decode`
+  (v1 + v2; accepted bytes must re-encode identically, one identity per object),
+  `prepare_body` / `accept_body` (strict JSON → handler normalization → request identity;
+  the identity must not change under JSON key order, whitespace, operation or evidence
+  order), `request_identity` (structured `arbitrary` bodies; asymmetric acceptance only when
+  the duplicated evidence crosses the real metadata budget), `timestamp` (canonical form
+  satisfies the strict parser). Corpora seeded from the golden vectors and grown/minimized
+  by libFuzzer (`cargo fuzz cmin`), committed under `fuzz/corpus/` and used read-only by
+  runs (new inputs go to `target/`). `scripts/fuzz.sh [seconds]` runs every declared target
+  with debug assertions (`-a`) and fails on any crash or on an empty target list; `ci-fuzz`
+  runs 45 s per target on every pull request and weekly with the pinned nightly.
+- Executed (2026-09-27, `scripts/fuzz.sh 60`, sanitizer `none`, debug assertions on):
+  0 crashes across ≈80 M executions — quad_parse 8.8 M (cov 1645), patch_canonical 4.2 M
+  (1768), commit_decode 14.6 M (655), prepare_body 7.3 M (2891), accept_body 14.9 M (1017),
+  request_identity 2.1 M (1718), timestamp 28.2 M (203). **Deferred:** the AddressSanitizer
   build crashes at start-up on the qualification host (SIGSEGV before the first input, all
-  targets alike; the same binaries run when built without the sanitizer), so ASan runs are
-  not claimed; the workspace forbids `unsafe`, so ASan would only observe dependencies.
-  Validate `FUZZ_SANITIZER=address` on a compatible host and record a longer (hours) run
-  before the final qualification decision.
+  targets alike; the same binaries run without the sanitizer), so ASan runs are not claimed;
+  the workspace forbids `unsafe`, so ASan would only observe dependencies. Validate
+  `FUZZ_SANITIZER=address` on a compatible host and record a longer (hours) run before the
+  final qualification decision. Not fuzzed: the `Idempotency-Key` header parser and the
+  path `CommitId`.
 
 ### Slice 7 — upgrade from the previous release (§7, 2026-09-27): executed, PASS
 - `scripts/upgrade.sh [rev] [commits]`: builds the previous release (`f027fbf`, the merged
   Phase-1 baseline at schema 0007; the repository has no tags yet) from git, runs it against
-  a fresh PostgreSQL (owner URL, self-migrating), writes commits through its API recording
-  keys/bodies/answers/states, then upgrades in the documented order (stop → owner
-  `ledger-admin migrate --runtime-role` → new image as the runtime identity) and checks:
-  schema at the required level with the checksums of the already-applied migrations
-  untouched, runtime identity connected, identical head/version and states, verbatim replay
-  of every old prepare/accept key (`replayed: true`, identical identifiers, ref unchanged),
-  a new commit on top, `ledger-admin verify`, and clean-install vs upgraded schema
-  convergence (`pg_dump --schema-only`, normalized, diff empty — grants included).
-- Evidence (`docs/quality/evidence/upgrade-2026-09-27.md`): 25 commits before, schema
-  7 → 9, 25 states identical, 50 keys replayed identically, version 26 after, verifier
-  clean, schemas identical (592 lines); `UPGRADE OK`.
+  a fresh PostgreSQL from which the development runtime role was dropped (a Phase-1 cluster
+  has a single identity), writes commits through its API recording keys/bodies/answers/states,
+  then upgrades in the runbook order (stop → create the runtime role → owner `ledger-admin
+  migrate --runtime-role` → new image as the runtime identity) and checks: schema at the
+  required level; recorded checksums of the already-applied migrations unchanged, equal to
+  the SHA-384 of the previous release's files, which are byte-identical at HEAD; runtime
+  identity connected; identical head/version and states; verbatim replay of every old
+  prepare/accept key (`replayed: true`, identical identifiers, ref unchanged); a new commit on
+  top; `ledger-admin verify`; clean-install vs upgraded convergence of normalized DDL plus
+  grants and of object ownership (not covered: role attributes, database-level ACLs,
+  sequence values, seed rows).
+- Evidence (`docs/quality/evidence/upgrade-2026-09-27.md`, rerun after the review fixes):
+  25 commits before, schema 7 → 9, 25 states identical, 50 keys replayed identically,
+  version 26 after, verifier clean, 592 DDL lines and 55 owned objects identical;
+  `UPGRADE OK`. Data set is one graph on the happy path (undecided/rejected proposals and
+  imported v1 data not carried across; recorded).
 
 ### Slice 8 — backup/restore smoke (§8, 2026-09-27): executed, PASS
 - `scripts/backup-restore.sh`: under a sustained 50-writer load over 10 graphs, take
-  `pg_dump -Fc` and `pg_basebackup -c fast -X stream` (local socket; a production
-  deployment uses a `replication` role over TLS — runbook), restore the dump into a new
-  database (`pg_restore --no-owner`) and start a second PostgreSQL instance from the base
-  backup; for each: `ledger-admin verify` → `VERIFY OK`, every ref's `(version, head)`
-  chain an exact contiguous prefix of the live chain, and a server on the restored database
-  (runtime identity) serving the restored heads with matching versions and reconstructing
-  states identical to the live server at the same commit ids. The load generator's own
-  gate (invariants, landings matched to `ref_events`, verifier) applied to the live database.
-- Evidence (`docs/quality/evidence/backup-restore-2026-09-27.md`): dump at 209 commits,
-  base backup at 599, live at 861 when the load stopped (899 events at comparison time);
-  dump restore 10 refs / 184 events, base-backup instance 10 refs / 313 events, both exact
-  prefixes; 10 + 10 restored heads served, states identical; both verifies clean;
-  `BACKUP RESTORE OK`. First attempt failed on the missing network replication entry in
-  `pg_hba.conf` (procedure corrected to the local socket and documented).
+  `pg_dump -Fc` and `pg_basebackup -c fast -X stream` (local socket; production uses a
+  `replication` role over TLS — runbook), each after recording the commits already
+  acknowledged to clients; restore the dump by the documented path (`pg_restore --no-owner
+  --no-acl` as the owner, `GRANT CONNECT`, `ledger-admin migrate --runtime-role` re-deriving
+  the grants) and start a second PostgreSQL instance from the base backup; for each:
+  `ledger-admin verify` → `VERIFY OK`, graph set equal to live, restored ref events ≥ the
+  pre-backup watermark, every ref's `(version, head)` chain an exact contiguous prefix of
+  the live chain, every restored decision/outbox/idempotency/proposal row present
+  identically in live, and a server on the restored database (runtime identity) serving the
+  restored heads with matching versions and reconstructing states identical to the live
+  server at the same commit ids.
+- Evidence (`docs/quality/evidence/backup-restore-2026-09-27.md`, rerun after the review
+  fixes): dump at 279 commits (≥ 214 acknowledged before), base backup at 647 (≥ 279), live
+  898 when the load stopped; dump restore 253 events / 2,575 audit rows, base-backup
+  instance 374 events / 3,714 audit rows, all prefixes and present in live; 10 + 10
+  restored heads served, states identical; both verifies clean; `BACKUP RESTORE OK`.
+  Restore forks history from the snapshot (versions reissued); runbook states the
+  consequences, PITR/fencing decision in tech-debt. The smoke does not write to a restore.
 
 ### Slice 9 — adversarial resource limits (§9, 2026-09-26): executed
 - `pg_api::expensive_operations_are_admission_controlled_under_a_slow_database`: owner
@@ -441,27 +453,64 @@ supply-chain, upgrade, backup harnesses), `docs/` (operations runbook, security)
   rotation latency under the 60 s refresh throttle; a bounded admission queue as a possible
   refinement; the live Entra ID issuer test remains pending.
 
-### Slice 10 — performance baselines (§10, 2026-09-27): first run recorded, depth 10,000 in progress
-- `ledger-stress bench` + `scripts/bench.sh`: single client, linear history, prepare / accept /
-  ref read / state read at depths 1, 100, 1,000, 10,000 (20 samples each). First run aborted
-  at depth 5,902 by client-token expiry (the build takes hours because prepare reconstructs
-  the parent state; fixed with a 12 h token) after recording depths 1–1,000:
-  accept ≈3–4 ms and ref read ≈1 ms flat; prepare 4.8 → 20.5 → 194.7 ms p50 and state read
-  11 → 30 → 211 ms p50, i.e. ≈0.19 ms per ancestor commit. `docs/quality/performance-baselines.md`
-  holds the table and the checkpoint policy proposal (content-addressed snapshots every k
-  commits, written after COMMIT, verifiable by digest, cache-only for correctness; ADR needed
-  before Phase 4). The depth-10,000 rerun is running; its row is appended when it completes.
+### Slice 10 — performance baselines (§10, 2026-09-27): executed, recorded
+- `ledger-stress bench` + `scripts/bench.sh`: single client, linear history, prepare /
+  accept / ref read / state read at depths 1, 100, 1,000, 10,000 (prepare/accept on the last
+  20 commits before each depth, reads at exactly that depth), plus a `--constant-state`
+  control (add one quad, delete the previous) to separate history depth from state size.
+- Evidence (`docs/quality/performance-baselines.md`): accept 3–4 ms and ref read ≈1 ms flat;
+  prepare 11 → 18 → 216 → 1,905 ms p50 and state read 0.7 → 30 → 188 → 1,983 ms p50 from
+  depth 1 to 10,000 (2.8 h to build the history); the constant-state control reproduces the
+  growth with a one-quad state (200 ms at depth 1,000), so the per-ancestor fetch dominates
+  (≈0.19–0.20 ms per ancestor). The document proposes batching/caching the ancestor fetch
+  first and a checkpoint policy constrained by ADR-0008/0012/0013/0016 (verified-at-write
+  or owner-written snapshots, never used by `prepare` unless verified, never dropped, new
+  hashed format = protocol with ADR and golden vectors) — a decision for Phase 4.
 
-## Qualification decision (§22–23, interim, 2026-09-27)
-**Production-qualified: NO.** Executed and passing: slices 1 (least privilege), 2 (supply
-chain, image), 3 (1,000 writers), 4 (kill injection), 5 except the live issuer, 6 bounded
-fuzzing, 7 (upgrade), 8 (backup/restore), 9 (adversarial limits), §20 verifier, §21 runbook.
-Open before the gate can pass: **live Entra ID issuer smoke test (pending, no tenant
-credentials available to the runs)**; AddressSanitizer fuzz runs and a multi-hour fuzz
-campaign (deferred: ASan runtime crashes at start-up on the qualification host); depth-10,000
-baseline row (running); final independent reviews of slices 6–10 with no open P0/P1. Deferred
-design work recorded in tech-debt (checkpoints, admission budget for accept, cancellation of
-abandoned statements, deterministic post-commit crash switch).
+### Review record — slices 6, 7, 8, 10 (test, storage/concurrency; Opus, read-only, on commit 9b60d23)
+- No P0. P1s: (1) the depth benchmark sampled *after* each target depth, so the depth-10,000
+  row could never be produced under the development `max_depth` (the run was stopped and
+  the sampling changed to the last commits *before* each target; reads at exactly the
+  target); (2) the baseline conflated history depth with state size (one quad per commit) →
+  a `--constant-state` control run (add one / delete previous) is part of the baseline and
+  the conclusions are stated per experiment; (3) the checkpoint proposal would have let a
+  runtime-written cache decide the ADR-0008 effective delta and thus commit identity, and
+  "dropping" checkpoints conflicted with ADR-0013's readability guarantee and 0005's
+  write-once guard → rewritten: verified-at-write or owner-written snapshots, never used by
+  `prepare` unless verified, never dropped, new hashed format = protocol (ADR + golden
+  vectors); (4) restore forks history and reissues versions → runbook states the
+  consequences and the open PITR/fencing decisions (tech-debt). P2s fixed: fuzz targets
+  run with debug assertions (`-a`), pinned nightly honoured in CI, non-empty target list
+  asserted, checked-in corpora read-only during runs, `prepare_body`/`accept_body` assert
+  JSON-shape and element-order independence instead of comparing a digest with itself,
+  `request_identity` tolerance uses the real metadata budget formula; restore checks require
+  the graph set, a pre-backup watermark of acknowledged commits and identical audit rows
+  (decisions/outbox/idempotency/proposals) in live; the documented restore path
+  (`--no-owner --no-acl`, `GRANT CONNECT`, `migrate --runtime-role` re-deriving grants) is the
+  one exercised; the upgrade harness emulates a Phase-1 cluster (no runtime role) and
+  creates it as the runbook step, proves recorded checksums are sha384 of the previous
+  release's files and compares object ownership beside the DDL diff (with `\restrict`
+  lines filtered for newer `pg_dump`); evidence files record the exact build revision.
+  Accepted/recorded: narrow upgrade data set (one graph, happy path), no write to a restore
+  during the smoke, ASan validation deferred, remaining untested inputs (`Idempotency-Key`
+  header parser, path `CommitId`).
+
+## Qualification decision (§22–23, 2026-09-27)
+**Production-qualified: NO.** Executed and passing on this branch: slices 1 (least
+privilege, ADR-0016), 2 (supply chain, image), 3 (1,000 writers over two replicas),
+4 (kill injection), 5 except the live issuer, 6 bounded fuzzing without ASan, 7 (upgrade),
+8 (backup/restore), 9 (adversarial limits), 10 (baselines with the checkpoint proposal),
+§20 verifier, §21 runbook; every slice reviewed independently with no open P0/P1.
+Open before the gate can pass:
+- **Live Entra ID issuer smoke test — PENDING** (no tenant credentials available to these
+  runs; never marked passed). Release prerequisite.
+- AddressSanitizer fuzz runs and a multi-hour fuzz campaign (deferred: ASan runtime crashes
+  at start-up on the qualification host; validate on the CI runner or another host).
+- Deployment decisions recorded in tech-debt that a production operator must take:
+  restore semantics (PITR/WAL archiving, writer fencing, projection rebuild), checkpoint ADR
+  before Phase 4, admission budget for `accept` and cancellation of abandoned statements.
+- Final independent security review of the complete branch before merge (requested with
+  the pull request).
 
 ## Sub-agent decomposition (§42)
 storage/concurrency (role split, kill injection), API/security (multi-replica auth,

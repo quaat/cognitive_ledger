@@ -8,10 +8,10 @@ so sanitizer builds never touch the release build graph.
 | target | entry point | property checked besides "never panics" |
 |---|---|---|
 | `quad_parse` | `ledger_rdf::Quad::from_str` (N-Quads, blank nodes refused) | canonical text is a fixed point of parse ∘ print |
-| `patch_canonical` | `ledger_rdf::Patch::from_canonical_bytes` | accepted bytes re-encode identically (one identity per patch) |
+| `patch_canonical` | `ledger_rdf::Patch::from_canonical_bytes` | crash-only in practice: the decoder itself refuses non-canonical bytes; the target re-asserts it |
 | `commit_decode` | `ledger_core::AnyCommit::from_canonical_bytes` (v1 + v2) | accepted bytes re-encode identically; id stable |
-| `prepare_body` | `serde_json` → `ledger_api::PrepareBody` → `canonical_prepare` | request identity deterministic; normalized patch canonical |
-| `accept_body` | `serde_json` → `ledger_api::AcceptBody` → `canonical_accept` | request identity deterministic |
+| `prepare_body` | `serde_json` → `ledger_api::PrepareBody` → `canonical_prepare` | identity unchanged by JSON key order, whitespace, operation and evidence order |
+| `accept_body` | `serde_json` → `ledger_api::AcceptBody` → `canonical_accept` | identity unchanged by JSON key order and whitespace |
 | `request_identity` | structured (`arbitrary`) prepare bodies through `canonical_prepare` | operation order / duplicated evidence never change the identity |
 | `timestamp` | `ledger_core::LedgerTimestamp::parse_rfc3339` | canonical form satisfies the strict canonical parser |
 

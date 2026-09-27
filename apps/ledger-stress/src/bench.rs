@@ -26,6 +26,9 @@ struct BenchConfig {
     owner_database_url: String,
     depths: Vec<u64>,
     samples: usize,
+    /// Control experiment: every commit adds one quad and deletes the previous one, so the
+    /// state stays at one quad while the history deepens (separates depth from state size).
+    constant_state: bool,
     out: PathBuf,
     issuer: String,
     audience: String,
@@ -34,7 +37,7 @@ struct BenchConfig {
 
 fn usage() -> &'static str {
     "usage: ledger-stress bench --replica <url> --out <dir> [--depths 1,100,1000,10000] \
-     [--samples 20] [--issuer <iss>] [--audience <aud>] [--secret-env LEDGER_STRESS_HS256_SECRET] \
+     [--samples 20] [--constant-state] [--issuer <iss>] [--audience <aud>] [--secret-env LEDGER_STRESS_HS256_SECRET] \
      [--owner-database-url <url>] [--allow-non-loopback]"
 }
 
@@ -44,6 +47,7 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<BenchConfig, String> 
         owner_database_url: std::env::var("LEDGER_STRESS_OWNER_DATABASE_URL").unwrap_or_default(),
         depths: vec![1, 100, 1000, 10_000],
         samples: 20,
+        constant_state: false,
         out: PathBuf::new(),
         issuer: "https://dev-issuer.example/".into(),
         audience: "api://sculpin-ledger-dev".into(),
@@ -65,6 +69,7 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<BenchConfig, String> 
                 c.depths.dedup();
             }
             "--samples" => c.samples = value()?.parse().map_err(|_| "--samples")?,
+            "--constant-state" => c.constant_state = true,
             "--out" => c.out = value()?.into(),
             "--issuer" => c.issuer = value()?,
             "--audience" => c.audience = value()?,
@@ -91,6 +96,8 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<BenchConfig, String> 
 #[derive(Serialize, Clone)]
 struct DepthReport {
     depth: u64,
+    /// Commits measured for prepare/accept; they landed at depths `depth-commit_samples+1 ..= depth`.
+    commit_samples: usize,
     quads_in_state: usize,
     prepare: crate::Percentiles,
     accept: crate::Percentiles,
@@ -102,6 +109,7 @@ struct DepthReport {
 struct BenchReport {
     run: String,
     environment: crate::Environment,
+    constant_state: bool,
     samples: usize,
     depths: Vec<DepthReport>,
     total_commits: u64,
@@ -112,10 +120,15 @@ struct BenchReport {
 
 fn markdown(r: &BenchReport) -> String {
     let mut m = format!(
-        "# Performance baseline `{}` — {}\n\nSingle client, one graph, linear history of {} commits (one quad added per commit), {} samples per cell; {:.1} s to build. Hardware: {} × {}, {} GiB RAM, kernel {}. PostgreSQL: {}. Replica: {}.\n\n| depth | quads in state | prepare p50 / p95 ms | accept p50 / p95 ms | ref read p50 / p95 ms | state read p50 / p95 ms |\n|---:|---:|---:|---:|---:|---:|\n",
+        "# Performance baseline `{}` — {}\n\nSingle client, one graph, linear history of {} commits ({}); up to {} samples per cell: prepare/accept measured on the last commits before each depth, ref and state reads at exactly that depth; {:.1} s to build. Hardware: {} × {}, {} GiB RAM, kernel {}. PostgreSQL: {}. Replica: {}.\n\n| depth | commit samples | quads in state | prepare p50 / p95 ms | accept p50 / p95 ms | ref read p50 / p95 ms | state read p50 / p95 ms |\n|---:|---:|---:|---:|---:|---:|---:|\n",
         r.run,
         if r.passed { "complete" } else { "INCOMPLETE" },
         r.total_commits,
+        if r.constant_state {
+            "constant one-quad state: each commit adds one quad and deletes the previous"
+        } else {
+            "one quad added per commit, so the state grows with depth"
+        },
         r.samples,
         r.build_seconds,
         r.environment.cpus,
@@ -127,8 +140,9 @@ fn markdown(r: &BenchReport) -> String {
     );
     for d in &r.depths {
         m.push_str(&format!(
-            "| {} | {} | {:.1} / {:.1} | {:.1} / {:.1} | {:.1} / {:.1} | {:.1} / {:.1} |\n",
+            "| {} | {} | {} | {:.1} / {:.1} | {:.1} / {:.1} | {:.1} / {:.1} | {:.1} / {:.1} |\n",
             d.depth,
+            d.commit_samples,
             d.quads_in_state,
             d.prepare.p50_ms,
             d.prepare.p95_ms,
@@ -153,6 +167,7 @@ struct Client<'a> {
     proposals: &'a str,
     refs: &'a str,
     run: &'a str,
+    constant_state: bool,
 }
 
 impl Client<'_> {
@@ -190,14 +205,21 @@ impl Client<'_> {
     ) -> Result<(Duration, Duration), String> {
         let _ = self.refs;
         let seq = *depth + 1;
-        let quad = format!("<urn:bench:{}:{seq}> <urn:bench:seq> \"{seq}\" .", self.run);
+        let quad = |n: u64| format!("<urn:bench:{}:{n}> <urn:bench:seq> \"{n}\" .", self.run);
+        let mut body = prepare_body(head.as_deref(), &quad(seq));
+        if self.constant_state && seq > 1 {
+            body["operations"] = json!([
+                {"op": "add", "quad": quad(seq)},
+                {"op": "delete", "quad": quad(seq - 1)},
+            ]);
+        }
         let (p, p_ms) = self
             .send(
                 Op::Prepare,
                 reqwest::Method::POST,
                 self.proposals.to_owned(),
                 Some(format!("{}-p{seq}", self.run)),
-                Some(prepare_body(head.as_deref(), &quad)),
+                Some(body),
             )
             .await;
         let candidate = match p {
@@ -276,11 +298,16 @@ pub async fn run(argv: impl Iterator<Item = String>) -> ExitCode {
         proposals: &proposals,
         refs: &refs,
         run: &run,
+        constant_state: cfg.constant_state,
     };
     'outer: for target in cfg.depths.clone() {
-        // Build up to (target - 1) unmeasured, then measure `samples` commits that land at
-        // depths target .. target + samples - 1 (the first one is exactly `target`).
-        while depth + 1 < target {
+        // Build unmeasured up to `target - s`, then measure the last `s` commits, which land
+        // at depths target-s+1 ..= target (so the head, and the state reads, are at exactly
+        // `target`; `s` is `samples` or fewer for shallow targets). The measured prepares
+        // therefore reconstruct parents of depth target-s ..= target-1, and the run never
+        // needs a history deeper than the largest target (the development `max_depth`).
+        let s = (cfg.samples as u64).min(target.saturating_sub(depth).max(1)) as usize;
+        while depth + (s as u64) < target {
             if let Err(e) = client.commit(&mut head, &mut depth).await {
                 errors.push(e);
                 break 'outer;
@@ -288,7 +315,7 @@ pub async fn run(argv: impl Iterator<Item = String>) -> ExitCode {
         }
         let mut p_lat = Vec::new();
         let mut a_lat = Vec::new();
-        for _ in 0..cfg.samples {
+        for _ in 0..s {
             match client.commit(&mut head, &mut depth).await {
                 Ok((p, a)) => {
                     p_lat.push(p.as_micros() as u64);
@@ -332,13 +359,14 @@ pub async fn run(argv: impl Iterator<Item = String>) -> ExitCode {
             s_lat.push(s_ms.as_micros() as u64);
         }
         eprintln!(
-            "depth {target}: {} quads, prepare p50 {:.1} ms, state read p50 {:.1} ms",
+            "depth {target}: {} quads, {s} commit samples, prepare p50 {:.1} ms, state read p50 {:.1} ms",
             quads,
             percentiles("prepare", "ok", &mut p_lat.clone()).p50_ms,
             percentiles("state", "ok", &mut s_lat.clone()).p50_ms
         );
         reports.push(DepthReport {
             depth: target,
+            commit_samples: s,
             quads_in_state: quads,
             prepare: percentiles("prepare", "ok", &mut p_lat),
             accept: percentiles("accept", "ok", &mut a_lat),
@@ -350,6 +378,7 @@ pub async fn run(argv: impl Iterator<Item = String>) -> ExitCode {
     let report = BenchReport {
         run,
         environment: env,
+        constant_state: cfg.constant_state,
         samples: cfg.samples,
         depths: reports,
         total_commits: depth,

@@ -95,3 +95,5 @@ Schema migrations never move content. Immutable objects move with the administra
 idempotent, resumable, verification-first and never overwrites a ref that already differs.
 A failed sqlx migration run keeps its session-level advisory lock on the pooled connection
 that ran it; retry from a fresh process (or a fresh pool), which the admin tool does.
+
+Before applying 0009 to an existing database run `ledger-admin verify` (owner identity): 0009 validates the content-addressed CHECK by hashing every stored object under `ACCESS EXCLUSIVE` and aborts on a corrupt row with a raw `23514` that names no id; the offline window grows with the store size.

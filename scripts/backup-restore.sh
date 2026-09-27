@@ -21,11 +21,12 @@ BBVOL="${PROJECT}_basebackup"
 BBNAME="${PROJECT}-bb"
 PG_IMAGE=$(grep -oE 'image: postgres:[^ ]+' compose.yaml | head -1 | cut -d' ' -f2)
 COMPOSE=(docker compose -p "${PROJECT}" -f compose.yaml -f compose.stress.yaml)
-OWNER_HOST_URL='postgres://ledger:ledger-development-only@localhost:55432/ledger?sslmode=disable'
+OWNER_HOST_URL='postgres://ledger:ledger-development-only@127.0.0.1:55432/ledger?sslmode=disable'
 LOAD_PID=""
 cleanup() {
   if [ -n "${LOAD_PID}" ]; then touch "${STOP}"; wait "${LOAD_PID}" 2>/dev/null || true; fi
   docker rm -f "${BBNAME}" "${PROJECT}-bbcopy" >/dev/null 2>&1 || true
+  rm -rf "${OUT}/bb"
   docker rm -f "${PROJECT}-restored-server" >/dev/null 2>&1 || true
   "${COMPOSE[@]}" logs --no-color ledger ledger-b postgres >"${OUT}/containers.log" 2>&1 || true
   "${COMPOSE[@]}" down --remove-orphans --volumes >/dev/null 2>&1 || true
@@ -52,11 +53,16 @@ echo "live load established: $(progress landed) commits"
 
 # --- Backups while writes continue ---------------------------------------------------------
 PG_CID=$("${COMPOSE[@]}" ps -q postgres)
+git describe --always --dirty --long >"${OUT}/build-rev.txt" 2>/dev/null || git rev-parse HEAD >"${OUT}/build-rev.txt"
+# Watermarks: commits the clients had already been acknowledged BEFORE each backup started;
+# the restore must contain at least that many ref events and every graph.
+DUMP_BEFORE=$(progress landed)
 docker exec "${PG_CID}" pg_dump -U ledger -Fc -d ledger -f /tmp/ledger.dump
 DUMP_AT_LANDED=$(progress landed)
 # Physical base backup over the local socket (the development pg_hba has no network
 # replication entry; a production deployment grants `replication` to a dedicated role and
 # streams over TLS), then moved into a fresh volume for a second instance.
+BB_BEFORE=$(progress landed)
 docker exec "${PG_CID}" sh -c 'rm -rf /tmp/bb && pg_basebackup -U ledger -D /tmp/bb -c fast -X stream' >"${OUT}/basebackup.log" 2>&1
 BB_AT_LANDED=$(progress landed)
 docker volume create "${BBVOL}" >/dev/null
@@ -71,8 +77,13 @@ touch "${STOP}"; set +e; wait "${LOAD_PID}"; LOAD_EXIT=$?; set -e; LOAD_PID=""
 [ "${LOAD_EXIT}" -eq 0 ] || { echo "FAIL: load generator exit ${LOAD_EXIT}" >&2; cat "${OUT}/load/report.md" >&2; exit 1; }
 
 # --- Restore: logical dump into a new database, physical base backup as a new instance ------
+# Documented restore path (runbook): restore objects only (no owner, no ACLs), then let
+# `ledger-admin migrate --runtime-role` re-derive the runtime grants from migration 0008
+# instead of trusting ACLs carried in the dump; grant CONNECT explicitly.
 psql_q ledger "CREATE DATABASE restored_dump" >/dev/null
-docker exec "${PG_CID}" pg_restore -U ledger -d restored_dump --no-owner /tmp/ledger.dump >"${OUT}/pg_restore.log" 2>&1 || { echo "pg_restore reported errors:" >&2; cat "${OUT}/pg_restore.log" >&2; exit 1; }
+docker exec "${PG_CID}" pg_restore -U ledger -d restored_dump --no-owner --no-acl /tmp/ledger.dump >"${OUT}/pg_restore.log" 2>&1 || { echo "pg_restore reported errors:" >&2; cat "${OUT}/pg_restore.log" >&2; exit 1; }
+psql_q ledger "GRANT CONNECT ON DATABASE restored_dump TO ledger_runtime" >/dev/null
+"${COMPOSE[@]}" run --rm migrate migrate --runtime-role ledger_runtime --database-url 'postgres://ledger:ledger-development-only@postgres:5432/restored_dump?sslmode=disable' >"${OUT}/restored-migrate.log" 2>&1 || { echo "FAIL: migrate/grant on the restored database" >&2; cat "${OUT}/restored-migrate.log" >&2; exit 1; }
 docker run -d --name "${BBNAME}" --network "${NET}" -e POSTGRES_PASSWORD=ledger-development-only \
   -v "${BBVOL}:/var/lib/postgresql/data" "${PG_IMAGE}" >/dev/null
 wait_pg "${BBNAME}"
@@ -94,7 +105,15 @@ for target in "dump|${OWNER_IN_NET}/restored_dump?sslmode=disable|${RUNTIME_IN_N
     docker exec "${BBNAME}" psql -U ledger -d ledger -tAc "SELECT graph_id||'|'||branch||'|'||new_version||'|'||new_head FROM ref_events ORDER BY 1" >"${OUT}/events-${name}.txt"
   fi
   docker exec "${PG_CID}" psql -U ledger -d ledger -tAc "SELECT graph_id||'|'||branch||'|'||new_version||'|'||new_head FROM ref_events ORDER BY 1" >"${OUT}/events-live.txt"
-  python3 - "${OUT}/events-${name}.txt" "${OUT}/events-live.txt" "${name}" <<'PY'
+  # Audit rows below the snapshot must exist identically in the live database (decisions,
+  # outbox, idempotency results, proposals): a restore may only be a prefix, never differ.
+  ROWS_SQL="SELECT 'd|'||decision_id||'|'||coalesce(proposal_id::text,'')||'|'||decision||'|'||coalesce(ref_event_id::text,'') FROM decisions UNION ALL SELECT 'o|'||outbox_id||'|'||ref_event_id||'|'||commit_id||'|'||ref_version FROM projection_outbox UNION ALL SELECT 'i|'||md5(row_to_json(i)::text) FROM idempotency i UNION ALL SELECT 'p|'||proposal_id||'|'||graph_id||'|'||candidate_commit FROM proposals ORDER BY 1"
+  if [ "${name}" = dump ]; then docker exec "${PG_CID}" psql -U ledger -d restored_dump -tAc "${ROWS_SQL}" >"${OUT}/rows-${name}.txt"; else docker exec "${BBNAME}" psql -U ledger -d ledger -tAc "${ROWS_SQL}" >"${OUT}/rows-${name}.txt"; fi
+  docker exec "${PG_CID}" psql -U ledger -d ledger -tAc "${ROWS_SQL}" >"${OUT}/rows-live.txt"
+  if [ "${name}" = dump ]; then BEFORE=${DUMP_BEFORE}; else BEFORE=${BB_BEFORE}; fi
+  docker exec "${PG_CID}" psql -U ledger -d ledger -tAc "SELECT graph_id FROM graphs ORDER BY 1" >"${OUT}/graphs-live.txt"
+  if [ "${name}" = dump ]; then docker exec "${PG_CID}" psql -U ledger -d restored_dump -tAc "SELECT graph_id FROM graphs ORDER BY 1" >"${OUT}/graphs-${name}.txt"; else docker exec "${BBNAME}" psql -U ledger -d ledger -tAc "SELECT graph_id FROM graphs ORDER BY 1" >"${OUT}/graphs-${name}.txt"; fi
+  python3 - "${OUT}/events-${name}.txt" "${OUT}/events-live.txt" "${name}" "${BEFORE}" "${OUT}/rows-${name}.txt" "${OUT}/rows-live.txt" "${OUT}/graphs-${name}.txt" "${OUT}/graphs-live.txt" <<'PY'
 import sys, collections
 def load(p):
     d = collections.defaultdict(dict)
@@ -104,15 +123,22 @@ def load(p):
         g,b,v,h = line.split('|')
         d[(g,b)][int(v)] = h
     return d
-r, l, name = load(sys.argv[1]), load(sys.argv[2]), sys.argv[3]
+r, l, name, before = load(sys.argv[1]), load(sys.argv[2]), sys.argv[3], int(sys.argv[4])
+rows_r = set(x.strip() for x in open(sys.argv[5]) if x.strip()); rows_l = set(x.strip() for x in open(sys.argv[6]) if x.strip())
+graphs_r = sorted(x.strip() for x in open(sys.argv[7]) if x.strip()); graphs_l = sorted(x.strip() for x in open(sys.argv[8]) if x.strip())
 if not r: sys.exit(f"FAIL: {name} restore has no ref events")
+if graphs_r != graphs_l: sys.exit(f"FAIL: {name}: graph set differs ({len(graphs_r)} restored vs {len(graphs_l)} live)")
+total = sum(len(e) for e in r.values())
+if total < before: sys.exit(f"FAIL: {name}: {total} restored ref events < {before} commits acknowledged before the backup started")
+missing = rows_r - rows_l
+if missing: sys.exit(f"FAIL: {name}: {len(missing)} restored audit rows (decisions/outbox/idempotency/proposals) do not exist identically in the live database, e.g. {sorted(missing)[:2]}")
 for ref, events in r.items():
     live = l.get(ref) or sys.exit(f"FAIL: {name}: ref {ref} missing live")
     n = max(events)
     if sorted(events) != list(range(1, n+1)): sys.exit(f"FAIL: {name}: {ref} chain not contiguous")
     for v, h in events.items():
         if live.get(v) != h: sys.exit(f"FAIL: {name}: {ref} version {v} head differs from live")
-print(f"{name}: {len(r)} refs, {sum(len(e) for e in r.values())} ref events, each chain an exact prefix of the live chain (live has {sum(len(e) for e in l.values())} events)")
+print(f"{name}: {len(graphs_r)} graphs (same set as live), {len(r)} refs, {total} ref events (>= {before} acknowledged before the backup), each chain an exact prefix of the live chain (live has {sum(len(e) for e in l.values())} events); {len(rows_r)} decision/outbox/idempotency/proposal rows all present identically in live")
 PY
   # 3. A server against the restored database serves the restored heads and reconstructs
   #    states identical to the live server at the same commit ids.
@@ -153,7 +179,7 @@ print(f"{sys.argv[2]}: {checked} restored heads served with versions matching, s
 PY
   docker rm -f "${PROJECT}-restored-server" >/dev/null
 done | tee "${OUT}/checks.log"
-grep -q "^dump: .* exact prefix" "${OUT}/checks.log" && grep -q "^basebackup: .* exact prefix" "${OUT}/checks.log" \
+grep -q "^dump: .* exact prefix.*present identically" "${OUT}/checks.log" && grep -q "^basebackup: .* exact prefix.*present identically" "${OUT}/checks.log" \
   && grep -q "^dump: .* states identical" "${OUT}/checks.log" && grep -q "^basebackup: .* states identical" "${OUT}/checks.log" \
   || { echo "FAIL: not every restore check passed" >&2; exit 1; }
 cp "${OUT}/load/report.md" "${OUT}/load-report.md"

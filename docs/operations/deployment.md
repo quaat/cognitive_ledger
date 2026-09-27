@@ -38,10 +38,23 @@ roles. Never give a serving container the owner URL (the server warns if it sees
 5. Terminate TLS in front of the service; bearer tokens travel in clear otherwise.
 
 ## Upgrades
-Stop every replica (0007 note in `migrations/README.md`), run step 2 with the new
-`ledger-admin` (`migrate --runtime-role <role>` under the owner identity), start the new
-build. A build started against another schema level refuses to serve; nothing upgrades
-implicitly. The path from the previous release is exercised by `scripts/upgrade.sh`
+1. Take a backup first (below). There is no rollback: once 0008/0009 are recorded the
+   previous binary refuses to start (`VersionMissing`), so the only way back is a restore,
+   which loses everything written after the upgrade.
+2. Run `ledger-admin verify` against the current database and fix anything it reports;
+   migration 0009 validates every stored object hash under `ACCESS EXCLUSIVE` and aborts
+   on a corrupt row without naming it.
+3. Stop every replica (0007 note in `migrations/README.md`).
+4. Upgrading from Phase 1 (single identity): create the runtime role with a managed
+   password (`CREATE ROLE <role> LOGIN PASSWORD …`; it owns nothing and has no `CREATE`),
+   and prepare the replicas' `LEDGER_DATABASE_URL` to use it — the owner URL moves to
+   `LEDGER_MIGRATION_DATABASE_URL` on the operator host only.
+5. Run `ledger-admin migrate --runtime-role <role>` with the new `ledger-admin` under the
+   owner identity.
+6. Start the new build. A build started against another schema level, or with an identity
+   that owns tables, refuses to serve; nothing upgrades implicitly.
+
+The path from the previous release is exercised by `scripts/upgrade.sh`
 (previous image built from git, data written through its API, upgrade in this order, then:
 schema at the required level with the checksums of already-applied migrations untouched,
 identical heads/versions and reconstructed states, verbatim replay of the previous
@@ -77,10 +90,12 @@ it after every end-to-end scenario.
 
 ## Backup, restore, failure recovery
 - **Logical backup:** `pg_dump -Fc` of the ledger database (a consistent snapshot even
-  under writes). Restore with `pg_restore --no-owner` into a new database as the owner
-  identity, then `ledger-admin verify --database-url <owner url of the restored database>`
-  must print `VERIFY OK` before any server is pointed at it. Grants for the runtime role
-  are part of the dump (the role must exist in the target cluster; it is cluster-wide).
+  under writes). Restore with `pg_restore --no-owner --no-acl` into a new database as the
+  owner identity, `GRANT CONNECT` on it to the runtime role, then run `ledger-admin migrate
+  --runtime-role <role> --database-url <owner url of the restored database>` so the runtime
+  grants are re-derived from migration 0008 rather than trusted from the dump (the role is
+  cluster-wide; it must exist in the target cluster), and `ledger-admin verify` on it must
+  print `VERIFY OK` before any server is pointed at it.
 - **Physical backup:** `pg_basebackup -c fast -X stream` by a role with `replication`
   privilege (the development compose has no network replication entry in `pg_hba.conf`;
   production grants it to a dedicated backup role over TLS). A new instance started from
@@ -90,6 +105,15 @@ it after every end-to-end scenario.
   reconstructs states identical to the live server for the same commit ids (content
   identity makes the comparison exact). `scripts/backup-restore.sh` proves both variants
   under live load; run it per release.
+- **What restore does not preserve — decide before you need it:** everything acknowledged
+  after the snapshot is gone, and the restored ledger will issue the same `(graph, branch,
+  version)` numbers again for different commits. Before a restore: fence all writers, record
+  the restore point (last restored version per ref), rebuild any projection (Phase 3
+  consumers may have projected commits that no longer exist), and expect clients holding a
+  lost head to receive `HEAD_CHANGED`; idempotency keys issued after the snapshot will run
+  fresh. The physical backup has no WAL archive here, so the recovery point is the backup
+  time; whether PITR/WAL archiving is required is an open deployment decision recorded in
+  `docs/exec-plans/tech-debt.md`.
 - **Failure recovery:** a killed replica is restarted; a killed PostgreSQL recovers from
   its WAL and running replicas reconnect without restart (`/ready` returns 200 again).
   After any recovery run `ledger-admin verify`; clients retry ambiguous requests with their

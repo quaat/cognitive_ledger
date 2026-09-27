@@ -66,12 +66,19 @@ fuzz_target!(|input: Input| {
         }
         (Err(_), Err(_)) => {}
         (Ok(_), Err(_)) | (Err(_), Ok(_)) => {
-            // Reordering/duplicating evidence can only differ in acceptance through the
-            // metadata byte budget (the duplicate adds bytes); anything else is a bug.
-            let total: usize = input.evidence_refs.iter().map(String::len).sum();
+            // The reversed body duplicates the first evidence ref, which can only change the
+            // outcome by pushing the metadata byte budget (activity + message + evidence +
+            // source system, `ApiLimits::max_metadata_bytes`) over its limit. Any other
+            // asymmetry is a bug.
+            let limits = ledger_api::ApiLimits::default();
+            let meta: usize = input.activity.len()
+                + input.message.len()
+                + input.evidence_refs.iter().map(String::len).sum::<usize>()
+                + input.source_system.as_deref().map_or(0, str::len);
+            let extra = input.evidence_refs.first().map_or(0, String::len);
             assert!(
-                total + input.activity.len() + input.message.len() > 1024,
-                "acceptance differed for a small request"
+                meta <= limits.max_metadata_bytes && meta + extra > limits.max_metadata_bytes,
+                "acceptance differed without crossing the metadata budget (meta {meta}, extra {extra})"
             );
         }
     }
