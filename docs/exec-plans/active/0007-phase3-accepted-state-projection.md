@@ -200,10 +200,10 @@ Final code candidate **`fe6ad16`** (clean tree; later commits change documentati
 | `scripts/upgrade-p3.sh` (0010 from `0a56092` → 0011; populated Phase-2 DB incl. validations; 36-row outbox backlog) | `fe6ad16` | `UPGRADE-P3 OK` (`target/upgrade-p3/20260928T002456Z`): pre-upgrade rows byte-identical after migrate and replay, backlog projected exactly, named-graph streams blocked, old server refuses 0011, new server and projector refuse 0010, clean ≡ upgraded schema |
 | `./scripts/test-integration.sh` (compose PG 17.2, Fuseki, projector; all PG suites; e2e projection, verify, second target id refused, target restart) | `fe6ad16` | exit 0, `INTEGRATION OK` (12 suites, `fuseki_projection` 21/21). A first run on `fe6ad16` failed in `pg_immutable_store` with "terminating connection due to administrator command" while an earlier gate chain was still tearing down its containers; rerun alone: green. Also green on `0634a27`, `251b66e`, `a9e0b33`. |
 | `./scripts/backup-restore.sh` (dump + base backup under load, restored servers) | `fe6ad16` | `BACKUP RESTORE OK` (`target/backup/20260928T003050Z`); it does not yet exercise the projector (a restored ledger + `MARKER_AHEAD` rebuild is covered by the Fuseki suite and the runbook, not by this script) |
+| hosted CI on draft PR #8: `ci-fast`, `ci-integration`, `ci-security` (supply chain, container, dependency review), `ci-fuzz` (none + address) | `5399d29` (= `fe6ad16` + architecture-check CI fallback + docs) | all **success** (runs 36363293420 / 36363293402 / 36363293425 / 36363293405). The first run on `ff4d6da` failed `ci-fast`: the architecture check's `cargo metadata --offline` has no registry cache on a fresh runner → online fallback (`5399d29`). |
 | Mutation checks | various | removing the CAS precondition → 3 Fuseki tests red; skipping the disable fence → ABA test red; removing the lease re-check → late-observation test red; removing the delayed-rebuild check → its test red at the time (now defence in depth) |
 
-Not executed here (recorded, not claimed): hosted CI on the Phase-3 PR (pending the PR),
-backup/restore qualification *with a running projector* (`scripts/backup-restore.sh` covers
+Not executed here (recorded, not claimed): backup/restore qualification *with a running projector* (`scripts/backup-restore.sh` covers
 the ledger only), fuzzing (no new decoder of untrusted input except SPARQL
 JSON results from the configured target, covered by unit tests; no fuzz target added).
 
