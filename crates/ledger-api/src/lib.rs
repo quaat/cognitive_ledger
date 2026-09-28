@@ -533,6 +533,36 @@ impl ApiError {
                         .map_or("none".to_owned(), ToString::to_string)
                 ),
             ),
+            E::BranchNotFound(_) => (
+                StatusCode::NOT_FOUND,
+                "BRANCH_NOT_FOUND",
+                "branch not found".into(),
+            ),
+            E::BranchExists(_) => (
+                StatusCode::CONFLICT,
+                "BRANCH_EXISTS",
+                "a branch of that name already exists in this graph".into(),
+            ),
+            E::BranchDeleted(_) => (
+                StatusCode::CONFLICT,
+                "BRANCH_DELETED",
+                "the branch is deleted; restore it before proposing or accepting on it".into(),
+            ),
+            E::BranchPointUnreachable => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "BRANCH_POINT_UNREACHABLE",
+                "the branch point is not the source branch head nor reachable from it".into(),
+            ),
+            E::BranchPolicyViolation(message) => (
+                StatusCode::CONFLICT,
+                "BRANCH_POLICY_VIOLATION",
+                message.clone(),
+            ),
+            E::BranchStateConflict(message) => (
+                StatusCode::CONFLICT,
+                "BRANCH_STATE_CONFLICT",
+                message.clone(),
+            ),
             E::IdempotencyConflict => (
                 StatusCode::CONFLICT,
                 "IDEMPOTENCY_CONFLICT",

@@ -215,7 +215,7 @@ async fn clean_history_verifies_and_each_bypass_is_detected() {
     .await;
     bypass(
         "DELETE FROM decisions WHERE decision = 'accepted'",
-        "every ref event has exactly one accepted decision",
+        "every ref event has exactly one accepted decision (except a created branch's first)",
     )
     .await;
     bypass(

@@ -986,6 +986,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ledger-dag"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ledger-core",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "ledger-projection"
 version = "0.1.0"
 dependencies = [
@@ -1066,6 +1076,7 @@ dependencies = [
  "fs2",
  "hex",
  "ledger-core",
+ "ledger-dag",
  "ledger-rdf",
  "ledger-validation-protocol",
  "serde",

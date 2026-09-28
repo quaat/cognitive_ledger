@@ -127,6 +127,27 @@ pub enum LedgerError {
     /// rules (ADR-0018).
     #[error("INVALID_VALIDATION: {0}")]
     InvalidValidation(String),
+    /// The branch does not exist in the caller's graph (a foreign graph's branch is
+    /// reported identically, ADR-0022).
+    #[error("BRANCH_NOT_FOUND: branch {0} does not exist")]
+    BranchNotFound(String),
+    /// A branch of that name already exists in the graph (names are never reused).
+    #[error("BRANCH_EXISTS: branch {0} already exists")]
+    BranchExists(String),
+    /// The branch is deleted (tombstoned): it receives no proposal and its head never moves.
+    #[error("BRANCH_DELETED: branch {0} is deleted")]
+    BranchDeleted(String),
+    /// The requested branch point is not the source head nor reachable from it within the
+    /// graph (unknown, foreign and unreachable commits are reported identically).
+    #[error("BRANCH_POINT_UNREACHABLE: the branch point is not reachable from the source branch")]
+    BranchPointUnreachable,
+    /// The operation would violate a branch policy or a `main` protection rule.
+    #[error("BRANCH_POLICY_VIOLATION: {0}")]
+    BranchPolicyViolation(String),
+    /// A lifecycle transition that does not apply to the branch's current status (e.g.
+    /// deleting a deleted branch under a new key).
+    #[error("BRANCH_STATE_CONFLICT: {0}")]
+    BranchStateConflict(String),
     #[error("graph {0} already exists")]
     GraphAlreadyExists(String),
     #[error("graph {0} does not exist")]
