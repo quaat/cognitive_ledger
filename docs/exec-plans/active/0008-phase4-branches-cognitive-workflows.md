@@ -97,7 +97,7 @@ All on the qualification host (Linux 5.10, Docker; scratch PostgreSQL 15-bookwor
 | `backup-restore.sh` (50 writers, 10 graphs, branch workload) | `BACKUP RESTORE OK` |
 | Golden vectors | 21 request vectors (6 v1, 6 v2, 9 branch); Rust and the Python reference agree; no v1/v2 vector changed |
 | Live Fluree branch differential | **deferred** (BUSL-1.1 sign-off pending) — not run, not counted |
-| Hosted CI | see the PR |
+| Hosted CI (PR #9) on `ab4b38a` | pass — ci-fast 36392899625, ci-security 36392899317 (supply chain, dependency review, container), ci-integration 36392899217, ci-fuzz 36392899384 (address + none) |
 
 **100-branch stress** (`scripts/stress-branches.sh 100 3 4`, final run `6aba194cb`,
 `target/stress-branches/20260928T073518Z`): 100 branches × 3 commits (every fourth from
