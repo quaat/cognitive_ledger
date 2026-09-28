@@ -17,12 +17,22 @@ def fail(msg):
     sys.exit(1)
 
 
-try:
-    meta = json.loads(subprocess.run(
-        ["cargo", "metadata", "--format-version", "1", "--locked", "--offline"],
-        cwd=root, check=True, capture_output=True, text=True).stdout)
-except (OSError, subprocess.CalledProcessError) as e:
-    fail(f"cargo metadata failed (the architecture check needs the resolved graph): {e}")
+def metadata():
+    # Offline first (developer machines, sandboxes); a fresh CI runner has no registry cache
+    # yet, so fall back to a normal resolve. `--locked` either way: the graph checked is the
+    # lockfile's.
+    errors = []
+    for extra in (["--offline"], []):
+        try:
+            return json.loads(subprocess.run(
+                ["cargo", "metadata", "--format-version", "1", "--locked", *extra],
+                cwd=root, check=True, capture_output=True, text=True).stdout)
+        except (OSError, subprocess.CalledProcessError) as e:
+            errors.append(f"{' '.join(extra) or 'online'}: {e}")
+    fail(f"cargo metadata failed (the architecture check needs the resolved graph): {errors}")
+
+
+meta = metadata()
 
 packages = {p["id"]: p for p in meta["packages"]}
 members = {packages[i]["name"]: i for i in meta["workspace_members"]}
