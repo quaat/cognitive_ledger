@@ -170,7 +170,14 @@ projection fault suite, compose integration, upgrade 0010 → 0011; Phase-2 suit
   compare-and-swap against that current marker would pass. Fixed by checking, after the
   observation and before every write and fence, that the worker still holds its lease
   (ADR-0020 "Authority after observation");
-  `a_rebuild_that_observes_after_losing_its_lease_writes_nothing` reproduces the schedule.
+  `a_rebuild_that_observes_after_losing_its_lease_writes_nothing` reproduces the schedule
+  (a mutation removing the check turns it red).
+- Codex round 4 on `0634a27`: no further target-write defect; **P1** — re-enabling a stream
+  kept its recorded progress as current although another feed may have written the graph
+  meanwhile (status "active, lag 0" until a later reconciliation) → re-enabling clears the
+  stream's last check so reconciliation re-observes it at once (and reports
+  `TARGET_CONFLICT` if another feed's marker is there); **P2** — column-level `REFERENCES`
+  grants passed the identity check → refused (tested).
 
 ## Evidence
 (filled as slices land)

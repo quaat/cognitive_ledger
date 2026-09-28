@@ -2848,7 +2848,8 @@ async fn verify_table_privileges_for(
     let columns = sqlx::query(
         "SELECT a.attname::text AS name, \
                 has_column_privilege($2, a.attrelid, a.attnum, 'INSERT') AS ins, \
-                has_column_privilege($2, a.attrelid, a.attnum, 'UPDATE') AS upd \
+                has_column_privilege($2, a.attrelid, a.attnum, 'UPDATE') AS upd, \
+                has_column_privilege($2, a.attrelid, a.attnum, 'REFERENCES') AS refs \
          FROM pg_attribute a \
          WHERE a.attrelid = to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped",
     )
@@ -2862,6 +2863,13 @@ async fn verify_table_privileges_for(
         let name: String = column.try_get("name").map_err(db_error)?;
         let ins: bool = column.try_get("ins").map_err(db_error)?;
         let upd: bool = column.try_get("upd").map_err(db_error)?;
+        // No identity may reference ledger columns from its own tables (column grants too).
+        if column.try_get::<bool, _>("refs").map_err(db_error)? {
+            return Err(identity(format!(
+                "role {who} holds REFERENCES on {qualified}.{name}{via}; the {kind} identity must \
+                 not ({adr})"
+            )));
+        }
         let expect_ins = model.insert_columns.contains(&name.as_str());
         let expect_upd = model.update_columns.contains(&name.as_str());
         let violates = |has: bool, expect: bool| match exactness {

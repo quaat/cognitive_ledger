@@ -44,7 +44,9 @@ created_at
   (checked in the enabling transaction, and by the partial unique index against races,
   SQLSTATE 23505). Re-enabling a disabled row reactivates it with its original cognitive
   graph; if the graph's (mutable) `knowledge_base_id` now derives another IRI, enable is
-  refused instead of reporting a graph the stream does not write.
+  refused instead of reporting a graph the stream does not write. Re-enabling also clears
+  `last_success_at`, so reconciliation re-observes the target at once: the recorded progress
+  is not trusted across a disable (another feed may have written the graph meanwhile).
 - The uniqueness is **partial** (`status <> 'disabled'`): disabling a stream frees its
   cognitive graph, so the KB's feed can be switched to another ledger graph (disable + enable
   + rebuild; ADR-0020 `TARGET_CONFLICT`) without deleting rows, which the guard forbids.

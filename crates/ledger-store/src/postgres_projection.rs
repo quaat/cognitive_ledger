@@ -306,7 +306,8 @@ impl ProjectionRepository {
         sqlx::query(
             "INSERT INTO projection_state (graph_id, branch, target_id, tenant_id, cognitive_graph) \
              VALUES ($1, $2, $3, $4, $5) \
-             ON CONFLICT (graph_id, branch, target_id) DO UPDATE SET status = 'active' \
+             ON CONFLICT (graph_id, branch, target_id) DO UPDATE SET status = 'active', \
+                 last_success_at = NULL, next_attempt_at = now() \
              WHERE projection_state.status IN ('disabled', 'disabling')",
         )
         .bind(key.graph_id.as_str())

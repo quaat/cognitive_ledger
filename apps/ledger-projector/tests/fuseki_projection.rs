@@ -1473,6 +1473,9 @@ async fn a_stalled_rebuild_of_a_disabled_feed_never_lands_after_the_old_feed_ret
         .await
         .unwrap();
     assert_eq!(w.status(&ga).await.status, "active");
+    // A re-enabled stream is re-checked against the target at once (its recorded progress
+    // is not trusted across a disable): here the target still holds A's own projection.
+    assert_eq!(healthy.reconcile_step().await.unwrap(), acknowledged(1));
     // B's stalled replacement lands now and must be a no-op.
     gate.notify_one();
     let outcome = stale_rebuild.await.unwrap();

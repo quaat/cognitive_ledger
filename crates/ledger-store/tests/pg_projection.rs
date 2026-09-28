@@ -648,6 +648,13 @@ async fn the_projector_identity_holds_exactly_its_model() {
     )
     .await;
     assert!(m.contains("ledger_grant_projector"), "{m}");
+    // Column-level REFERENCES is refused like the table-level one.
+    let m = refused(
+        format!("GRANT REFERENCES (graph_id) ON graphs TO {role}"),
+        format!("REVOKE REFERENCES (graph_id) ON graphs FROM {role}"),
+    )
+    .await;
+    assert!(m.contains("REFERENCES") && m.contains("graph_id"), "{m}");
     // CREATE anywhere (database, or a schema it owns) could shadow objects: refused.
     let db: String = sqlx::query_scalar("SELECT current_database()::text")
         .fetch_one(&admin)
