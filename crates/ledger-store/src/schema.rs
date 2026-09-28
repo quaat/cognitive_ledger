@@ -512,6 +512,19 @@ const GUARD_TRIGGERS: &[ExpectedTrigger] = &[
         deferrable: true,
         initially_deferred: true,
     },
+    ExpectedTrigger {
+        name: "graphs_adopt_refs",
+        table: "graphs",
+        function: "graphs_adopt_refs_on_activation",
+        before: false,
+        insert: false,
+        update: true,
+        delete: false,
+        update_columns: &["status"],
+        constraint: false,
+        deferrable: false,
+        initially_deferred: false,
+    },
     before(
         "refs_branch_active",
         "refs",
@@ -569,6 +582,7 @@ const GUARD_FUNCTIONS: &[&str] = &[
     "refs_are_branches",
     "refs_branch_is_active",
     "proposals_branch_is_active",
+    "graphs_adopt_refs_on_activation",
 ];
 
 /// Parse every `CREATE OR REPLACE FUNCTION … AS $$ … $$` in the embedded migrations (up to
@@ -1509,7 +1523,7 @@ const EXPECTED_CHECKS: &[(&str, &str, &str)] = &[
     (
         "branch_events",
         "branch_events_reason_bounds",
-        "CHECK(((reasonISNULL)OR((octet_length(reason)>=1)AND(octet_length(reason)<=1024))))",
+        "CHECK(((reasonISNULL)OR((octet_length(reason)>=1)AND(octet_length(reason)<=4096))))",
     ),
     (
         "branch_events",
@@ -3409,6 +3423,7 @@ mod tests {
         assert_eq!(by_name("refs_are_branches"), 5); // ROW AFTER INSERT (deferred)
         assert_eq!(by_name("refs_branch_active"), 19); // ROW BEFORE UPDATE
         assert_eq!(by_name("proposals_branch_active"), 7); // ROW BEFORE INSERT
-        assert_eq!(GUARD_TRIGGERS.len(), 27);
+        assert_eq!(by_name("graphs_adopt_refs"), 17); // ROW AFTER UPDATE
+        assert_eq!(GUARD_TRIGGERS.len(), 28);
     }
 }

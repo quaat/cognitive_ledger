@@ -99,8 +99,9 @@ pub struct RefMovement {
     pub recorded_at: String,
 }
 
-/// Commit parents of one graph, read on the caller's transaction connection (immutable
-/// rows; a commit not indexed under the graph is unknown — foreign commits never resolve).
+/// Commit parents of one graph, read on one connection (immutable rows; a commit not indexed
+/// under the graph is unknown — foreign commits never resolve). Fails closed on a parent list
+/// that disagrees with the indexed `parent_count` (corruption, never "fewer parents").
 struct GraphParents<'c> {
     conn: Mutex<&'c mut PgConnection>,
     graph: GraphId,
@@ -119,16 +120,27 @@ impl ParentProvider for GraphParents<'_> {
         .fetch_optional(&mut **conn)
         .await
         .map_err(db_error)?;
-        if indexed.is_none() {
+        let Some(parent_count) = indexed else {
             return Ok(None);
-        }
+        };
         let rows = sqlx::query(
-            "SELECT parent_id FROM commit_parents WHERE commit_id = $1 ORDER BY position",
+            "SELECT position, parent_id FROM commit_parents WHERE commit_id = $1 ORDER BY position",
         )
         .bind(commit.to_string())
         .fetch_all(&mut **conn)
         .await
         .map_err(db_error)?;
+        let contiguous = rows.len() == usize::try_from(parent_count).unwrap_or(usize::MAX)
+            && rows.iter().enumerate().all(|(i, r)| {
+                r.try_get::<i16, _>("position")
+                    .is_ok_and(|p| usize::try_from(p) == Ok(i))
+            });
+        if !contiguous {
+            return Err(LedgerError::CorruptObject {
+                id: commit.0.clone(),
+                reason: format!("commit_parents rows disagree with parent_count {parent_count}"),
+            });
+        }
         rows.iter()
             .map(|r| {
                 r.try_get::<String, _>("parent_id")
@@ -370,6 +382,67 @@ impl WorkflowRepository {
         })
     }
 
+    /// Whether `commit` is the source head or reachable from it, read without locks on a pooled
+    /// connection. Returns the head it was decided against. Unknown and foreign commits are
+    /// refused without walking (indistinguishable from unreachable ones, ADR-0022).
+    async fn reachable_from_source(
+        &self,
+        scope: &RequestScope,
+        request: &CreateBranchRequest,
+        commit: &CommitId,
+        limits: TraversalLimits,
+    ) -> Result<(CommitId, bool), LedgerError> {
+        let mut conn = self.pool.acquire().await.map_err(db_error)?;
+        let head: Option<String> =
+            sqlx::query_scalar("SELECT head FROM refs WHERE graph_id = $1 AND branch = $2")
+                .bind(scope.graph.as_str())
+                .bind(&request.source)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(db_error)?;
+        let Some(head) = head else {
+            // The transaction reports the missing source (after the tenant check).
+            return Err(LedgerError::BranchNotFound(request.source.clone()));
+        };
+        let head: CommitId = head.parse()?;
+        if *commit == head {
+            return Ok((head, true));
+        }
+        let known: Option<i32> =
+            sqlx::query_scalar("SELECT 1 FROM commit_index WHERE id = $1 AND graph_id = $2")
+                .bind(commit.to_string())
+                .bind(scope.graph.as_str())
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(db_error)?;
+        if known.is_none() {
+            return Ok((head, false));
+        }
+        let provider = GraphParents {
+            conn: Mutex::new(&mut *conn),
+            graph: scope.graph.clone(),
+        };
+        match ledger_dag::is_ancestor(&provider, commit, &head, limits).await {
+            Ok(reachable) => Ok((head, reachable)),
+            Err(DagError::VisitLimit { visited }) => Err(LedgerError::ResourceLimit(format!(
+                "branch point search exceeded {visited} commits"
+            ))),
+            Err(DagError::Deadline) => Err(LedgerError::ResourceLimit(
+                "branch point search exceeded its time limit".into(),
+            )),
+            // The start commit is indexed, so an unknown commit here is a missing parent.
+            Err(DagError::UnknownCommit(c)) => Err(LedgerError::CorruptObject {
+                id: c.0,
+                reason: "parent commit missing from the graph's index".into(),
+            }),
+            Err(DagError::Cycle(c)) => Err(LedgerError::CorruptObject {
+                id: c.0,
+                reason: "commit cycle".into(),
+            }),
+            Err(DagError::Provider(e)) => Err(e),
+        }
+    }
+
     /// Create a named branch at the source head or at a commit reachable from it (ADR-0022).
     pub async fn create_branch(
         &self,
@@ -385,6 +458,17 @@ impl WorkflowRepository {
                 "`main` is created only by the graph's genesis acceptance".into(),
             ));
         }
+        // Reachability is decided before the transaction, on one pooled connection released
+        // before the transaction begins, so no lock (source ref, branch, graph status) is held
+        // while walking (ADR-0022). History only moves forward: a commit reachable from the
+        // head read here stays reachable from any later head.
+        let reachable = match &request.from_commit {
+            None => None,
+            Some(commit) => Some(
+                self.reachable_from_source(scope, request, commit, limits)
+                    .await,
+            ),
+        };
         let mut tx = Self::begin_scoped(&self.pool, scope, Operation::BranchCreate).await?;
         if let Some(stored) = Self::stored_result(&mut tx, scope, Operation::BranchCreate).await? {
             return Self::replay_branch(&mut tx, stored, scope, "branch_created").await;
@@ -410,35 +494,15 @@ impl WorkflowRepository {
         let point = match &request.from_commit {
             None => source_head.clone(),
             Some(commit) if *commit == source_head => source_head.clone(),
-            Some(commit) => {
-                let provider = GraphParents {
-                    conn: Mutex::new(&mut *tx),
-                    graph: scope.graph.clone(),
-                };
-                match ledger_dag::is_ancestor(&provider, commit, &source_head, limits).await {
-                    Ok(true) => commit.clone(),
-                    Ok(false) | Err(DagError::UnknownCommit(_)) => {
-                        return Err(LedgerError::BranchPointUnreachable);
-                    }
-                    Err(DagError::VisitLimit { visited }) => {
-                        return Err(LedgerError::ResourceLimit(format!(
-                            "branch point search exceeded {visited} commits"
-                        )));
-                    }
-                    Err(DagError::Deadline) => {
-                        return Err(LedgerError::ResourceLimit(
-                            "branch point search exceeded its time limit".into(),
-                        ));
-                    }
-                    Err(DagError::Cycle(c)) => {
-                        return Err(LedgerError::CorruptObject {
-                            id: c.0,
-                            reason: "commit cycle".into(),
-                        });
-                    }
-                    Err(DagError::Provider(e)) => return Err(e),
-                }
-            }
+            Some(commit) => match reachable {
+                // Decided against the source head of the pre-transaction read; a head that
+                // moved since only extends what is reachable (a newly reachable commit is
+                // refused and the client retries).
+                Some(Ok((_, true))) => commit.clone(),
+                Some(Ok(_)) => return Err(LedgerError::BranchPointUnreachable),
+                Some(Err(e)) => return Err(e),
+                None => return Err(LedgerError::BranchPointUnreachable),
+            },
         };
         let inserted = sqlx::query(
             "INSERT INTO refs (graph_id, branch, head, version, protected) VALUES ($1, $2, $3, 1, $4) \

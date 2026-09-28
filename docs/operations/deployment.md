@@ -240,7 +240,11 @@ Readers' contract: [reading the projection](../design/sculpin-projection.md).
 - **Capabilities**: `read` lists/inspects (`GET …/branches`, `…/branches/status|history|log?name=`);
   `propose` creates unprotected branches; `admin` creates protected branches and deletes
   (`POST …/branches/delete`) or restores (`POST …/branches/restore`) any non-`main` branch.
-  Map an operator group to `admin` in `LEDGER_AUTH_ROLE_MAP` (`ledger.admin`).
+  Map an operator group to `admin` in `LEDGER_AUTH_ROLE_MAP` (`ledger.admin`); creating a
+  protected branch needs both `propose` and `admin`.
+- **Imported graphs**: a graph moved (by the owner) from `bootstrap`/`importing` to `active`
+  or `archived` adopts its refs as branches automatically (`adopted` event by
+  `urn:sculpin:ledger:graph-activation`).
 - **Deletion is a tombstone**: the head stops moving and no new proposal is admitted
   (`409 BRANCH_DELETED`); pending proposals may still be rejected; history, proposals and
   decisions stay readable; restore resumes at the same head/version. There is no hard delete

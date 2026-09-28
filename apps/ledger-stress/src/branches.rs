@@ -208,13 +208,26 @@ async fn land(
     key: &str,
     duplicate: bool,
 ) -> Result<(String, i64), String> {
+    let candidate = prepare_candidate(api, graph, token, branch, head, key, duplicate).await?;
+    accept_candidate(api, graph, token, branch, head, key, &candidate, duplicate).await
+}
+
+async fn prepare_candidate(
+    api: &Api,
+    graph: &str,
+    token: &str,
+    branch: &str,
+    head: Option<&str>,
+    key: &str,
+    duplicate: bool,
+) -> Result<String, String> {
     let proposals = format!("/v1/graphs/{graph}/proposals");
     let body = prepare(
         branch,
         head,
         &format!("<urn:branch-stress:{key}> <urn:branch-stress:p> \"{key}\" ."),
     );
-    let candidate = match send(
+    match send(
         api,
         Call {
             op: Op::Prepare,
@@ -230,11 +243,24 @@ async fn land(
     {
         Outcome::Ok(v) => v["candidate"]
             .as_str()
-            .ok_or_else(|| format!("prepare {key}: 2xx without candidate"))?
-            .to_owned(),
-        other => return Err(format!("prepare {key}: {}", code(&other))),
-    };
-    let accept = format!("{proposals}/{candidate}/accept");
+            .map(str::to_owned)
+            .ok_or_else(|| format!("prepare {key}: 2xx without candidate")),
+        other => Err(format!("prepare {key}: {}", code(&other))),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn accept_candidate(
+    api: &Api,
+    graph: &str,
+    token: &str,
+    branch: &str,
+    head: Option<&str>,
+    key: &str,
+    candidate: &str,
+    duplicate: bool,
+) -> Result<(String, i64), String> {
+    let accept = format!("/v1/graphs/{graph}/proposals/{candidate}/accept");
     let body = json!({"ref": branch, "expected_head": head, "reason": "branch stress"});
     match send(
         api,
@@ -442,13 +468,32 @@ async fn race_delete(
         },
         true,
     );
-    let accept = land(
+    // Prepare first: only the acceptance races the tombstone.
+    let candidate = match prepare_candidate(
         &api,
         &graph,
         &agent_token,
         &branch,
         Some(&head),
         &race_key,
+        false,
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            log.failures.push(format!("race prepare: {e}"));
+            return log;
+        }
+    };
+    let accept = accept_candidate(
+        &api,
+        &graph,
+        &agent_token,
+        &branch,
+        Some(&head),
+        &race_key,
+        &candidate,
         false,
     );
     let (deleted_outcome, accepted) = tokio::join!(delete, accept);
@@ -962,7 +1007,7 @@ pub async fn run(argv: impl Iterator<Item = String>) -> ExitCode {
     }
 
     // 4. Reads across replicas.
-    let list_path = format!("/v1/graphs/{graph}/branches");
+    let list_path = format!("/v1/graphs/{graph}/branches?limit=1000");
     let listed_branches = match send(
         &api,
         Call {

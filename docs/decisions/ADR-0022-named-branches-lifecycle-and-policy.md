@@ -49,9 +49,16 @@ acceptance and can never be created, deleted or re-created through branch operat
    event `created`, and the idempotency result. A concurrent create of the same name loses on
    the ref's primary key (`BRANCH_EXISTS`).
 Because history only moves forward (every head movement is a direct descendant), a branch
-point reachable from the source head when checked stays reachable from any later head;
-the check runs outside the transaction (immutable data, no second pool connection held),
-the transaction re-reads the source's status.
+point reachable from the source head when checked stays reachable from any later head.
+The check therefore runs **before** the transaction, on one pooled connection released
+before the transaction begins (no lock on the source ref, branch or graph is held while
+walking; never two connections at once): an unknown or foreign `from_commit` is refused
+without walking (a graph-scoped `commit_index` lookup, same error as unreachable); a walk
+that exceeds its bounds (100 000 commits, 5 s) is `413 RESOURCE_LIMIT`; a missing parent or
+a parent list disagreeing with `parent_count` is corruption (`CorruptObject`), never "not
+reachable". The transaction then locks and re-reads the source (exists, active). A commit
+that became reachable only because the source head moved after the check is refused; the
+client retries.
 
 The ref-creation event of a created branch has no decision (nothing was accepted);
 `ledger-admin verify`'s "one accepted decision per ref event" invariant exempts exactly the
@@ -88,14 +95,22 @@ Concurrency: `accept` locks the ref row (`FOR UPDATE`) and then the branch row (
 `delete`/`restore` lock the branch row (`FOR UPDATE`) and never the ref. The lock order is
 the same everywhere a ref is involved, so accept vs delete serializes without deadlock:
 exactly one of "accepted on an active branch" or "deleted, acceptance refused" commits.
-`prepare` takes `FOR SHARE` on the branch row as well (delete vs prepare).
+`prepare` takes `FOR SHARE` on the branch row as well (delete vs prepare). The database
+guards on `refs` (head move) and `proposals` (insert) read the branch row `FOR SHARE` too,
+so a raw write racing an uncommitted delete waits for it and is refused instead of reading
+the pre-delete status (READ COMMITTED). The tests force every pair to interleave in both
+orders (`pg_branches`).
+
+A graph that leaves `bootstrap`/`importing` for `active` or `archived` (owner-only) adopts
+every ref that has no `branches` row, as migration 0012 did (`graphs_adopt_refs`, principal
+`urn:sculpin:ledger:graph-activation`), so imported heads can be accepted onto.
 
 ### Policy v1 (small, enforceable, immutable at creation)
 | field | meaning | enforced where |
 |---|---|---|
 | `protected` (`refs.protected`, unchanged authority) | strict effective delta; delete/restore need admin; creation needs admin | repository (delta policy), API (capability), DB (`main` must be protected) |
 | `require_validation` | acceptance must cite a conforming validation of the candidate even where the deployment allows unvalidated acceptance (development) | repository, in the acceptance transaction |
-| `require_distinct_reviewer` | the accepting principal (id, type, on-behalf-of) must differ from the proposing one | repository, in the acceptance transaction |
+| `require_distinct_reviewer` | the accepting and proposing **parties** are distinct: the sets {principal id, on-behalf-of} of proposer and acceptor share no member (principal type does not distinguish; an agent acting for the proposer, or the proposer acting for someone else, is the same party) | repository, in the acceptance transaction |
 
 The **deployment security floor always applies**: production refuses unvalidated acceptance
 for every branch (ADR-0019); a branch policy can only add requirements, never remove them —
@@ -107,7 +122,9 @@ CHECK makes `main` always protected. Defaults: `main` — protected, deployment 
 validation, no distinct-reviewer rule; created branches — whatever the request asks within
 the caller's authority (unprotected by default). Pre-Phase-4 refs are adopted by migration
 0012 as `origin = 'adopted'`, `active`, `require_validation = false`,
-`require_distinct_reviewer = false`, keeping their `protected` value.
+`require_distinct_reviewer = false`, keeping their `protected` value. Policy is **not
+inherited**: a branch created from a strict branch may be unprotected and unvalidated (it
+only moves itself). Phase 5 merge must therefore enforce the **target** branch's policy.
 
 ### Authorization (existing capabilities, no per-branch ACLs)
 | capability | may |
@@ -115,8 +132,10 @@ the caller's authority (unprotected by default). Pre-Phase-4 refs are adopted by
 | `read` | list branches, read status, lifecycle and movement history |
 | `propose` | create **unprotected** branches; prepare on active branches |
 | `review` | accept / reject subject to branch policy |
-| `admin` | create protected branches; delete and restore branches |
-Cross-tenant access stays non-disclosing (`404` for another tenant's graph, branch or commit).
+| `admin` | create protected branches (together with `propose`); delete and restore branches |
+Cross-tenant access stays non-disclosing: `404` for another tenant's graph (and so its
+branches); a branch point naming another graph's commit is the same `422
+BRANCH_POINT_UNREACHABLE` as an unknown or unreachable one.
 There is no hidden override: `main` cannot be deleted by anyone through the API or the
 runtime identity (database CHECK), and any future emergency operation is an explicit,
 audited operator command.
@@ -139,7 +158,10 @@ field graph_id · field name
 ```
 Same key + same normalized request → the original durable result; same key + different
 request → `IDEMPOTENCY_CONFLICT`. An omitted `from_commit` means "the source head when first
-executed"; a replay returns that original branch point.
+executed"; a replay returns that original branch point. Omitted and explicit `from_commit`
+are **distinct identities** even when the explicit commit is the current head (a retry must
+resend what it first sent). Normalization, pinned by alias vectors: an omitted `policy` is
+all-false flags; an empty or null `reason` is no reason.
 
 ### Projection
 Projection v1 stays `main`-only (ADR-0020). Acceptance on any branch still writes its

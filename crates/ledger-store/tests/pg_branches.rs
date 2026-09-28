@@ -2,8 +2,9 @@
 //! source head and from reachable history (unreachable, foreign and unknown points fail
 //! closed), tombstone deletion and restore with head/version preserved, idempotency of every
 //! lifecycle operation, policy enforcement inside the acceptance transaction, `main`
-//! protection, the database guards behind all of it, and the lifecycle races (accept vs
-//! delete, restore vs accept, delete vs prepare) under real row locks. Every test is
+//! protection, the database guards behind all of it (including raw SQL racing an
+//! uncommitted tombstone), and the lifecycle races (accept vs delete, restore vs accept,
+//! delete vs prepare) forced to interleave in both orders under real row locks. Every test is
 //! `#[ignore]` and runs through the PostgreSQL suites with `LEDGER_TEST_DATABASE_URL`.
 #![cfg(feature = "postgres")]
 
@@ -777,7 +778,10 @@ async fn branch_policy_tightens_acceptance_inside_the_transaction() {
     assert_eq!(work.policy, strict.policy);
 }
 
-#[tokio::test]
+/// Unforced accept-vs-delete rounds (either outcome valid, checked each round); the forced
+/// interleavings of every lifecycle pair are in
+/// `lifecycle_races_are_forced_to_interleave_in_both_orders`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
 async fn lifecycle_races_have_exactly_one_valid_outcome() {
     let store = Arc::new(store().await);
@@ -847,7 +851,7 @@ async fn lifecycle_races_have_exactly_one_valid_outcome() {
             }
             Err(e) => panic!("round {round}: unexpected accept outcome {e}"),
         }
-        // restore vs accept of a fresh proposal: the accept succeeds only on an active branch.
+        // Sequential: no prepare on the tombstone; restore; prepare again.
         let fresh = prepare_on(&store, &g, &name, None, "unused").await;
         assert!(matches!(fresh, Err(LedgerError::BranchDeleted(_))));
         let (s3, g3, n3) = (store.clone(), g.clone(), name.clone());
@@ -866,8 +870,8 @@ async fn lifecycle_races_have_exactly_one_valid_outcome() {
         )
         .await
         .unwrap();
-        // delete vs prepare-then-accept: exactly one of "accepted on an active branch" or
-        // "refused as deleted".
+        // A second accept vs delete round on the restored branch: exactly one of "accepted on
+        // an active branch" or "refused as deleted".
         let (s4, s5, g4, g5, n4, n5, h4) = (
             store.clone(),
             store.clone(),
@@ -971,7 +975,9 @@ async fn the_database_enforces_the_branch_rules_even_for_the_owner() {
         }
     };
     let (gs, c0) = (g.as_str().to_owned(), c[0].to_string());
-    // A deleted branch's head never moves (the movement guard of 0012, before 0009's).
+    // Moving a deleted branch without an audit row is refused (0009's audit here; 0012's
+    // deleted-branch guard is exercised with a genuine audited move in
+    // `a_deleted_branch_head_never_moves_even_by_raw_sql_racing_the_delete`).
     let code = refused(format!(
         "UPDATE refs SET head = '{c0}', version = version + 1 WHERE graph_id = '{gs}' AND branch = 'work'"
     ))
@@ -1018,4 +1024,674 @@ async fn the_database_enforces_the_branch_rules_even_for_the_owner() {
          VALUES ('{gs}', 'nowhere', 'tenant-a', 'urn:x', 'agent', NULL, 'sha256:{z}', 'sha256:{z}', '{c0}')",
         z = "0".repeat(64)
     )).await, "23000");
+}
+
+/// Backends currently blocked by `holder`, directly or transitively (a second waiter on a
+/// row queues behind the first waiter's tuple lock, not behind the holder itself).
+async fn waiting_on(pool: &sqlx::PgPool, holder: i32) -> i64 {
+    sqlx::query_scalar(
+        "WITH RECURSIVE w(pid) AS ( \
+             SELECT pid FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)) \
+             UNION SELECT a.pid FROM pg_stat_activity a JOIN w ON w.pid = ANY(pg_blocking_pids(a.pid))) \
+         SELECT count(*) FROM w",
+    )
+    .bind(holder)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// Wait until `n` backends are blocked by `holder` (panics after 20 s: the interleaving the
+/// test claims never happened).
+async fn until_waiting(pool: &sqlx::PgPool, holder: i32, n: i64) {
+    for _ in 0..400 {
+        if waiting_on(pool, holder).await >= n {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("{n} backends never queued behind {holder}");
+}
+
+/// An owner transaction holding the branch row exclusively, so the lifecycle operations
+/// spawned next queue behind it in a known order (PostgreSQL grants tuple locks in queue
+/// order) and genuinely overlap.
+async fn hold_branch(
+    pool: &sqlx::PgPool,
+    graph: &GraphId,
+    branch: &str,
+) -> (sqlx::Transaction<'static, sqlx::Postgres>, i32) {
+    let mut tx = pool.begin().await.unwrap();
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("SELECT 1 FROM branches WHERE graph_id = $1 AND branch = $2 FOR UPDATE")
+        .bind(graph.as_str())
+        .bind(branch)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    (tx, pid)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn lifecycle_races_are_forced_to_interleave_in_both_orders() {
+    let store = Arc::new(store().await);
+    let pool = store.pool().clone();
+    let g = graph(&store, "tenant-a").await;
+    let c = main_history(&store, &g, 1).await;
+    for accept_first in [true, false] {
+        // accept vs delete: both queued behind the held branch row.
+        let name = format!("forced-ad-{accept_first}");
+        store
+            .workflows()
+            .create_branch(
+                &create(&g, &format!("c-{name}"), &name, "main", None),
+                limits(),
+            )
+            .await
+            .unwrap();
+        let cand = prepare_on(
+            &store,
+            &g,
+            &name,
+            Some(c[0].clone()),
+            &format!("{g}-{name}"),
+        )
+        .await
+        .unwrap();
+        let (hold, pid) = hold_branch(&pool, &g, &name).await;
+        let spawn_accept =
+            |s: Arc<PostgresLedgerStore>, g: GraphId, n: String, h: CommitId, cand: CommitId| {
+                tokio::spawn(async move {
+                    accept_candidate(&s, &g, &n, Some(h), &cand, &format!("fa-{n}")).await
+                })
+            };
+        let spawn_delete = |s: Arc<PostgresLedgerStore>, g: GraphId, n: String| {
+            tokio::spawn(async move {
+                s.workflows()
+                    .delete_branch(&lifecycle(&g, &format!("fd-{n}"), &n))
+                    .await
+            })
+        };
+        let (accept, delete) = if accept_first {
+            let a = spawn_accept(
+                store.clone(),
+                g.clone(),
+                name.clone(),
+                c[0].clone(),
+                cand.clone(),
+            );
+            until_waiting(&pool, pid, 1).await;
+            let d = spawn_delete(store.clone(), g.clone(), name.clone());
+            until_waiting(&pool, pid, 2).await;
+            (a, d)
+        } else {
+            let d = spawn_delete(store.clone(), g.clone(), name.clone());
+            until_waiting(&pool, pid, 1).await;
+            let a = spawn_accept(
+                store.clone(),
+                g.clone(),
+                name.clone(),
+                c[0].clone(),
+                cand.clone(),
+            );
+            until_waiting(&pool, pid, 2).await;
+            (a, d)
+        };
+        hold.commit().await.unwrap();
+        let (accepted, deleted) = (accept.await.unwrap(), delete.await.unwrap().unwrap());
+        let (head, version) = store.ref_head(&g, &name).await.unwrap().unwrap();
+        if accept_first {
+            accepted.unwrap();
+            assert_eq!((head.clone(), version), (cand.clone(), 2));
+        } else {
+            assert!(
+                matches!(accepted, Err(LedgerError::BranchDeleted(_))),
+                "{accepted:?}"
+            );
+            assert_eq!((head.clone(), version), (c[0].clone(), 1));
+        }
+        assert_eq!(
+            (deleted.event.head, deleted.event.ref_version),
+            (head.clone(), version)
+        );
+
+        // restore vs accept of a proposal prepared before the deletion.
+        let name = format!("forced-ra-{accept_first}");
+        store
+            .workflows()
+            .create_branch(
+                &create(&g, &format!("c-{name}"), &name, "main", None),
+                limits(),
+            )
+            .await
+            .unwrap();
+        let cand = prepare_on(
+            &store,
+            &g,
+            &name,
+            Some(c[0].clone()),
+            &format!("{g}-{name}"),
+        )
+        .await
+        .unwrap();
+        store
+            .workflows()
+            .delete_branch(&lifecycle(&g, &format!("d-{name}"), &name))
+            .await
+            .unwrap();
+        let (hold, pid) = hold_branch(&pool, &g, &name).await;
+        let spawn_restore = |s: Arc<PostgresLedgerStore>, g: GraphId, n: String| {
+            tokio::spawn(async move {
+                s.workflows()
+                    .restore_branch(&lifecycle(&g, &format!("fr-{n}"), &n))
+                    .await
+            })
+        };
+        let (accept, restore) = if accept_first {
+            let a = spawn_accept(
+                store.clone(),
+                g.clone(),
+                name.clone(),
+                c[0].clone(),
+                cand.clone(),
+            );
+            until_waiting(&pool, pid, 1).await;
+            let r = spawn_restore(store.clone(), g.clone(), name.clone());
+            until_waiting(&pool, pid, 2).await;
+            (a, r)
+        } else {
+            let r = spawn_restore(store.clone(), g.clone(), name.clone());
+            until_waiting(&pool, pid, 1).await;
+            let a = spawn_accept(
+                store.clone(),
+                g.clone(),
+                name.clone(),
+                c[0].clone(),
+                cand.clone(),
+            );
+            until_waiting(&pool, pid, 2).await;
+            (a, r)
+        };
+        hold.commit().await.unwrap();
+        let (accepted, restored) = (accept.await.unwrap(), restore.await.unwrap().unwrap());
+        assert_eq!(
+            (restored.event.head.clone(), restored.event.ref_version),
+            (c[0].clone(), 1)
+        );
+        let (head, version) = store.ref_head(&g, &name).await.unwrap().unwrap();
+        if accept_first {
+            // Queued ahead of the restore: it still saw the tombstone.
+            assert!(
+                matches!(accepted, Err(LedgerError::BranchDeleted(_))),
+                "{accepted:?}"
+            );
+            assert_eq!((head, version), (c[0].clone(), 1));
+        } else {
+            accepted.unwrap();
+            assert_eq!((head, version), (cand.clone(), 2));
+        }
+
+        // delete vs prepare.
+        let name = format!("forced-dp-{accept_first}");
+        store
+            .workflows()
+            .create_branch(
+                &create(&g, &format!("c-{name}"), &name, "main", None),
+                limits(),
+            )
+            .await
+            .unwrap();
+        let (hold, pid) = hold_branch(&pool, &g, &name).await;
+        let spawn_prepare = |s: Arc<PostgresLedgerStore>, g: GraphId, n: String, h: CommitId| {
+            tokio::spawn(
+                async move { prepare_on(&s, &g, &n, Some(h), &format!("{g}-{n}-p")).await },
+            )
+        };
+        let (prepare, delete) = if accept_first {
+            let p = spawn_prepare(store.clone(), g.clone(), name.clone(), c[0].clone());
+            until_waiting(&pool, pid, 1).await;
+            let d = spawn_delete(store.clone(), g.clone(), name.clone());
+            until_waiting(&pool, pid, 2).await;
+            (p, d)
+        } else {
+            let d = spawn_delete(store.clone(), g.clone(), name.clone());
+            until_waiting(&pool, pid, 1).await;
+            let p = spawn_prepare(store.clone(), g.clone(), name.clone(), c[0].clone());
+            until_waiting(&pool, pid, 2).await;
+            (p, d)
+        };
+        hold.commit().await.unwrap();
+        let (prepared, deleted) = (prepare.await.unwrap(), delete.await.unwrap().unwrap());
+        assert_eq!(
+            (deleted.event.head, deleted.event.ref_version),
+            (c[0].clone(), 1)
+        );
+        let proposals: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM proposals WHERE graph_id = $1 AND branch = $2",
+        )
+        .bind(g.as_str())
+        .bind(&name)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if accept_first {
+            prepared.unwrap();
+            assert_eq!(proposals, 1);
+        } else {
+            assert!(
+                matches!(prepared, Err(LedgerError::BranchDeleted(_))),
+                "{prepared:?}"
+            );
+            assert_eq!(proposals, 0);
+        }
+    }
+    let report = ledger_store::verify::run(store.pool()).await.unwrap();
+    assert!(
+        report.is_clean(),
+        "{:?}",
+        report
+            .checks
+            .iter()
+            .filter(|c| c.violations > 0)
+            .map(|c| (c.name, &c.sample))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Move `branch` from `from` (version `v`) to the indexed commit `to` with a correct audit
+/// row, as raw SQL in `tx` (what a runtime bypassing the repository could attempt).
+async fn raw_move(
+    tx: &mut sqlx::PgConnection,
+    graph: &GraphId,
+    branch: &str,
+    from: &CommitId,
+    v: i64,
+    to: &CommitId,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO ref_events (graph_id, branch, old_head, new_head, old_version, new_version, operation, \
+         tenant_id, principal_id, principal_type) VALUES ($1, $2, $3, $4, $5, $6, 'advance', 'tenant-a', 'urn:it:raw', 'agent')",
+    )
+    .bind(graph.as_str())
+    .bind(branch)
+    .bind(from.to_string())
+    .bind(to.to_string())
+    .bind(v)
+    .bind(v + 1)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("UPDATE refs SET head = $3, version = $4, updated_at = now() WHERE graph_id = $1 AND branch = $2")
+        .bind(graph.as_str())
+        .bind(branch)
+        .bind(to.to_string())
+        .bind(v + 1)
+        .execute(&mut *tx)
+        .await?;
+    Ok(())
+}
+
+fn db_message(e: sqlx::Error) -> String {
+    match e {
+        sqlx::Error::Database(d) => format!("{} {}", d.code().unwrap_or_default(), d.message()),
+        e => panic!("not a database error: {e}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn a_deleted_branch_head_never_moves_even_by_raw_sql_racing_the_delete() {
+    let store = store().await;
+    let pool = store.pool().clone();
+    let g = graph(&store, "tenant-a").await;
+    let c = main_history(&store, &g, 1).await;
+    for name in ["guard-control", "guard-deleted", "guard-race"] {
+        store
+            .workflows()
+            .create_branch(
+                &create(&g, &format!("c-{name}"), name, "main", None),
+                limits(),
+            )
+            .await
+            .unwrap();
+    }
+    let target = |n: &str| {
+        let (store, g, c0, n) = (&store, &g, c[0].clone(), n.to_owned());
+        async move {
+            prepare_on(store, g, &n, Some(c0), &format!("{g}-{n}-t"))
+                .await
+                .unwrap()
+        }
+    };
+    // Control: a genuine fast-forward with its audit row moves an active branch.
+    let to = target("guard-control").await;
+    let mut tx = pool.begin().await.unwrap();
+    raw_move(&mut tx, &g, "guard-control", &c[0], 1, &to)
+        .await
+        .unwrap();
+    // Evaluate the deferred audit triggers now: the move would commit (then undo it).
+    sqlx::query("SET CONSTRAINTS ALL IMMEDIATE")
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.rollback().await.unwrap();
+    // The same move on a deleted branch is refused by 0012's guard (not by 0009's audit).
+    let to = target("guard-deleted").await;
+    store
+        .workflows()
+        .delete_branch(&lifecycle(&g, "d-guard", "guard-deleted"))
+        .await
+        .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    let e = raw_move(&mut tx, &g, "guard-deleted", &c[0], 1, &to)
+        .await
+        .unwrap_err();
+    let msg = db_message(e);
+    assert!(
+        msg.starts_with("23000") && msg.contains("is deleted; its head does not move"),
+        "{msg}"
+    );
+    tx.rollback().await.unwrap();
+    // Race: an uncommitted tombstone (owner, by hand) and a raw move. The move's guard waits
+    // for the tombstone (FOR SHARE) instead of reading the pre-delete status, then refuses.
+    let to = target("guard-race").await;
+    let mut del = pool.begin().await.unwrap();
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *del)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE branches SET status = 'deleted', lifecycle_version = 2, updated_at = now() WHERE graph_id = $1 AND branch = 'guard-race'")
+        .bind(g.as_str())
+        .execute(&mut *del)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO branch_events (graph_id, branch, tenant_id, lifecycle_version, operation, status_after, head, ref_version, \
+         principal_id, principal_type) VALUES ($1, 'guard-race', 'tenant-a', 2, 'deleted', 'deleted', $2, 1, 'urn:it:owner', 'service')",
+    )
+    .bind(g.as_str())
+    .bind(c[0].to_string())
+    .execute(&mut *del)
+    .await
+    .unwrap();
+    let (p2, g2, c0, to2) = (pool.clone(), g.clone(), c[0].clone(), to.clone());
+    let mover = tokio::spawn(async move {
+        let mut tx = p2.begin().await.unwrap();
+        let r = raw_move(&mut tx, &g2, "guard-race", &c0, 1, &to2).await;
+        if r.is_ok() { tx.commit().await } else { r }
+    });
+    until_waiting(&pool, pid, 1).await;
+    del.commit().await.unwrap();
+    let msg = db_message(mover.await.unwrap().unwrap_err());
+    assert!(
+        msg.starts_with("23000") && msg.contains("is deleted"),
+        "{msg}"
+    );
+    assert_eq!(
+        store.ref_head(&g, "guard-race").await.unwrap().unwrap(),
+        (c[0].clone(), 1)
+    );
+    // Likewise a raw proposal racing an uncommitted tombstone waits and is refused.
+    store
+        .workflows()
+        .create_branch(&create(&g, "c-guard-p", "guard-p", "main", None), limits())
+        .await
+        .unwrap();
+    let mut del = pool.begin().await.unwrap();
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *del)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE branches SET status = 'deleted', lifecycle_version = 2, updated_at = now() WHERE graph_id = $1 AND branch = 'guard-p'")
+        .bind(g.as_str())
+        .execute(&mut *del)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO branch_events (graph_id, branch, tenant_id, lifecycle_version, operation, status_after, head, ref_version, \
+         principal_id, principal_type) VALUES ($1, 'guard-p', 'tenant-a', 2, 'deleted', 'deleted', $2, 1, 'urn:it:owner', 'service')",
+    )
+    .bind(g.as_str())
+    .bind(c[0].to_string())
+    .execute(&mut *del)
+    .await
+    .unwrap();
+    let (p3, g3, c0, to3) = (pool.clone(), g.clone(), c[0].clone(), to.clone());
+    let proposer = tokio::spawn(async move {
+        sqlx::query(
+            "INSERT INTO proposals (graph_id, branch, tenant_id, principal_id, principal_type, expected_head, requested_patch_id, \
+             effective_patch_id, candidate_commit) SELECT graph_id, 'guard-p', tenant_id, 'urn:it:raw', 'agent', $2, requested_patch_id, \
+             effective_patch_id, $3 FROM proposals WHERE graph_id = $1 AND candidate_commit = $3 LIMIT 1",
+        )
+        .bind(g3.as_str())
+        .bind(c0.to_string())
+        .bind(to3.to_string())
+        .execute(&p3)
+        .await
+    });
+    until_waiting(&pool, pid, 1).await;
+    del.commit().await.unwrap();
+    let msg = db_message(proposer.await.unwrap().unwrap_err());
+    assert!(
+        msg.starts_with("23000") && msg.contains("is deleted"),
+        "{msg}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn distinct_reviewer_means_distinct_accountable_parties() {
+    let store = store().await;
+    let g = graph(&store, "tenant-a").await;
+    let c = main_history(&store, &g, 1).await;
+    let review = CreateBranchRequest {
+        policy: BranchPolicy {
+            protected: false,
+            require_validation: false,
+            require_distinct_reviewer: true,
+        },
+        ..create(&g, "rv", "four-eyes", "main", None)
+    };
+    store
+        .workflows()
+        .create_branch(&review, limits())
+        .await
+        .unwrap();
+    // Proposed by urn:it:curator (agent, no delegator).
+    let candidate = prepare_on(
+        &store,
+        &g,
+        "four-eyes",
+        Some(c[0].clone()),
+        &format!("{g}-fe"),
+    )
+    .await
+    .unwrap();
+    let accept_as = |who: AuthenticatedPrincipal, key: &str| {
+        let (store, g, c0, candidate, key) =
+            (&store, &g, c[0].clone(), candidate.clone(), key.to_owned());
+        async move {
+            store
+                .workflows()
+                .accept(&AcceptRequest {
+                    scope: scope_as(who, g, &key, &key),
+                    branch: "four-eyes".into(),
+                    expected_head: Some(c0),
+                    candidate,
+                    reason: None,
+                    validation: ValidationPolicy::NoValidation,
+                })
+                .await
+        }
+    };
+    let mut same_with_delegator = actor("tenant-a", "curator");
+    same_with_delegator.on_behalf_of = Some(PrincipalId::new("urn:it:boss").unwrap());
+    let mut same_other_type = actor("tenant-a", "curator");
+    same_other_type.principal_type = PrincipalType::Human;
+    let mut agent_for_proposer = actor("tenant-a", "helper");
+    agent_for_proposer.on_behalf_of = Some(PrincipalId::new("urn:it:curator").unwrap());
+    for (who, key) in [
+        (same_with_delegator, "fe-delegated"),
+        (same_other_type, "fe-type"),
+        (agent_for_proposer, "fe-for-proposer"),
+    ] {
+        let r = accept_as(who, key).await;
+        assert!(
+            matches!(r, Err(LedgerError::BranchPolicyViolation(_))),
+            "{key}: {r:?}"
+        );
+    }
+    // A different party (even acting for someone else) accepts.
+    let mut other = actor("tenant-a", "reviewer");
+    other.on_behalf_of = Some(PrincipalId::new("urn:it:lead").unwrap());
+    accept_as(other, "fe-other").await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn main_stays_protected_and_activated_graphs_adopt_their_refs() {
+    // Own database: the raw import below has no ref events for its imported head (Phase-1
+    // import semantics), which the shared database's global verify must never see active.
+    let base = database_url();
+    let (head, query) = base
+        .split_once('?')
+        .map_or((base.as_str(), None), |(h, q)| (h, Some(q)));
+    let name = unique("br_activation").replace('-', "_").to_lowercase();
+    let admin = sqlx::PgPool::connect(&base).await.unwrap();
+    sqlx::query(&format!("CREATE DATABASE {name}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let mut url = format!("{}/{name}", &head[..head.rfind('/').unwrap()]);
+    if let Some(q) = query {
+        url.push('?');
+        url.push_str(q);
+    }
+    let store = PostgresLedgerStore::connect_and_migrate(&url, V1Binding::Reject)
+        .await
+        .unwrap();
+    let pool = store.pool().clone();
+    // refs_main_protected: no role can record an unprotected main.
+    let g = graph(&store, "tenant-a").await;
+    let candidate = prepare_on(&store, &g, "main", None, &format!("{g}-root"))
+        .await
+        .unwrap();
+    let e = sqlx::query(
+        "INSERT INTO refs (graph_id, branch, head, protected) VALUES ($1, 'main', $2, false)",
+    )
+    .bind(g.as_str())
+    .bind(candidate.to_string())
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert!(db_message(e).starts_with("23514"));
+    // An importing graph gets a raw main; activation adopts it, and it can then be accepted onto.
+    sqlx::query("UPDATE graphs SET status = 'importing' WHERE graph_id = $1")
+        .bind(g.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO refs (graph_id, branch, head) VALUES ($1, 'main', $2)")
+        .bind(g.as_str())
+        .bind(candidate.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .workflows()
+            .branch(&tenant(), &g, "main")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    sqlx::query("UPDATE graphs SET status = 'active' WHERE graph_id = $1")
+        .bind(g.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let main = store
+        .workflows()
+        .branch(&tenant(), &g, "main")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            main.origin.as_str(),
+            main.status.as_str(),
+            main.lifecycle_version
+        ),
+        ("adopted", "active", 1)
+    );
+    let (events, _) = store
+        .workflows()
+        .branch_history(&tenant(), &g, "main", 10)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            events.len(),
+            events[0].operation.as_str(),
+            events[0].head.clone(),
+            events[0].principal_id.as_str()
+        ),
+        (
+            1,
+            "adopted",
+            candidate.clone(),
+            "urn:sculpin:ledger:graph-activation"
+        )
+    );
+    accept_on(
+        &store,
+        &g,
+        "main",
+        Some(candidate),
+        &format!("{g}-after-activation"),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn lifecycle_reasons_take_the_same_bound_as_decisions() {
+    let store = store().await;
+    let g = graph(&store, "tenant-a").await;
+    main_history(&store, &g, 1).await;
+    let repo = store.workflows();
+    repo.create_branch(&create(&g, "c-long", "long-reason", "main", None), limits())
+        .await
+        .unwrap();
+    // The longest reason the API accepts (MAX_REASON_BYTES) is stored, not a database error.
+    let longest = "r".repeat(ledger_store::MAX_REASON_BYTES);
+    let deleted = repo
+        .delete_branch(&BranchLifecycleRequest {
+            reason: Some(longest.clone()),
+            ..lifecycle(&g, "d-long", "long-reason")
+        })
+        .await
+        .unwrap();
+    assert_eq!(deleted.event.reason.as_deref(), Some(longest.as_str()));
+    let too_long = repo
+        .restore_branch(&BranchLifecycleRequest {
+            reason: Some("r".repeat(ledger_store::MAX_REASON_BYTES + 1)),
+            ..lifecycle(&g, "r-long", "long-reason")
+        })
+        .await;
+    assert!(
+        matches!(
+            too_long,
+            Err(LedgerError::InvalidIdentifier {
+                field: "reason",
+                ..
+            })
+        ),
+        "{too_long:?}"
+    );
 }

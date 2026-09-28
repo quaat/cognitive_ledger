@@ -90,7 +90,7 @@ CREATE TABLE branch_events (
     CONSTRAINT branch_events_ref_version_positive CHECK (ref_version >= 1),
     CONSTRAINT branch_events_principal_type CHECK (principal_type IN ('human', 'agent', 'service')),
     CONSTRAINT branch_events_reason_bounds CHECK (reason IS NULL OR (octet_length(reason) >= 1
-        AND octet_length(reason) <= 1024)),
+        AND octet_length(reason) <= 4096)),
     CONSTRAINT branch_events_correlation_bounds CHECK (correlation_id IS NULL
         OR (octet_length(correlation_id) >= 1 AND octet_length(correlation_id) <= 128))
 );
@@ -231,16 +231,21 @@ CREATE CONSTRAINT TRIGGER refs_are_branches
     DEFERRABLE INITIALLY DEFERRED
     FOR EACH ROW EXECUTE FUNCTION public.refs_are_branches();
 
--- A deleted branch's head never moves.
+-- A deleted branch's head never moves. The branch row is read FOR SHARE: a plain read would
+-- miss an uncommitted delete (READ COMMITTED) and let the head move under a tombstone; the
+-- share lock waits for it (lock order ref -> branch, as in accept).
 CREATE OR REPLACE FUNCTION public.refs_branch_is_active() RETURNS trigger
 LANGUAGE plpgsql
 SET search_path = pg_catalog, public
 AS $$
+DECLARE
+    st text;
 BEGIN
-    IF NEW.head IS DISTINCT FROM OLD.head AND EXISTS (
-        SELECT 1 FROM public.branches b
-         WHERE b.graph_id = NEW.graph_id AND b.branch = NEW.branch AND b.status <> 'active'
-    ) THEN
+    IF NEW.head IS DISTINCT FROM OLD.head THEN
+        SELECT b.status INTO st FROM public.branches b
+         WHERE b.graph_id = NEW.graph_id AND b.branch = NEW.branch FOR SHARE;
+    END IF;
+    IF st IS NOT NULL AND st <> 'active' THEN
         RAISE EXCEPTION 'refs: branch %/% is deleted; its head does not move', NEW.graph_id, NEW.branch
             USING ERRCODE = 'integrity_constraint_violation';
     END IF;
@@ -263,7 +268,9 @@ BEGIN
     IF (SELECT g.status FROM public.graphs g WHERE g.graph_id = NEW.graph_id) IS DISTINCT FROM 'active' THEN
         RETURN NEW;
     END IF;
-    SELECT b.status INTO st FROM public.branches b WHERE b.graph_id = NEW.graph_id AND b.branch = NEW.branch;
+    -- FOR SHARE: waits for an uncommitted delete instead of reading the pre-delete status.
+    SELECT b.status INTO st FROM public.branches b
+     WHERE b.graph_id = NEW.graph_id AND b.branch = NEW.branch FOR SHARE;
     IF st IS NULL AND NEW.branch <> 'main' THEN
         RAISE EXCEPTION 'proposals: branch %/% does not exist; create it first', NEW.graph_id, NEW.branch
             USING ERRCODE = 'integrity_constraint_violation';
@@ -278,6 +285,39 @@ $$;
 DROP TRIGGER IF EXISTS proposals_branch_active ON proposals;
 CREATE TRIGGER proposals_branch_active BEFORE INSERT ON proposals
     FOR EACH ROW EXECUTE FUNCTION public.proposals_branch_is_active();
+
+-- A graph that leaves bootstrap / importing (-> active or archived; owner-only: the runtime
+-- has no UPDATE on graphs) adopts its refs like migration 0012 adopted the pre-Phase-4 ones,
+-- so every ref of an active or archived graph is a branch (as `verify` checks) and imported
+-- heads can be accepted onto.
+CREATE OR REPLACE FUNCTION public.graphs_adopt_refs_on_activation() RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog, public
+AS $$
+BEGIN
+    IF NEW.status IN ('active', 'archived') AND OLD.status NOT IN ('active', 'archived') THEN
+        WITH adopted AS (
+            INSERT INTO public.branches (graph_id, branch, tenant_id, status, lifecycle_version, origin,
+                                         require_validation, require_distinct_reviewer)
+            SELECT r.graph_id, r.branch, NEW.tenant_id, 'active', 1, 'adopted', false, false
+              FROM public.refs r
+             WHERE r.graph_id = NEW.graph_id
+               AND NOT EXISTS (SELECT 1 FROM public.branches b
+                                WHERE b.graph_id = r.graph_id AND b.branch = r.branch)
+            RETURNING graph_id, branch
+        )
+        INSERT INTO public.branch_events (graph_id, branch, tenant_id, lifecycle_version, operation,
+                                          status_after, head, ref_version, principal_id, principal_type, reason)
+        SELECT r.graph_id, r.branch, NEW.tenant_id, 1, 'adopted', 'active', r.head, r.version,
+               'urn:sculpin:ledger:graph-activation', 'service', 'ref adopted when its graph became active'
+          FROM adopted a JOIN public.refs r ON r.graph_id = a.graph_id AND r.branch = a.branch;
+    END IF;
+    RETURN NULL;
+END
+$$;
+DROP TRIGGER IF EXISTS graphs_adopt_refs ON graphs;
+CREATE TRIGGER graphs_adopt_refs AFTER UPDATE OF status ON graphs
+    FOR EACH ROW EXECUTE FUNCTION public.graphs_adopt_refs_on_activation();
 
 -- ---- idempotency: branch lifecycle operations ---------------------------------------------
 ALTER TABLE idempotency DROP CONSTRAINT idempotency_operation;

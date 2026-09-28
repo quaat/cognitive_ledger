@@ -1253,26 +1253,35 @@ impl WorkflowRepository {
         .await?;
         if branch.as_ref().is_some_and(|b| b.require_distinct_reviewer) {
             let proposer = sqlx::query(
-                "SELECT principal_id, principal_type, on_behalf_of FROM proposals WHERE proposal_id = $1",
+                "SELECT principal_id, on_behalf_of FROM proposals WHERE proposal_id = $1",
             )
             .bind(proposal.proposal_id)
             .fetch_one(&mut *tx)
             .await
             .map_err(db_error)?;
+            // Distinct accountable parties (ADR-0022): the proposer's {principal, delegator}
+            // and the acceptor's {principal, delegator} must not share a member. Principal
+            // type does not distinguish parties (the same subject under another type, or an
+            // agent acting for the proposer, is the same party).
             let actor = scope.principal.actor();
-            let same = proposer
-                .try_get::<String, _>("principal_id")
-                .map_err(db_error)?
-                == actor.principal_id.as_str()
-                && proposer
-                    .try_get::<String, _>("principal_type")
-                    .map_err(db_error)?
-                    == actor.principal_type.as_str()
-                && proposer
+            let proposer_parties = [
+                Some(
+                    proposer
+                        .try_get::<String, _>("principal_id")
+                        .map_err(db_error)?,
+                ),
+                proposer
                     .try_get::<Option<String>, _>("on_behalf_of")
-                    .map_err(db_error)?
-                    .as_deref()
-                    == actor.on_behalf_of.as_ref().map(|p| p.as_str());
+                    .map_err(db_error)?,
+            ];
+            let acceptor_parties = [
+                Some(actor.principal_id.as_str().to_owned()),
+                actor.on_behalf_of.as_ref().map(|p| p.as_str().to_owned()),
+            ];
+            let same = proposer_parties
+                .iter()
+                .flatten()
+                .any(|p| acceptor_parties.iter().flatten().any(|a| a == p));
             if same {
                 return Err(LedgerError::BranchPolicyViolation(
                     "this branch requires a reviewer distinct from the proposer".into(),

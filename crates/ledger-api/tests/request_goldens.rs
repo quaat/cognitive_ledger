@@ -112,8 +112,43 @@ fn every_request_identity_vector_matches_bytes_and_digest_through_the_handlers()
         );
     }
     assert!(
-        count == 16,
-        "expected exactly 16 request vectors (6 v1 + 6 v2 + 4 branch v1), found {count}"
+        count == 21,
+        "expected exactly 21 request vectors (6 v1 + 6 v2 + 9 branch v1), found {count}"
+    );
+}
+
+/// Branch request normalization (ADR-0022): an explicit all-false policy is the omitted
+/// policy, an empty reason is no reason; `from_commit` absent and present stay distinct.
+#[test]
+fn branch_defaults_normalize_and_aliases_share_one_identity() {
+    let load = |n: &str| -> Value {
+        serde_json::from_str(&fs::read_to_string(fixtures().join(n)).unwrap()).unwrap()
+    };
+    for (a, b) in [
+        (
+            "request-branch-create-head.input",
+            "request-branch-create-head-explicit-defaults.input",
+        ),
+        (
+            "request-branch-restore-no-reason.input",
+            "request-branch-restore-empty-reason.input",
+        ),
+    ] {
+        let (a, b) = (load(a), load(b));
+        assert_ne!(
+            a.to_string(),
+            b.to_string(),
+            "fixtures must differ textually"
+        );
+        assert_eq!(through_the_api(&a).digest(), through_the_api(&b).digest());
+    }
+    let head = load("request-branch-create-head.input");
+    let mut pinned = head.clone();
+    pinned["from_commit"] =
+        json!("sha256:73399c34028c2686df761ff8e508ebfb7aa40bb982ff9bcfe9dfc0d432ef903c");
+    assert_ne!(
+        through_the_api(&head).digest(),
+        through_the_api(&pinned).digest()
     );
 }
 

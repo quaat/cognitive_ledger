@@ -196,7 +196,7 @@ model is unchanged (it never reads branch lifecycle).
   role but the owner.
 - `branch_events`: `SELECT`; column `INSERT` (never `event_id`/`recorded_at`, which are
   database-assigned); write-once trigger; `USAGE` on `branch_events_event_id_seq`.
-- `idempotency_keys`: column `INSERT` additionally covers `result_branch_event_id`.
+- `idempotency`: column `INSERT` additionally covers `result_branch_event_id`.
 
 The deferred constraint triggers (`branches_lifecycle_audited`, `branch_events_current`,
 `refs_are_branches`) make "every status change is exactly one event and every event describes

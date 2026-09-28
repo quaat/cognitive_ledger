@@ -584,8 +584,15 @@
       "$ref": "#/components/schemas/RefName"
      },
      "from_commit": {
-      "$ref": "#/components/schemas/ContentId",
-      "description": "Historical branch point; must be the source head or reachable from it. Omitted: the source head."
+      "anyOf": [
+       {
+        "$ref": "#/components/schemas/ContentId"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "description": "Historical branch point; must be the source head or reachable from it. Omitted: the source head. Null is the same as omitted; omitted and an explicit commit are distinct request identities."
      },
      "policy": {
       "$ref": "#/components/schemas/BranchPolicy"
@@ -603,8 +610,12 @@
       "$ref": "#/components/schemas/RefName"
      },
      "reason": {
-      "type": "string",
-      "maxLength": 4096
+      "type": [
+       "string",
+       "null"
+      ],
+      "maxLength": 4096,
+      "description": "Optional; empty or null is the same request as no reason."
      }
     }
    },
