@@ -51,7 +51,8 @@ LOAD_PID=$!
 wait_progress 100 120
 echo "live load established: $(progress landed) commits"
 # Branch rows in the backup (Plan 0008): created / historical / deleted / restored branches.
-BRANCH_GRAPH=$(psql_q ledger "SELECT graph_id FROM graphs ORDER BY 1 LIMIT 1")
+BRANCH_GRAPH=$(psql_q ledger "SELECT graph_id FROM refs WHERE branch = 'main' ORDER BY version DESC, graph_id LIMIT 1")
+[ -n "${BRANCH_GRAPH}" ] || { echo "FAIL: no graph with a main ref under the load" >&2; exit 1; }
 python3 scripts/backup-restore/branches.py http://127.0.0.1:8080 "${BRANCH_GRAPH}" | tee "${OUT}/branches.log"
 
 # --- Backups while writes continue ---------------------------------------------------------
