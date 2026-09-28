@@ -1,6 +1,6 @@
 # Plan 0007: Phase 3 — accepted-state projection
 
-Status: **in progress** (started 2026-09-27). Branch `claude/p3-accepted-state-projection` from
+Status: **implementation complete, in review** (started 2026-09-27; draft PR, not merged). Branch `claude/p3-accepted-state-projection` from
 `main` at `0a56092484ba890df3cf43f297e690db1132cc4b` (the PR #7 merge; Phase 2 complete, see
 [Plan 0006](../completed/0006-phase2-semantic-validation.md)). No gate is reported as passed
 until it is executable and has run.
@@ -189,7 +189,23 @@ projection fault suite, compose integration, upgrade 0010 → 0011; Phase-2 suit
   schema) → schemas without `USAGE` are ignored (tested healthy).
 
 ## Evidence
-(filled as slices land)
+Final code candidate **`fe6ad16`** (clean tree; later commits change documentation only).
+| Gate | Head | Result |
+|---|---|---|
+| `./scripts/check-fast.sh` (fmt, clippy `-D warnings`, workspace tests, doc links, architecture on `cargo metadata`, Python references: 18 commit-v2, 12 request, 42 validation, 3 state-digest vectors) | `fe6ad16` | exit 0; canonical goldens unchanged (`ledger-rdf` gained only the additive `Quad::default_graph_triple`) |
+| `./scripts/check-supply-chain.sh` | `fe6ad16` | exit 0 (advisories/bans/licenses/sources ok; SBOM 214 components) |
+| PostgreSQL 15.19 — all 11 suites (`pg_cas_race` 1, `pg_immutable_store` 9, `pg_graphs_migration` 7, `pg_fs_migration` 8, `pg_workflow` 14, `pg_api` 13, `pg_least_privilege` 19, `pg_verify` 2, `pg_validation` 9, `pg_validation_api` 17, `pg_projection` 7) | `fe6ad16` | all passed |
+| PostgreSQL 17.11 — same 11 suites | `fe6ad16` | all passed |
+| Real Fuseki (`fuseki_projection`, 21 scenarios against pinned `stain/jena-fuseki:5.1.0` TDB2 + PostgreSQL) | `fe6ad16` | all passed (in the integration run below and standalone) |
+| `scripts/upgrade-p3.sh` (0010 from `0a56092` → 0011; populated Phase-2 DB incl. validations; 36-row outbox backlog) | `fe6ad16` | `UPGRADE-P3 OK` (`target/upgrade-p3/20260928T002456Z`): pre-upgrade rows byte-identical after migrate and replay, backlog projected exactly, named-graph streams blocked, old server refuses 0011, new server and projector refuse 0010, clean ≡ upgraded schema |
+| `./scripts/test-integration.sh` (compose PG 17.2, Fuseki, projector; all PG suites; e2e projection, verify, second target id refused, target restart) | `fe6ad16` | exit 0, `INTEGRATION OK` (12 suites, `fuseki_projection` 21/21). A first run on `fe6ad16` failed in `pg_immutable_store` with "terminating connection due to administrator command" while an earlier gate chain was still tearing down its containers; rerun alone: green. Also green on `0634a27`, `251b66e`, `a9e0b33`. |
+| `./scripts/backup-restore.sh` (dump + base backup under load, restored servers) | `fe6ad16` | `BACKUP RESTORE OK` (`target/backup/20260928T003050Z`); it does not yet exercise the projector (a restored ledger + `MARKER_AHEAD` rebuild is covered by the Fuseki suite and the runbook, not by this script) |
+| Mutation checks | various | removing the CAS precondition → 3 Fuseki tests red; skipping the disable fence → ABA test red; removing the lease re-check → late-observation test red; removing the delayed-rebuild check → its test red at the time (now defence in depth) |
+
+Not executed here (recorded, not claimed): hosted CI on the Phase-3 PR (pending the PR),
+backup/restore qualification *with a running projector* (`scripts/backup-restore.sh` covers
+the ledger only), fuzzing (no new decoder of untrusted input except SPARQL
+JSON results from the configured target, covered by unit tests; no fuzz target added).
 
 ## Sub-agent decomposition (§42)
 Main session owns the protocol crate, the migration, the verifier and the repository.
