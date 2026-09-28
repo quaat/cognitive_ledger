@@ -3047,6 +3047,10 @@ async fn weakened_projection_controls_are_refused_at_startup_and_readiness() {
     // …and on any other schema's relations too (not only `public`).
     owner_exec(&fx, "CREATE SCHEMA lp_private").await;
     owner_exec(&fx, "CREATE TABLE lp_private.secrets (x int)").await;
+    // A PUBLIC grant in a schema the role cannot use is unreachable: still healthy.
+    owner_exec(&fx, "GRANT SELECT ON lp_private.secrets TO PUBLIC").await;
+    assert_healthy(&fx, "PUBLIC grant behind a schema without USAGE").await;
+    owner_exec(&fx, "REVOKE SELECT ON lp_private.secrets FROM PUBLIC").await;
     owner_exec(
         &fx,
         &format!("GRANT USAGE ON SCHEMA lp_private TO {}", fx.role),

@@ -2743,7 +2743,9 @@ async fn verify_no_grant_function_execute(
 
 /// Exhaustive models: no privilege of any kind on any relation (table, partitioned table,
 /// view, materialized view, foreign table) of any non-system schema that the model does not
-/// list (the model lists `public` tables only).
+/// list (the model lists `public` tables only). A relation in a schema the role has no
+/// `USAGE` on is unreachable and ignored (e.g. an extension's PUBLIC view in a locked-down
+/// schema).
 async fn verify_no_unlisted_table_privileges(
     pool: &PgPool,
     subject: &str,
@@ -2756,6 +2758,7 @@ async fn verify_no_unlisted_table_privileges(
          JOIN pg_namespace n ON n.oid = c.relnamespace \
          WHERE n.nspname <> 'information_schema' AND n.nspname NOT LIKE 'pg\\_%' \
            AND c.relkind IN ('r', 'p', 'v', 'm', 'f') \
+           AND (n.nspname = 'public' OR has_schema_privilege($1, n.oid, 'USAGE')) \
            AND (has_table_privilege($1, c.oid, 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER') \
                 OR CASE WHEN current_setting('server_version_num')::int >= 170000 \
                         THEN has_table_privilege($1, c.oid, 'MAINTAIN') ELSE false END \

@@ -184,6 +184,9 @@ projection fault suite, compose integration, upgrade 0010 → 0011; Phase-2 suit
   tested); the delayed-rebuild test overstated its proof (reworded, see above); update
   response excerpts copied whole chunks (now bounded to the excerpt). P3 fixed: secret files
   were trimmed of all surrounding whitespace (now only one trailing line ending; tested).
+- Codex delta review of `251b66e..a9e0b33`: **no P0/P1**; P2 — the widened exhaustive check
+  would refuse a PUBLIC-granted relation in a schema the role cannot use (an extension
+  schema) → schemas without `USAGE` are ignored (tested healthy).
 
 ## Evidence
 (filled as slices land)
