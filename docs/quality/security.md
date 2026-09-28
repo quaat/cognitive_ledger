@@ -102,6 +102,52 @@ Preserve object digest verification and atomic ref updates. Never commit secrets
   compromised runtime could fabricate a validation record for its own tenants. The report
   digest/reference lets auditors cross-check against Sculpin's own report store.
 
+## Accepted-state projection boundary (Phase 3, ADR-0020/0021)
+- Projection is strictly downstream: acceptance never waits for it, a failure never touches
+  ledger history, and nothing is ever read back from the target into the ledger.
+- Targets are deployment configuration only (query/update endpoint URLs, credential files);
+  no request, graph or ledger value becomes a URL. The client takes no proxy from the
+  environment, follows no redirects, bounds connect and total time and both body sizes,
+  requires the exact response media types, and never logs or echoes endpoints or
+  credentials. https is required outside the explicit development switch.
+- Every string placed into SPARQL is either an IRI built by the ADR-0020 mapping (percent-
+  encoded, re-validated with `CognitiveGraph::parse` when read from the database), a ledger
+  quad's canonical N-Triples terms (blank-node free, validated), a marker value escaped as
+  a string literal from ledger-validated identifiers, an integer, or the `target_id`
+  (restricted to `[A-Za-z0-9._:-]{1,128}` by CHECK and client validation).
+- Tenant isolation: a stream writes only the cognitive graph recorded at enable time, derived
+  from its own graph's KB id; the partial `UNIQUE (target_id, cognitive_graph) WHERE status
+  <> 'disabled'` makes the database refuse any second live stream — of any tenant — for the
+  same target graph, and enabling/disabling is owner-only (guard trigger), so the projector
+  role cannot re-point a graph. A cognitive graph holding another stream's marker is never
+  overwritten automatically (`TARGET_CONFLICT`), and a dataset is bound to one target id, so
+  a second deployment pointed at it refuses to start rather than overwriting it.
+- Stale or concurrent writers cannot regress or cross-write the target: every write,
+  including recovery replacements, is a compare-and-swap in the target transaction on the
+  exact marker terms the writer observed (ADR-0020), every write stamps a fresh write id (no
+  ABA), and a disable fences the target before the graph can go to another stream, so a
+  late write after a version change, a repair, or a feed switch to another tenant's graph —
+  including a switch back — is a no-op; leases are an efficiency
+  measure, not the safety mechanism. Observed terms are embedded only as validated IRIs or
+  `ECHAR`-escaped literals; anything else (blank nodes, forbidden IRI characters, invalid
+  language tags, > 64 values) refuses the write.
+- The projector runs as `ledger_projector`: SELECT on the nine tables it needs, UPDATE on
+  outbox delivery columns and stream progress/lease/error columns only, no privilege on any
+  other table, no sequence, no grant function; startup refuses any drift. The runtime role
+  can read but never write projection progress.
+- Residual: queries on the target are whatever the deployment exposes (the compose dataset
+  allows anonymous queries); the marker graph reveals ledger graph ids and commit ids of the
+  projected streams to target readers. More importantly, **anyone with query access to a
+  target dataset reads every projected tenant's accepted content**: one dataset per target
+  is shared by all tenants' streams. Deployments that must separate tenants use a dataset
+  (and target id) per tenant or query authentication in front of Fuseki; the compose
+  dataset allows anonymous queries (development only). Re-pointing a KB's cognitive graph
+  from one tenant's ledger graph to another's is an operator action (disable + enable +
+  rebuild) the ledger does not second-guess. The target itself is trusted: whoever can write
+  it can forge a marker or edit a graph; reconciliation (count) and `verify` (content)
+  detect damage, they do not prevent it — keep the projector's update account the only
+  writer.
+
 ## Mutation semantics
 - `Idempotency-Key` is required; idempotency is scoped by tenant, complete actor
   (principal id, type, on-behalf-of), graph, operation and key, and by the server-computed

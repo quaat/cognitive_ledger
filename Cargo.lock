@@ -986,6 +986,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "ledger-projection"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ledger-core",
+ "ledger-rdf",
+ "thiserror",
+]
+
+[[package]]
+name = "ledger-projection-fuseki"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ledger-core",
+ "ledger-projection",
+ "ledger-rdf",
+ "reqwest",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "ledger-projector"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "ledger-core",
+ "ledger-projection",
+ "ledger-projection-fuseki",
+ "ledger-rdf",
+ "ledger-store",
+ "reqwest",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "ledger-rdf"
 version = "0.1.0"
 dependencies = [
@@ -1004,6 +1046,7 @@ dependencies = [
  "axum",
  "ledger-api",
  "ledger-core",
+ "ledger-projection",
  "ledger-store",
  "ledger-validation-protocol",
  "reqwest",

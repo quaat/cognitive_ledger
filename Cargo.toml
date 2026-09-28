@@ -4,9 +4,12 @@ members = [
   "crates/ledger-rdf",
   "crates/ledger-store",
   "crates/ledger-validation-protocol",
+  "crates/ledger-projection",
+  "crates/ledger-projection-fuseki",
   "crates/ledger-api",
   "crates/ledger-testkit",
   "apps/ledger-server",
+  "apps/ledger-projector",
   "apps/ledger-stress",
 ]
 resolver = "2"

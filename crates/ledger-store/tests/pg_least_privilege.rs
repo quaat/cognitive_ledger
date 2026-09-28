@@ -591,7 +591,8 @@ async fn startup_and_readiness_refuse_any_schema_level_but_the_required_one() {
         .err()
         .unwrap();
     assert!(
-        matches!(&err, LedgerError::SchemaIncompatible(m) if m.contains("0007") && m.contains("requires 0010")),
+        matches!(&err, LedgerError::SchemaIncompatible(m) if m.contains("0007")
+            && m.contains(&format!("requires {:04}", schema::REQUIRED_SCHEMA_VERSION))),
         "{err}"
     );
     // Exactly right: connects; then readiness follows the schema level live.
@@ -2805,4 +2806,271 @@ async fn drifted_phase2_identity_constraints_and_checks_are_refused_at_startup_a
         .await
         .expect("start-up after every restoration");
     fx.teardown().await;
+}
+
+/// The owner-side definition of a named constraint, index or function (for restoration).
+async fn catalog_def(fx: &Fixture, sql: &str) -> String {
+    sqlx::query_scalar(sql)
+        .fetch_one(&fx.owner)
+        .await
+        .unwrap_or_else(|e| panic!("{sql}: {e}"))
+}
+
+/// Migration 0011's controls (ADR-0021): guard triggers and their function bodies, the
+/// partial one-stream-per-cognitive-graph index, the progress and tenant FKs and the
+/// projection CHECKs are each refused at start-up and readiness when weakened, and the
+/// database is healthy again after restoration.
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn weakened_projection_controls_are_refused_at_startup_and_readiness() {
+    let fx = fixture("lp_proj_drift").await;
+    fx.migrate_and_grant().await;
+    let running = PostgresLedgerStore::connect(&fx.runtime_db_url, V1Binding::Reject)
+        .await
+        .expect("healthy database serves");
+    assert_healthy(&fx, "fresh migration").await;
+    // The projector identity on the same database: its readiness must refuse the same drift.
+    let projector_role = unique("lp_pj");
+    owner_exec(
+        &fx,
+        &format!("CREATE ROLE {projector_role} LOGIN PASSWORD 'pj-test-secret'"),
+    )
+    .await;
+    {
+        let mut conn = PgConnection::connect(&fx.owner_db_url).await.unwrap();
+        schema::grant_projector_role(&mut conn, &projector_role)
+            .await
+            .unwrap();
+        conn.close().await.unwrap();
+    }
+    let projector = ledger_store::ProjectionRepository::connect(
+        &with_credentials(&fx.owner_db_url, &projector_role, "pj-test-secret"),
+        DbSessionLimits::default(),
+    )
+    .await
+    .expect("the projector identity verifies");
+    projector.ready().await.expect("projector ready");
+    // A privilege granted after start-up is refused by the projector's readiness.
+    owner_exec(&fx, &format!("GRANT INSERT ON refs TO {projector_role}")).await;
+    match projector.ready().await {
+        Err(LedgerError::RuntimeIdentity(m)) => assert!(m.contains("refs"), "{m}"),
+        other => panic!("projector readiness must refuse a drifted grant: {other:?}"),
+    }
+    owner_exec(&fx, &format!("REVOKE INSERT ON refs FROM {projector_role}")).await;
+    projector
+        .ready()
+        .await
+        .expect("projector ready after revoke");
+
+    // Guard triggers disabled.
+    for (trigger, table) in [
+        ("projection_state_guard", "projection_state"),
+        ("outbox_delivery_monotonic", "projection_outbox"),
+    ] {
+        owner_exec(
+            &fx,
+            &format!("ALTER TABLE {table} DISABLE TRIGGER {trigger}"),
+        )
+        .await;
+        let m = assert_refused_by_schema(&fx, &running, &format!("{trigger} disabled")).await;
+        assert!(m.contains(trigger), "{m}");
+        owner_exec(
+            &fx,
+            &format!("ALTER TABLE {table} ENABLE TRIGGER {trigger}"),
+        )
+        .await;
+        assert_healthy(&fx, &format!("{trigger} enabled")).await;
+    }
+
+    // Guard function bodies replaced by a pass-through.
+    for function in ["projection_state_guard", "outbox_delivery_is_monotonic"] {
+        let real = catalog_def(
+            &fx,
+            &format!("SELECT pg_get_functiondef('public.{function}()'::regprocedure)"),
+        )
+        .await;
+        owner_exec(
+            &fx,
+            &format!(
+                "CREATE OR REPLACE FUNCTION public.{function}() RETURNS trigger \
+                 LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$"
+            ),
+        )
+        .await;
+        let m = assert_refused_by_schema(&fx, &running, &format!("{function} replaced")).await;
+        assert!(m.contains(function), "{m}");
+        owner_exec(&fx, &real).await;
+        assert_healthy(&fx, &format!("{function} restored")).await;
+    }
+
+    // The partial unique index: dropped, or recreated without its predicate.
+    let index = catalog_def(
+        &fx,
+        "SELECT pg_get_indexdef('public.projection_state_graph_unique'::regclass)",
+    )
+    .await;
+    owner_exec(&fx, "DROP INDEX projection_state_graph_unique").await;
+    let m = assert_refused_by_schema(&fx, &running, "graph-unique index dropped").await;
+    assert!(m.contains("projection_state_graph_unique"), "{m}");
+    owner_exec(
+        &fx,
+        "CREATE UNIQUE INDEX projection_state_graph_unique ON projection_state (target_id, cognitive_graph) WHERE status = 'active'",
+    )
+    .await;
+    // Same catalog shape, narrower predicate (two blocked streams could then share a graph):
+    // refused by deparse at start-up and by fingerprint on readiness.
+    match PostgresLedgerStore::connect(&fx.runtime_db_url, V1Binding::Reject).await {
+        Err(LedgerError::SchemaIncompatible(m)) => {
+            assert!(
+                m.contains("projection_state_graph_unique") && m.contains("predicate"),
+                "{m}"
+            )
+        }
+        other => panic!("narrowed graph-unique predicate must refuse start-up: {other:?}"),
+    }
+    match running.ready().await {
+        Err(LedgerError::SchemaIncompatible(m)) => {
+            assert!(m.contains("projection_state_graph_unique"), "{m}")
+        }
+        other => panic!("narrowed graph-unique predicate must refuse readiness: {other:?}"),
+    }
+    assert!(
+        matches!(
+            projector.ready().await,
+            Err(LedgerError::SchemaIncompatible(_))
+        ),
+        "narrowed graph-unique predicate must refuse the projector's readiness"
+    );
+    owner_exec(&fx, "DROP INDEX projection_state_graph_unique").await;
+    owner_exec(&fx, &index).await;
+    assert_healthy(&fx, "graph-unique index restored").await;
+
+    // The progress and tenant FKs.
+    for fk in [
+        "projection_state_progress_fk",
+        "projection_state_graph_tenant_fk",
+    ] {
+        let def = catalog_def(
+            &fx,
+            &format!("SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = '{fk}'"),
+        )
+        .await;
+        owner_exec(
+            &fx,
+            &format!("ALTER TABLE projection_state DROP CONSTRAINT {fk}"),
+        )
+        .await;
+        let m = assert_refused_by_schema(&fx, &running, &format!("{fk} dropped")).await;
+        assert!(m.contains("projection_state FOREIGN KEY"), "{m}");
+        owner_exec(
+            &fx,
+            &format!("ALTER TABLE projection_state ADD CONSTRAINT {fk} {def}"),
+        )
+        .await;
+        assert_healthy(&fx, &format!("{fk} restored")).await;
+    }
+
+    // Projection CHECKs dropped, or replaced by vacuous ones under the same name.
+    for check in [
+        "ps_status",
+        "ps_progress_shape",
+        "ps_lease_shape",
+        "ps_error_code_format",
+        "ps_counters",
+    ] {
+        let def = catalog_def(
+            &fx,
+            &format!(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = '{check}'"
+            ),
+        )
+        .await;
+        owner_exec(
+            &fx,
+            &format!("ALTER TABLE projection_state DROP CONSTRAINT {check}"),
+        )
+        .await;
+        let m = assert_refused_by_schema(&fx, &running, &format!("{check} dropped")).await;
+        assert!(m.contains(check), "{m}");
+        owner_exec(
+            &fx,
+            &format!("ALTER TABLE projection_state ADD CONSTRAINT {check} CHECK (true)"),
+        )
+        .await;
+        match PostgresLedgerStore::connect(&fx.runtime_db_url, V1Binding::Reject).await {
+            Err(LedgerError::SchemaIncompatible(m)) => assert!(m.contains(check), "{m}"),
+            other => panic!("vacuous {check} must refuse start-up: {other:?}"),
+        }
+        assert!(
+            matches!(
+                running.ready().await,
+                Err(LedgerError::SchemaIncompatible(_))
+            ),
+            "vacuous {check} must refuse readiness"
+        );
+        assert!(
+            matches!(
+                projector.ready().await,
+                Err(LedgerError::SchemaIncompatible(_))
+            ),
+            "vacuous {check} must refuse the projector's readiness"
+        );
+        owner_exec(
+            &fx,
+            &format!("ALTER TABLE projection_state DROP CONSTRAINT {check}"),
+        )
+        .await;
+        owner_exec(
+            &fx,
+            &format!("ALTER TABLE projection_state ADD CONSTRAINT {check} {def}"),
+        )
+        .await;
+        assert_healthy(&fx, &format!("{check} restored")).await;
+    }
+    running.ready().await.expect("readiness after restore");
+    projector
+        .ready()
+        .await
+        .expect("projector readiness after restore");
+    // Both identity models are exhaustive: a privilege on any other public table refuses.
+    owner_exec(&fx, "CREATE TABLE public.lp_extra (x int)").await;
+    for role in [fx.role.clone(), projector_role.clone()] {
+        owner_exec(&fx, &format!("GRANT SELECT ON public.lp_extra TO {role}")).await;
+    }
+    let m = assert_refused_by_identity(&fx, "runtime SELECT on an unlisted table").await;
+    assert!(m.contains("lp_extra"), "{m}");
+    match projector.ready().await {
+        Err(LedgerError::RuntimeIdentity(m)) => assert!(m.contains("lp_extra"), "{m}"),
+        other => panic!("projector readiness must refuse an unlisted grant: {other:?}"),
+    }
+    owner_exec(&fx, "DROP TABLE public.lp_extra").await;
+    // …and on any other schema's relations too (not only `public`).
+    owner_exec(&fx, "CREATE SCHEMA lp_private").await;
+    owner_exec(&fx, "CREATE TABLE lp_private.secrets (x int)").await;
+    // A PUBLIC grant in a schema the role cannot use is unreachable: still healthy.
+    owner_exec(&fx, "GRANT SELECT ON lp_private.secrets TO PUBLIC").await;
+    assert_healthy(&fx, "PUBLIC grant behind a schema without USAGE").await;
+    owner_exec(&fx, "REVOKE SELECT ON lp_private.secrets FROM PUBLIC").await;
+    owner_exec(
+        &fx,
+        &format!("GRANT USAGE ON SCHEMA lp_private TO {}", fx.role),
+    )
+    .await;
+    owner_exec(
+        &fx,
+        &format!("GRANT SELECT ON lp_private.secrets TO {}", fx.role),
+    )
+    .await;
+    let m = assert_refused_by_identity(&fx, "runtime SELECT on another schema").await;
+    assert!(m.contains("lp_private.secrets"), "{m}");
+    owner_exec(&fx, "DROP SCHEMA lp_private CASCADE").await;
+    drop(running);
+    projector.pool().close().await;
+    drop(projector);
+    let admin = fx.admin.clone();
+    fx.teardown().await;
+    sqlx::query(&format!("DROP ROLE {projector_role}"))
+        .execute(&admin)
+        .await
+        .unwrap();
 }

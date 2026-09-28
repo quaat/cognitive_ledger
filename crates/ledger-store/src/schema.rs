@@ -52,6 +52,21 @@ fn db_migrate(e: sqlx::migrate::MigrateError) -> LedgerError {
     }
 }
 
+/// `ledger_grant_projector` (0011, ADR-0021) for `role`, then the same PUBLIC-EXECUTE revoke
+/// as [`grant_runtime_role`].
+pub async fn grant_projector_role(conn: &mut PgConnection, role: &str) -> Result<(), LedgerError> {
+    sqlx::query("SELECT ledger_grant_projector($1)")
+        .bind(role)
+        .execute(&mut *conn)
+        .await
+        .map_err(db_error)?;
+    sqlx::query("REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC")
+        .execute(&mut *conn)
+        .await
+        .map_err(db_error)?;
+    Ok(())
+}
+
 /// Grant the runtime role its privileges through the versioned `ledger_grant_runtime`
 /// function installed by migration 0008 (owner connection; idempotent).
 pub async fn grant_runtime_role(conn: &mut PgConnection, role: &str) -> Result<(), LedgerError> {
@@ -77,7 +92,7 @@ pub async fn grant_runtime_role(conn: &mut PgConnection, role: &str) -> Result<(
 pub const CONTENT_SCHEMA_VERSION: i64 = 5;
 /// The exact schema level this build requires at runtime (startup and readiness refuse
 /// anything else, ADR-0016).
-pub const REQUIRED_SCHEMA_VERSION: i64 = 10;
+pub const REQUIRED_SCHEMA_VERSION: i64 = 11;
 
 /// What `verify` found.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -91,7 +106,7 @@ pub struct SchemaReport {
 }
 
 /// Verify that the database is at exactly `REQUIRED_SCHEMA_VERSION` with intact migration
-/// metadata. Runs on the runtime identity (SELECT on `_sqlx_migrations`).
+/// metadata. Runs on the runtime or projector identity (SELECT on `_sqlx_migrations`).
 pub async fn verify(pool: &PgPool) -> Result<SchemaReport, LedgerError> {
     let rows = match sqlx::query(
         "SELECT version, checksum, success FROM _sqlx_migrations ORDER BY version",
@@ -103,8 +118,10 @@ pub async fn verify(pool: &PgPool) -> Result<SchemaReport, LedgerError> {
         Err(sqlx::Error::Database(d)) if d.code().as_deref() == Some("42501") => {
             return Err(LedgerError::RuntimeIdentity(
                 "the connected role cannot read the migration metadata: it has not been \
-                 granted the runtime privileges; run `ledger-admin migrate --runtime-role <role>` \
-                 with the owner identity (ADR-0016)"
+                 granted its identity's privileges on this database (or the schema predates \
+                 them); run `ledger-admin migrate --runtime-role <role>` for the server or \
+                 `--projector-role <role>` for the projector with the owner identity \
+                 (ADR-0016, ADR-0021)"
                     .into(),
             ));
         }
@@ -418,6 +435,25 @@ const GUARD_TRIGGERS: &[ExpectedTrigger] = &[
         true,
         &[],
     ),
+    // 0011
+    before(
+        "projection_state_guard",
+        "projection_state",
+        "projection_state_guard",
+        false,
+        true,
+        true,
+        &[],
+    ),
+    before(
+        "outbox_delivery_monotonic",
+        "projection_outbox",
+        "outbox_delivery_is_monotonic",
+        false,
+        true,
+        false,
+        &[],
+    ),
 ];
 
 fn incompatible(message: String) -> LedgerError {
@@ -449,6 +485,8 @@ const GUARD_FUNCTIONS: &[&str] = &[
     "refs_movement_is_audited",
     "graphs_status_change_serializes",
     "ledger_lock_key",
+    "projection_state_guard",
+    "outbox_delivery_is_monotonic",
 ];
 
 /// Parse every `CREATE OR REPLACE FUNCTION … AS $$ … $$` in the embedded migrations (up to
@@ -747,7 +785,7 @@ const fn uq(table: &'static str, columns: &'static [&'static str]) -> ExpectedCo
     }
 }
 
-/// Every column migrations 0001–0010 declare `NOT NULL`, by table. Composite foreign keys use
+/// Every column migrations 0001–0011 declare `NOT NULL`, by table. Composite foreign keys use
 /// `MATCH SIMPLE`, so a key column that became nullable would let a row skip its foreign key
 /// entirely; the verifier therefore checks nullability structurally like every other
 /// control (a column that is additionally `NOT NULL` is harmless and accepted).
@@ -817,6 +855,22 @@ pub const EXPECTED_NOT_NULL: &[(&str, &[&str])] = &[
             "outbox_id",
             "ref_event_id",
             "ref_version",
+        ],
+    ),
+    (
+        "projection_state",
+        &[
+            "graph_id",
+            "branch",
+            "target_id",
+            "tenant_id",
+            "cognitive_graph",
+            "status",
+            "lease_epoch",
+            "next_attempt_at",
+            "consecutive_failures",
+            "rebuilds",
+            "created_at",
         ],
     ),
     (
@@ -1199,6 +1253,29 @@ const EXPECTED_CONSTRAINTS: &[ExpectedConstraint] = &[
         "validation_records",
         &["validation_id", "graph_id", "candidate_commit"],
     ),
+    // 0011
+    uq(
+        "ref_events",
+        &["graph_id", "branch", "new_version", "new_head"],
+    ),
+    pk("projection_state", &["graph_id", "branch", "target_id"]),
+    fk(
+        "projection_state",
+        &["graph_id", "tenant_id"],
+        "graphs",
+        &["graph_id", "tenant_id"],
+    ),
+    fk(
+        "projection_state",
+        &[
+            "graph_id",
+            "branch",
+            "projected_ref_version",
+            "projected_commit",
+        ],
+        "ref_events",
+        &["graph_id", "branch", "new_version", "new_head"],
+    ),
 ];
 
 /// Unique indexes the workflow relies on (one terminal decision per candidate / proposal /
@@ -1222,6 +1299,13 @@ const EXPECTED_UNIQUE_INDEXES: &[(&str, &str, &[&str], &str)] = &[
         "decisions",
         &["ref_event_id"],
         "(ref_event_idISNOTNULL)",
+    ),
+    // 0011: one live stream per (target, cognitive graph) — tenant isolation (ADR-0020).
+    (
+        "projection_state_graph_unique",
+        "projection_state",
+        &["target_id", "cognitive_graph"],
+        "(status<>'disabled')",
     ),
 ];
 
@@ -1506,6 +1590,51 @@ const EXPECTED_CHECKS: &[(&str, &str, &str)] = &[
         "validation_violations",
         "vv_position",
         "CHECK(((\"position\">=0)AND(\"position\"<=63)))",
+    ),
+    (
+        "projection_state",
+        "ps_branch_bounds",
+        "CHECK(((octet_length(branch)>=1)AND(octet_length(branch)<=128)AND(branch~'^[A-Za-z0-9._/-]+$')))",
+    ),
+    (
+        "projection_state",
+        "ps_cognitive_graph_format",
+        "CHECK(((octet_length(cognitive_graph)<=2048)AND(cognitive_graph~'^urn:sculpin:kb:[A-Za-z0-9._~%-]+:cognitive$')))",
+    ),
+    (
+        "projection_state",
+        "ps_counters",
+        "CHECK(((lease_epoch>=0)AND(consecutive_failures>=0)AND(rebuilds>=0)AND((projected_ref_versionISNULL)OR(projected_ref_version>=1))))",
+    ),
+    (
+        "projection_state",
+        "ps_error_code_format",
+        "CHECK(((last_error_codeISNULL)OR(last_error_code~'^[A-Z_]{1,64}$')))",
+    ),
+    (
+        "projection_state",
+        "ps_lease_owner_bounds",
+        "CHECK(((lease_ownerISNULL)OR((octet_length(lease_owner)>=1)AND(octet_length(lease_owner)<=256))))",
+    ),
+    (
+        "projection_state",
+        "ps_lease_shape",
+        "CHECK(((lease_ownerISNULL)=(lease_untilISNULL)))",
+    ),
+    (
+        "projection_state",
+        "ps_progress_shape",
+        "CHECK(((projected_commitISNULL)=(projected_ref_versionISNULL)))",
+    ),
+    (
+        "projection_state",
+        "ps_status",
+        "CHECK((status=ANY(ARRAY['active','blocked','rebuild_required','disabling','disabled'])))",
+    ),
+    (
+        "projection_state",
+        "ps_target_id_format",
+        "CHECK((target_id~'^[A-Za-z0-9._:-]{1,128}$'))",
     ),
 ];
 
@@ -1838,7 +1967,7 @@ async fn verify_constraints_and_indexes(
 /// rolled-back semantic probe of the content-address CHECK. Deparsing opens relations with
 /// `ACCESS SHARE` and the probe takes a row lock, so this runs at start-up only; readiness
 /// compares the expression fingerprints `verify` returns with the ones validated here.
-pub async fn verify_definitions_at_startup(pool: &PgPool) -> Result<(), LedgerError> {
+pub async fn verify_definitions(pool: &PgPool) -> Result<(), LedgerError> {
     for (table, name, expected) in EXPECTED_CHECKS {
         let def: Option<String> = sqlx::query_scalar(
             "SELECT pg_get_constraintdef(con.oid) FROM pg_constraint con \
@@ -1891,6 +2020,14 @@ pub async fn verify_definitions_at_startup(pool: &PgPool) -> Result<(), LedgerEr
             )));
         }
     }
+    Ok(())
+}
+
+/// The runtime server's start-up check: every definition ([`verify_definitions`]) plus the
+/// rolled-back semantic probes of the content-address CHECKs (which need the runtime's INSERT
+/// grants; the projector, which has none, runs [`verify_definitions`] only).
+pub async fn verify_definitions_at_startup(pool: &PgPool) -> Result<(), LedgerError> {
+    verify_definitions(pool).await?;
     probe_content_address_check(pool).await?;
     probe_validation_content_address_checks(pool).await
 }
@@ -2197,7 +2334,113 @@ const RUNTIME_TABLE_MODEL: &[TablePrivileges] = &[
         ],
         update_columns: &[],
     },
+    // 0011: status reads only; the runtime never writes projection progress.
+    TablePrivileges {
+        table: "projection_state",
+        insert_columns: &[],
+        update_columns: &[],
+    },
 ];
+
+/// The projector identity's exact table privileges (0011 `ledger_grant_projector`,
+/// ADR-0021): SELECT on the tables reconstruction and projection read, UPDATE on the outbox
+/// delivery columns and the stream's progress/lease/error columns, nothing else — and, unlike
+/// the runtime, no privilege at all on any table not listed here.
+const PROJECTOR_TABLE_MODEL: &[TablePrivileges] = &[
+    TablePrivileges {
+        table: "graphs",
+        insert_columns: &[],
+        update_columns: &[],
+    },
+    TablePrivileges {
+        table: "refs",
+        insert_columns: &[],
+        update_columns: &[],
+    },
+    TablePrivileges {
+        table: "immutable_objects",
+        insert_columns: &[],
+        update_columns: &[],
+    },
+    TablePrivileges {
+        table: "commit_index",
+        insert_columns: &[],
+        update_columns: &[],
+    },
+    TablePrivileges {
+        table: "commit_parents",
+        insert_columns: &[],
+        update_columns: &[],
+    },
+    TablePrivileges {
+        table: "ref_events",
+        insert_columns: &[],
+        update_columns: &[],
+    },
+    TablePrivileges {
+        table: "projection_outbox",
+        insert_columns: &[],
+        update_columns: &["delivered_at", "attempts"],
+    },
+    TablePrivileges {
+        table: "projection_state",
+        insert_columns: &[],
+        update_columns: &[
+            "status",
+            "projected_commit",
+            "projected_ref_version",
+            "lease_owner",
+            "lease_until",
+            "lease_epoch",
+            "next_attempt_at",
+            "consecutive_failures",
+            "last_success_at",
+            "last_error_at",
+            "last_error_code",
+            "rebuilds",
+        ],
+    },
+    TablePrivileges {
+        table: "_sqlx_migrations",
+        insert_columns: &[],
+        update_columns: &[],
+    },
+];
+
+/// A least-privilege database identity the verifier checks exactly (ADR-0016, ADR-0021).
+pub(crate) struct IdentityModel {
+    /// "runtime" or "projector" (messages).
+    kind: &'static str,
+    /// The `ledger-admin migrate` flag that (re)grants it.
+    flag: &'static str,
+    adr: &'static str,
+    tables: &'static [TablePrivileges],
+    sequences: &'static [&'static str],
+    /// No privilege at all on any public table outside `tables`.
+    exhaustive: bool,
+}
+
+const RUNTIME_IDENTITY: IdentityModel = IdentityModel {
+    kind: "runtime",
+    flag: "--runtime-role",
+    adr: "ADR-0016",
+    tables: RUNTIME_TABLE_MODEL,
+    sequences: RUNTIME_SEQUENCES,
+    exhaustive: true,
+};
+
+const PROJECTOR_IDENTITY: IdentityModel = IdentityModel {
+    kind: "projector",
+    flag: "--projector-role",
+    adr: "ADR-0021",
+    tables: PROJECTOR_TABLE_MODEL,
+    sequences: &[],
+    exhaustive: true,
+};
+
+/// Functions that hand out privileges: no least-privilege identity (nor any role it can
+/// become) may execute them.
+const GRANT_FUNCTIONS: &[&str] = &["ledger_grant_runtime", "ledger_grant_projector"];
 
 /// Sequences the workflow inserts draw from: `USAGE` only (0008), nothing on any other one.
 const RUNTIME_SEQUENCES: &[&str] = &[
@@ -2221,10 +2464,27 @@ fn identity(message: String) -> LedgerError {
 /// sequence. The server refuses to start otherwise, so a deployment that kept the owner URL
 /// or a drifted role cannot silently serve.
 pub async fn verify_runtime_identity(pool: &PgPool) -> Result<(), LedgerError> {
+    verify_identity(pool, &RUNTIME_IDENTITY).await
+}
+
+/// The projector's counterpart of [`verify_runtime_identity`] (ADR-0021): the same
+/// structural checks against the projector model, plus no privilege on unlisted tables.
+pub async fn verify_projector_identity(pool: &PgPool) -> Result<(), LedgerError> {
+    verify_identity(pool, &PROJECTOR_IDENTITY).await
+}
+
+async fn verify_identity(pool: &PgPool, model: &IdentityModel) -> Result<(), LedgerError> {
+    let kind = model.kind;
+    let adr = model.adr;
     let row = sqlx::query(
         "SELECT current_user::text AS who, \
                 (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) AS super, \
                 has_schema_privilege(current_user, 'public', 'CREATE') AS can_create, \
+                has_database_privilege(current_user, current_database(), 'CREATE') AS can_create_db, \
+                (SELECT string_agg(nspname::text, ', ' ORDER BY nspname) FROM pg_namespace \
+                    WHERE nspname <> 'public' AND nspname <> 'information_schema' \
+                      AND nspname NOT LIKE 'pg\\_%' \
+                      AND has_schema_privilege(current_user, oid, 'CREATE')) AS create_schemas, \
                 (SELECT count(*) FROM pg_tables WHERE schemaname = 'public' \
                     AND tableowner = current_user) AS owned",
     )
@@ -2234,29 +2494,46 @@ pub async fn verify_runtime_identity(pool: &PgPool) -> Result<(), LedgerError> {
     let who: String = row.try_get("who").map_err(db_error)?;
     let is_super: Option<bool> = row.try_get("super").map_err(db_error)?;
     let can_create: bool = row.try_get("can_create").map_err(db_error)?;
+    let can_create_db: bool = row.try_get("can_create_db").map_err(db_error)?;
+    let create_schemas: Option<String> = row.try_get("create_schemas").map_err(db_error)?;
     let owned: i64 = row.try_get("owned").map_err(db_error)?;
     if is_super.unwrap_or(false) {
         return Err(identity(format!(
-            "role {who} is a superuser; the server must run as the least-privilege runtime \
-             identity (ADR-0016)"
+            "role {who} is a superuser; the {kind} must run as the least-privilege {kind} \
+             identity ({adr})"
         )));
     }
     if owned > 0 {
         return Err(identity(format!(
-            "role {who} owns {owned} ledger table(s); the server must not run as the schema \
-             owner (ADR-0016)"
+            "role {who} owns {owned} ledger table(s); the {kind} must not run as the schema \
+             owner ({adr})"
         )));
     }
     if can_create {
         return Err(identity(format!(
-            "role {who} holds CREATE on schema public; revoke it (ADR-0016)"
+            "role {who} holds CREATE on schema public; revoke it ({adr})"
         )));
     }
-    verify_role_attributes_and_memberships(pool, &who).await?;
-    for model in RUNTIME_TABLE_MODEL {
-        verify_table_privileges(pool, &who, model).await?;
+    // CREATE anywhere lets the identity shadow objects through its own search_path; the
+    // guard functions pin theirs, and the identity may create nothing at all.
+    if can_create_db {
+        return Err(identity(format!(
+            "role {who} holds CREATE on the database (it could create schemas); revoke it ({adr})"
+        )));
     }
-    verify_sequence_privileges(pool, &who).await
+    if let Some(schemas) = create_schemas {
+        return Err(identity(format!(
+            "role {who} holds CREATE on schema(s) {schemas}; revoke it ({adr})"
+        )));
+    }
+    verify_role_attributes_and_memberships(pool, &who, model).await?;
+    for table in model.tables {
+        verify_table_privileges_for(pool, &who, &who, table, model, Exactness::Exact).await?;
+    }
+    if model.exhaustive {
+        verify_no_unlisted_table_privileges(pool, &who, &who, model).await?;
+    }
+    verify_sequence_privileges_for(pool, &who, &who, model, Exactness::Exact).await
 }
 
 /// The runtime role must not be able to *become* anything more privileged or to silence the
@@ -2268,7 +2545,9 @@ pub async fn verify_runtime_identity(pool: &PgPool) -> Result<(), LedgerError> {
 async fn verify_role_attributes_and_memberships(
     pool: &PgPool,
     who: &str,
+    model: &IdentityModel,
 ) -> Result<(), LedgerError> {
+    let (kind, adr) = (model.kind, model.adr);
     let me = sqlx::query(
         "SELECT rolcreaterole, rolcreatedb, rolreplication, rolbypassrls \
          FROM pg_roles WHERE rolname = current_user",
@@ -2284,8 +2563,8 @@ async fn verify_role_attributes_and_memberships(
     ] {
         if me.try_get::<bool, _>(col).map_err(db_error)? {
             return Err(identity(format!(
-                "role {who} has the {attr} attribute; the runtime identity must be a plain LOGIN \
-                 role (ADR-0016)"
+                "role {who} has the {attr} attribute; the {kind} identity must be a plain LOGIN \
+                 role ({adr})"
             )));
         }
     }
@@ -2341,6 +2620,10 @@ async fn verify_role_attributes_and_memberships(
                 (SELECT count(*) FROM pg_tables t WHERE t.schemaname = 'public' AND t.tableowner = r.rolname) AS owned, \
                 (SELECT count(*) FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace AND p.proowner = r.oid) AS owned_functions, \
                 has_schema_privilege(r.oid, 'public', 'CREATE') AS can_create, \
+                (has_database_privilege(r.oid, current_database(), 'CREATE') \
+                 OR EXISTS (SELECT 1 FROM pg_namespace n WHERE n.nspname <> 'public' \
+                            AND n.nspname <> 'information_schema' AND n.nspname NOT LIKE 'pg\\_%' \
+                            AND has_schema_privilege(r.oid, n.oid, 'CREATE'))) AS can_create_elsewhere, \
                 {srr} AS can_set_srr \
          FROM m JOIN pg_roles r ON r.oid = m.roleid",
         srr = if version >= 150_000 {
@@ -2389,6 +2672,11 @@ async fn verify_role_attributes_and_memberships(
                 "a CREATE holder on schema public",
             ),
             (
+                row.try_get::<bool, _>("can_create_elsewhere")
+                    .map_err(db_error)?,
+                "a CREATE holder on the database or another schema",
+            ),
+            (
                 row.try_get::<bool, _>("can_set_srr").map_err(db_error)?,
                 "allowed to SET or ALTER SYSTEM session_replication_role",
             ),
@@ -2399,19 +2687,22 @@ async fn verify_role_attributes_and_memberships(
         if let Some((_, what)) = flags.iter().find(|(bad, _)| *bad) {
             return Err(identity(format!(
                 "role {who} is a member of {name} ({what}; inherit={inherit}, set={set}); the \
-                 runtime identity must not be able to assume more privilege (ADR-0016)"
+                 {kind} identity must not be able to assume more privilege ({adr})"
             )));
         }
         // Object privileges an assumable role holds must stay within the runtime model too:
         // a NOINHERIT/SET-only parent's grants are invisible to the current_user checks but
         // one `SET ROLE` away.
-        for model in RUNTIME_TABLE_MODEL {
-            verify_table_privileges_for(pool, &name, who, model, Exactness::Subset).await?;
+        for table in model.tables {
+            verify_table_privileges_for(pool, &name, who, table, model, Exactness::Subset).await?;
         }
-        verify_sequence_privileges_for(pool, &name, who, Exactness::Subset).await?;
-        verify_no_grant_function_execute(pool, &name, who).await?;
+        if model.exhaustive {
+            verify_no_unlisted_table_privileges(pool, &name, who, model).await?;
+        }
+        verify_sequence_privileges_for(pool, &name, who, model, Exactness::Subset).await?;
+        verify_no_grant_function_execute(pool, &name, who, model).await?;
     }
-    verify_no_grant_function_execute(pool, who, who).await
+    verify_no_grant_function_execute(pool, who, who, model).await
 }
 
 /// Whether a role must hold the model exactly (the runtime itself) or at most the model
@@ -2422,35 +2713,80 @@ enum Exactness {
     Subset,
 }
 
-/// `ledger_grant_runtime` hands out privileges; neither the runtime nor any role it can
-/// become may execute it (the function refuses non-owners, but defence in depth).
+/// The grant functions hand out privileges; neither a least-privilege identity nor any role it
+/// can become may execute them (they refuse non-owners, but defence in depth).
 async fn verify_no_grant_function_execute(
     pool: &PgPool,
     subject: &str,
     who: &str,
+    model: &IdentityModel,
 ) -> Result<(), LedgerError> {
-    let can: bool = sqlx::query_scalar(
-        "SELECT has_function_privilege($1, 'public.ledger_grant_runtime(text)', 'EXECUTE')",
-    )
-    .bind(subject)
-    .fetch_one(pool)
-    .await
-    .map_err(db_error)?;
-    if can {
-        return Err(identity(format!(
-            "role {subject} (reachable by {who}) may execute ledger_grant_runtime; the runtime \
-             identity must not (ADR-0016)"
-        )));
+    for function in GRANT_FUNCTIONS {
+        let can: bool = sqlx::query_scalar(
+            "SELECT to_regprocedure($2) IS NOT NULL AND has_function_privilege($1, $2, 'EXECUTE')",
+        )
+        .bind(subject)
+        .bind(format!("public.{function}(text)"))
+        .fetch_one(pool)
+        .await
+        .map_err(db_error)?;
+        if can {
+            return Err(identity(format!(
+                "role {subject} (reachable by {who}) may execute {function}; the {} identity \
+                 must not ({})",
+                model.kind, model.adr
+            )));
+        }
     }
     Ok(())
 }
 
-async fn verify_table_privileges(
+/// Exhaustive models: no privilege of any kind on any relation (table, partitioned table,
+/// view, materialized view, foreign table) of any non-system schema that the model does not
+/// list (the model lists `public` tables only). A relation in a schema the role has no
+/// `USAGE` on is unreachable and ignored (e.g. an extension's PUBLIC view in a locked-down
+/// schema).
+async fn verify_no_unlisted_table_privileges(
     pool: &PgPool,
+    subject: &str,
     who: &str,
-    model: &TablePrivileges,
+    model: &IdentityModel,
 ) -> Result<(), LedgerError> {
-    verify_table_privileges_for(pool, who, who, model, Exactness::Exact).await
+    let listed: Vec<&str> = model.tables.iter().map(|t| t.table).collect();
+    let rows = sqlx::query(
+        "SELECT n.nspname::text AS schema, c.relname::text AS name FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname <> 'information_schema' AND n.nspname NOT LIKE 'pg\\_%' \
+           AND c.relkind IN ('r', 'p', 'v', 'm', 'f') \
+           AND (n.nspname = 'public' OR has_schema_privilege($1, n.oid, 'USAGE')) \
+           AND (has_table_privilege($1, c.oid, 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER') \
+                OR CASE WHEN current_setting('server_version_num')::int >= 170000 \
+                        THEN has_table_privilege($1, c.oid, 'MAINTAIN') ELSE false END \
+                OR has_any_column_privilege($1, c.oid, 'SELECT, INSERT, UPDATE, REFERENCES'))",
+    )
+    .bind(subject)
+    .fetch_all(pool)
+    .await
+    .map_err(db_error)?;
+    for row in &rows {
+        let schema: String = row.try_get("schema").map_err(db_error)?;
+        let name: String = row.try_get("name").map_err(db_error)?;
+        if schema != "public" || !listed.contains(&name.as_str()) {
+            return Err(identity(format!(
+                "role {who} holds privileges on {schema}.{name}{}; the {} identity may only access \
+                 {listed:?}; run `ledger-admin migrate {} {who}` with the owner identity ({})",
+                if subject == who {
+                    String::new()
+                } else {
+                    format!(" (through membership in {subject})")
+                },
+                model.kind,
+                model.flag,
+                model.adr
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// `subject` is the role whose privileges are examined (the runtime, or a role it can
@@ -2460,8 +2796,10 @@ async fn verify_table_privileges_for(
     subject: &str,
     who: &str,
     model: &TablePrivileges,
+    identity_model: &IdentityModel,
     exactness: Exactness,
 ) -> Result<(), LedgerError> {
+    let (kind, flag, adr) = (identity_model.kind, identity_model.flag, identity_model.adr);
     let qualified = format!("public.{}", model.table);
     let table = sqlx::query(
         "SELECT to_regclass($1) IS NOT NULL AS present, \
@@ -2471,7 +2809,9 @@ async fn verify_table_privileges_for(
                 has_table_privilege($2, $1, 'DELETE') AS del, \
                 has_table_privilege($2, $1, 'TRUNCATE') AS trunc, \
                 has_table_privilege($2, $1, 'TRIGGER') AS trig, \
-                has_table_privilege($2, $1, 'REFERENCES') AS refs",
+                has_table_privilege($2, $1, 'REFERENCES') AS refs, \
+                CASE WHEN current_setting('server_version_num')::int >= 170000 \
+                     THEN has_table_privilege($2, $1, 'MAINTAIN') ELSE false END AS maint",
     )
     .bind(&qualified)
     .bind(subject)
@@ -2484,9 +2824,7 @@ async fn verify_table_privileges_for(
             "table {qualified} is missing; refusing to serve"
         )));
     }
-    let fix = format!(
-        "run `ledger-admin migrate --runtime-role {who}` with the owner identity (ADR-0016)"
-    );
+    let fix = format!("run `ledger-admin migrate {flag} {who}` with the owner identity ({adr})");
     let via = if subject == who {
         String::new()
     } else {
@@ -2504,11 +2842,12 @@ async fn verify_table_privileges_for(
         ("trunc", "TRUNCATE"),
         ("trig", "TRIGGER"),
         ("refs", "REFERENCES"),
+        ("maint", "MAINTAIN"),
     ] {
         if table.try_get::<bool, _>(column).map_err(db_error)? {
             return Err(identity(format!(
-                "role {who} holds {privilege} on {qualified}{via}; the runtime identity must not \
-                 (only the column grants of migration 0008 are allowed; ADR-0016)"
+                "role {who} holds {privilege} on {qualified}{via}; the {kind} identity must not \
+                 (only its column grants are allowed; {adr})"
             )));
         }
     }
@@ -2517,7 +2856,8 @@ async fn verify_table_privileges_for(
     let columns = sqlx::query(
         "SELECT a.attname::text AS name, \
                 has_column_privilege($2, a.attrelid, a.attnum, 'INSERT') AS ins, \
-                has_column_privilege($2, a.attrelid, a.attnum, 'UPDATE') AS upd \
+                has_column_privilege($2, a.attrelid, a.attnum, 'UPDATE') AS upd, \
+                has_column_privilege($2, a.attrelid, a.attnum, 'REFERENCES') AS refs \
          FROM pg_attribute a \
          WHERE a.attrelid = to_regclass($1) AND a.attnum > 0 AND NOT a.attisdropped",
     )
@@ -2531,6 +2871,13 @@ async fn verify_table_privileges_for(
         let name: String = column.try_get("name").map_err(db_error)?;
         let ins: bool = column.try_get("ins").map_err(db_error)?;
         let upd: bool = column.try_get("upd").map_err(db_error)?;
+        // No identity may reference ledger columns from its own tables (column grants too).
+        if column.try_get::<bool, _>("refs").map_err(db_error)? {
+            return Err(identity(format!(
+                "role {who} holds REFERENCES on {qualified}.{name}{via}; the {kind} identity must \
+                 not ({adr})"
+            )));
+        }
         let expect_ins = model.insert_columns.contains(&name.as_str());
         let expect_upd = model.update_columns.contains(&name.as_str());
         let violates = |has: bool, expect: bool| match exactness {
@@ -2539,7 +2886,7 @@ async fn verify_table_privileges_for(
         };
         if violates(ins, expect_ins) {
             return Err(identity(format!(
-                "role {who} {} INSERT on {qualified}.{name}{via}; the runtime identity's INSERT \
+                "role {who} {} INSERT on {qualified}.{name}{via}; the {kind} identity's INSERT \
                  columns on {} are exactly {:?}; {fix}",
                 if ins { "holds" } else { "lacks" },
                 model.table,
@@ -2548,7 +2895,7 @@ async fn verify_table_privileges_for(
         }
         if violates(upd, expect_upd) {
             return Err(identity(format!(
-                "role {who} {} UPDATE on {qualified}.{name}{via}; the runtime identity's UPDATE \
+                "role {who} {} UPDATE on {qualified}.{name}{via}; the {kind} identity's UPDATE \
                  columns on {} are exactly {:?}; {fix}",
                 if upd { "holds" } else { "lacks" },
                 model.table,
@@ -2568,16 +2915,14 @@ async fn verify_table_privileges_for(
     Ok(())
 }
 
-async fn verify_sequence_privileges(pool: &PgPool, who: &str) -> Result<(), LedgerError> {
-    verify_sequence_privileges_for(pool, who, who, Exactness::Exact).await
-}
-
 async fn verify_sequence_privileges_for(
     pool: &PgPool,
     subject: &str,
     who: &str,
+    model: &IdentityModel,
     exactness: Exactness,
 ) -> Result<(), LedgerError> {
+    let (kind, flag, adr, sequences) = (model.kind, model.flag, model.adr, model.sequences);
     let rows = sqlx::query(
         "SELECT c.relname::text AS name, \
                 has_sequence_privilege($1, c.oid, 'USAGE') AS usage, \
@@ -2600,29 +2945,29 @@ async fn verify_sequence_privileges_for(
         let usage: bool = row.try_get("usage").map_err(db_error)?;
         let sel: bool = row.try_get("sel").map_err(db_error)?;
         let upd: bool = row.try_get("upd").map_err(db_error)?;
-        let expected = RUNTIME_SEQUENCES.contains(&name.as_str());
+        let expected = sequences.contains(&name.as_str());
         let violates = match exactness {
             Exactness::Exact => usage != expected,
             Exactness::Subset => usage && !expected,
         };
         if violates {
             return Err(identity(format!(
-                "role {who} {} USAGE on sequence public.{name}{via}; the runtime identity has USAGE \
-                 on exactly {RUNTIME_SEQUENCES:?}; run `ledger-admin migrate --runtime-role {who}` \
-                 with the owner identity (ADR-0016)",
+                "role {who} {} USAGE on sequence public.{name}{via}; the {kind} identity has USAGE \
+                 on exactly {sequences:?}; run `ledger-admin migrate {flag} {who}` \
+                 with the owner identity ({adr})",
                 if usage { "holds" } else { "lacks" }
             )));
         }
         if sel || upd {
             return Err(identity(format!(
                 "role {who} holds SELECT/UPDATE on sequence public.{name}{via}; only USAGE is granted \
-                 to the runtime identity (ADR-0016)"
+                 to the {kind} identity ({adr})"
             )));
         }
         seen.push(name);
     }
     if exactness == Exactness::Exact {
-        for expected in RUNTIME_SEQUENCES {
+        for expected in sequences {
             if !seen.iter().any(|s| s == expected) {
                 return Err(incompatible(format!(
                     "sequence public.{expected} is missing; refusing to serve"
@@ -2648,7 +2993,7 @@ mod tests {
             .2;
         assert_eq!(normalize_constraint_def(pg17), expected);
         assert_ne!(normalize_constraint_def("CHECK (true)"), expected);
-        assert_eq!(EXPECTED_CHECKS.len(), 56);
+        assert_eq!(EXPECTED_CHECKS.len(), 65);
     }
 
     #[test]
@@ -2753,6 +3098,8 @@ mod tests {
         assert_eq!(by_name("graphs_identity_immutable"), 19); // ROW BEFORE UPDATE
         assert_eq!(by_name("refs_version_monotonic"), 23); // ROW BEFORE INSERT UPDATE
         assert_eq!(by_name("refs_movement_audited"), 21); // ROW AFTER INSERT UPDATE
-        assert_eq!(GUARD_TRIGGERS.len(), 18);
+        assert_eq!(by_name("projection_state_guard"), 27); // ROW BEFORE UPDATE DELETE
+        assert_eq!(by_name("outbox_delivery_monotonic"), 19); // ROW BEFORE UPDATE
+        assert_eq!(GUARD_TRIGGERS.len(), 20);
     }
 }
