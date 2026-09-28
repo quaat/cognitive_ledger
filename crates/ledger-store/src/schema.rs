@@ -92,7 +92,7 @@ pub async fn grant_runtime_role(conn: &mut PgConnection, role: &str) -> Result<(
 pub const CONTENT_SCHEMA_VERSION: i64 = 5;
 /// The exact schema level this build requires at runtime (startup and readiness refuse
 /// anything else, ADR-0016).
-pub const REQUIRED_SCHEMA_VERSION: i64 = 11;
+pub const REQUIRED_SCHEMA_VERSION: i64 = 12;
 
 /// What `verify` found.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -454,6 +454,95 @@ const GUARD_TRIGGERS: &[ExpectedTrigger] = &[
         false,
         &[],
     ),
+    // 0012: named branches (ADR-0022)
+    before(
+        "branch_events_write_once",
+        "branch_events",
+        "ledger_rows_are_write_once",
+        false,
+        true,
+        true,
+        &[],
+    ),
+    before(
+        "branches_guard",
+        "branches",
+        "branches_guard",
+        true,
+        true,
+        true,
+        &[],
+    ),
+    ExpectedTrigger {
+        name: "branches_lifecycle_audited",
+        table: "branches",
+        function: "branches_lifecycle_is_audited",
+        before: false,
+        insert: true,
+        update: true,
+        delete: false,
+        update_columns: &["status", "lifecycle_version"],
+        constraint: true,
+        deferrable: true,
+        initially_deferred: true,
+    },
+    ExpectedTrigger {
+        name: "branch_events_current",
+        table: "branch_events",
+        function: "branch_event_is_current",
+        before: false,
+        insert: true,
+        update: false,
+        delete: false,
+        update_columns: &[],
+        constraint: true,
+        deferrable: true,
+        initially_deferred: true,
+    },
+    ExpectedTrigger {
+        name: "refs_are_branches",
+        table: "refs",
+        function: "refs_are_branches",
+        before: false,
+        insert: true,
+        update: false,
+        delete: false,
+        update_columns: &[],
+        constraint: true,
+        deferrable: true,
+        initially_deferred: true,
+    },
+    ExpectedTrigger {
+        name: "graphs_adopt_refs",
+        table: "graphs",
+        function: "graphs_adopt_refs_on_activation",
+        before: false,
+        insert: false,
+        update: true,
+        delete: false,
+        update_columns: &["status"],
+        constraint: false,
+        deferrable: false,
+        initially_deferred: false,
+    },
+    before(
+        "refs_branch_active",
+        "refs",
+        "refs_branch_is_active",
+        false,
+        true,
+        false,
+        &["head"],
+    ),
+    before(
+        "proposals_branch_active",
+        "proposals",
+        "proposals_branch_is_active",
+        true,
+        false,
+        false,
+        &[],
+    ),
 ];
 
 fn incompatible(message: String) -> LedgerError {
@@ -487,6 +576,13 @@ const GUARD_FUNCTIONS: &[&str] = &[
     "ledger_lock_key",
     "projection_state_guard",
     "outbox_delivery_is_monotonic",
+    "branches_guard",
+    "branches_lifecycle_is_audited",
+    "branch_event_is_current",
+    "refs_are_branches",
+    "refs_branch_is_active",
+    "proposals_branch_is_active",
+    "graphs_adopt_refs_on_activation",
 ];
 
 /// Parse every `CREATE OR REPLACE FUNCTION … AS $$ … $$` in the embedded migrations (up to
@@ -791,6 +887,38 @@ const fn uq(table: &'static str, columns: &'static [&'static str]) -> ExpectedCo
 /// control (a column that is additionally `NOT NULL` is harmless and accepted).
 pub const EXPECTED_NOT_NULL: &[(&str, &[&str])] = &[
     (
+        "branches",
+        &[
+            "graph_id",
+            "branch",
+            "tenant_id",
+            "status",
+            "lifecycle_version",
+            "origin",
+            "require_validation",
+            "require_distinct_reviewer",
+            "created_at",
+            "updated_at",
+        ],
+    ),
+    (
+        "branch_events",
+        &[
+            "event_id",
+            "graph_id",
+            "branch",
+            "tenant_id",
+            "lifecycle_version",
+            "operation",
+            "status_after",
+            "head",
+            "ref_version",
+            "principal_id",
+            "principal_type",
+            "recorded_at",
+        ],
+    ),
+    (
         "commit_index",
         &[
             "graph_id",
@@ -975,6 +1103,68 @@ pub const EXPECTED_NOT_NULL: &[(&str, &[&str])] = &[
 ];
 
 const EXPECTED_CONSTRAINTS: &[ExpectedConstraint] = &[
+    // 0012: named branches (ADR-0022)
+    pk("branches", &["graph_id", "branch"]),
+    fk(
+        "branches",
+        &["graph_id", "branch"],
+        "refs",
+        &["graph_id", "branch"],
+    ),
+    fk(
+        "branches",
+        &["graph_id", "tenant_id"],
+        "graphs",
+        &["graph_id", "tenant_id"],
+    ),
+    fk(
+        "branches",
+        &["graph_id", "source_branch"],
+        "branches",
+        &["graph_id", "branch"],
+    ),
+    fk(
+        "branches",
+        &["graph_id", "source_commit"],
+        "commit_index",
+        &["graph_id", "id"],
+    ),
+    pk("branch_events", &["event_id"]),
+    fk(
+        "branch_events",
+        &["graph_id", "branch"],
+        "branches",
+        &["graph_id", "branch"],
+    ),
+    fk(
+        "branch_events",
+        &["graph_id", "tenant_id"],
+        "graphs",
+        &["graph_id", "tenant_id"],
+    ),
+    fk(
+        "branch_events",
+        &["graph_id", "head"],
+        "commit_index",
+        &["graph_id", "id"],
+    ),
+    fk(
+        "branch_events",
+        &["graph_id", "source_commit"],
+        "commit_index",
+        &["graph_id", "id"],
+    ),
+    uq(
+        "branch_events",
+        &["graph_id", "branch", "lifecycle_version"],
+    ),
+    uq("branch_events", &["event_id", "graph_id"]),
+    fk(
+        "idempotency",
+        &["result_branch_event_id", "graph_id"],
+        "branch_events",
+        &["event_id", "graph_id"],
+    ),
     // 0001–0004: content, index, graphs
     pk("refs", &["graph_id", "branch"]),
     pk("immutable_objects", &["id"]),
@@ -1314,6 +1504,92 @@ const EXPECTED_UNIQUE_INDEXES: &[(&str, &str, &[&str], &str)] = &[
 /// compared by deparse at start-up and by expression fingerprint on readiness, so a same-named
 /// vacuous replacement cannot pass; the Rust layer enforces the same domain rules independently.
 const EXPECTED_CHECKS: &[(&str, &str, &str)] = &[
+    // 0012: named branches (ADR-0022)
+    (
+        "branch_events",
+        "branch_events_correlation_bounds",
+        "CHECK(((correlation_idISNULL)OR((octet_length(correlation_id)>=1)AND(octet_length(correlation_id)<=128))))",
+    ),
+    (
+        "branch_events",
+        "branch_events_operation",
+        "CHECK((operation=ANY(ARRAY['genesis','created','adopted','deleted','restored'])))",
+    ),
+    (
+        "branch_events",
+        "branch_events_principal_type",
+        "CHECK((principal_type=ANY(ARRAY['human','agent','service'])))",
+    ),
+    (
+        "branch_events",
+        "branch_events_reason_bounds",
+        "CHECK(((reasonISNULL)OR((octet_length(reason)>=1)AND(octet_length(reason)<=4096))))",
+    ),
+    (
+        "branch_events",
+        "branch_events_ref_version_positive",
+        "CHECK((ref_version>=1))",
+    ),
+    (
+        "branch_events",
+        "branch_events_shape",
+        "CHECK((((operation=ANY(ARRAY['genesis','created','adopted']))AND(lifecycle_version=1)AND(status_after='active'))OR((operation='deleted')AND(lifecycle_version>1)AND(status_after='deleted'))OR((operation='restored')AND(lifecycle_version>1)AND(status_after='active'))))",
+    ),
+    (
+        "branch_events",
+        "branch_events_source_shape",
+        "CHECK((((operation='created')=(source_branchISNOTNULL))AND((source_branchISNULL)=(source_commitISNULL))))",
+    ),
+    (
+        "branch_events",
+        "branch_events_status_after",
+        "CHECK((status_after=ANY(ARRAY['active','deleted'])))",
+    ),
+    (
+        "branches",
+        "branches_genesis_is_main",
+        "CHECK(((origin<>'genesis')OR(branch='main')))",
+    ),
+    (
+        "branches",
+        "branches_lifecycle_version_positive",
+        "CHECK((lifecycle_version>=1))",
+    ),
+    (
+        "branches",
+        "branches_main_shape",
+        "CHECK(((branch<>'main')OR((origin<>'created')AND(status='active'))))",
+    ),
+    (
+        "branches",
+        "branches_name_bounds",
+        "CHECK(((octet_length(branch)>=1)AND(octet_length(branch)<=128)AND(branch~'^[A-Za-z0-9._/-]+$')))",
+    ),
+    (
+        "branches",
+        "branches_origin_shape",
+        "CHECK((((origin='created')=(source_branchISNOTNULL))AND((source_branchISNULL)=(source_commitISNULL))))",
+    ),
+    (
+        "branches",
+        "branches_origin",
+        "CHECK((origin=ANY(ARRAY['genesis','created','adopted'])))",
+    ),
+    (
+        "branches",
+        "branches_status",
+        "CHECK((status=ANY(ARRAY['active','deleted'])))",
+    ),
+    (
+        "idempotency",
+        "idempotency_branch_shape",
+        "CHECK((((operation='branch_create')=(result_kind='branch_created'))AND((operation='branch_delete')=(result_kind='branch_deleted'))AND((operation='branch_restore')=(result_kind='branch_restored'))AND((operation=ANY(ARRAY['branch_create','branch_delete','branch_restore']))=(result_branch_event_idISNOTNULL))))",
+    ),
+    (
+        "refs",
+        "refs_main_protected",
+        "CHECK(((branch<>'main')ORprotected))",
+    ),
     (
         "commit_index",
         "commit_index_graph_id_format",
@@ -1397,7 +1673,7 @@ const EXPECTED_CHECKS: &[(&str, &str, &str)] = &[
     (
         "idempotency",
         "idempotency_operation",
-        "CHECK((operation=ANY(ARRAY['prepare','accept','reject','validate'])))",
+        "CHECK((operation=ANY(ARRAY['prepare','accept','reject','validate','branch_create','branch_delete','branch_restore'])))",
     ),
     (
         "idempotency",
@@ -1412,7 +1688,7 @@ const EXPECTED_CHECKS: &[(&str, &str, &str)] = &[
     (
         "idempotency",
         "idempotency_result_kind",
-        "CHECK((result_kind=ANY(ARRAY['prepared','accepted','rejected','validated'])))",
+        "CHECK((result_kind=ANY(ARRAY['prepared','accepted','rejected','validated','branch_created','branch_deleted','branch_restored'])))",
     ),
     (
         "immutable_objects",
@@ -2144,7 +2420,7 @@ const RUNTIME_TABLE_MODEL: &[TablePrivileges] = &[
     },
     TablePrivileges {
         table: "refs",
-        insert_columns: &["graph_id", "branch", "head", "version"],
+        insert_columns: &["graph_id", "branch", "head", "version", "protected"],
         update_columns: &["head", "version", "updated_at"],
     },
     TablePrivileges {
@@ -2246,6 +2522,7 @@ const RUNTIME_TABLE_MODEL: &[TablePrivileges] = &[
             "result_decision_id",
             "result_proposal_id",
             "result_validation_id",
+            "result_branch_event_id",
         ],
         update_columns: &[],
     },
@@ -2338,6 +2615,43 @@ const RUNTIME_TABLE_MODEL: &[TablePrivileges] = &[
     TablePrivileges {
         table: "projection_state",
         insert_columns: &[],
+        update_columns: &[],
+    },
+    TablePrivileges {
+        table: "branches",
+        insert_columns: &[
+            "graph_id",
+            "branch",
+            "tenant_id",
+            "status",
+            "lifecycle_version",
+            "origin",
+            "source_branch",
+            "source_commit",
+            "require_validation",
+            "require_distinct_reviewer",
+        ],
+        update_columns: &["status", "lifecycle_version", "updated_at"],
+    },
+    TablePrivileges {
+        table: "branch_events",
+        insert_columns: &[
+            "graph_id",
+            "branch",
+            "tenant_id",
+            "lifecycle_version",
+            "operation",
+            "status_after",
+            "head",
+            "ref_version",
+            "source_branch",
+            "source_commit",
+            "principal_id",
+            "principal_type",
+            "on_behalf_of",
+            "reason",
+            "correlation_id",
+        ],
         update_columns: &[],
     },
 ];
@@ -2449,6 +2763,7 @@ const RUNTIME_SEQUENCES: &[&str] = &[
     "decisions_decision_id_seq",
     "projection_outbox_outbox_id_seq",
     "idempotency_idempotency_id_seq",
+    "branch_events_event_id_seq",
 ];
 
 fn identity(message: String) -> LedgerError {
@@ -2993,7 +3308,7 @@ mod tests {
             .2;
         assert_eq!(normalize_constraint_def(pg17), expected);
         assert_ne!(normalize_constraint_def("CHECK (true)"), expected);
-        assert_eq!(EXPECTED_CHECKS.len(), 65);
+        assert_eq!(EXPECTED_CHECKS.len(), 82);
     }
 
     #[test]
@@ -3100,6 +3415,15 @@ mod tests {
         assert_eq!(by_name("refs_movement_audited"), 21); // ROW AFTER INSERT UPDATE
         assert_eq!(by_name("projection_state_guard"), 27); // ROW BEFORE UPDATE DELETE
         assert_eq!(by_name("outbox_delivery_monotonic"), 19); // ROW BEFORE UPDATE
-        assert_eq!(GUARD_TRIGGERS.len(), 20);
+        // Migration 0012 (observed on PostgreSQL 17).
+        assert_eq!(by_name("branch_events_write_once"), 27); // ROW BEFORE UPDATE DELETE
+        assert_eq!(by_name("branches_guard"), 31); // ROW BEFORE INSERT UPDATE DELETE
+        assert_eq!(by_name("branches_lifecycle_audited"), 21); // ROW AFTER INSERT UPDATE (deferred)
+        assert_eq!(by_name("branch_events_current"), 5); // ROW AFTER INSERT (deferred)
+        assert_eq!(by_name("refs_are_branches"), 5); // ROW AFTER INSERT (deferred)
+        assert_eq!(by_name("refs_branch_active"), 19); // ROW BEFORE UPDATE
+        assert_eq!(by_name("proposals_branch_active"), 7); // ROW BEFORE INSERT
+        assert_eq!(by_name("graphs_adopt_refs"), 17); // ROW AFTER UPDATE
+        assert_eq!(GUARD_TRIGGERS.len(), 28);
     }
 }

@@ -95,3 +95,12 @@ environment. The `validate` vectors were regenerated during review, before any r
 Vectors: `fixtures/golden/requests/request-v2-*.{input,hex,sha256}`, checked by
 `scripts/golden/request_v1_reference.py` (which now also implements v2) and
 `crates/ledger-api/tests/request_goldens.rs`. The six v1 vectors are unchanged.
+
+## Amendment: branch request domain (2026-09-28, Plan 0008)
+Branch lifecycle requests use a separate domain, `sculpin-ledger-branch-request/v1`
+(header `sculpin-ledger-branch-request/v1\0`, no prefix of the v1/v2 headers), whose layout
+and normalization are specified in
+[ADR-0022](ADR-0022-named-branches-lifecycle-and-policy.md#idempotency-and-request-identity).
+Vectors `fixtures/golden/requests/request-branch-*` (Rust builder and
+`scripts/golden/request_v1_reference.py` agree on all 21 request vectors); no v1/v2 vector
+changed.

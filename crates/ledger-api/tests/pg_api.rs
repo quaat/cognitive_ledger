@@ -859,11 +859,13 @@ async fn foreign_tenant_graphs_and_commits_are_indistinguishable_from_nonexisten
 #[tokio::test]
 #[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
 async fn lost_responses_replay_identically_and_conflicts_are_detected() {
+    // Genesis onto `main` (ADR-0022: only `main` is born by genesis; other branches are
+    // created explicitly and have their own suite).
     let h = harness(dev(), ApiLimits::default()).await;
     let g = h.graph("tenant-a").await;
     let t = token("tenant-a", "actor", &ALL);
     let proposals = format!("/v1/graphs/{g}/proposals");
-    let first_body = r#"{"message":"m","ref":"feature/curation-2026","activity":"a",
+    let first_body = r#"{"message":"m","ref":"main","activity":"a",
         "operations":[{"op":"add","quad":"<urn:s> <urn:p> \"2\" ."},{"op":"add","quad":"<urn:s> <urn:p> \"1\" ."}],
         "evidence_refs":["urn:e:2","urn:e:1"],"expected_head":null,"event_time":"2026-09-24T13:00:00+02:00"}"#;
     let (s1, first, c1) = h
@@ -880,7 +882,7 @@ async fn lost_responses_replay_identically_and_conflicts_are_detected() {
     // The client never saw `first` and retries with different JSON key order, reversed
     // operation order, reordered/duplicated evidence and the same instant in UTC: the same
     // canonical request, the same durable result.
-    let retry_body = r#"{"event_time":"2026-09-24T11:00:00Z","expected_head":null,"ref":"feature/curation-2026",
+    let retry_body = r#"{"event_time":"2026-09-24T11:00:00Z","expected_head":null,"ref":"main",
         "evidence_refs":["urn:e:1","urn:e:2","urn:e:1"],
         "operations":[{"quad":"<urn:s> <urn:p> \"1\" .","op":"add"},{"quad":"<urn:s> <urn:p> \"2\" .","op":"add"}],
         "activity":"a","message":"m"}"#;
@@ -941,7 +943,7 @@ async fn lost_responses_replay_identically_and_conflicts_are_detected() {
     // Accept, lose the response, retry: identical, and the ref advanced exactly once.
     let candidate = first["candidate"].as_str().unwrap().to_owned();
     let accept = format!("/v1/graphs/{g}/proposals/{candidate}/accept");
-    let accept_body = json!({"ref": "feature/curation-2026", "expected_head": null});
+    let accept_body = json!({"ref": "main", "expected_head": null});
     let (s4, a1, _) = h
         .call(
             "POST",
@@ -969,7 +971,7 @@ async fn lost_responses_replay_identically_and_conflicts_are_detected() {
     let (_, r, _) = h
         .call(
             "GET",
-            &format!("/v1/graphs/{g}/refs?name=feature/curation-2026"),
+            &format!("/v1/graphs/{g}/refs?name=main"),
             Some(&t),
             None,
             None,
@@ -994,7 +996,7 @@ async fn lost_responses_replay_identically_and_conflicts_are_detected() {
             &accept,
             Some(&t),
             Some("lost-3"),
-            Some(json!({"ref": "feature/curation-2026", "expected_head": null, "reason": "again"})),
+            Some(json!({"ref": "main", "expected_head": null, "reason": "again"})),
         )
         .await,
         StatusCode::CONFLICT,
@@ -1007,7 +1009,7 @@ async fn lost_responses_replay_identically_and_conflicts_are_detected() {
             &format!("/v1/graphs/{g}/proposals/{third_candidate}/accept"),
             Some(&t),
             Some("lost-4"),
-            Some(json!({"ref": "feature/curation-2026", "expected_head": candidate})),
+            Some(json!({"ref": "main", "expected_head": candidate})),
         )
         .await;
     assert_eq!(r.0, StatusCode::CONFLICT, "{:?}", r.1);
@@ -1019,7 +1021,7 @@ async fn lost_responses_replay_identically_and_conflicts_are_detected() {
     let (_, r, _) = h
         .call(
             "GET",
-            &format!("/v1/graphs/{g}/refs?name=feature/curation-2026"),
+            &format!("/v1/graphs/{g}/refs?name=main"),
             Some(&t),
             None,
             None,

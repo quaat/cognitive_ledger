@@ -21,6 +21,7 @@
 //! ```
 
 mod bench;
+mod branches;
 mod fault;
 
 use ledger_core::{GraphId, TenantId};
@@ -203,9 +204,21 @@ fn mint_claims(issuer: &str, audience: &str, secret: &str, subject: &str) -> Str
 
 /// `mint_claims` with an explicit validity (the depth benchmark runs for hours).
 fn mint_claims_ttl(issuer: &str, audience: &str, secret: &str, subject: &str, ttl: u64) -> String {
+    mint_roles(issuer, audience, secret, subject, ttl, &ROLES)
+}
+
+/// `mint_claims_ttl` with explicit roles (the branch stress needs an administrator).
+fn mint_roles(
+    issuer: &str,
+    audience: &str,
+    secret: &str,
+    subject: &str,
+    ttl: u64,
+    roles: &[&str],
+) -> String {
     let claims = json!({
         "iss": issuer, "aud": audience, "exp": now_secs() + ttl, "nbf": now_secs() - 30,
-        "tid": TENANT, "oid": subject, "sculpin_principal_type": "agent", "roles": ROLES,
+        "tid": TENANT, "oid": subject, "sculpin_principal_type": "agent", "roles": roles,
     });
     jsonwebtoken::encode(
         &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
@@ -224,6 +237,10 @@ enum Op {
     RefRead,
     Prepare,
     Accept,
+    BranchCreate,
+    BranchDelete,
+    BranchRestore,
+    BranchRead,
 }
 
 impl Op {
@@ -232,6 +249,10 @@ impl Op {
             Op::RefRead => "ref_read",
             Op::Prepare => "prepare",
             Op::Accept => "accept",
+            Op::BranchCreate => "branch_create",
+            Op::BranchDelete => "branch_delete",
+            Op::BranchRestore => "branch_restore",
+            Op::BranchRead => "branch_read",
         }
     }
 }
@@ -1306,6 +1327,10 @@ async fn main() -> ExitCode {
     if argv.peek().map(String::as_str) == Some("fault") {
         argv.next();
         return fault::run(argv).await;
+    }
+    if argv.peek().map(String::as_str) == Some("branches") {
+        argv.next();
+        return branches::run(argv).await;
     }
     if argv.peek().map(String::as_str) == Some("bench") {
         argv.next();

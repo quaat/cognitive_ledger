@@ -215,7 +215,7 @@ async fn clean_history_verifies_and_each_bypass_is_detected() {
     .await;
     bypass(
         "DELETE FROM decisions WHERE decision = 'accepted'",
-        "every ref event has exactly one accepted decision",
+        "every ref event has exactly one accepted decision (except a created branch's first)",
     )
     .await;
     bypass(
@@ -968,6 +968,177 @@ async fn each_phase2_check_detects_exactly_its_own_tampering() {
     let restored = verify::run(&pool).await.unwrap();
     assert!(restored.is_clean(), "{:?}", failing(&restored));
 
+    pool.close().await;
+    sqlx::query(&format!("DROP DATABASE {db} WITH (FORCE)"))
+        .execute(&admin)
+        .await
+        .unwrap();
+}
+
+// =========================================================================================
+// Phase 4 (ADR-0022): every branch lifecycle check detects its own tampering
+// =========================================================================================
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn each_branch_check_detects_its_own_tampering() {
+    use ledger_store::{
+        BranchLifecycleRequest, BranchPolicy, CreateBranchRequest, TraversalLimits,
+    };
+    let (admin, pool, db) = fresh_database("verify_br").await;
+    let g = GraphId::new(unique("g").replace('_', "-")).unwrap();
+    PgGraphs::new(pool.clone())
+        .create(&NewGraph {
+            graph_id: g.clone(),
+            tenant_id: TenantId::new("tenant-v").unwrap(),
+            knowledge_base_id: None,
+            purpose: None,
+            status: GraphStatus::Active,
+        })
+        .await
+        .unwrap();
+    let store = PostgresLedgerStore::from_pool_migrated(pool.clone(), V1Binding::Reject);
+    let wf = store.workflows();
+    let land = |branch: &'static str, head: Option<ledger_core::CommitId>, i: &'static str| {
+        let (wf, g) = (wf.clone(), g.clone());
+        async move {
+            let p = wf
+                .prepare(&PrepareRequest {
+                    scope: scope(&g, &format!("p{i}")),
+                    branch: branch.into(),
+                    expected_head: head.clone(),
+                    requested: patch(&format!("<urn:s> <urn:p> \"{i}\" .")),
+                    activity: "a".into(),
+                    event_time: None,
+                    evidence_refs: vec![],
+                    source_system: None,
+                    message: "m".into(),
+                })
+                .await
+                .unwrap();
+            wf.accept(&AcceptRequest {
+                scope: scope(&g, &format!("a{i}")),
+                branch: branch.into(),
+                expected_head: head,
+                candidate: p.candidate.clone(),
+                reason: None,
+                validation: ValidationPolicy::NoValidation,
+            })
+            .await
+            .unwrap();
+            p.candidate
+        }
+    };
+    let c1 = land("main", None, "m1").await;
+    let _c2 = land("main", Some(c1.clone()), "m2").await;
+    let create = |name: &str, from: Option<ledger_core::CommitId>| CreateBranchRequest {
+        scope: scope(&g, &format!("c-{name}")),
+        name: name.into(),
+        source: "main".into(),
+        from_commit: from,
+        policy: BranchPolicy::default(),
+    };
+    let life = |name: &str, key: &str| BranchLifecycleRequest {
+        scope: scope(&g, key),
+        name: name.into(),
+        reason: None,
+    };
+    // b: from historical c1, one commit; d: deleted; r: deleted and restored.
+    wf.create_branch(&create("b", Some(c1.clone())), TraversalLimits::DEFAULT)
+        .await
+        .unwrap();
+    land("b", Some(c1.clone()), "b1").await;
+    for n in ["d", "r"] {
+        wf.create_branch(&create(n, None), TraversalLimits::DEFAULT)
+            .await
+            .unwrap();
+        wf.delete_branch(&life(n, &format!("d-{n}"))).await.unwrap();
+    }
+    wf.restore_branch(&life("r", "r-r")).await.unwrap();
+    let clean = verify::run(&pool).await.unwrap();
+    assert!(clean.is_clean(), "{:?}", failing(&clean));
+
+    let bypass = |sql: &'static str, expect: &'static str| {
+        let pool = pool.clone();
+        async move {
+            let mut tx = pool.begin().await.unwrap();
+            for guard in [
+                "ALTER TABLE refs DISABLE TRIGGER ALL",
+                "ALTER TABLE ref_events DISABLE TRIGGER ALL",
+                "ALTER TABLE decisions DISABLE TRIGGER ALL",
+                "ALTER TABLE projection_outbox DISABLE TRIGGER ALL",
+                "ALTER TABLE branches DISABLE TRIGGER ALL",
+                "ALTER TABLE branch_events DISABLE TRIGGER ALL",
+            ] {
+                sqlx::query(guard).execute(&mut *tx).await.unwrap();
+            }
+            // Still clean inside the transaction before the tampering.
+            let count = |name: &'static str| {
+                format!("SELECT count(*) AS n FROM ({}) v", verify_query(name))
+            };
+            let n: i64 = sqlx::query(&count(expect))
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap()
+                .try_get("n")
+                .unwrap();
+            assert_eq!(n, 0, "{expect}: violated before tampering");
+            sqlx::query(sql).execute(&mut *tx).await.unwrap();
+            let n: i64 = sqlx::query(&count(expect))
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap()
+                .try_get("n")
+                .unwrap();
+            assert!(n > 0, "{expect}: tampering {sql:?} not detected");
+            tx.rollback().await.unwrap();
+        }
+    };
+    bypass(
+        "UPDATE branch_events SET lifecycle_version = lifecycle_version + 10 WHERE branch = 'd' AND operation = 'deleted'",
+        "lifecycle events are numbered 1..n per branch",
+    )
+    .await;
+    bypass(
+        "UPDATE branches SET lifecycle_version = lifecycle_version + 1 WHERE branch = 'b'",
+        "a branch's lifecycle version is its event count and its status its latest event's",
+    )
+    .await;
+    bypass(
+        "UPDATE branch_events SET head = (SELECT head FROM refs WHERE branch = 'main' AND graph_id = branch_events.graph_id) \
+         WHERE branch = 'b' AND operation = 'created'",
+        "every lifecycle event names a real position of its ref",
+    )
+    .await;
+    bypass(
+        "UPDATE branch_events SET head = (SELECT head FROM refs WHERE branch = 'main' AND graph_id = branch_events.graph_id) \
+         WHERE branch = 'b' AND operation = 'created'",
+        "a created branch's first lifecycle event starts at its source commit",
+    )
+    .await;
+    bypass(
+        "UPDATE refs SET version = version + 1 WHERE branch = 'd'",
+        "a deleted branch's ref is where its tombstone left it",
+    )
+    .await;
+    bypass(
+        "UPDATE branch_events SET ref_version = ref_version + 1 WHERE branch = 'r' AND operation = 'restored'",
+        "a restore resumes exactly at its tombstone",
+    )
+    .await;
+    bypass(
+        "UPDATE ref_events SET new_head = (SELECT head FROM refs WHERE branch = 'main' AND graph_id = ref_events.graph_id) \
+         WHERE branch = 'b' AND new_version = 1",
+        "a created branch starts at its recorded branch point",
+    )
+    .await;
+    // The genesis exemption covers only a created branch's version-1 event.
+    bypass(
+        "DELETE FROM decisions WHERE ref_event_id IN (SELECT event_id FROM ref_events WHERE branch = 'b' AND new_version = 2)",
+        "every ref event has exactly one accepted decision (except a created branch's first)",
+    )
+    .await;
+    assert!(verify::run(&pool).await.unwrap().is_clean());
     pool.close().await;
     sqlx::query(&format!("DROP DATABASE {db} WITH (FORCE)"))
         .execute(&admin)

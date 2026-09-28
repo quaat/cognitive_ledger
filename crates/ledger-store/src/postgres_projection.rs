@@ -803,13 +803,18 @@ impl ProjectionRepository {
             .collect()
     }
 
-    /// Outbox events of `(graph, branch)` pairs no stream projects (unconfigured backlog).
+    /// Outbox events of projection-eligible refs (`main` under v1) that no stream projects
+    /// (unconfigured backlog).
     pub async fn unconfigured_pending(&self) -> Result<i64, LedgerError> {
+        // Only projection-eligible refs count (ADR-0022): v1 projects `main`, so outbox rows
+        // of cognitive work branches are kept (future protocols) but never a backlog alarm.
         sqlx::query_scalar(
             "SELECT count(*) FROM projection_outbox o WHERE o.delivered_at IS NULL \
+             AND o.branch = $1 \
              AND NOT EXISTS (SELECT 1 FROM projection_state s WHERE s.graph_id = o.graph_id \
                              AND s.branch = o.branch AND s.status <> 'disabled')",
         )
+        .bind(PROJECTED_REF)
         .fetch_one(&self.pool)
         .await
         .map_err(db_error)
