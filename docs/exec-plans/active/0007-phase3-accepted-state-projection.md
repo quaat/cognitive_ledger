@@ -162,7 +162,8 @@ projection fault suite, compose integration, upgrade 0010 → 0011; Phase-2 suit
   another worker's newer projection and replace it with its older head (Replace has no
   version rule) → a forced rebuild now stops as superseded when the target holds a newer
   genuine state of the stream (`a_delayed_operator_rebuild_never_regresses_a_newer_projection`;
-  a mutation removing the check turns it red); **P2** — the runtime identity model was not
+  since round 3's lease re-check this is defence in depth — the test asserts the target
+  keeps v2 whichever check stops the rebuild); **P2** — the runtime identity model was not
   exhaustive (privileges on unlisted tables passed) → exhaustive for both identities
   (`weakened_projection_controls…` asserts the refusal for both).
 - Codex round 3 on `bffa6e0`: **P0** — a rebuild whose claim reply was delayed past its
@@ -178,6 +179,11 @@ projection fault suite, compose integration, upgrade 0010 → 0011; Phase-2 suit
   stream's last check so reconciliation re-observes it at once (and reports
   `TARGET_CONFLICT` if another feed's marker is there); **P2** — column-level `REFERENCES`
   grants passed the identity check → refused (tested).
+- Codex round 5 on `251b66e`: **no P0/P1**. P2s fixed: the exhaustive identity check
+  covered only `public` tables/views (now every non-system schema and foreign tables,
+  tested); the delayed-rebuild test overstated its proof (reworded, see above); update
+  response excerpts copied whole chunks (now bounded to the excerpt). P3 fixed: secret files
+  were trimmed of all surrounding whitespace (now only one trailing line ending; tested).
 
 ## Evidence
 (filled as slices land)

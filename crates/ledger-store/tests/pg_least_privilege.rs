@@ -3044,6 +3044,22 @@ async fn weakened_projection_controls_are_refused_at_startup_and_readiness() {
         other => panic!("projector readiness must refuse an unlisted grant: {other:?}"),
     }
     owner_exec(&fx, "DROP TABLE public.lp_extra").await;
+    // …and on any other schema's relations too (not only `public`).
+    owner_exec(&fx, "CREATE SCHEMA lp_private").await;
+    owner_exec(&fx, "CREATE TABLE lp_private.secrets (x int)").await;
+    owner_exec(
+        &fx,
+        &format!("GRANT USAGE ON SCHEMA lp_private TO {}", fx.role),
+    )
+    .await;
+    owner_exec(
+        &fx,
+        &format!("GRANT SELECT ON lp_private.secrets TO {}", fx.role),
+    )
+    .await;
+    let m = assert_refused_by_identity(&fx, "runtime SELECT on another schema").await;
+    assert!(m.contains("lp_private.secrets"), "{m}");
+    owner_exec(&fx, "DROP SCHEMA lp_private CASCADE").await;
     drop(running);
     projector.pool().close().await;
     drop(projector);

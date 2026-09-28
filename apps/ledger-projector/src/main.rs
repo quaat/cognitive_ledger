@@ -97,7 +97,16 @@ fn secret_file(env: Env, name: &str) -> Result<Option<String>, String> {
         return Err(format!("{name} exceeds {MAX_SECRET_FILE_BYTES} bytes"));
     }
     let text = String::from_utf8(bytes).map_err(|_| format!("{name} is not UTF-8"))?;
-    Ok(Some(text.trim().to_owned()))
+    // Only the one line ending a file editor adds is not part of the secret; any other
+    // whitespace is (a password may legitimately start or end with a space).
+    let secret = text
+        .strip_suffix("\r\n")
+        .or_else(|| text.strip_suffix('\n'))
+        .unwrap_or(&text);
+    if secret.is_empty() {
+        return Err(format!("{name} is empty"));
+    }
+    Ok(Some(secret.to_owned()))
 }
 
 struct Settings {
@@ -440,6 +449,29 @@ async fn main() -> ExitCode {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn secret_files_keep_everything_but_one_trailing_line_ending() {
+        let dir = std::env::temp_dir().join(format!("lp-secret-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (content, expected) in [
+            (" pass word \n", Ok(" pass word ".to_owned())),
+            ("secret\r\n", Ok("secret".to_owned())),
+            ("secret", Ok("secret".to_owned())),
+            ("two\n\n", Ok("two\n".to_owned())),
+            ("\n", Err(())),
+        ] {
+            let path = dir.join("pw");
+            std::fs::write(&path, content).unwrap();
+            let path = path.to_string_lossy().into_owned();
+            let env = |name: &str| (name == "SECRET").then(|| path.clone());
+            let got = secret_file(&env, "SECRET")
+                .map(|v| v.unwrap())
+                .map_err(|_| ());
+            assert_eq!(got, expected, "{content:?}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn lease_owners_are_bounded_by_bytes_and_free_of_control_characters() {

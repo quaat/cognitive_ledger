@@ -2741,7 +2741,9 @@ async fn verify_no_grant_function_execute(
     Ok(())
 }
 
-/// Exhaustive models: no privilege of any kind on a public table the model does not list.
+/// Exhaustive models: no privilege of any kind on any relation (table, partitioned table,
+/// view, materialized view, foreign table) of any non-system schema that the model does not
+/// list (the model lists `public` tables only).
 async fn verify_no_unlisted_table_privileges(
     pool: &PgPool,
     subject: &str,
@@ -2750,8 +2752,10 @@ async fn verify_no_unlisted_table_privileges(
 ) -> Result<(), LedgerError> {
     let listed: Vec<&str> = model.tables.iter().map(|t| t.table).collect();
     let rows = sqlx::query(
-        "SELECT c.relname::text AS name FROM pg_class c \
-         WHERE c.relnamespace = 'public'::regnamespace AND c.relkind IN ('r', 'p', 'v', 'm') \
+        "SELECT n.nspname::text AS schema, c.relname::text AS name FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname <> 'information_schema' AND n.nspname NOT LIKE 'pg\\_%' \
+           AND c.relkind IN ('r', 'p', 'v', 'm', 'f') \
            AND (has_table_privilege($1, c.oid, 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER') \
                 OR CASE WHEN current_setting('server_version_num')::int >= 170000 \
                         THEN has_table_privilege($1, c.oid, 'MAINTAIN') ELSE false END \
@@ -2762,10 +2766,11 @@ async fn verify_no_unlisted_table_privileges(
     .await
     .map_err(db_error)?;
     for row in &rows {
+        let schema: String = row.try_get("schema").map_err(db_error)?;
         let name: String = row.try_get("name").map_err(db_error)?;
-        if !listed.contains(&name.as_str()) {
+        if schema != "public" || !listed.contains(&name.as_str()) {
             return Err(identity(format!(
-                "role {who} holds privileges on public.{name}{}; the {} identity may only access \
+                "role {who} holds privileges on {schema}.{name}{}; the {} identity may only access \
                  {listed:?}; run `ledger-admin migrate {} {who}` with the owner identity ({})",
                 if subject == who {
                     String::new()

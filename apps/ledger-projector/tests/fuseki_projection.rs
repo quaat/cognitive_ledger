@@ -1524,9 +1524,19 @@ async fn a_delayed_operator_rebuild_never_regresses_a_newer_projection() {
     w.expire_lease(&g).await;
     let c2 = w.accept(&g, Some(&c1), &[Q2]).await;
     assert_eq!(healthy.step().await.unwrap(), projected(2, false));
-    // The rebuild now observes v2 — genuine ledger history newer than its work — and stops.
+    // The rebuild now observes v2 — genuine ledger history newer than its work — and stops:
+    // superseded (the newer-state check), and it has lost its lease anyway (the re-check
+    // after observation would stop it too; the two are defence in depth). What matters is
+    // that the target keeps v2.
     gate.notify_one();
-    assert_eq!(stale_rebuild.await.unwrap(), Some(StepOutcome::Superseded));
+    let outcome = stale_rebuild.await.unwrap();
+    assert!(
+        matches!(
+            outcome,
+            Some(StepOutcome::Superseded) | Some(StepOutcome::LeaseLost)
+        ),
+        "{outcome:?}"
+    );
     assert_projected(&cg, &g, &quads(&[Q1, Q2]), &c2, 2).await;
     assert_eq!(w.status(&g).await.projected_ref_version, Some(2));
 }

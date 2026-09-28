@@ -268,7 +268,11 @@ impl FusekiClient {
         let mut excerpt = Vec::new();
         while excerpt.len() < 4096 {
             match response.chunk().await {
-                Ok(Some(chunk)) => excerpt.extend_from_slice(&chunk),
+                Ok(Some(chunk)) => {
+                    // Keep at most the excerpt; never copy a whole oversized chunk.
+                    let take = (4096 - excerpt.len()).min(chunk.len());
+                    excerpt.extend_from_slice(&chunk[..take]);
+                }
                 _ => break,
             }
         }
