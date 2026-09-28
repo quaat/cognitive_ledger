@@ -358,6 +358,9 @@ struct AgentLog {
     branch: String,
     /// Head the creation answered (the branch point).
     created_at: String,
+    /// `main`'s version read just before the create request: a head-created branch must
+    /// start at this version or a later one (never at an older head).
+    main_version_before: i64,
     /// Client-observed landings `(version, head)` on the branch.
     landings: Vec<(i64, String)>,
     head: String,
@@ -383,6 +386,27 @@ async fn agent(
         ..AgentLog::default()
     };
     let path = format!("/v1/graphs/{graph}/branches");
+    let refs = format!("/v1/graphs/{graph}/refs?name=main");
+    match send(
+        &api,
+        Call {
+            op: Op::RefRead,
+            method: reqwest::Method::GET,
+            path: &refs,
+            token: &token,
+            key: None,
+            body: None,
+        },
+        false,
+    )
+    .await
+    {
+        Outcome::Ok(v) => log.main_version_before = v["version"].as_i64().unwrap_or(i64::MAX),
+        other => {
+            log.failures.push(format!("main read: {}", code(&other)));
+            return log;
+        }
+    }
     let body = if historical(i) {
         json!({"name": branch, "source": "main", "from_commit": root})
     } else {
@@ -639,7 +663,7 @@ async fn branch_invariants(
     graph: &str,
     log: &AgentLog,
     root: &str,
-    main_heads: &[String],
+    main_versions: &BTreeMap<String, i64>,
 ) -> BranchInvariants {
     let b = log.branch.as_str();
     let row = sqlx::query(
@@ -726,9 +750,15 @@ async fn branch_invariants(
             && if historical(i) {
                 creation_head == root
             } else {
-                main_heads.contains(&creation_head)
+                main_versions
+                    .get(&creation_head)
+                    .is_some_and(|v| *v >= log.main_version_before)
             },
-        format!("branch point {creation_head}"),
+        format!(
+            "branch point {creation_head} (main v{:?}, read v{} before create)",
+            main_versions.get(&creation_head),
+            log.main_version_before
+        ),
     );
     if deleted(i) {
         // The tombstone names the head the branch stopped at: after a landed race
@@ -1087,16 +1117,18 @@ pub async fn run(argv: impl Iterator<Item = String>) -> ExitCode {
     if !main.ok {
         failures.push("main graph invariants".into());
     }
-    let main_heads: Vec<String> = sqlx::query_scalar(
-        "SELECT new_head FROM ref_events WHERE graph_id = $1 AND branch = 'main'",
+    let main_versions: BTreeMap<String, i64> = sqlx::query_as::<_, (String, i64)>(
+        "SELECT new_head, new_version FROM ref_events WHERE graph_id = $1 AND branch = 'main'",
     )
     .bind(&graph)
     .fetch_all(&pool)
     .await
-    .expect("main heads");
+    .expect("main heads")
+    .into_iter()
+    .collect();
     let mut branch_invariants_failed = Vec::new();
     for log in &logs {
-        let inv = branch_invariants(&pool, &graph, log, &root, &main_heads).await;
+        let inv = branch_invariants(&pool, &graph, log, &root, &main_versions).await;
         if !inv.ok {
             branch_invariants_failed.push(inv);
         }

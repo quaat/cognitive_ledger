@@ -1678,6 +1678,28 @@ async fn lifecycle_reasons_take_the_same_bound_as_decisions() {
         .await
         .unwrap();
     assert_eq!(deleted.event.reason.as_deref(), Some(longest.as_str()));
+    // History is bounded by `limit`: the latest lifecycle events, oldest first among them.
+    let (events, movements) = repo
+        .branch_history(&tenant(), &g, "long-reason", 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (events.len(), events[0].operation.as_str(), movements.len()),
+        (1, "deleted", 1)
+    );
+    let (events, _) = repo
+        .branch_history(&tenant(), &g, "long-reason", 10)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .map(|e| e.operation.as_str())
+            .collect::<Vec<_>>(),
+        ["created", "deleted"]
+    );
     let too_long = repo
         .restore_branch(&BranchLifecycleRequest {
             reason: Some("r".repeat(ledger_store::MAX_REASON_BYTES + 1)),

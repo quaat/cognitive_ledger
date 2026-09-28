@@ -752,8 +752,8 @@ impl WorkflowRepository {
         rows.iter().map(info_from_row).collect()
     }
 
-    /// A branch's lifecycle history (all events, oldest first) and its latest `limit` head
-    /// movements (newest first). `None` if the branch does not exist.
+    /// A branch's latest `limit` lifecycle events (oldest first among them) and its latest
+    /// `limit` head movements (newest first). `None` if the branch does not exist.
     pub async fn branch_history(
         &self,
         tenant: &TenantId,
@@ -763,12 +763,14 @@ impl WorkflowRepository {
     ) -> Result<Option<(Vec<BranchEvent>, Vec<RefMovement>)>, LedgerError> {
         validate_branch(name)?;
         self.readable_graph(tenant, graph).await?;
+        let limit = limit.clamp(1, 10_000);
         let events = sqlx::query(&format!(
-            "SELECT {BRANCH_EVENT_COLUMNS} FROM branch_events WHERE graph_id = $1 AND branch = $2 \
-             ORDER BY lifecycle_version"
+            "SELECT * FROM (SELECT {BRANCH_EVENT_COLUMNS}, lifecycle_version AS lv FROM branch_events \
+             WHERE graph_id = $1 AND branch = $2 ORDER BY lifecycle_version DESC LIMIT $3) e ORDER BY lv"
         ))
         .bind(graph.as_str())
         .bind(name)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await
         .map_err(db_error)?;
@@ -782,7 +784,7 @@ impl WorkflowRepository {
         )
         .bind(graph.as_str())
         .bind(name)
-        .bind(limit.clamp(1, 10_000))
+        .bind(limit)
         .fetch_all(&self.pool)
         .await
         .map_err(db_error)?;

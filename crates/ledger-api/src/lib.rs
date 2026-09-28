@@ -1943,7 +1943,7 @@ pub struct RefMovementResponse {
 #[derive(Serialize)]
 pub struct BranchHistoryResponse {
     pub name: String,
-    /// Lifecycle events (created / deleted / restored …), oldest first.
+    /// The latest `limit` lifecycle events (created / deleted / restored …), oldest first.
     pub lifecycle: Vec<BranchEventResponse>,
     /// Head movements (ref events), newest first.
     pub movements: Vec<RefMovementResponse>,

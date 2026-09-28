@@ -1,6 +1,6 @@
 # Plan 0008: Phase 4 — branches and cognitive workflows
 
-Status: **in progress** (started 2026-09-28). Branch `claude/p4-branches-cognitive-workflows`
+Status: **complete — pending hosted CI and PR review** (started 2026-09-28). Branch `claude/p4-branches-cognitive-workflows`
 from `main` at `848ec28bfd48ffc7f0a1257058b21dc68a204ebc` (the PR #8 merge; Phase 3 complete,
 see [Plan 0007](../completed/0007-phase3-accepted-state-projection.md)). No gate is reported as
 passed until it is executable and has run.
@@ -82,7 +82,84 @@ Fuseki regression, 100-branch stress, historical branching, lifecycle races, upg
   assert the class, not the text.
 
 ## Evidence
-(filled as gates run)
+All on the qualification host (Linux 5.10, Docker; scratch PostgreSQL 15-bookworm and
+17-bookworm), 2026-09-28. Candidate `83e5f3f` (+ `5779839`: backup harness graph choice).
+
+| gate | result |
+|---|---|
+| `check-fast` (fmt, clippy `-D warnings`, unit tests, architecture, doc links) | pass on `83e5f3f` |
+| `check-supply-chain` (advisories, bans, licenses, sources, SBOM) | pass |
+| PostgreSQL 17 suites (`ledger-store --features postgres`, `ledger-api`, `--ignored`) | pass — incl. `pg_branches` 13, `pg_verify` 3, `pg_least_privilege` 19, `pg_validation_api` 21, `pg_api` 13 |
+| PostgreSQL 15 suites (same) | pass (same counts) |
+| `test-integration.sh` (compose, owner migrate → runtime/projector, Fuseki projection regression, branch e2e, verify) | `INTEGRATION OK` |
+| `stress-branches.sh 100 3 4` (2 replicas) | `BRANCH STRESS GATE OK` — see below |
+| `upgrade-p4.sh` (from `848ec28`, schema 11 → 12) | `UPGRADE-P4 OK`, run `20260928T072740Z` |
+| `backup-restore.sh` (50 writers, 10 graphs, branch workload) | `BACKUP RESTORE OK` |
+| Golden vectors | 21 request vectors (6 v1, 6 v2, 9 branch); Rust and the Python reference agree; no v1/v2 vector changed |
+| Live Fluree branch differential | **deferred** (BUSL-1.1 sign-off pending) — not run, not counted |
+| Hosted CI | see the PR |
+
+**100-branch stress** (`scripts/stress-branches.sh 100 3 4`, final run `6aba194cb`,
+`target/stress-branches/20260928T073518Z`): 100 branches × 3 commits (every fourth from
+`main`'s root, the rest from the moving head; a head-created branch must start at or after
+the `main` version its agent read before creating) while 4 writers land 20 commits on
+`main`; every tenth agent duplicates each request to the second replica. 1 519 requests in
+0.9 s. Delete-vs-accept (acceptance only, prepared beforehand): 0 landed before the
+tombstone / 20 refused `BRANCH_DELETED` in this run (the previous run: 2 / 18; both
+orders are proven deterministically by the forced-interleaving store tests); 20 prepares on
+tombstones refused; 10 restores (duplicated across replicas) and 10 refused second restores
+(`BRANCH_STATE_CONFLICT`); the list returned 101 branches. 88 duplicated pairs compared, 0
+disagreements; 0 deadlocks; no unexpected error class (191 admission refusals `503
+RESOURCE_LIMIT`, retried under the same key). Owner-side invariants hold for every branch
+(version = events = 1 + landings, landings are ref events, branch point, lifecycle count and
+status, tombstone head, outbox = accepted) and for `main` (Plan-0005 graph invariants);
+unconfigured projection backlog 22 = `main` undelivered 22; `verify` clean.
+Successful-operation latency p50 / p95 / p99 (ms): create 69.1 / 108.7 / 120.9, prepare
+28.8 / 72.9 / 104.8, accept 23.6 / 45.9 / 58.8, delete 10.4 / 13.7 / 16.2, restore 4.9 /
+6.9 / 7.7, branch reads 14.9 / 23.0 / 24.1. The first run (`6aba0feab`) failed only on its
+own list check (default page 100 of 101 branches); the harness now pages with
+`limit=1000` and races the acceptance only (the first run raced prepare, 0 / 20).
+
+**Upgrade 0011 → 0012** (`scripts/upgrade-p4.sh`): previous release `848ec28` built from git
+and deployed as owner/runtime/projector with a real Fuseki; populated through its API (two
+tenants, `dev` ref, rejected/pending proposals, validations, validated acceptances,
+projection to lag 0, then a backlog). After `migrate`: 0001–0011 checksums untouched, 0012
+checksum = sha384 of the file, all 17 pre-upgrade tables byte-identical, 6 refs adopted
+(one `adopted` event each at their head/version), 85 recorded idempotency keys replay
+identically without calling the validator (51 Phase-2 workload keys: 27 prepare, 21 accept,
+3 reject; 34 Phase-3 keys), VERIFY OK; branch create (head and historical),
+three validated cycles, delete/restore with head kept and lifecycle replays on an upgraded
+graph with `main` unchanged; the new projector consumed the old backlog (lag 0, target =
+accepted state); unconfigured backlog 20 = `main`-only (7 non-`main` rows excluded, metric
+agrees); previous server refuses 0012 (ahead), new server and projector refuse 0011
+(behind); clean 0012 install and upgraded 0012 identical (schema dump and ownership).
+
+**Backup/restore**: branch workload (created, historical, deleted, deleted+restored) before
+the backups, under a live write load; both the logical dump and the base backup restore
+the branch and lifecycle rows identically (subset of live) with the expected lifecycle
+states, VERIFY OK, identical states served; a restore missing `branches_guard` is refused
+at start-up (fifth drift case).
+
+**Reviews** (independent Opus, read-only, on `cc4219b`): lifecycle/invariants, DAG,
+storage/concurrency, security, API/idempotency, tests, projection — no P0. P1s fixed in
+`83e5f3f`: reachability walk held the source-ref share lock (walk now precedes the
+transaction; unknown/foreign refused without walking); deleted-branch database guards read
+the branch row without a lock (raw writes racing an uncommitted delete were admitted; now
+`FOR SHARE`, proven by a forced race test); refs of graphs activated from
+`bootstrap`/`importing` had no branch row (`graphs_adopt_refs`); `require_distinct_reviewer`
+was bypassable by varying delegation or principal type (now accountable parties); two
+lifecycle races were not concurrent in the tests (now forced in both orders under held row
+locks); the deleted-head guard test never reached the guard; policy-flag order not pinned
+by a vector. Also fixed: `branch_events.reason` bound (1 024) below the API's (4 096), a
+latent database error; verifier gaps (numbering, event positions, tombstone position,
+restore position, created event head) with a bypass test each; corruption no longer
+reported as "unreachable". Documented instead of changed (tech-debt): pagination cursors,
+N+1 walk cost, outbox scan index, confusable names, runtime trusted-writer residuals.
+Codex (`codex exec -s read-only`) on `5779839`: **no P0/P1**; three P2 — lifecycle history
+ignored `limit` (fixed: latest `limit` events), the stress accepted any historical `main` head
+as a head-created branch point (fixed: must be ≥ the version read before creating), and
+activating a raw import leaves verifier findings (documented: the pre-existing import gap,
+tech-debt).
 
 ## Sub-agent decomposition (§42)
 Main session owns the ADR, migration, verifier, repository, request identity and API.

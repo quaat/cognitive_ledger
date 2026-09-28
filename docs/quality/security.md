@@ -66,7 +66,7 @@ Preserve object digest verification and atomic ref updates. Never commit secrets
   without walking, and runs before the creating transaction on one pooled connection, so no
   lock on the source ref is held while walking (a `propose` caller cannot stall acceptance on
   `main`). Movement pages, the branch list and the first-parent log are capped at 1 000 (no
-  cursor yet); the lifecycle list is complete (it grows only by admin actions).
+  cursor yet); branch history returns the latest `limit` lifecycle events and movements.
 - Database facts (migration 0012): `main` is protected (CHECK), a deleted branch's head
   cannot move and it admits no proposal (triggers), lifecycle rows are write-once and every
   status change is exactly one audited event (deferred constraint triggers), policy and
