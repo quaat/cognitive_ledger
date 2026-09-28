@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Independent reference encoder for `sculpin-ledger-request/v1` and `/v2` (canonical HTTP
+"""Independent reference encoder for `sculpin-ledger-request/v1`, `/v2` and `sculpin-ledger-branch-request/v1` (canonical HTTP
 request identity that scopes idempotency; v2 per the ADR-0015 amendment of Plan 0006). Second implementation of the layout documented in
 `crates/ledger-api/src/request_identity.rs`; vectors in `fixtures/golden/requests/`.
 
@@ -22,6 +22,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 FIXTURES = ROOT / "fixtures" / "golden" / "requests"
 HEADER = b"sculpin-ledger-request/v1\0"
 HEADER_V2 = b"sculpin-ledger-request/v2\0"
+HEADER_BRANCH = b"sculpin-ledger-branch-request/v1\0"
 
 
 def field(value: str) -> bytes:
@@ -87,8 +88,30 @@ def encode_v2(req: dict) -> bytes:
     return bytes(out)
 
 
+def encode_branch(req: dict) -> bytes:
+    """`sculpin-ledger-branch-request/v1` (ADR-0022): a separate domain for branch lifecycle."""
+    out = bytearray(HEADER_BRANCH)
+    op = req["operation"]
+    out += field(op)
+    out += field(req["graph_id"])
+    out += field(req["name"])
+    if op == "branch_create":
+        out += field(req["source"])
+        out += optional(req.get("from_commit"))
+        policy = req.get("policy", {})
+        for flag in ("protected", "require_validation", "require_distinct_reviewer"):
+            out += b"\x01" if policy.get(flag, False) else b"\x00"
+    elif op in ("branch_delete", "branch_restore"):
+        out += optional(req.get("reason"))
+    else:
+        raise ValueError(op)
+    return bytes(out)
+
+
 def encode(req: dict) -> bytes:
     op = req["operation"]
+    if op.startswith("branch_"):
+        return encode_branch(req)
     if op == "validate" or (op in ("accept", "reject") and "validation_id" in req):
         return encode_v2(req)
     out = bytearray(HEADER)

@@ -223,6 +223,13 @@ pub const ROUTES: &[(&str, &str)] = &[
     ),
     ("GET", "/v1/graphs/{graph}/refs"),
     ("GET", "/v1/graphs/{graph}/commits/{commit}/state"),
+    ("POST", "/v1/graphs/{graph}/branches"),
+    ("GET", "/v1/graphs/{graph}/branches"),
+    ("GET", "/v1/graphs/{graph}/branches/status"),
+    ("GET", "/v1/graphs/{graph}/branches/history"),
+    ("GET", "/v1/graphs/{graph}/branches/log"),
+    ("POST", "/v1/graphs/{graph}/branches/delete"),
+    ("POST", "/v1/graphs/{graph}/branches/restore"),
 ];
 
 pub const OPENAPI_JSON: &str = include_str!("../../../docs/api/openapi.json");
@@ -253,6 +260,17 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/graphs/{graph}/refs", get(read_ref))
         .route("/v1/graphs/{graph}/commits/{commit}/state", get(read_state))
+        // Branch names travel in bodies and query parameters only (ADR-0022): `/` inside a
+        // name (`agent/task-17`) never becomes path structure.
+        .route(
+            "/v1/graphs/{graph}/branches",
+            post(create_branch).get(list_branches),
+        )
+        .route("/v1/graphs/{graph}/branches/status", get(branch_status))
+        .route("/v1/graphs/{graph}/branches/history", get(branch_history))
+        .route("/v1/graphs/{graph}/branches/log", get(branch_log))
+        .route("/v1/graphs/{graph}/branches/delete", post(delete_branch))
+        .route("/v1/graphs/{graph}/branches/restore", post(restore_branch))
         .fallback(unknown_route)
         .method_not_allowed_fallback(unknown_route)
         .layer(DefaultBodyLimit::max(body_limit))
@@ -1715,6 +1733,489 @@ async fn read_ref(
     }
 }
 
+// ---- branches (ADR-0022) ------------------------------------------------------------------
+
+/// Visit bound and time budget for the branch-point reachability proof.
+const BRANCH_POINT_MAX_VISITED: usize = 100_000;
+const BRANCH_POINT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+/// Upper bound for history and log pages.
+const MAX_HISTORY_PAGE: i64 = 1_000;
+
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BranchPolicyBody {
+    #[serde(default)]
+    pub protected: bool,
+    #[serde(default)]
+    pub require_validation: bool,
+    #[serde(default)]
+    pub require_distinct_reviewer: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateBranchBody {
+    pub name: String,
+    pub source: String,
+    #[serde(default)]
+    pub from_commit: Option<CommitId>,
+    #[serde(default)]
+    pub policy: BranchPolicyBody,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BranchLifecycleBody {
+    pub name: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Validate a branch creation body and compute its canonical identity (branch request v1).
+pub fn canonical_branch_create(
+    graph: &GraphId,
+    body: &CreateBranchBody,
+    correlation: &str,
+) -> Result<CanonicalRequest, ApiError> {
+    check_branch(&body.name, correlation)?;
+    check_branch(&body.source, correlation)?;
+    Ok(CanonicalRequest::BranchCreate {
+        graph: graph.clone(),
+        name: body.name.clone(),
+        source: body.source.clone(),
+        from_commit: body.from_commit.clone(),
+        protected: body.policy.protected,
+        require_validation: body.policy.require_validation,
+        require_distinct_reviewer: body.policy.require_distinct_reviewer,
+    })
+}
+
+/// Validate a delete/restore body and compute its canonical identity (branch request v1).
+pub fn canonical_branch_lifecycle(
+    graph: &GraphId,
+    delete: bool,
+    body: &BranchLifecycleBody,
+    correlation: &str,
+) -> Result<CanonicalRequest, ApiError> {
+    check_branch(&body.name, correlation)?;
+    // An empty reason carries no meaning and is normalized to absence (ADR-0015).
+    let reason = body.reason.clone().filter(|r| !r.is_empty());
+    check_reason(reason.as_deref(), correlation)?;
+    Ok(if delete {
+        CanonicalRequest::BranchDelete {
+            graph: graph.clone(),
+            name: body.name.clone(),
+            reason,
+        }
+    } else {
+        CanonicalRequest::BranchRestore {
+            graph: graph.clone(),
+            name: body.name.clone(),
+            reason,
+        }
+    })
+}
+
+#[derive(Serialize)]
+pub struct BranchPolicyResponse {
+    pub protected: bool,
+    pub require_validation: bool,
+    pub require_distinct_reviewer: bool,
+}
+
+impl From<ledger_store::BranchPolicy> for BranchPolicyResponse {
+    fn from(p: ledger_store::BranchPolicy) -> Self {
+        Self {
+            protected: p.protected,
+            require_validation: p.require_validation,
+            require_distinct_reviewer: p.require_distinct_reviewer,
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct BranchEventResponse {
+    pub event_id: i64,
+    pub name: String,
+    pub lifecycle_version: i64,
+    pub operation: String,
+    pub status: String,
+    pub head: CommitId,
+    pub version: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_commit: Option<CommitId>,
+    pub principal_id: String,
+    pub principal_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_behalf_of: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub recorded_at: String,
+}
+
+impl From<ledger_store::BranchEvent> for BranchEventResponse {
+    fn from(e: ledger_store::BranchEvent) -> Self {
+        Self {
+            event_id: e.event_id,
+            name: e.branch,
+            lifecycle_version: e.lifecycle_version,
+            operation: e.operation,
+            status: e.status_after,
+            head: e.head,
+            version: e.ref_version,
+            source: e.source_branch,
+            source_commit: e.source_commit,
+            principal_id: e.principal_id,
+            principal_type: e.principal_type,
+            on_behalf_of: e.on_behalf_of,
+            reason: e.reason,
+            recorded_at: e.recorded_at,
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct BranchLifecycleResponse {
+    pub event: BranchEventResponse,
+    pub replayed: bool,
+    pub correlation_id: String,
+}
+
+#[derive(Serialize)]
+pub struct BranchResponse {
+    pub name: String,
+    pub status: String,
+    pub lifecycle_version: i64,
+    pub origin: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_commit: Option<CommitId>,
+    pub head: CommitId,
+    pub version: i64,
+    pub policy: BranchPolicyResponse,
+    pub created_at: String,
+}
+
+impl From<ledger_store::BranchInfo> for BranchResponse {
+    fn from(b: ledger_store::BranchInfo) -> Self {
+        Self {
+            name: b.name,
+            status: b.status,
+            lifecycle_version: b.lifecycle_version,
+            origin: b.origin,
+            source: b.source_branch,
+            source_commit: b.source_commit,
+            head: b.head,
+            version: b.version,
+            policy: b.policy.into(),
+            created_at: b.created_at,
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct BranchListResponse {
+    pub branches: Vec<BranchResponse>,
+}
+
+#[derive(Serialize)]
+pub struct RefMovementResponse {
+    pub event_id: i64,
+    pub operation: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_head: Option<CommitId>,
+    pub new_head: CommitId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_version: Option<i64>,
+    pub new_version: i64,
+    pub principal_id: String,
+    pub principal_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_behalf_of: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub recorded_at: String,
+}
+
+#[derive(Serialize)]
+pub struct BranchHistoryResponse {
+    pub name: String,
+    /// Lifecycle events (created / deleted / restored …), oldest first.
+    pub lifecycle: Vec<BranchEventResponse>,
+    /// Head movements (ref events), newest first.
+    pub movements: Vec<RefMovementResponse>,
+}
+
+#[derive(Serialize)]
+pub struct BranchLogResponse {
+    pub name: String,
+    pub head: CommitId,
+    /// First-parent commit history from the head, head first.
+    pub commits: Vec<CommitId>,
+}
+
+fn query_name(query: &BTreeMap<String, String>, correlation: &str) -> Result<String, ApiError> {
+    let name = query.get("name").cloned().ok_or_else(|| {
+        ApiError::invalid(
+            "query parameter `name` (branch name) is required",
+            correlation,
+        )
+    })?;
+    check_branch(&name, correlation)?;
+    Ok(name)
+}
+
+fn query_limit(query: &BTreeMap<String, String>, correlation: &str) -> Result<i64, ApiError> {
+    match query.get("limit") {
+        None => Ok(100),
+        Some(v) => v
+            .parse::<i64>()
+            .ok()
+            .filter(|n| (1..=MAX_HISTORY_PAGE).contains(n))
+            .ok_or_else(|| {
+                ApiError::invalid(
+                    format!("`limit` must be an integer between 1 and {MAX_HISTORY_PAGE}"),
+                    correlation,
+                )
+            }),
+    }
+}
+
+async fn create_branch(
+    State(state): State<AppState>,
+    ctx: RequestContext,
+    Path(graph): Path<String>,
+    headers: HeaderMap,
+    ValidJson(body): ValidJson<CreateBranchBody>,
+) -> Result<(StatusCode, Json<BranchLifecycleResponse>), ApiError> {
+    ctx.require(Capability::Propose)?;
+    // A protected branch is an administrative decision (ADR-0022).
+    if body.policy.protected {
+        ctx.require(Capability::Admin)?;
+    }
+    let correlation = ctx.correlation_id.clone();
+    let key = idempotency_key(&headers, &correlation)?;
+    let graph = authorized_graph(&state, &ctx, &graph).await?;
+    let canonical = canonical_branch_create(&graph, &body, &correlation)?;
+    let request = ledger_store::CreateBranchRequest {
+        scope: scope(&ctx, &graph, key, canonical.digest()),
+        name: body.name,
+        source: body.source,
+        from_commit: body.from_commit,
+        policy: ledger_store::BranchPolicy {
+            protected: body.policy.protected,
+            require_validation: body.policy.require_validation,
+            require_distinct_reviewer: body.policy.require_distinct_reviewer,
+        },
+    };
+    let limits = ledger_store::TraversalLimits {
+        max_visited: BRANCH_POINT_MAX_VISITED,
+        deadline: Some(std::time::Instant::now() + BRANCH_POINT_DEADLINE),
+    };
+    let outcome = state
+        .0
+        .store
+        .workflows()
+        .create_branch(&request, limits)
+        .await
+        .map_err(|e| ApiError::from_ledger(e, &correlation))?;
+    let status = if outcome.replayed {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    Ok((
+        status,
+        Json(BranchLifecycleResponse {
+            event: outcome.event.into(),
+            replayed: outcome.replayed,
+            correlation_id: correlation,
+        }),
+    ))
+}
+
+async fn change_branch(
+    state: AppState,
+    ctx: RequestContext,
+    graph: String,
+    headers: HeaderMap,
+    body: BranchLifecycleBody,
+    delete: bool,
+) -> Result<Json<BranchLifecycleResponse>, ApiError> {
+    // Deletion and restore are administrative (ADR-0022).
+    ctx.require(Capability::Admin)?;
+    let correlation = ctx.correlation_id.clone();
+    let key = idempotency_key(&headers, &correlation)?;
+    let graph = authorized_graph(&state, &ctx, &graph).await?;
+    let canonical = canonical_branch_lifecycle(&graph, delete, &body, &correlation)?;
+    let request = ledger_store::BranchLifecycleRequest {
+        scope: scope(&ctx, &graph, key, canonical.digest()),
+        name: body.name,
+        reason: body.reason.filter(|r| !r.is_empty()),
+    };
+    let repo = state.0.store.workflows();
+    let outcome = if delete {
+        repo.delete_branch(&request).await
+    } else {
+        repo.restore_branch(&request).await
+    }
+    .map_err(|e| ApiError::from_ledger(e, &correlation))?;
+    Ok(Json(BranchLifecycleResponse {
+        event: outcome.event.into(),
+        replayed: outcome.replayed,
+        correlation_id: correlation,
+    }))
+}
+
+async fn delete_branch(
+    State(state): State<AppState>,
+    ctx: RequestContext,
+    Path(graph): Path<String>,
+    headers: HeaderMap,
+    ValidJson(body): ValidJson<BranchLifecycleBody>,
+) -> Result<Json<BranchLifecycleResponse>, ApiError> {
+    change_branch(state, ctx, graph, headers, body, true).await
+}
+
+async fn restore_branch(
+    State(state): State<AppState>,
+    ctx: RequestContext,
+    Path(graph): Path<String>,
+    headers: HeaderMap,
+    ValidJson(body): ValidJson<BranchLifecycleBody>,
+) -> Result<Json<BranchLifecycleResponse>, ApiError> {
+    change_branch(state, ctx, graph, headers, body, false).await
+}
+
+async fn list_branches(
+    State(state): State<AppState>,
+    ctx: RequestContext,
+    Path(graph): Path<String>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Result<Json<BranchListResponse>, ApiError> {
+    ctx.require(Capability::Read)?;
+    let correlation = ctx.correlation_id.clone();
+    let graph = authorized_graph(&state, &ctx, &graph).await?;
+    let limit = query_limit(&query, &correlation)?;
+    let branches = state
+        .0
+        .store
+        .workflows()
+        .branches(&ctx.identity.principal.tenant_id, &graph, limit)
+        .await
+        .map_err(|e| ApiError::from_ledger(e, &correlation))?;
+    Ok(Json(BranchListResponse {
+        branches: branches.into_iter().map(Into::into).collect(),
+    }))
+}
+
+async fn branch_status(
+    State(state): State<AppState>,
+    ctx: RequestContext,
+    Path(graph): Path<String>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Result<Json<BranchResponse>, ApiError> {
+    ctx.require(Capability::Read)?;
+    let correlation = ctx.correlation_id.clone();
+    let graph = authorized_graph(&state, &ctx, &graph).await?;
+    let name = query_name(&query, &correlation)?;
+    state
+        .0
+        .store
+        .workflows()
+        .branch(&ctx.identity.principal.tenant_id, &graph, &name)
+        .await
+        .map_err(|e| ApiError::from_ledger(e, &correlation))?
+        .map(|b| Json(b.into()))
+        .ok_or_else(|| ApiError::from_ledger(LedgerError::BranchNotFound(name), &correlation))
+}
+
+async fn branch_history(
+    State(state): State<AppState>,
+    ctx: RequestContext,
+    Path(graph): Path<String>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Result<Json<BranchHistoryResponse>, ApiError> {
+    ctx.require(Capability::Read)?;
+    let correlation = ctx.correlation_id.clone();
+    let graph = authorized_graph(&state, &ctx, &graph).await?;
+    let name = query_name(&query, &correlation)?;
+    let limit = query_limit(&query, &correlation)?;
+    let (lifecycle, movements) = state
+        .0
+        .store
+        .workflows()
+        .branch_history(&ctx.identity.principal.tenant_id, &graph, &name, limit)
+        .await
+        .map_err(|e| ApiError::from_ledger(e, &correlation))?
+        .ok_or_else(|| {
+            ApiError::from_ledger(LedgerError::BranchNotFound(name.clone()), &correlation)
+        })?;
+    Ok(Json(BranchHistoryResponse {
+        name,
+        lifecycle: lifecycle.into_iter().map(Into::into).collect(),
+        movements: movements
+            .into_iter()
+            .map(|m| RefMovementResponse {
+                event_id: m.event_id,
+                operation: m.operation,
+                old_head: m.old_head,
+                new_head: m.new_head,
+                old_version: m.old_version,
+                new_version: m.new_version,
+                principal_id: m.principal_id,
+                principal_type: m.principal_type,
+                on_behalf_of: m.on_behalf_of,
+                reason: m.reason,
+                recorded_at: m.recorded_at,
+            })
+            .collect(),
+    }))
+}
+
+async fn branch_log(
+    State(state): State<AppState>,
+    ctx: RequestContext,
+    Path(graph): Path<String>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Result<Json<BranchLogResponse>, ApiError> {
+    ctx.require(Capability::Read)?;
+    let correlation = ctx.correlation_id.clone();
+    let graph = authorized_graph(&state, &ctx, &graph).await?;
+    let name = query_name(&query, &correlation)?;
+    let limit = query_limit(&query, &correlation)?;
+    let tenant = &ctx.identity.principal.tenant_id;
+    let repo = state.0.store.workflows();
+    let branch = repo
+        .branch(tenant, &graph, &name)
+        .await
+        .map_err(|e| ApiError::from_ledger(e, &correlation))?
+        .ok_or_else(|| {
+            ApiError::from_ledger(LedgerError::BranchNotFound(name.clone()), &correlation)
+        })?;
+    let commits = repo
+        .first_parent_history(
+            tenant,
+            &graph,
+            &branch.head,
+            limit as usize,
+            ledger_store::TraversalLimits {
+                max_visited: MAX_HISTORY_PAGE as usize,
+                deadline: Some(std::time::Instant::now() + BRANCH_POINT_DEADLINE),
+            },
+        )
+        .await
+        .map_err(|e| ApiError::from_ledger(e, &correlation))?;
+    Ok(Json(BranchLogResponse {
+        name,
+        head: branch.head,
+        commits,
+    }))
+}
+
 #[derive(Serialize)]
 pub struct StateResponse {
     pub commit: CommitId,
@@ -1812,6 +2313,12 @@ mod tests {
             "DEPENDENCY_UNAVAILABLE",
             "DEPENDENCY_TIMEOUT",
             "INTERNAL",
+            "BRANCH_NOT_FOUND",
+            "BRANCH_EXISTS",
+            "BRANCH_DELETED",
+            "BRANCH_POINT_UNREACHABLE",
+            "BRANCH_POLICY_VIOLATION",
+            "BRANCH_STATE_CONFLICT",
         ] {
             assert!(codes.contains(code), "OpenAPI error enum lacks {code}");
         }

@@ -2,7 +2,7 @@
  "openapi": "3.1.0",
  "info": {
   "title": "Sculpin Cognitive Ledger",
-  "version": "1.1.0-p2",
+  "version": "1.2.0-p4",
   "description": "Authenticated, graph-scoped API over the atomic cognitive-change workflow (ADR-0013). Mutations require a bearer token, an Idempotency-Key header and the `propose` (prepare) or `review` (accept/reject) capability; reads require `read`. Ref names may contain `/` and are therefore body/query fields. A graph that does not exist or belongs to another tenant is reported as NOT_FOUND alike. Every response carries X-Correlation-Id; every error is the Error envelope. No query language is exposed. Unknown paths and methods also answer with the Error envelope. Phase 2 (ADR-0014/0018/0019): `validate` capability requests a semantic validation of a prepared candidate (the ledger calls its configured validation service and records an immutable SemanticExecutionContext + ValidationRecord; no ref moves); accept names validation_id and semantic_environment_id and succeeds only for a conforming validation of that candidate run in that environment; reject may cite a validation."
  },
  "servers": [
@@ -117,7 +117,13 @@
        "RESOURCE_LIMIT",
        "DEPENDENCY_UNAVAILABLE",
        "DEPENDENCY_TIMEOUT",
-       "INTERNAL"
+       "INTERNAL",
+       "BRANCH_NOT_FOUND",
+       "BRANCH_EXISTS",
+       "BRANCH_DELETED",
+       "BRANCH_POINT_UNREACHABLE",
+       "BRANCH_POLICY_VIOLATION",
+       "BRANCH_STATE_CONFLICT"
       ]
      },
      "message": {
@@ -541,6 +547,319 @@
      },
      "correlation_id": {
       "type": "string"
+     }
+    }
+   },
+   "BranchPolicy": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+     "protected": {
+      "type": "boolean",
+      "default": false
+     },
+     "require_validation": {
+      "type": "boolean",
+      "default": false
+     },
+     "require_distinct_reviewer": {
+      "type": "boolean",
+      "default": false
+     }
+    },
+    "description": "Immutable at creation; only tightens the deployment floor (ADR-0022)."
+   },
+   "CreateBranchRequest": {
+    "type": "object",
+    "required": [
+     "name",
+     "source"
+    ],
+    "additionalProperties": false,
+    "properties": {
+     "name": {
+      "$ref": "#/components/schemas/RefName"
+     },
+     "source": {
+      "$ref": "#/components/schemas/RefName"
+     },
+     "from_commit": {
+      "$ref": "#/components/schemas/ContentId",
+      "description": "Historical branch point; must be the source head or reachable from it. Omitted: the source head."
+     },
+     "policy": {
+      "$ref": "#/components/schemas/BranchPolicy"
+     }
+    }
+   },
+   "BranchLifecycleRequest": {
+    "type": "object",
+    "required": [
+     "name"
+    ],
+    "additionalProperties": false,
+    "properties": {
+     "name": {
+      "$ref": "#/components/schemas/RefName"
+     },
+     "reason": {
+      "type": "string",
+      "maxLength": 4096
+     }
+    }
+   },
+   "BranchEvent": {
+    "type": "object",
+    "required": [
+     "event_id",
+     "name",
+     "lifecycle_version",
+     "operation",
+     "status",
+     "head",
+     "version",
+     "principal_id",
+     "principal_type",
+     "recorded_at"
+    ],
+    "properties": {
+     "event_id": {
+      "type": "integer"
+     },
+     "name": {
+      "$ref": "#/components/schemas/RefName"
+     },
+     "lifecycle_version": {
+      "type": "integer"
+     },
+     "operation": {
+      "type": "string",
+      "enum": [
+       "genesis",
+       "created",
+       "adopted",
+       "deleted",
+       "restored"
+      ]
+     },
+     "status": {
+      "type": "string",
+      "enum": [
+       "active",
+       "deleted"
+      ]
+     },
+     "head": {
+      "$ref": "#/components/schemas/ContentId"
+     },
+     "version": {
+      "type": "integer"
+     },
+     "source": {
+      "$ref": "#/components/schemas/RefName"
+     },
+     "source_commit": {
+      "$ref": "#/components/schemas/ContentId"
+     },
+     "principal_id": {
+      "type": "string"
+     },
+     "principal_type": {
+      "type": "string"
+     },
+     "on_behalf_of": {
+      "type": "string"
+     },
+     "reason": {
+      "type": "string"
+     },
+     "recorded_at": {
+      "type": "string"
+     }
+    }
+   },
+   "BranchLifecycleResponse": {
+    "type": "object",
+    "required": [
+     "event",
+     "replayed",
+     "correlation_id"
+    ],
+    "properties": {
+     "event": {
+      "$ref": "#/components/schemas/BranchEvent"
+     },
+     "replayed": {
+      "type": "boolean"
+     },
+     "correlation_id": {
+      "type": "string"
+     }
+    }
+   },
+   "BranchResponse": {
+    "type": "object",
+    "required": [
+     "name",
+     "status",
+     "lifecycle_version",
+     "origin",
+     "head",
+     "version",
+     "policy",
+     "created_at"
+    ],
+    "properties": {
+     "name": {
+      "$ref": "#/components/schemas/RefName"
+     },
+     "status": {
+      "type": "string",
+      "enum": [
+       "active",
+       "deleted"
+      ]
+     },
+     "lifecycle_version": {
+      "type": "integer"
+     },
+     "origin": {
+      "type": "string",
+      "enum": [
+       "genesis",
+       "created",
+       "adopted"
+      ]
+     },
+     "source": {
+      "$ref": "#/components/schemas/RefName"
+     },
+     "source_commit": {
+      "$ref": "#/components/schemas/ContentId"
+     },
+     "head": {
+      "$ref": "#/components/schemas/ContentId"
+     },
+     "version": {
+      "type": "integer"
+     },
+     "policy": {
+      "$ref": "#/components/schemas/BranchPolicy"
+     },
+     "created_at": {
+      "type": "string"
+     }
+    }
+   },
+   "BranchListResponse": {
+    "type": "object",
+    "required": [
+     "branches"
+    ],
+    "properties": {
+     "branches": {
+      "type": "array",
+      "items": {
+       "$ref": "#/components/schemas/BranchResponse"
+      }
+     }
+    }
+   },
+   "RefMovement": {
+    "type": "object",
+    "required": [
+     "event_id",
+     "operation",
+     "new_head",
+     "new_version",
+     "principal_id",
+     "principal_type",
+     "recorded_at"
+    ],
+    "properties": {
+     "event_id": {
+      "type": "integer"
+     },
+     "operation": {
+      "type": "string",
+      "enum": [
+       "genesis",
+       "advance"
+      ]
+     },
+     "old_head": {
+      "$ref": "#/components/schemas/ContentId"
+     },
+     "new_head": {
+      "$ref": "#/components/schemas/ContentId"
+     },
+     "old_version": {
+      "type": "integer"
+     },
+     "new_version": {
+      "type": "integer"
+     },
+     "principal_id": {
+      "type": "string"
+     },
+     "principal_type": {
+      "type": "string"
+     },
+     "on_behalf_of": {
+      "type": "string"
+     },
+     "reason": {
+      "type": "string"
+     },
+     "recorded_at": {
+      "type": "string"
+     }
+    }
+   },
+   "BranchHistoryResponse": {
+    "type": "object",
+    "required": [
+     "name",
+     "lifecycle",
+     "movements"
+    ],
+    "properties": {
+     "name": {
+      "$ref": "#/components/schemas/RefName"
+     },
+     "lifecycle": {
+      "type": "array",
+      "items": {
+       "$ref": "#/components/schemas/BranchEvent"
+      }
+     },
+     "movements": {
+      "type": "array",
+      "items": {
+       "$ref": "#/components/schemas/RefMovement"
+      }
+     }
+    }
+   },
+   "BranchLogResponse": {
+    "type": "object",
+    "required": [
+     "name",
+     "head",
+     "commits"
+    ],
+    "properties": {
+     "name": {
+      "$ref": "#/components/schemas/RefName"
+     },
+     "head": {
+      "$ref": "#/components/schemas/ContentId"
+     },
+     "commits": {
+      "type": "array",
+      "items": {
+       "$ref": "#/components/schemas/ContentId"
+      }
      }
     }
    }
@@ -1041,6 +1360,432 @@
       "$ref": "#/components/responses/Error"
      },
      "404": {
+      "$ref": "#/components/responses/Error"
+     },
+     "500": {
+      "$ref": "#/components/responses/Error"
+     },
+     "503": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/v1/graphs/{graph}/branches": {
+   "post": {
+    "summary": "Create a named branch at the source head or a commit reachable from it (propose capability; admin for a protected branch). No data is copied.",
+    "parameters": [
+     {
+      "$ref": "#/components/parameters/Graph"
+     },
+     {
+      "$ref": "#/components/parameters/IdempotencyKey"
+     },
+     {
+      "$ref": "#/components/parameters/CorrelationId"
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/CreateBranchRequest"
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "created",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/BranchLifecycleResponse"
+        }
+       }
+      }
+     },
+     "200": {
+      "description": "replayed",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/BranchLifecycleResponse"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     },
+     "409": {
+      "$ref": "#/components/responses/Error"
+     },
+     "413": {
+      "$ref": "#/components/responses/Error"
+     },
+     "422": {
+      "$ref": "#/components/responses/Error"
+     },
+     "500": {
+      "$ref": "#/components/responses/Error"
+     },
+     "503": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   },
+   "get": {
+    "summary": "List the graph's branches (read capability)",
+    "parameters": [
+     {
+      "$ref": "#/components/parameters/Graph"
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "type": "integer",
+       "minimum": 1,
+       "maximum": 1000,
+       "default": 100
+      }
+     },
+     {
+      "$ref": "#/components/parameters/CorrelationId"
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "branches",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/BranchListResponse"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     },
+     "500": {
+      "$ref": "#/components/responses/Error"
+     },
+     "503": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/v1/graphs/{graph}/branches/status": {
+   "get": {
+    "summary": "A branch's status, head, version, policy and provenance (read capability)",
+    "parameters": [
+     {
+      "$ref": "#/components/parameters/Graph"
+     },
+     {
+      "name": "name",
+      "in": "query",
+      "required": true,
+      "schema": {
+       "$ref": "#/components/schemas/RefName"
+      },
+      "description": "Branch name (may contain `/`); never part of the path."
+     },
+     {
+      "$ref": "#/components/parameters/CorrelationId"
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "branch",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/BranchResponse"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     },
+     "500": {
+      "$ref": "#/components/responses/Error"
+     },
+     "503": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/v1/graphs/{graph}/branches/history": {
+   "get": {
+    "summary": "A branch's lifecycle events (oldest first) and head movements (newest first) (read capability)",
+    "parameters": [
+     {
+      "$ref": "#/components/parameters/Graph"
+     },
+     {
+      "name": "name",
+      "in": "query",
+      "required": true,
+      "schema": {
+       "$ref": "#/components/schemas/RefName"
+      },
+      "description": "Branch name (may contain `/`); never part of the path."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "type": "integer",
+       "minimum": 1,
+       "maximum": 1000,
+       "default": 100
+      }
+     },
+     {
+      "$ref": "#/components/parameters/CorrelationId"
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "history",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/BranchHistoryResponse"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     },
+     "500": {
+      "$ref": "#/components/responses/Error"
+     },
+     "503": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/v1/graphs/{graph}/branches/log": {
+   "get": {
+    "summary": "First-parent commit history from a branch head (read capability)",
+    "parameters": [
+     {
+      "$ref": "#/components/parameters/Graph"
+     },
+     {
+      "name": "name",
+      "in": "query",
+      "required": true,
+      "schema": {
+       "$ref": "#/components/schemas/RefName"
+      },
+      "description": "Branch name (may contain `/`); never part of the path."
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "required": false,
+      "schema": {
+       "type": "integer",
+       "minimum": 1,
+       "maximum": 1000,
+       "default": 100
+      }
+     },
+     {
+      "$ref": "#/components/parameters/CorrelationId"
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "log",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/BranchLogResponse"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     },
+     "413": {
+      "$ref": "#/components/responses/Error"
+     },
+     "500": {
+      "$ref": "#/components/responses/Error"
+     },
+     "503": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/v1/graphs/{graph}/branches/delete": {
+   "post": {
+    "summary": "Delete (tombstone) a branch; head, version and history are kept (admin capability). `main` cannot be deleted.",
+    "parameters": [
+     {
+      "$ref": "#/components/parameters/Graph"
+     },
+     {
+      "$ref": "#/components/parameters/IdempotencyKey"
+     },
+     {
+      "$ref": "#/components/parameters/CorrelationId"
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/BranchLifecycleRequest"
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "deleted (or replayed)",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/BranchLifecycleResponse"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     },
+     "409": {
+      "$ref": "#/components/responses/Error"
+     },
+     "500": {
+      "$ref": "#/components/responses/Error"
+     },
+     "503": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/v1/graphs/{graph}/branches/restore": {
+   "post": {
+    "summary": "Restore a deleted branch with the same head and version (admin capability).",
+    "parameters": [
+     {
+      "$ref": "#/components/parameters/Graph"
+     },
+     {
+      "$ref": "#/components/parameters/IdempotencyKey"
+     },
+     {
+      "$ref": "#/components/parameters/CorrelationId"
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/BranchLifecycleRequest"
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "restored (or replayed)",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/BranchLifecycleResponse"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     },
+     "409": {
       "$ref": "#/components/responses/Error"
      },
      "500": {
