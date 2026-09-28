@@ -34,7 +34,7 @@ See [Plan 0006](../exec-plans/completed/0006-phase2-semantic-validation.md).
 - [ADR-0019: Validation freshness and the binding of acceptance to a validation record](ADR-0019-validation-freshness-and-acceptance-binding.md)
 
 ## Phase 3 accepted-state projection (P3)
-See [Plan 0007](../exec-plans/active/0007-phase3-accepted-state-projection.md).
+See [Plan 0007](../exec-plans/completed/0007-phase3-accepted-state-projection.md).
 
 - [ADR-0020: Accepted-state projection protocol: target graph identity, marker and write semantics](ADR-0020-accepted-state-projection-protocol.md)
 - [ADR-0021: Projection state, stream leases and the projector database identity](ADR-0021-projection-state-leases-and-projector-identity.md)

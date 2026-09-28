@@ -1,8 +1,15 @@
 # Plan 0007: Phase 3 — accepted-state projection
 
-Status: **implementation complete, in review** (started 2026-09-27; draft PR, not merged). Branch `claude/p3-accepted-state-projection` from
+Status: **complete / merge-ready** (started 2026-09-27; closed 2026-09-28 on PR #8 head
+`0712c83`, runtime code `fe6ad16`). Branch `claude/p3-accepted-state-projection` from
 `main` at `0a56092484ba890df3cf43f297e690db1132cc4b` (the PR #7 merge; Phase 2 complete, see
-[Plan 0006](../completed/0006-phase2-semantic-validation.md)). No gate is reported as passed
+[Plan 0006](0006-phase2-semantic-validation.md)).
+
+| | |
+|---|---|
+| Phase-3 implementation | complete |
+| Phase-3 merge-ready | yes (all gates below; hosted CI green on the PR head; 0 unresolved review threads) |
+| production-qualified | **no** — pending: live Entra ID issuer, PITR/WAL deployment, writer fencing during restore, live Sculpin validation service, production Fuseki deployment (dedicated update account over https, no union default graph) | No gate is reported as passed
 until it is executable and has run.
 
 ## Goal
@@ -200,7 +207,7 @@ Final code candidate **`fe6ad16`** (clean tree; later commits change documentati
 | `scripts/upgrade-p3.sh` (0010 from `0a56092` → 0011; populated Phase-2 DB incl. validations; 36-row outbox backlog) | `fe6ad16` | `UPGRADE-P3 OK` (`target/upgrade-p3/20260928T002456Z`): pre-upgrade rows byte-identical after migrate and replay, backlog projected exactly, named-graph streams blocked, old server refuses 0011, new server and projector refuse 0010, clean ≡ upgraded schema |
 | `./scripts/test-integration.sh` (compose PG 17.2, Fuseki, projector; all PG suites; e2e projection, verify, second target id refused, target restart) | `fe6ad16` | exit 0, `INTEGRATION OK` (12 suites, `fuseki_projection` 21/21). A first run on `fe6ad16` failed in `pg_immutable_store` with "terminating connection due to administrator command" while an earlier gate chain was still tearing down its containers; rerun alone: green. Also green on `0634a27`, `251b66e`, `a9e0b33`. |
 | `./scripts/backup-restore.sh` (dump + base backup under load, restored servers) | `fe6ad16` | `BACKUP RESTORE OK` (`target/backup/20260928T003050Z`); it does not yet exercise the projector (a restored ledger + `MARKER_AHEAD` rebuild is covered by the Fuseki suite and the runbook, not by this script) |
-| hosted CI on draft PR #8: `ci-fast`, `ci-integration`, `ci-security` (supply chain, container, dependency review), `ci-fuzz` (none + address) | `5399d29` (= `fe6ad16` + architecture-check CI fallback + docs) | all **success** (runs 36363293420 / 36363293402 / 36363293425 / 36363293405). The first run on `ff4d6da` failed `ci-fast`: the architecture check's `cargo metadata --offline` has no registry cache on a fresh runner → online fallback (`5399d29`). |
+| hosted CI on PR #8: `ci-fast`, `ci-integration`, `ci-security` (supply chain, container, dependency review), `ci-fuzz` (none + address) | **`0712c83`** (PR head = `fe6ad16` + architecture-check CI fallback + docs) | all **success** (runs 36363962018 / 36363962167 / 36363962056 / 36363962094); earlier also on `5399d29` (36363293420 / 36363293402 / 36363293425 / 36363293405). The first run on `ff4d6da` failed `ci-fast`: the architecture check's `cargo metadata --offline` has no registry cache on a fresh runner → online fallback (`5399d29`). |
 | Mutation checks | various | removing the CAS precondition → 3 Fuseki tests red; skipping the disable fence → ABA test red; removing the lease re-check → late-observation test red; removing the delayed-rebuild check → its test red at the time (now defence in depth) |
 
 Not executed here (recorded, not claimed): backup/restore qualification *with a running projector* (`scripts/backup-restore.sh` covers
