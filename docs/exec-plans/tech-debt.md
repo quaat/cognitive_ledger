@@ -97,6 +97,15 @@
 - Test isolation: the Rust Fuseki suite shares the compose dataset (bound to target id `fuseki` by the compose projector) under per-test target ids and never calls `bind_target` (the second-id refusal is exercised by the integration script); it serializes itself with a process-wide lock. `dead_target()` binds and releases a port (small reuse race). Test roles `it_projector_<pid>` and Fuseki test graphs are not cleaned up (development targets only).
 - The integration script's Fuseki restart proves TDB2 durability and a projector restart onto the restarted target; a running projector riding out a target outage is covered by `fuseki_projection::a_target_outage_never_blocks_acceptance_and_the_projector_catches_up`, not by the compose scenario.
 
+## Phase 4 (Plan 0008) residuals and accepted risk
+
+- Branch policy is immutable after creation (policy v1); changing it needs a new branch. Mutable, audited policy changes (and per-branch ACLs) are deferred to a later ADR.
+- The runtime can fabricate a consistent lifecycle event (delete/restore) within its tenants, like any other audit row (ADR-0016 trusted-writer class); `SECURITY DEFINER` write functions would close this with the rest.
+- Branch outbox rows are written and never delivered (projection v1 is `main` only); they accumulate with branch traffic until a later protocol projects branches or GC exists. `unconfigured_pending` ignores them by design.
+- Branch-point reachability is a bounded DFS per request (100 000 commits / 5 s); on very deep histories a historical branch point far from the head is refused `BRANCH_POINT_UNREACHABLE` rather than found. A commit-graph index (generation numbers) would make it O(1)-ish; not needed at current depths (Phase-1 benchmark).
+- Live Fluree branch differential: deferred with the rest of the Fluree comparison (BUSL-1.1 sign-off pending); not run, not counted.
+- Merge-base, merge, conflicts, checkpoints and GC of deleted branches are Phase 5+ (product plan).
+
 ## Later-phase work and accepted residual risk (does not block Phase 2 or the P1.5 gate)
 
 - Design a stable skolemization/import protocol and hostile-input limits around the standards N-Quads parser.

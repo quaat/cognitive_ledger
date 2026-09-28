@@ -80,6 +80,10 @@ cargo test -p ledger-api --test pg_validation_api -- --ignored --nocapture
 # --- 1k. Projection streams: enable rules, leases, fencing, guards, projector identity (Plan 0007)
 cargo test -p ledger-store --features postgres --test pg_projection -- --ignored --nocapture
 
+# --- 1k2. Named branches (ADR-0022, Plan 0008): creation from head / reachable history,
+#          tombstone delete, restore, policy, idempotency, DB guards and lifecycle races ---
+cargo test -p ledger-store --features postgres --test pg_branches -- --ignored --nocapture
+
 # --- 1l. Projection against the real Fuseki (compose `fuseki`, own TDB2 dataset): genesis,
 #         advance, duplicate/stale/equal-version writes, outage + catch-up, lost response,
 #         every crash window at genesis and over a predecessor, lost/corrupt/ahead/foreign
@@ -323,6 +327,42 @@ DATA_VOLUME=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/d
 LOCAL_OBJECTS=$(docker run --rm -v "${DATA_VOLUME}:/data:ro" busybox:1.37@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e sh -c 'find /data -type f | wc -l' | tr -d '[:space:]')
 [ "${LOCAL_OBJECTS}" = "0" ] || { echo "FAIL: ledger container holds ${LOCAL_OBJECTS} node-local object file(s)" >&2; exit 1; }
 echo "invariants confirmed: 2 v2 commits indexed under ${GRAPH}, no non-v2 commit anywhere, exactly 4 new objects, refs.version=2 with 2 ref events, 2 accepted decisions, 2 outbox rows, 4 idempotency rows, correlation ids recorded, 0 node-local object files"
+# --- Named branches end to end (ADR-0022): after the exact counts above, so their own
+#     decision/outbox/idempotency rows do not disturb them. A cognitive branch from the
+#     historical C1, one accepted change on it, delete (tombstone) and restore; main is
+#     untouched and cannot be deleted. -------------------------------------------------------
+ADMIN_TOKEN=$(mint "${TENANT}" "ledger.read,ledger.propose,ledger.review,ledger.admin")
+R=$(api POST "/v1/graphs/${GRAPH}/branches" "${TOKEN}" "it-b1" "{\"name\":\"agent/it-task\",\"source\":\"main\",\"from_commit\":\"${C1}\"}")
+[ "$(echo "${R}" | status_of)" = "201" ] || { echo "FAIL: branch create: ${R}" >&2; exit 1; }
+R=$(api POST "/v1/graphs/${GRAPH}/branches" "${TOKEN}" "it-b1" "{\"name\":\"agent/it-task\",\"source\":\"main\",\"from_commit\":\"${C1}\"}")
+[ "$(echo "${R}" | status_of)" = "200" ] || { echo "FAIL: branch create retry: ${R}" >&2; exit 1; }
+BODY=$(python3 -c 'import json,sys; print(json.dumps({"ref":"agent/it-task","expected_head":sys.argv[1],"operations":[{"op":"add","quad":"<urn:material:a> <urn:note> \"branch\" ."}],"activity":"integration","message":"on the branch"}))' "${C1}")
+R=$(api POST "/v1/graphs/${GRAPH}/proposals" "${TOKEN}" "it-bp1" "${BODY}")
+[ "$(echo "${R}" | status_of)" = "201" ] || { echo "FAIL: branch prepare: ${R}" >&2; exit 1; }
+B1=$(echo "${R}" | body_of | json_field candidate)
+R=$(api POST "/v1/graphs/${GRAPH}/proposals/${B1}/accept" "${TOKEN}" "it-ba1" "{\"ref\":\"agent/it-task\",\"expected_head\":\"${C1}\",\"reason\":\"integration\"}")
+[ "$(echo "${R}" | status_of)" = "200" ] || { echo "FAIL: branch accept: ${R}" >&2; exit 1; }
+R=$(api GET "/v1/graphs/${GRAPH}/refs?name=main" "${TOKEN}" "" "")
+[ "$(echo "${R}" | body_of | json_field head)" = "${C2}" ] || { echo "FAIL: main moved by branch work: ${R}" >&2; exit 1; }
+R=$(api POST "/v1/graphs/${GRAPH}/branches/delete" "${TOKEN}" "it-bd1" '{"name":"agent/it-task"}')
+[ "$(echo "${R}" | status_of)" = "403" ] || { echo "FAIL: branch delete without admin: ${R}" >&2; exit 1; }
+R=$(api POST "/v1/graphs/${GRAPH}/branches/delete" "${ADMIN_TOKEN}" "it-bd1" '{"name":"agent/it-task","reason":"integration"}')
+[ "$(echo "${R}" | status_of)" = "200" ] || { echo "FAIL: branch delete: ${R}" >&2; exit 1; }
+BODY2=$(python3 -c 'import json,sys; print(json.dumps({"ref":"agent/it-task","expected_head":sys.argv[1],"operations":[{"op":"add","quad":"<urn:x> <urn:y> \"z\" ."}],"activity":"integration","message":"refused"}))' "${B1}")
+R=$(api POST "/v1/graphs/${GRAPH}/proposals" "${TOKEN}" "it-bp2" "${BODY2}")
+[ "$(echo "${R}" | status_of)" = "409" ] && echo "${R}" | body_of | grep -q BRANCH_DELETED || { echo "FAIL: prepare on a deleted branch: ${R}" >&2; exit 1; }
+R=$(api POST "/v1/graphs/${GRAPH}/branches/restore" "${ADMIN_TOKEN}" "it-br1" '{"name":"agent/it-task"}')
+[ "$(echo "${R}" | status_of)" = "200" ] || { echo "FAIL: branch restore: ${R}" >&2; exit 1; }
+R=$(api GET "/v1/graphs/${GRAPH}/branches/status?name=agent/it-task" "${TOKEN}" "" "")
+python3 - "${B1}" <<PY || { echo "FAIL: restored branch status: ${R}" >&2; exit 1; }
+import json, sys
+b = json.loads('''$(echo "${R}" | body_of)''')
+assert b["status"] == "active" and b["head"] == sys.argv[1] and b["version"] == 2 and b["lifecycle_version"] == 3, b
+PY
+R=$(api POST "/v1/graphs/${GRAPH}/branches/delete" "${ADMIN_TOKEN}" "it-bdm" '{"name":"main"}')
+[ "$(echo "${R}" | status_of)" = "409" ] || { echo "FAIL: main delete not refused: ${R}" >&2; exit 1; }
+echo "branches: agent/it-task created from C1 (retry replayed), advanced once, deleted (admin only, prepare refused), restored with head/version kept; main untouched and undeletable"
+
 # The reusable invariant suite (Plan 0005 §20) over the whole database, as the owner.
 docker compose run --rm migrate verify | tail -3 | grep -q "VERIFY OK" || { echo "FAIL: ledger-admin verify reported violations" >&2; docker compose run --rm migrate verify >&2 || true; exit 1; }
 echo "ledger-admin verify: VERIFY OK"

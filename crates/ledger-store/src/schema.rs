@@ -3294,7 +3294,7 @@ mod tests {
             .2;
         assert_eq!(normalize_constraint_def(pg17), expected);
         assert_ne!(normalize_constraint_def("CHECK (true)"), expected);
-        assert_eq!(EXPECTED_CHECKS.len(), 65);
+        assert_eq!(EXPECTED_CHECKS.len(), 82);
     }
 
     #[test]
@@ -3401,6 +3401,14 @@ mod tests {
         assert_eq!(by_name("refs_movement_audited"), 21); // ROW AFTER INSERT UPDATE
         assert_eq!(by_name("projection_state_guard"), 27); // ROW BEFORE UPDATE DELETE
         assert_eq!(by_name("outbox_delivery_monotonic"), 19); // ROW BEFORE UPDATE
-        assert_eq!(GUARD_TRIGGERS.len(), 20);
+        // Migration 0012 (observed on PostgreSQL 17).
+        assert_eq!(by_name("branch_events_write_once"), 27); // ROW BEFORE UPDATE DELETE
+        assert_eq!(by_name("branches_guard"), 31); // ROW BEFORE INSERT UPDATE DELETE
+        assert_eq!(by_name("branches_lifecycle_audited"), 21); // ROW AFTER INSERT UPDATE (deferred)
+        assert_eq!(by_name("branch_events_current"), 5); // ROW AFTER INSERT (deferred)
+        assert_eq!(by_name("refs_are_branches"), 5); // ROW AFTER INSERT (deferred)
+        assert_eq!(by_name("refs_branch_active"), 19); // ROW BEFORE UPDATE
+        assert_eq!(by_name("proposals_branch_active"), 7); // ROW BEFORE INSERT
+        assert_eq!(GUARD_TRIGGERS.len(), 27);
     }
 }

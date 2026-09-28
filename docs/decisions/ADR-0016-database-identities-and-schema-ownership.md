@@ -180,3 +180,29 @@ that could create objects could shadow what an unpinned function resolves.
 `pg_projection` and `pg_least_privilege` exercise it on PostgreSQL 15 and 17, including
 drift in either direction, CREATE on the database or an owned schema, projector readiness
 after a grant or definition drift, and weakened 0011 guards, indexes, FKs and CHECKs.
+
+## Amendment: Phase 4 branch grant set (2026-09-28, Plan 0008, migration 0012)
+Migration 0012 ([ADR-0022](ADR-0022-named-branches-lifecycle-and-policy.md)) re-issues
+`ledger_grant_runtime` with the branch tables and changes one existing grant; the projector
+model is unchanged (it never reads branch lifecycle).
+
+- `refs`: column `INSERT` now includes `protected` (branch creation records the policy flag;
+  `refs_main_protected` CHECK keeps `main` protected, and the guard triggers keep
+  `protected` immutable after insert). `UPDATE (head, version, updated_at)` unchanged.
+- `branches`: `SELECT`; column `INSERT` of the identity, origin, source and policy columns
+  plus `status`/`lifecycle_version`; column `UPDATE (status, lifecycle_version, updated_at)`
+  only. `branches_guard` forbids `DELETE`, any change of identity or policy, any
+  `lifecycle_version` step other than +1 on a status change, and origin `adopted` from any
+  role but the owner.
+- `branch_events`: `SELECT`; column `INSERT` (never `event_id`/`recorded_at`, which are
+  database-assigned); write-once trigger; `USAGE` on `branch_events_event_id_seq`.
+- `idempotency_keys`: column `INSERT` additionally covers `result_branch_event_id`.
+
+The deferred constraint triggers (`branches_lifecycle_audited`, `branch_events_current`,
+`refs_are_branches`) make "every status change is exactly one event and every event describes
+the current state" a commit-time fact for the runtime as for any role. **Residual (same
+trusted-writer class as ADR-0016):** a compromised runtime can still write a consistent,
+fabricated lifecycle event (a delete or restore it was never asked for) within its tenants;
+it cannot remove history, move a deleted branch's head, un-protect `main` or rewrite a policy.
+`pg_least_privilege` asserts the exact 0012 model (drift in `refs.updated_at`,
+`branch_events.recorded_at`, `branches.require_validation` refused) on PostgreSQL 15 and 17.

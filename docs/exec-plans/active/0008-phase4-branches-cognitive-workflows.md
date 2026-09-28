@@ -62,7 +62,24 @@ Fuseki regression, 100-branch stress, historical branching, lifecycle races, upg
 0011 → 0012, backup/restore regression, hosted CI.
 
 ## Discoveries
-(recorded as work lands)
+- Phase 1–3 created any ref implicitly by a genesis acceptance. Keeping that would give a
+  branch no creation event, source or policy, so 0012 limits genesis to `main` and adopts
+  every existing ref (`origin = adopted`, one `adopted` event). This is a client-visible
+  behaviour change (runbook); `pg_api`'s genesis test moved to `main`.
+- A created branch's first ref event is a `genesis`-kind row without a decision (no
+  proposal moved it). `verify`'s decision check exempts exactly that case: the version-1
+  event of a branch whose `created` lifecycle event names the same head.
+- Holding a second pool connection for the reachability walk while the creating
+  transaction holds the source ref lock could exhaust the pool under load. The walk runs
+  on the transaction's own connection (`GraphParents`), bounded by `TraversalLimits`.
+- `projection_unconfigured_pending` counted every undelivered outbox row, so branch
+  traffic would look like a projection backlog. It now counts `main` only (`PROJECTED_REF`).
+  The metric's HELP text says so.
+- The runtime needs `INSERT (protected)` on `refs` to record branch protection. The
+  `refs_main_protected` CHECK plus the guard triggers keep that grant from un-protecting
+  `main` or changing protection later.
+- Trigger-raised violations surface as SQLSTATE 23000 (integrity), not P0001; the tests
+  assert the class, not the text.
 
 ## Evidence
 (filled as gates run)

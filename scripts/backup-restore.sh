@@ -50,6 +50,9 @@ cargo build --locked --release -p ledger-stress
 LOAD_PID=$!
 wait_progress 100 120
 echo "live load established: $(progress landed) commits"
+# Branch rows in the backup (Plan 0008): created / historical / deleted / restored branches.
+BRANCH_GRAPH=$(psql_q ledger "SELECT graph_id FROM graphs ORDER BY 1 LIMIT 1")
+python3 scripts/backup-restore/branches.py http://127.0.0.1:8080 "${BRANCH_GRAPH}" | tee "${OUT}/branches.log"
 
 # --- Backups while writes continue ---------------------------------------------------------
 PG_CID=$("${COMPOSE[@]}" ps -q postgres)
@@ -111,7 +114,7 @@ for target in "dump|${OWNER_IN_NET}/restored_dump?sslmode=disable|${RUNTIME_IN_N
   docker exec "${PG_CID}" psql -U ledger -d ledger -tAc "SELECT graph_id||'|'||branch||'|'||new_version||'|'||new_head FROM ref_events ORDER BY 1" >"${OUT}/events-live.txt"
   # Audit rows below the snapshot must exist identically in the live database (decisions,
   # outbox, idempotency results, proposals): a restore may only be a prefix, never differ.
-  ROWS_SQL="SELECT 'd|'||decision_id||'|'||coalesce(proposal_id::text,'')||'|'||decision||'|'||coalesce(ref_event_id::text,'') FROM decisions UNION ALL SELECT 'o|'||outbox_id||'|'||ref_event_id||'|'||commit_id||'|'||ref_version FROM projection_outbox UNION ALL SELECT 'i|'||md5(row_to_json(i)::text) FROM idempotency i UNION ALL SELECT 'p|'||proposal_id||'|'||graph_id||'|'||candidate_commit FROM proposals ORDER BY 1"
+  ROWS_SQL="SELECT 'd|'||decision_id||'|'||coalesce(proposal_id::text,'')||'|'||decision||'|'||coalesce(ref_event_id::text,'') FROM decisions UNION ALL SELECT 'o|'||outbox_id||'|'||ref_event_id||'|'||commit_id||'|'||ref_version FROM projection_outbox UNION ALL SELECT 'i|'||md5(row_to_json(i)::text) FROM idempotency i UNION ALL SELECT 'p|'||proposal_id||'|'||graph_id||'|'||candidate_commit FROM proposals UNION ALL SELECT 'b|'||md5(row_to_json(b)::text) FROM branches b UNION ALL SELECT 'e|'||md5(row_to_json(e)::text) FROM branch_events e ORDER BY 1"
   if [ "${name}" = dump ]; then docker exec "${PG_CID}" psql -U ledger -d restored_dump -tAc "${ROWS_SQL}" >"${OUT}/rows-${name}.txt"; else docker exec "${BBNAME}" psql -U ledger -d ledger -tAc "${ROWS_SQL}" >"${OUT}/rows-${name}.txt"; fi
   docker exec "${PG_CID}" psql -U ledger -d ledger -tAc "${ROWS_SQL}" >"${OUT}/rows-live.txt"
   if [ "${name}" = dump ]; then BEFORE=${DUMP_BEFORE}; else BEFORE=${BB_BEFORE}; fi
@@ -135,7 +138,7 @@ if graphs_r != graphs_l: sys.exit(f"FAIL: {name}: graph set differs ({len(graphs
 total = sum(len(e) for e in r.values())
 if total < before: sys.exit(f"FAIL: {name}: {total} restored ref events < {before} commits acknowledged before the backup started")
 missing = rows_r - rows_l
-if missing: sys.exit(f"FAIL: {name}: {len(missing)} restored audit rows (decisions/outbox/idempotency/proposals) do not exist identically in the live database, e.g. {sorted(missing)[:2]}")
+if missing: sys.exit(f"FAIL: {name}: {len(missing)} restored audit rows (decisions/outbox/idempotency/proposals/branches/branch events) do not exist identically in the live database, e.g. {sorted(missing)[:2]}")
 for ref, events in r.items():
     live = l.get(ref) or sys.exit(f"FAIL: {name}: ref {ref} missing live")
     n = max(events)
@@ -182,9 +185,15 @@ for (g,b),(v,hd) in heads.items():
 print(f"{sys.argv[2]}: {checked} restored heads served with versions matching, states identical to the live server ({sum(1 for _ in heads)} graphs, digest sha256:{hashlib.sha256(json.dumps(sorted(heads.items())).encode()).hexdigest()[:16]})")
 PY
   docker rm -f "${PROJECT}-restored-server" >/dev/null
+  # 4. The branch workload taken before the backups is restored with its lifecycle.
+  BRANCH_SQL="SELECT string_agg(branch||':'||status||':'||lifecycle_version, ',' ORDER BY branch) FROM branches WHERE graph_id = '${BRANCH_GRAPH}' AND branch LIKE 'backup/%'"
+  if [ "${name}" = dump ]; then GOT=$(psql_q restored_dump "${BRANCH_SQL}"); else GOT=$(docker exec "${BBNAME}" psql -U ledger -d ledger -tAc "${BRANCH_SQL}"); fi
+  [ "${GOT}" = "backup/b0:active:1,backup/b1:deleted:2,backup/b2:active:3,backup/b3:active:1" ] || { echo "FAIL: ${name}: restored branches ${GOT}" >&2; exit 1; }
+  echo "${name}: branches restored with lifecycle (${GOT})"
 done | tee "${OUT}/checks.log"
 grep -q "^dump: .* exact prefix.*present identically" "${OUT}/checks.log" && grep -q "^basebackup: .* exact prefix.*present identically" "${OUT}/checks.log" \
   && grep -q "^dump: .* states identical" "${OUT}/checks.log" && grep -q "^basebackup: .* states identical" "${OUT}/checks.log" \
+  && grep -q "^dump: branches restored" "${OUT}/checks.log" && grep -q "^basebackup: branches restored" "${OUT}/checks.log" \
   || { echo "FAIL: not every restore check passed" >&2; exit 1; }
 # --- A restore that lost one integrity control or one grant must be refused at start-up,
 #     not fail on first use (ADR-0016 verifier). Each case restores the dump afresh.
@@ -203,6 +212,7 @@ declare -a DRIFTS=(
   "check|ALTER TABLE immutable_objects DROP CONSTRAINT immutable_objects_content_addressed|immutable_objects_content_addressed is missing"
   "column grant|REVOKE INSERT (bytes) ON immutable_objects FROM ledger_runtime|lacks INSERT on public.immutable_objects.bytes"
   "sequence grant|REVOKE USAGE ON SEQUENCE proposals_proposal_id_seq FROM ledger_runtime|lacks USAGE on sequence public.proposals_proposal_id_seq"
+  "branch guard|DROP TRIGGER branches_guard ON branches|integrity trigger branches_guard is missing on public.branches"
 )
 for d in "${DRIFTS[@]}"; do
   IFS='|' read -r name sql expect <<<"${d}"
@@ -216,7 +226,7 @@ for d in "${DRIFTS[@]}"; do
   [ "${CODE}" != 0 ] && grep -q "${expect}" <<<"${LINE}" && echo "drift refused (${name}): exit ${CODE}: ${LINE#*startup refused: }" || { echo "FAIL: drift ${name} not refused (exit ${CODE}): ${LINE}" >&2; exit 1; }
 done | tee -a "${OUT}/checks.log"
 psql_q ledger "DROP DATABASE IF EXISTS restored_drift WITH (FORCE)" >/dev/null
-[ "$(grep -c '^drift refused' "${OUT}/checks.log")" = 4 ] || { echo "FAIL: expected four refused drift cases" >&2; exit 1; }
+[ "$(grep -c '^drift refused' "${OUT}/checks.log")" = 5 ] || { echo "FAIL: expected five refused drift cases" >&2; exit 1; }
 cp "${OUT}/load/report.md" "${OUT}/load-report.md"
 echo "report: ${OUT}/checks.log"
 echo "BACKUP RESTORE OK"

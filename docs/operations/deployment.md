@@ -226,6 +226,37 @@ Readers' contract: [reading the projection](../design/sculpin-projection.md).
   its data is repaired by reconciliation or the same rebuild (the ledger is authoritative;
   nothing is ever read back into it).
 
+## Named branches (Phase 4, ADR-0022)
+- **Upgrade 0011 → 0012**: stop every replica and projector, take a backup, run
+  `ledger-admin migrate --runtime-role <runtime> --projector-role <projector>` (no new role);
+  every existing ref is adopted as an active branch with one `adopted` lifecycle event
+  (principal `urn:sculpin:ledger:migration:0012`). A 0011 build refuses 0012 (ahead) and a
+  0012 build refuses 0011 (behind); exercised end to end by `scripts/upgrade-p4.sh`.
+- **Behaviour change**: a genesis acceptance creates only `main`. Any other ref must be
+  created first with `POST /v1/graphs/{graph}/branches` (`name`, `source`, optional
+  `from_commit` reachable from the source head, optional `policy`); an acceptance or prepare
+  on an unknown non-`main` ref answers `404 BRANCH_NOT_FOUND`. Clients that relied on
+  implicit ref creation (Phase 1–3) must add the create call.
+- **Capabilities**: `read` lists/inspects (`GET …/branches`, `…/branches/status|history|log?name=`);
+  `propose` creates unprotected branches; `admin` creates protected branches and deletes
+  (`POST …/branches/delete`) or restores (`POST …/branches/restore`) any non-`main` branch.
+  Map an operator group to `admin` in `LEDGER_AUTH_ROLE_MAP` (`ledger.admin`).
+- **Deletion is a tombstone**: the head stops moving and no new proposal is admitted
+  (`409 BRANCH_DELETED`); pending proposals may still be rejected; history, proposals and
+  decisions stay readable; restore resumes at the same head/version. There is no hard delete
+  and no GC. `main` can never be deleted.
+- **Policy v1 is immutable** after creation: `require_validation` (acceptance needs a
+  matching validation even where the deployment allows unvalidated acceptance) and
+  `require_distinct_reviewer` (the accepting principal must differ from the proposer).
+  A branch's policy can only tighten the deployment floor.
+- **Projection** is still `main` only. Branch acceptances write outbox rows (kept for later
+  protocols) that are never delivered and never counted by `projection_unconfigured_pending`
+  or `ledger-admin projection status`.
+- `ledger-admin verify` additionally checks that every ref is a branch, lifecycle versions
+  equal event counts, the latest event describes the current status, and a created branch
+  starts at its recorded branch point. Qualification: `scripts/stress-branches.sh` (100
+  branches, two replicas).
+
 ## Development-only switches (never in production)
 `LEDGER_AUTH_MODE=dev-hs256`, `LEDGER_ALLOW_INSECURE_NON_LOOPBACK=allow-insecure-non-loopback-development-only`,
 `LEDGER_UNVALIDATED_ACCEPTANCE=allow-unvalidated-acceptance-development-only`, the compose
@@ -239,6 +270,6 @@ The server refuses the unvalidated-acceptance switch together with production au
 `./scripts/check-fast.sh`, `./scripts/check-supply-chain.sh`, the real PostgreSQL suites
 (including `pg_least_privilege`), `./scripts/test-integration.sh`, `./scripts/fuzz.sh`
 (bounded, also in CI); per release the qualification runs `scripts/stress.sh`,
-`scripts/fault.sh`, `scripts/backup-restore.sh`, `scripts/upgrade.sh` and `scripts/bench.sh`
+`scripts/fault.sh`, `scripts/backup-restore.sh`, `scripts/upgrade.sh` (and the phase upgrades `scripts/upgrade-p2.sh`, `upgrade-p3.sh`, `upgrade-p4.sh`), `scripts/stress-branches.sh` and `scripts/bench.sh`
 (baselines in `docs/quality/performance-baselines.md`), each recorded in the active plan.
 The live identity-provider smoke test (`scripts/live-issuer-smoke.sh`, configuration in the active plan) is a release prerequisite as long as it is pending.

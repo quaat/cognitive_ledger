@@ -52,6 +52,23 @@ Preserve object digest verification and atomic ref updates. Never commit secrets
   require the commit to be indexed under that graph. Migration 0007's composite
   `(graph_id, tenant_id)` foreign keys make tenant/graph agreement a database invariant.
 
+## Branch authorization and lifecycle (Phase 4, ADR-0022)
+- `read`: list, status, lifecycle/movement history, first-parent log. `propose`: create an
+  unprotected branch; prepare on an active branch. `review`: accept/reject. `admin`: create
+  a protected branch, delete, restore. Every branch route is graph- and tenant-scoped like
+  the rest (`NOT_FOUND` for a foreign graph); a branch point outside the graph, unknown, or
+  unreachable from the source head is `422 BRANCH_POINT_UNREACHABLE` (the three are not
+  distinguished, so foreign commit ids are not an oracle).
+- Branch names keep the ref grammar `[A-Za-z0-9._/-]{1,128}` (so `..` or empty segments are
+  legal characters, not structure) and travel only in JSON bodies or `?name=` query
+  parameters, never as path segments or file paths. Branch-point reachability is bounded (100 000 visited commits, 5 s) and runs on
+  the request's own transaction connection; history pages are capped at 1 000.
+- Database facts (migration 0012): `main` is protected (CHECK), a deleted branch's head
+  cannot move and it admits no proposal (triggers), lifecycle rows are write-once and every
+  status change is exactly one audited event (deferred constraint triggers), policy and
+  identity columns are immutable. Residual: the runtime, as trusted writer, can fabricate a
+  consistent lifecycle event within its tenants (ADR-0016 Phase-4 amendment).
+
 ## Semantic validation boundary (Phase 2, ADR-0014/0018/0019)
 - Capabilities: `validate` (`ledger.validate`) requests a validation of a prepared candidate;
   it grants no power over refs (`review` accepts/rejects). Proposers cannot validate;
