@@ -309,7 +309,11 @@ GET that accepts only a parsed plain-http URL whose host is a loopback address o
 `ci-security`'s `container` job builds the image, emits its CycloneDX SBOM and the full JSON
 report first (uploaded even when the gate fails), then fails on any CRITICAL/HIGH finding
 whether or not a fix exists: an unfixed one must be classified in `.trivyignore` with
-rationale and review trigger (it is empty), never dropped by `ignore-unfixed`. The scanner
+rationale and review trigger, never dropped by `ignore-unfixed`. In force since
+2026-10-05: CVE-2026-84782 (`libssl3` 3.0.20, HIGH, Debian `affected`, no fix) — **not
+applicable**: no shipped binary links or references libssl/libcrypto (`readelf -d` NEEDED:
+libgcc_s, libm, libc, ld-linux; rustls/aws-lc-rs only; OpenSSL crates banned); review on a
+Debian fix (then refresh the digest and drop the exception) or any base refresh. The scanner
 version is pinned to the one this classification used.
 Classification of the 2026-09-26 scan (Trivy 0.74.0; 0 CRITICAL, 0 HIGH, 17 MEDIUM, 16 LOW,
 1 UNKNOWN):
