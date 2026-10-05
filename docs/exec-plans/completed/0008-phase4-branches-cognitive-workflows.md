@@ -1,12 +1,13 @@
 # Plan 0008: Phase 4 — branches and cognitive workflows
 
-Status: **complete / merge-ready** (started 2026-09-28; closed 2026-10-05 on PR #9, final
-code `46d3eb7`).
+Status: **complete / merge-ready** (started 2026-09-28; first closed 2026-10-05 on final code
+`46d3eb7`; **reopened by a post-closure GitHub Codex finding and re-closed 2026-10-06 on final
+code `599ca07`** — see "Post-closure finding").
 
 | | |
 |---|---|
 | Phase-4 implementation | complete |
-| Phase-4 merge-ready | yes (closure gates below on `46d3eb7`; exact-head Codex no P0/P1; hosted CI green on the PR head; 0 unresolved review threads) |
+| Phase-4 merge-ready | yes (gates re-run on `599ca07`; exact-head Codex no P0/P1 locally and on GitHub; hosted CI green; 0 unresolved review threads) |
 | production-qualified | **no** — see "Still pending" below and the P1.5/Phase-2/Phase-3 blockers in [tech-debt](../tech-debt.md) |
 
 Branch `claude/p4-branches-cognitive-workflows`
@@ -208,6 +209,57 @@ tech-debt).
   lifecycles restored from dump and base backup; five drift cases refused).
 - Hosted CI on the PR head: recorded in the PR (ci-fast, ci-integration, ci-security,
   ci-fuzz).
+
+## Post-closure finding (2026-10-06, final code `599ca07`)
+The plan above was closed and moved to `completed/` on 2026-10-05. GitHub Codex then
+reviewed PR head `022d31d` and opened one thread: **P2 — durable branch-create replay was
+preceded by the historical reachability check.** Durable idempotency is a core invariant
+here, so it was treated as blocking.
+- **Verified on the unchanged code**: replaying a completed historical create on an active
+  graph whose source had moved ran the lock-free walk first. With `commit_index` /
+  `commit_parents` locked, the replay blocked (test timed out after 10 s). The
+  archived-graph `BRANCH_NOT_FOUND` described in the finding did not reproduce: the
+  pre-walk error was held, not returned, and the transaction's replay check ran first.
+  Replay still depended on DAG and traversal state, which breaks the stated rule.
+- **Fix**: `create_branch` with `from_commit` looks up a completed result on a short-lived
+  connection (no lock, no transaction) before walking, and replays it or returns
+  `IDEMPOTENCY_CONFLICT`. The definitive second check, in the scoped transaction under the
+  idempotency advisory lock, is retained as the serialization point. ADR-0022 now states:
+  a completed branch lifecycle request is replayed before any mutable graph/source/
+  reachability check; preflight reachability applies only to requests with no durable
+  result. No request identity, golden vector or migration changed.
+- **Regression tests** (`pg_branches`, PostgreSQL 15 and 17, 18/18):
+  - `a_completed_historical_create_replays_without_any_source_or_dag_check`: replay with
+    `max_visited = 0`, an expired deadline and the DAG tables locked `ACCESS EXCLUSIVE`,
+    first on the active graph after the source moved, then after the graph is archived.
+    Result: original event, `replayed = true`. A changed request under the same key after
+    archive returns `IDEMPOTENCY_CONFLICT`.
+  - `concurrent_identical_historical_creates_create_once_and_replay_once`: both requests
+    past their walk and queued on the idempotency lock; one creates, one replays, same
+    event, one durable result.
+- **Security hardening**: the `.trivyignore` exception for CVE-2026-84782 (`libssl3` in
+  the distroless base) now has a mechanical premise check. `scripts/check-runtime-linkage.sh`
+  runs in `ci-security`'s container job: it prints `NEEDED` for ledger-server, ledger-admin
+  and ledger-projector (libgcc_s, libm, libc, ld-linux) and fails on libssl/libcrypto.
+  Verified to fail against an image whose binary links libcrypto.
+- **Gates on `599ca07`**:
+  - `check-fast` pass; `check-supply-chain` pass.
+  - PostgreSQL 17 and 15 suites pass: `pg_branches` 18, `pg_workflow` 14, `pg_verify` 3,
+    `pg_least_privilege` 19, `pg_api` 13, `pg_validation_api` 21.
+  - `INTEGRATION OK`, including the Fuseki regression.
+  - `UPGRADE-P4 OK` (`target/upgrade-p4/20261005T222102Z`); `BACKUP RESTORE OK`.
+  - 100-branch stress PASS, run twice:
+    - `20261005T222013Z`, under host load (load average 3.8): every operation sat on a
+      uniform ~500 ms plateau, create p99 581 ms;
+    - `20261005T222253Z`, on an idle host: create p50 / p95 / p99 = 58.9 / 180.1 / 198.7
+      ms, accept 32.9 / 78.4 / 97.1, prepare 39.0 / 88.5 / 105.2.
+    - Both runs: 0 deadlocks, 0 pair disagreements, verify clean, unconfigured backlog
+      equal to `main` only.
+- **Exact-head Codex on `599ca07`**: local `codex exec -s read-only` reported **no
+  P0/P1**; GitHub Codex said "Didn't find any major issues". The original thread was
+  resolved after the regression test passed.
+- **Hosted CI on `599ca07`**: ci-fast, ci-integration, ci-security (with the new linkage
+  step) and ci-fuzz all pass.
 
 ### Still pending (accepted, not merge blockers)
 Live Fluree branch differential (BUSL-1.1 approval pending; not run, not counted);
