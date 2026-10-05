@@ -1,8 +1,17 @@
 # Plan 0008: Phase 4 — branches and cognitive workflows
 
-Status: **complete — pending hosted CI and PR review** (started 2026-09-28). Branch `claude/p4-branches-cognitive-workflows`
+Status: **complete / merge-ready** (started 2026-09-28; closed 2026-10-05 on PR #9, final
+code `46d3eb7`).
+
+| | |
+|---|---|
+| Phase-4 implementation | complete |
+| Phase-4 merge-ready | yes (closure gates below on `46d3eb7`; exact-head Codex no P0/P1; hosted CI green on the PR head; 0 unresolved review threads) |
+| production-qualified | **no** — see "Still pending" below and the P1.5/Phase-2/Phase-3 blockers in [tech-debt](../tech-debt.md) |
+
+Branch `claude/p4-branches-cognitive-workflows`
 from `main` at `848ec28bfd48ffc7f0a1257058b21dc68a204ebc` (the PR #8 merge; Phase 3 complete,
-see [Plan 0007](../completed/0007-phase3-accepted-state-projection.md)). No gate is reported as
+see [Plan 0007](0007-phase3-accepted-state-projection.md)). No gate is reported as
 passed until it is executable and has run.
 
 ## Goal
@@ -160,6 +169,51 @@ ignored `limit` (fixed: latest `limit` events), the stress accepted any historic
 as a head-created branch point (fixed: must be ≥ the version read before creating), and
 activating a raw import leaves verifier findings (documented: the pre-existing import gap,
 tech-debt).
+
+## Closure (2026-10-05, final code `46d3eb7`)
+- **Exact-head Codex** (`codex exec -s read-only`, P0/P1-only brief covering creation
+  concurrency, reachability, tombstone/restore, lifecycle serialization, policy, distinct
+  parties, idempotency, event integrity, tenancy, `main` protection, 0012, verifier,
+  projection, request identity): `e3fb2d7` — **no P0/P1**; after the closure changes,
+  `46d3eb7` — **no P0/P1**.
+- **Deterministic create-vs-source-advance races** (`pg_branches`, forced with row locks
+  and the request's own idempotency advisory lock, no sleeps; 20/20 repeated runs on
+  PostgreSQL 15 and 17):
+  `create_racing_a_source_acceptance_branches_from_an_authoritative_head` — case 1 (create
+  holds the source share lock first): branch at C1 v1, main C2; case 2 (acceptance holds
+  main first): branch at C2; case 2b (create paused between its lock-free phase and its
+  transaction while main commits C2): branch at C2; case 3 (explicit C1 while main moves
+  C2 → C3, both orders): branch at C1; case 4 (point reachable only after the check):
+  `BRANCH_POINT_UNREACHABLE`, retry succeeds — a safe false negative, documented in ADR-0022
+  and tech-debt for Phase 5. Also `create_racing_the_deletion_of_its_source_has_one_valid_outcome`
+  (both orders) and `a_checked_branch_point_survives_only_audited_source_movement`.
+- **Focused storage/concurrency review** (Opus, read-only): no P0/P1; no create/accept,
+  create/delete, create/restore or same-name deadlock; no never-committed source state;
+  deleted sources refused. P2 D1 fixed in `46d3eb7`: a point checked against an earlier
+  head was trusted across a raw import move during an owner's `importing` flip; it now
+  carries over only across contiguous audited ref events, and the lock-free read is
+  limited to an active graph of the caller's tenant (mutation-checked: the rewind test fails
+  without the fix). Decisions recorded in tech-debt: graph status state machine; Phase 5
+  keeping "old head = first parent".
+- `Cargo.lock`: `yoke-derive` 0.8.3 was yanked upstream after the PR's CI; bumped to 0.8.4
+  (the advisory gate failed on it, not on Phase-4 code).
+- Gates on `46d3eb7` (2026-10-05): `check-fast` pass; `check-supply-chain` pass; PostgreSQL
+  17 and 15 suites pass (`pg_branches` 16, `pg_workflow` 14, `pg_verify` 3,
+  `pg_least_privilege` 19, `pg_api` 13, `pg_validation_api` 21, all other store suites);
+  `test-integration.sh` `INTEGRATION OK` (Fuseki projection regression, branch e2e, VERIFY
+  OK); `stress-branches.sh 100 3 4` PASS (`target/stress-branches/20261005T210333Z`: 1 493
+  requests, races 3 landed / 17 refused, 90 pairs 0 disagreements, 0 deadlocks, verify
+  clean; p99 create 98.6 ms, prepare 82.4, accept 59.8); `upgrade-p4.sh` `UPGRADE-P4 OK`
+  (`target/upgrade-p4/20261005T210437Z`); `backup-restore.sh` `BACKUP RESTORE OK` (branch
+  lifecycles restored from dump and base backup; five drift cases refused).
+- Hosted CI on the PR head: recorded in the PR (ci-fast, ci-integration, ci-security,
+  ci-fuzz).
+
+### Still pending (accepted, not merge blockers)
+Live Fluree branch differential (BUSL-1.1 approval pending; not run, not counted);
+pagination cursors; deep-history traversal optimization; branch outbox accumulation;
+projection-metrics partial index; confusable/odd-but-legal branch names; audited raw-import
+activation; trusted-writer database residual; graph status state machine.
 
 ## Sub-agent decomposition (§42)
 Main session owns the ADR, migration, verifier, repository, request identity and API.
