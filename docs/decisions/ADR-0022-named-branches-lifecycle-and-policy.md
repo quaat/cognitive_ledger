@@ -171,7 +171,16 @@ field graph_id · field name
 -- delete / restore --  opt reason
 ```
 Same key + same normalized request → the original durable result; same key + different
-request → `IDEMPOTENCY_CONFLICT`. An omitted `from_commit` means "the source head when first
+request → `IDEMPOTENCY_CONFLICT`. **A completed branch lifecycle request is replayed before any mutable
+graph/source/reachability check; preflight reachability applies only to requests that have
+no durable result.** Replay depends only on the authenticated actor scope, graph,
+operation, key, canonical request digest and the stored result — not on the graph's or
+source's current status, the source head, DAG depth or traversal limits. Creation with
+`from_commit` therefore looks up a completed result (short-lived connection, no lock)
+before walking; the scoped transaction still checks again under the idempotency advisory
+lock, which remains the serialization point for requests in flight (`pg_branches`:
+replay after the source moved and after archive while the DAG tables are locked; conflict
+after archive; two identical creates in flight → one creates, one replays). An omitted `from_commit` means "the source head when first
 executed"; a replay returns that original branch point. Omitted and explicit `from_commit`
 are **distinct identities** even when the explicit commit is the current head (a retry must
 resend what it first sent). Normalization, pinned by alias vectors: an omitted `policy` is

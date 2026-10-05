@@ -2093,3 +2093,133 @@ async fn create_racing_the_deletion_of_its_source_has_one_valid_outcome() {
     let report = ledger_store::verify::run(&pool).await.unwrap();
     assert!(report.is_clean());
 }
+
+/// A completed branch-create is replayed before any mutable graph/source/reachability check
+/// (ADR-0022): after the graph is archived, with an unusable traversal limit, and while the
+/// DAG tables are locked exclusively (a reachability walk would block), the identical
+/// request replays the original event and a changed request is `IDEMPOTENCY_CONFLICT`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn a_completed_historical_create_replays_without_any_source_or_dag_check() {
+    // Own database: it archives a graph and locks commit_index exclusively.
+    let store = Arc::new(isolated_store("br_replay").await);
+    let pool = store.pool().clone();
+    let g = graph(&store, "tenant-a").await;
+    let c = main_history(&store, &g, 2).await;
+    let request = create(&g, "k-hist", "agent/hist", "main", Some(&c[0]));
+    let original = store
+        .workflows()
+        .create_branch(&request, limits())
+        .await
+        .unwrap();
+    assert!(!original.replayed);
+    // Active graph, source moved since (C1 is no longer the head): a reachability walk
+    // would be needed for a new request — a completed one must not run it.
+    let unusable = TraversalLimits {
+        max_visited: 0,
+        deadline: Some(std::time::Instant::now()),
+    };
+    let mut dag_lock = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE commit_index, commit_parents IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *dag_lock)
+        .await
+        .unwrap();
+    let replay = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        store.workflows().create_branch(&request, unusable),
+    )
+    .await
+    .expect("replay on an active graph must not walk the DAG")
+    .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.event, original.event);
+    dag_lock.rollback().await.unwrap();
+    sqlx::query("UPDATE graphs SET status = 'archived' WHERE graph_id = $1")
+        .bind(g.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut dag_lock = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE commit_index, commit_parents IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *dag_lock)
+        .await
+        .unwrap();
+    let replay = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        store.workflows().create_branch(&request, unusable),
+    )
+    .await
+    .expect("replay must not wait for the DAG tables")
+    .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.event, original.event);
+    // Same scope and key, different canonical request: conflict, not a graph/source/limit
+    // error.
+    let changed = CreateBranchRequest {
+        scope: scope_as(
+            actor("tenant-a", "curator"),
+            &g,
+            "k-hist",
+            "a different request",
+        ),
+        ..create(&g, "k-hist", "agent/hist", "main", Some(&c[0]))
+    };
+    let conflict = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        store.workflows().create_branch(&changed, unusable),
+    )
+    .await
+    .expect("conflict must not wait for the DAG tables");
+    assert!(
+        matches!(conflict, Err(LedgerError::IdempotencyConflict)),
+        "{conflict:?}"
+    );
+    dag_lock.rollback().await.unwrap();
+}
+
+/// Two identical historical creates in flight at once (both past their lock-free walk,
+/// queued on the request's idempotency lock): exactly one creates, the other replays the
+/// same event; one durable idempotency result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn concurrent_identical_historical_creates_create_once_and_replay_once() {
+    let store = Arc::new(store().await);
+    let pool = store.pool().clone();
+    let g = graph(&store, "tenant-a").await;
+    let c = main_history(&store, &g, 2).await;
+    let (hold, pid) = hold_create_scope(&pool, &g, "k-twin").await;
+    let spawn = || {
+        let (s, g, c0) = (store.clone(), g.clone(), c[0].clone());
+        tokio::spawn(async move {
+            s.workflows()
+                .create_branch(
+                    &create(&g, "k-twin", "agent/twin", "main", Some(&c0)),
+                    limits(),
+                )
+                .await
+        })
+    };
+    let (a, b) = (spawn(), spawn());
+    until_waiting(&pool, pid, 2).await;
+    hold.commit().await.unwrap();
+    let (a, b) = (a.await.unwrap().unwrap(), b.await.unwrap().unwrap());
+    assert_eq!(
+        [a.replayed, b.replayed].iter().filter(|r| **r).count(),
+        1,
+        "exactly one replay"
+    );
+    assert_eq!(a.event, b.event);
+    assert_eq!(
+        (a.event.head.clone(), a.event.lifecycle_version),
+        (c[0].clone(), 1)
+    );
+    let results: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM idempotency WHERE graph_id = $1 AND operation = 'branch_create' \
+         AND idempotency_key = 'k-twin'",
+    )
+    .bind(g.as_str())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(results, 1);
+}

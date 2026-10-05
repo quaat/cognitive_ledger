@@ -500,6 +500,19 @@ impl WorkflowRepository {
                 "`main` is created only by the graph's genesis acceptance".into(),
             ));
         }
+        // A completed request is replayed before any mutable graph/source/reachability check
+        // (ADR-0022): its durable result depends only on the actor scope, graph, operation,
+        // key and request digest. This lookup is not the serialization point (no lock is
+        // held; the connection is released before walking) — the scoped transaction below
+        // checks again under the idempotency lock, for a request completed meanwhile.
+        if request.from_commit.is_some() {
+            let mut conn = self.pool.acquire().await.map_err(db_error)?;
+            if let Some(stored) =
+                Self::stored_result(&mut conn, scope, Operation::BranchCreate).await?
+            {
+                return Self::replay_branch(&mut conn, stored, scope, "branch_created").await;
+            }
+        }
         // Reachability is decided before the transaction, on one pooled connection released
         // before the transaction begins, so no lock (source ref, branch, graph status) is held
         // while walking (ADR-0022). History only moves forward: a commit reachable from the

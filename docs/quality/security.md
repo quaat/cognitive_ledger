@@ -312,8 +312,14 @@ whether or not a fix exists: an unfixed one must be classified in `.trivyignore`
 rationale and review trigger, never dropped by `ignore-unfixed`. In force since
 2026-10-05: CVE-2026-84782 (`libssl3` 3.0.20, HIGH, Debian `affected`, no fix) — **not
 applicable**: no shipped binary links or references libssl/libcrypto (`readelf -d` NEEDED:
-libgcc_s, libm, libc, ld-linux; rustls/aws-lc-rs only; OpenSSL crates banned); review on a
-Debian fix (then refresh the digest and drop the exception) or any base refresh. The scanner
+libgcc_s, libm, libc, ld-linux; rustls/aws-lc-rs only; OpenSSL crates banned). The
+non-linkage premise is **CI-enforced**: `ci-security`'s container job runs
+`scripts/check-runtime-linkage.sh` on the built image before the scan, prints every
+binary's `NEEDED` entries and fails if any names `libssl`/`libcrypto` (so a future
+OpenSSL-linked binary fails CI although Trivy would ignore this CVE; checked against a
+deliberately OpenSSL-linked image). The `deny.toml` crate bans remain as the earlier
+line of defence. Review on a Debian fix (then refresh the digest and drop the exception)
+or any base refresh. The scanner
 version is pinned to the one this classification used.
 Classification of the 2026-09-26 scan (Trivy 0.74.0; 0 CRITICAL, 0 HIGH, 17 MEDIUM, 16 LOW,
 1 UNKNOWN):
