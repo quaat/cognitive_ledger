@@ -56,9 +56,23 @@ walking; never two connections at once): an unknown or foreign `from_commit` is 
 without walking (a graph-scoped `commit_index` lookup, same error as unreachable); a walk
 that exceeds its bounds (100 000 commits, 5 s) is `413 RESOURCE_LIMIT`; a missing parent or
 a parent list disagreeing with `parent_count` is corruption (`CorruptObject`), never "not
-reachable". The transaction then locks and re-reads the source (exists, active). A commit
+reachable". The lock-free read only considers an active graph of the caller's tenant. The
+transaction then locks and re-reads the source (exists, active, head and version); a point
+checked against an earlier head carries over only if the source moved since **solely by
+audited fast-forwards** (one contiguous, chained ref event per version from that head —
+each checked by migration 0009); any other movement (a raw import move during an owner's
+`importing` flip) refuses the creation for a retry. A commit
 that became reachable only because the source head moved after the check is refused; the
-client retries.
+client retries. This false negative is safe by construction — a commit is accepted as a
+branch point only if it was proven reachable from an authoritative source head, and
+reachability is monotone under fast-forward movement — and remains so when Phase 5 merge
+commits make second-parent history reachable; holding the source lock across a
+potentially long walk to remove it is rejected (it would let any `propose` caller stall
+acceptance on the source). Without `from_commit`, the branch point is the head the
+creating transaction reads under its share lock: if the source moves first, the branch
+starts at the new head; if the creation reads first, the acceptance waits for it. Both
+orders, the explicit-historical case and the false negative are forced in `pg_branches`
+(`create_racing_a_source_acceptance_branches_from_an_authoritative_head`).
 
 The ref-creation event of a created branch has no decision (nothing was accepted);
 `ledger-admin verify`'s "one accepted decision per ref event" invariant exempts exactly the

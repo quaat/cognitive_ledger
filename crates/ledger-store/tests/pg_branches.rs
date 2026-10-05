@@ -1717,3 +1717,379 @@ async fn lifecycle_reasons_take_the_same_bound_as_decisions() {
         "{too_long:?}"
     );
 }
+
+/// An owner transaction holding the idempotency advisory lock of `scope(graph, key)` for
+/// `branch_create` (same derivation as the repository's `begin_scoped`): a create with that
+/// key finishes its lock-free reachability walk and then waits at the start of its
+/// transaction until this one ends.
+async fn hold_create_scope(
+    pool: &sqlx::PgPool,
+    graph: &GraphId,
+    key: &str,
+) -> (sqlx::Transaction<'static, sqlx::Postgres>, i32) {
+    let mut tx = pool.begin().await.unwrap();
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    let scope = format!(
+        "tenant-a\u{1f}urn:it:curator\u{1f}agent\u{1f}\u{1f}{}\u{1f}branch_create\u{1f}{key}",
+        graph.as_str()
+    );
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(ledger_store::lock_key(&format!("idempotency:{scope}")))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    (tx, pid)
+}
+
+/// Create (A) racing an acceptance on its source (B), forced in both orders (Plan 0008):
+/// the branch point is the source head at the instant the creating transaction read it
+/// under its share lock — never a head that was not authoritative — and an explicit
+/// historical point stays valid however the source moves. A point that became reachable
+/// only after the lock-free check is a retryable false negative, never an unchecked accept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn create_racing_a_source_acceptance_branches_from_an_authoritative_head() {
+    let store = Arc::new(store().await);
+    let pool = store.pool().clone();
+    let spawn_create = |name: &str, key: &str, from: Option<CommitId>, g: &GraphId| {
+        let (s, g, name, key) = (store.clone(), g.clone(), name.to_owned(), key.to_owned());
+        tokio::spawn(async move {
+            s.workflows()
+                .create_branch(&create(&g, &key, &name, "main", from.as_ref()), limits())
+                .await
+        })
+    };
+    let spawn_accept = |head: CommitId, cand: CommitId, key: &str, g: &GraphId| {
+        let (s, g, key) = (store.clone(), g.clone(), key.to_owned());
+        tokio::spawn(async move { accept_candidate(&s, &g, "main", Some(head), &cand, &key).await })
+    };
+
+    // Case 1: A holds main's ref share lock first; B's acceptance waits for it.
+    // Case 2: B holds main's ref (FOR UPDATE) first; A's transactional read waits and sees C2.
+    for create_first in [true, false] {
+        let g = graph(&store, "tenant-a").await;
+        let c = main_history(&store, &g, 1).await;
+        let c2 = prepare_on(&store, &g, "main", Some(c[0].clone()), &format!("{g}-c2"))
+            .await
+            .unwrap();
+        let (hold, pid) = hold_branch(&pool, &g, "main").await;
+        let (a, b) = if create_first {
+            let a = spawn_create("agent/task", "k-task", None, &g);
+            until_waiting(&pool, pid, 1).await; // A: ref shared, waiting on main's branch row
+            let b = spawn_accept(c[0].clone(), c2.clone(), "acc-c2", &g);
+            until_waiting(&pool, pid, 2).await; // B: waiting on main's ref behind A
+            (a, b)
+        } else {
+            let b = spawn_accept(c[0].clone(), c2.clone(), "acc-c2", &g);
+            until_waiting(&pool, pid, 1).await; // B: ref FOR UPDATE, waiting on main's branch row
+            let a = spawn_create("agent/task", "k-task", None, &g);
+            until_waiting(&pool, pid, 2).await; // A: waiting on main's ref behind B
+            (a, b)
+        };
+        hold.commit().await.unwrap();
+        let (created, accepted) = (a.await.unwrap().unwrap(), b.await.unwrap());
+        accepted.unwrap();
+        let expected = if create_first { &c[0] } else { &c2 };
+        assert_eq!(
+            (&created.event.head, created.event.ref_version),
+            (expected, 1),
+            "create_first={create_first}"
+        );
+        assert_eq!(
+            store.ref_head(&g, "agent/task").await.unwrap().unwrap(),
+            (expected.clone(), 1)
+        );
+        assert_eq!(
+            store.ref_head(&g, "main").await.unwrap().unwrap(),
+            (c2.clone(), 2)
+        );
+        let info = store
+            .workflows()
+            .branch(&tenant(), &g, "agent/task")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(info.source_commit.as_ref(), Some(expected));
+    }
+
+    // Case 3: an explicit historical point C1 (main C1 -> C2) stays valid while B moves main
+    // C2 -> C3, in both orders.
+    for create_first in [true, false] {
+        let g = graph(&store, "tenant-a").await;
+        let c = main_history(&store, &g, 2).await;
+        let c3 = prepare_on(&store, &g, "main", Some(c[1].clone()), &format!("{g}-c3"))
+            .await
+            .unwrap();
+        let (hold, pid) = hold_branch(&pool, &g, "main").await;
+        let (a, b) = if create_first {
+            let a = spawn_create("agent/hist", "k-hist", Some(c[0].clone()), &g);
+            until_waiting(&pool, pid, 1).await;
+            let b = spawn_accept(c[1].clone(), c3.clone(), "acc-c3", &g);
+            until_waiting(&pool, pid, 2).await;
+            (a, b)
+        } else {
+            let b = spawn_accept(c[1].clone(), c3.clone(), "acc-c3", &g);
+            until_waiting(&pool, pid, 1).await;
+            let a = spawn_create("agent/hist", "k-hist", Some(c[0].clone()), &g);
+            until_waiting(&pool, pid, 2).await;
+            (a, b)
+        };
+        hold.commit().await.unwrap();
+        let (created, accepted) = (a.await.unwrap().unwrap(), b.await.unwrap());
+        accepted.unwrap();
+        assert_eq!(
+            (&created.event.head, created.event.ref_version),
+            (&c[0], 1),
+            "create_first={create_first}"
+        );
+        assert_eq!(
+            store.ref_head(&g, "main").await.unwrap().unwrap(),
+            (c3.clone(), 3)
+        );
+    }
+
+    // Case 2b: a create without `from_commit` paused between its lock-free phase and its
+    // transaction while main moves C1 -> C2 commits fully: it branches from C2, never from a
+    // head read before its transaction.
+    let g = graph(&store, "tenant-a").await;
+    let c = main_history(&store, &g, 1).await;
+    let (hold, pid) = hold_create_scope(&pool, &g, "k-paused").await;
+    let a = spawn_create("agent/paused", "k-paused", None, &g);
+    until_waiting(&pool, pid, 1).await;
+    let c2 = accept_on(&store, &g, "main", Some(c[0].clone()), &format!("{g}-p2"))
+        .await
+        .unwrap();
+    hold.commit().await.unwrap();
+    let created = a.await.unwrap().unwrap();
+    assert_eq!((&created.event.head, created.event.ref_version), (&c2, 1));
+
+    // Case 4: C2 exists (prepared) but is not reachable from main = C1 when A's lock-free
+    // check runs; A pauses; main then moves C1 -> C2 -> C3, making C2 reachable. A is refused
+    // BRANCH_POINT_UNREACHABLE (safe, retryable false negative: nothing unchecked is
+    // accepted); the retry branches at C2.
+    let g = graph(&store, "tenant-a").await;
+    let c = main_history(&store, &g, 1).await;
+    let c2 = prepare_on(&store, &g, "main", Some(c[0].clone()), &format!("{g}-f2"))
+        .await
+        .unwrap();
+    let (hold, pid) = hold_create_scope(&pool, &g, "k-fn").await;
+    let a = spawn_create("agent/late", "k-fn", Some(c2.clone()), &g);
+    until_waiting(&pool, pid, 1).await;
+    accept_candidate(&store, &g, "main", Some(c[0].clone()), &c2, "acc-f2")
+        .await
+        .unwrap();
+    let c3 = accept_on(&store, &g, "main", Some(c2.clone()), &format!("{g}-f3"))
+        .await
+        .unwrap();
+    hold.commit().await.unwrap();
+    assert!(matches!(
+        a.await.unwrap(),
+        Err(LedgerError::BranchPointUnreachable)
+    ));
+    assert!(store.ref_head(&g, "agent/late").await.unwrap().is_none());
+    let retried = store
+        .workflows()
+        .create_branch(
+            &create(&g, "k-fn-retry", "agent/late", "main", Some(&c2)),
+            limits(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retried.event.head, c2);
+    assert_eq!(store.ref_head(&g, "main").await.unwrap().unwrap(), (c3, 3));
+
+    let report = ledger_store::verify::run(&pool).await.unwrap();
+    assert!(
+        report.is_clean(),
+        "{:?}",
+        report
+            .checks
+            .iter()
+            .filter(|c| c.violations > 0)
+            .map(|c| (c.name, &c.sample))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// A store on a fresh database of its own (for scenarios that deliberately leave states the
+/// shared database's global `verify` must never see).
+async fn isolated_store(prefix: &str) -> PostgresLedgerStore {
+    let base = database_url();
+    let (head, query) = base
+        .split_once('?')
+        .map_or((base.as_str(), None), |(h, q)| (h, Some(q)));
+    let name = unique(prefix).replace('-', "_").to_lowercase();
+    let admin = sqlx::PgPool::connect(&base).await.unwrap();
+    sqlx::query(&format!("CREATE DATABASE {name}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let mut url = format!("{}/{name}", &head[..head.rfind('/').unwrap()]);
+    if let Some(q) = query {
+        url.push('?');
+        url.push_str(q);
+    }
+    PostgresLedgerStore::connect_and_migrate(&url, V1Binding::Reject)
+        .await
+        .unwrap()
+}
+
+/// A branch point checked before the creating transaction carries over only across audited
+/// fast-forwards of the source: a raw (import) move while the graph was briefly not active
+/// voids the check (retryable refusal), an audited advance keeps it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn a_checked_branch_point_survives_only_audited_source_movement() {
+    // Audited advance (shared database): from_commit = the pre-read head C2; main then moves
+    // C2 -> C3 by acceptance; the branch is created at C2.
+    let store = Arc::new(store().await);
+    let pool = store.pool().clone();
+    let g = graph(&store, "tenant-a").await;
+    let c = main_history(&store, &g, 2).await;
+    let (hold, pid) = hold_create_scope(&pool, &g, "k-ff").await;
+    let (s, g2, c1) = (store.clone(), g.clone(), c[1].clone());
+    let a = tokio::spawn(async move {
+        s.workflows()
+            .create_branch(
+                &create(&g2, "k-ff", "agent/ff", "main", Some(&c1)),
+                limits(),
+            )
+            .await
+    });
+    until_waiting(&pool, pid, 1).await;
+    accept_on(&store, &g, "main", Some(c[1].clone()), &format!("{g}-ff3"))
+        .await
+        .unwrap();
+    hold.commit().await.unwrap();
+    assert_eq!(a.await.unwrap().unwrap().event.head, c[1]);
+
+    // Raw rewind (own database): main C1 -> C2; the create checks C2 (= head) and pauses; the
+    // owner flips the graph to importing, moves main raw to D (a child of C1, not of C2) and
+    // re-activates it. C2 is no longer reachable: the create is refused, not trusted.
+    let store = Arc::new(isolated_store("br_rewind").await);
+    let pool = store.pool().clone();
+    let g = graph(&store, "tenant-a").await;
+    let c = main_history(&store, &g, 2).await;
+    store
+        .workflows()
+        .create_branch(&create(&g, "c-side", "side", "main", Some(&c[0])), limits())
+        .await
+        .unwrap();
+    let d = prepare_on(&store, &g, "side", Some(c[0].clone()), &format!("{g}-d"))
+        .await
+        .unwrap();
+    let (hold, pid) = hold_create_scope(&pool, &g, "k-rw").await;
+    let (s, g2, c1) = (store.clone(), g.clone(), c[1].clone());
+    let a = tokio::spawn(async move {
+        s.workflows()
+            .create_branch(
+                &create(&g2, "k-rw", "agent/rw", "main", Some(&c1)),
+                limits(),
+            )
+            .await
+    });
+    until_waiting(&pool, pid, 1).await;
+    for sql in [
+        "UPDATE graphs SET status = 'importing' WHERE graph_id = $1",
+        "UPDATE refs SET head = $2, version = version + 1 WHERE graph_id = $1 AND branch = 'main'",
+        "UPDATE graphs SET status = 'active' WHERE graph_id = $1",
+    ] {
+        sqlx::query(sql)
+            .bind(g.as_str())
+            .bind(d.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    hold.commit().await.unwrap();
+    assert!(matches!(
+        a.await.unwrap(),
+        Err(LedgerError::BranchPointUnreachable)
+    ));
+    assert!(store.ref_head(&g, "agent/rw").await.unwrap().is_none());
+}
+
+/// Create racing the deletion of its source branch, forced in both orders: a create that
+/// read the source first completes (the delete waits and tombstones afterwards); a delete
+/// that won first makes the create fail `BRANCH_DELETED`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn create_racing_the_deletion_of_its_source_has_one_valid_outcome() {
+    let store = Arc::new(store().await);
+    let pool = store.pool().clone();
+    let g = graph(&store, "tenant-a").await;
+    let c = main_history(&store, &g, 1).await;
+    for create_first in [true, false] {
+        let src = format!("src-{create_first}");
+        store
+            .workflows()
+            .create_branch(
+                &create(&g, &format!("c-{src}"), &src, "main", None),
+                limits(),
+            )
+            .await
+            .unwrap();
+        let (hold, pid) = hold_branch(&pool, &g, &src).await;
+        let spawn_create = || {
+            let (s, g, src) = (store.clone(), g.clone(), src.clone());
+            tokio::spawn(async move {
+                s.workflows()
+                    .create_branch(
+                        &create(
+                            &g,
+                            &format!("c-from-{src}"),
+                            &format!("from-{src}"),
+                            &src,
+                            None,
+                        ),
+                        limits(),
+                    )
+                    .await
+            })
+        };
+        let spawn_delete = || {
+            let (s, g, src) = (store.clone(), g.clone(), src.clone());
+            tokio::spawn(async move {
+                s.workflows()
+                    .delete_branch(&lifecycle(&g, &format!("d-{src}"), &src))
+                    .await
+            })
+        };
+        let (a, d) = if create_first {
+            let a = spawn_create();
+            until_waiting(&pool, pid, 1).await;
+            let d = spawn_delete();
+            until_waiting(&pool, pid, 2).await;
+            (a, d)
+        } else {
+            let d = spawn_delete();
+            until_waiting(&pool, pid, 1).await;
+            let a = spawn_create();
+            until_waiting(&pool, pid, 2).await;
+            (a, d)
+        };
+        hold.commit().await.unwrap();
+        let (created, deleted) = (a.await.unwrap(), d.await.unwrap().unwrap());
+        assert_eq!(deleted.event.status_after, "deleted");
+        if create_first {
+            assert_eq!(created.unwrap().event.head, c[0]);
+        } else {
+            assert!(
+                matches!(created, Err(LedgerError::BranchDeleted(_))),
+                "{created:?}"
+            );
+            assert!(
+                store
+                    .ref_head(&g, &format!("from-{src}"))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+    let report = ledger_store::verify::run(&pool).await.unwrap();
+    assert!(report.is_clean());
+}

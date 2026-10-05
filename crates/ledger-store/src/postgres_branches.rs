@@ -391,22 +391,30 @@ impl WorkflowRepository {
         request: &CreateBranchRequest,
         commit: &CommitId,
         limits: TraversalLimits,
-    ) -> Result<(CommitId, bool), LedgerError> {
+    ) -> Result<(CommitId, i64, bool), LedgerError> {
         let mut conn = self.pool.acquire().await.map_err(db_error)?;
-        let head: Option<String> =
-            sqlx::query_scalar("SELECT head FROM refs WHERE graph_id = $1 AND branch = $2")
-                .bind(scope.graph.as_str())
-                .bind(&request.source)
-                .fetch_optional(&mut *conn)
-                .await
-                .map_err(db_error)?;
-        let Some(head) = head else {
-            // The transaction reports the missing source (after the tenant check).
+        // Only an active graph of the caller's tenant is walked (nothing is read for, or
+        // spent on, another tenant's graph); the transaction reports the precise error.
+        let row = sqlx::query(
+            "SELECT r.head, r.version FROM refs r JOIN graphs g ON g.graph_id = r.graph_id \
+             WHERE r.graph_id = $1 AND r.branch = $2 AND g.tenant_id = $3 AND g.status = 'active'",
+        )
+        .bind(scope.graph.as_str())
+        .bind(&request.source)
+        .bind(scope.principal.tenant_id.as_str())
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(db_error)?;
+        let Some(row) = row else {
             return Err(LedgerError::BranchNotFound(request.source.clone()));
         };
-        let head: CommitId = head.parse()?;
+        let head: CommitId = row
+            .try_get::<String, _>("head")
+            .map_err(db_error)?
+            .parse()?;
+        let version: i64 = row.try_get("version").map_err(db_error)?;
         if *commit == head {
-            return Ok((head, true));
+            return Ok((head, version, true));
         }
         let known: Option<i32> =
             sqlx::query_scalar("SELECT 1 FROM commit_index WHERE id = $1 AND graph_id = $2")
@@ -416,14 +424,14 @@ impl WorkflowRepository {
                 .await
                 .map_err(db_error)?;
         if known.is_none() {
-            return Ok((head, false));
+            return Ok((head, version, false));
         }
         let provider = GraphParents {
             conn: Mutex::new(&mut *conn),
             graph: scope.graph.clone(),
         };
         match ledger_dag::is_ancestor(&provider, commit, &head, limits).await {
-            Ok(reachable) => Ok((head, reachable)),
+            Ok(reachable) => Ok((head, version, reachable)),
             Err(DagError::VisitLimit { visited }) => Err(LedgerError::ResourceLimit(format!(
                 "branch point search exceeded {visited} commits"
             ))),
@@ -441,6 +449,40 @@ impl WorkflowRepository {
             }),
             Err(DagError::Provider(e)) => Err(e),
         }
+    }
+
+    /// Whether `branch` moved from `head_then` (version `from`) to version `to` only through
+    /// audited ref events: exactly one event per version in `from+1..=to`, chained, the first
+    /// leaving `head_then`. Raw (import) moves write no events, so they fail this.
+    async fn moved_by_audited_fast_forwards(
+        conn: &mut PgConnection,
+        graph: &GraphId,
+        branch: &str,
+        head_then: &CommitId,
+        from: i64,
+        to: i64,
+    ) -> Result<bool, LedgerError> {
+        if to < from {
+            return Ok(false);
+        }
+        let chained: bool = sqlx::query_scalar(
+            "SELECT count(*) = $4 - $3 \
+                AND bool_and(e.old_head = coalesce( \
+                      (SELECT p.new_head FROM ref_events p WHERE p.graph_id = e.graph_id \
+                         AND p.branch = e.branch AND p.new_version = e.new_version - 1 \
+                         AND e.new_version - 1 > $3), $5)) \
+             FROM ref_events e WHERE e.graph_id = $1 AND e.branch = $2 \
+               AND e.new_version > $3 AND e.new_version <= $4",
+        )
+        .bind(graph.as_str())
+        .bind(branch)
+        .bind(from)
+        .bind(to)
+        .bind(head_then.to_string())
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(db_error)?;
+        Ok(chained)
     }
 
     /// Create a named branch at the source head or at a commit reachable from it (ADR-0022).
@@ -475,8 +517,8 @@ impl WorkflowRepository {
         }
         Self::graph_must_be_active(&mut tx, scope).await?;
         // Lock order: ref, then branch (as accept does).
-        let source_head: Option<String> = sqlx::query_scalar(
-            "SELECT head FROM refs WHERE graph_id = $1 AND branch = $2 FOR SHARE",
+        let source_ref = sqlx::query(
+            "SELECT head, version FROM refs WHERE graph_id = $1 AND branch = $2 FOR SHARE",
         )
         .bind(scope.graph.as_str())
         .bind(&request.source)
@@ -484,22 +526,49 @@ impl WorkflowRepository {
         .await
         .map_err(db_error)?;
         let source = Self::lock_branch(&mut tx, &scope.graph, &request.source, false).await?;
-        let (Some(source_head), Some(source)) = (source_head, source) else {
+        let (Some(source_ref), Some(source)) = (source_ref, source) else {
             return Err(LedgerError::BranchNotFound(request.source.clone()));
         };
         if source.status != "active" {
             return Err(LedgerError::BranchDeleted(request.source.clone()));
         }
-        let source_head: CommitId = source_head.parse()?;
+        let source_head: CommitId = source_ref
+            .try_get::<String, _>("head")
+            .map_err(db_error)?
+            .parse()?;
+        let source_version: i64 = source_ref.try_get("version").map_err(db_error)?;
         let point = match &request.from_commit {
             None => source_head.clone(),
             Some(commit) if *commit == source_head => source_head.clone(),
             Some(commit) => match reachable {
-                // Decided against the source head of the pre-transaction read; a head that
-                // moved since only extends what is reachable (a newly reachable commit is
-                // refused and the client retries).
-                Some(Ok((_, true))) => commit.clone(),
+                // Decided against the source head of the pre-transaction read. It carries
+                // over to the locked head only if every movement since was an audited
+                // fast-forward (contiguous ref events from that head; migration 0009 checks
+                // each one), so reachability only grew. Anything else — a raw import move
+                // while the graph was not active — is refused for a retry, never trusted. A
+                // commit that became reachable only after the check is refused as well.
+                Some(Ok((head_then, version_then, true))) => {
+                    if version_then != source_version
+                        && !Self::moved_by_audited_fast_forwards(
+                            &mut tx,
+                            &scope.graph,
+                            &request.source,
+                            &head_then,
+                            version_then,
+                            source_version,
+                        )
+                        .await?
+                    {
+                        return Err(LedgerError::BranchPointUnreachable);
+                    }
+                    commit.clone()
+                }
                 Some(Ok(_)) => return Err(LedgerError::BranchPointUnreachable),
+                // The source exists now but did not (or its graph was not active) when the
+                // point was checked: nothing was checked against it; retryable.
+                Some(Err(LedgerError::BranchNotFound(_))) => {
+                    return Err(LedgerError::BranchPointUnreachable);
+                }
                 Some(Err(e)) => return Err(e),
                 None => return Err(LedgerError::BranchPointUnreachable),
             },
