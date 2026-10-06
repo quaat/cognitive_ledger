@@ -1,0 +1,6445 @@
+{
+  "schema": "sculpin-ledger-bench-result/v1",
+  "status": "pass",
+  "run": {
+    "profile": "ci",
+    "harness_version": "ledger-bench 0.1.0",
+    "started_unix_ms": 1791316338987,
+    "finished_unix_ms": 1791316365774,
+    "wall_ms": 26786,
+    "meta": {
+      "acceptance_mode": "unvalidated-development",
+      "build_rev": "a68865e81dad095fbf9e9ba092a8bef57b22d5c3",
+      "compose": "2.39.2-desktop.1",
+      "compose_project": "ledger-qual-benchmark",
+      "docker": "29.7.2",
+      "inputs_sha256(Dockerfile,compose.yaml,Cargo.lock)": "3b6cedd2860ee46031eb80abf37c89b93e4f580867104b5dd86063377e49fe5d",
+      "rustc": "rustc 1.89.0 (29483883e 2025-08-04)",
+      "server_image": "sha256:4af7cb1af2c028260351348c73a5c1c381c8ec69e21ca5e379afa2595d4f298c",
+      "server_toolchain": "FROM rust:1.89-bookworm@sha256:948f9b08a66e7fe01b03a98ef1c7568292e07ec2e4fe90d88c07bb14563c84ff AS build",
+      "tracked_changes": "1",
+      "untracked_files": "2"
+    }
+  },
+  "environment": {
+    "os": "Debian GNU/Linux 11 (bullseye)",
+    "kernel": "5.10.0-44-amd64",
+    "cpu_model": "Intel(R) Core(TM) i7-4930K CPU @ 3.40GHz",
+    "cpus": 12,
+    "mem_total_kib": 16319204,
+    "postgres_version": "17.2 (Debian 17.2-1.pgdg120+1)",
+    "server": "http://127.0.0.1:8080"
+  },
+  "datasets": [
+    {
+      "id": "synthetic-ledger-ci",
+      "dataset": {
+        "generator": "ledger-bench synthetic",
+        "generator_version": "synthetic-ledger-gen/3",
+        "seed": "0x5eed0001c1ed6e00",
+        "params": {
+          "churn": 35,
+          "conflicts": 10,
+          "contested": 10,
+          "convergent": 2,
+          "entities": 1000,
+          "fast": 6,
+          "feature": 15,
+          "growth": 35,
+          "main_mid": 20,
+          "main_post": 10,
+          "main_pre": 20,
+          "meta_entities": 100,
+          "predicates": 6,
+          "sample_every": 10,
+          "verify_all_history": true
+        },
+        "manifest": "benchmark/datasets/synthetic-ledger-ci.json",
+        "manifest_checksum": "sha256:c8ad2fc2c2ada5f2df436898799c58093333e11d285d6536cabbcc79c1faf7ff",
+        "generated_checksum": "sha256:c8ad2fc2c2ada5f2df436898799c58093333e11d285d6536cabbcc79c1faf7ff",
+        "checksum_ok": true,
+        "license": "Apache-2.0 (project-owned generated data)"
+      },
+      "counts": {
+        "commits": 205,
+        "integration_commits": 15,
+        "branches": 9,
+        "merge_previews": 26,
+        "merges_applied": 15,
+        "designed_conflicts": 10,
+        "genesis_quads": 6100,
+        "final_main_quads": 6271,
+        "max_depth": 64
+      },
+      "correctness": {
+        "assertions": 1115,
+        "failed": 0,
+        "checks": {
+          "branch head": 9,
+          "commit parents": 205,
+          "commit provenance": 205,
+          "diff(A, B) == expected": 6,
+          "first-parent history (branch log)": 9,
+          "historical reconstruction": 217,
+          "merge ahead/behind": 26,
+          "merge apply moves the target to the candidate": 15,
+          "merge base": 26,
+          "merge base candidates": 26,
+          "merge classification": 26,
+          "merge conflict count": 26,
+          "merge conflict keys": 26,
+          "merge delta summary": 44,
+          "merge preview token presence": 26,
+          "merged state digest": 18,
+          "state after commit": 190,
+          "state after merge (reconstruct(I) == merged)": 15
+        },
+        "failures": []
+      },
+      "performance": {
+        "phases_ms": {
+          "diff checks": 487,
+          "generate (oracle)": 1086,
+          "historical reconstruction checks": 6392,
+          "ingest and per-step checks": 18578,
+          "persisted parents and provenance": 42
+        },
+        "throughput": {
+          "ingest_steps_per_s (commits + branches + applied merges, with per-step checks)": 11.46517386155668
+        },
+        "operations": [
+          {
+            "category": "algorithm",
+            "op": "rdf_diff",
+            "group": "all",
+            "count": 6,
+            "p50_ms": 0.325,
+            "p95_ms": 0.388,
+            "p99_ms": 0.388,
+            "max_ms": 0.388,
+            "mean_ms": 0.33
+          },
+          {
+            "category": "api",
+            "op": "accept",
+            "group": "all",
+            "count": 190,
+            "p50_ms": 4.021,
+            "p95_ms": 6.588,
+            "p99_ms": 19.966,
+            "max_ms": 20.736,
+            "mean_ms": 4.601152631578947
+          },
+          {
+            "category": "api",
+            "op": "branch_create",
+            "group": "all",
+            "count": 8,
+            "p50_ms": 7.232,
+            "p95_ms": 9.735,
+            "p99_ms": 9.735,
+            "max_ms": 9.735,
+            "mean_ms": 7.321
+          },
+          {
+            "category": "api",
+            "op": "branch_log",
+            "group": "all",
+            "count": 9,
+            "p50_ms": 11.219,
+            "p95_ms": 13.313,
+            "p99_ms": 13.313,
+            "max_ms": 13.313,
+            "mean_ms": 10.054666666666666
+          },
+          {
+            "category": "api",
+            "op": "merge_apply",
+            "group": "all",
+            "count": 15,
+            "p50_ms": 4.511,
+            "p95_ms": 6.404,
+            "p99_ms": 6.404,
+            "max_ms": 6.404,
+            "mean_ms": 4.7012
+          },
+          {
+            "category": "api",
+            "op": "merge_preview",
+            "group": "all",
+            "count": 26,
+            "p50_ms": 140.622,
+            "p95_ms": 163.426,
+            "p99_ms": 167.241,
+            "max_ms": 167.241,
+            "mean_ms": 127.2285
+          },
+          {
+            "category": "api",
+            "op": "merge_propose",
+            "group": "all",
+            "count": 15,
+            "p50_ms": 158.06,
+            "p95_ms": 184.28,
+            "p99_ms": 184.28,
+            "max_ms": 184.28,
+            "mean_ms": 153.3564
+          },
+          {
+            "category": "api",
+            "op": "prepare",
+            "group": "all",
+            "count": 190,
+            "p50_ms": 27.904,
+            "p95_ms": 41.582,
+            "p99_ms": 48.185,
+            "max_ms": 49.232,
+            "mean_ms": 29.20671052631579
+          },
+          {
+            "category": "api",
+            "op": "ref_read",
+            "group": "all",
+            "count": 9,
+            "p50_ms": 0.781,
+            "p95_ms": 1.174,
+            "p99_ms": 1.174,
+            "max_ms": 1.174,
+            "mean_ms": 0.8153333333333334
+          },
+          {
+            "category": "api",
+            "op": "state_read_head",
+            "group": "all",
+            "count": 205,
+            "p50_ms": 26.424,
+            "p95_ms": 37.039,
+            "p99_ms": 42.378,
+            "max_ms": 44.638,
+            "mean_ms": 27.393873170731705
+          },
+          {
+            "category": "api",
+            "op": "state_read_historical",
+            "group": "all",
+            "count": 217,
+            "p50_ms": 26.022,
+            "p95_ms": 41.089,
+            "p99_ms": 50.103,
+            "max_ms": 52.546,
+            "mean_ms": 28.032552995391708
+          },
+          {
+            "category": "persisted",
+            "op": "commit_read",
+            "group": "all",
+            "count": 205,
+            "p50_ms": 0.186,
+            "p95_ms": 0.236,
+            "p99_ms": 0.269,
+            "max_ms": 1.074,
+            "mean_ms": 0.19894146341463417
+          }
+        ],
+        "by_depth": [
+          {
+            "category": "api",
+            "op": "merge_preview",
+            "group": "feature · depth 10-49",
+            "count": 1,
+            "p50_ms": 128.309,
+            "p95_ms": 128.309,
+            "p99_ms": 128.309,
+            "max_ms": 128.309,
+            "mean_ms": 128.309
+          },
+          {
+            "category": "api",
+            "op": "merge_preview",
+            "group": "feature · depth 50-99",
+            "count": 4,
+            "p50_ms": 150.547,
+            "p95_ms": 163.426,
+            "p99_ms": 163.426,
+            "max_ms": 163.426,
+            "mean_ms": 154.688
+          },
+          {
+            "category": "api",
+            "op": "merge_preview",
+            "group": "main · depth 10-49",
+            "count": 2,
+            "p50_ms": 139.26,
+            "p95_ms": 155.942,
+            "p99_ms": 155.942,
+            "max_ms": 155.942,
+            "mean_ms": 147.601
+          },
+          {
+            "category": "api",
+            "op": "merge_preview",
+            "group": "main · depth 50-99",
+            "count": 4,
+            "p50_ms": 131.062,
+            "p95_ms": 154.792,
+            "p99_ms": 154.792,
+            "max_ms": 154.792,
+            "mean_ms": 137.7735
+          },
+          {
+            "category": "api",
+            "op": "merge_preview",
+            "group": "merge · depth 10-49",
+            "count": 11,
+            "p50_ms": 140.087,
+            "p95_ms": 159.179,
+            "p99_ms": 159.179,
+            "max_ms": 159.179,
+            "mean_ms": 108.68618181818182
+          },
+          {
+            "category": "api",
+            "op": "merge_preview",
+            "group": "merge · depth 50-99",
+            "count": 4,
+            "p50_ms": 154.701,
+            "p95_ms": 167.241,
+            "p99_ms": 167.241,
+            "max_ms": 167.241,
+            "mean_ms": 129.759
+          },
+          {
+            "category": "api",
+            "op": "prepare",
+            "group": "bulk · depth 0-9",
+            "count": 2,
+            "p50_ms": 30.264,
+            "p95_ms": 41.582,
+            "p99_ms": 41.582,
+            "max_ms": 41.582,
+            "mean_ms": 35.923
+          },
+          {
+            "category": "api",
+            "op": "prepare",
+            "group": "churn · depth 0-9",
+            "count": 3,
+            "p50_ms": 21.062,
+            "p95_ms": 38.727,
+            "p99_ms": 38.727,
+            "max_ms": 38.727,
+            "mean_ms": 26.944666666666667
+          },
+          {
+            "category": "api",
+            "op": "prepare",
+            "group": "churn · depth 10-49",
+            "count": 32,
+            "p50_ms": 27.77,
+            "p95_ms": 35.733,
+            "p99_ms": 49.232,
+            "max_ms": 49.232,
+            "mean_ms": 28.5236875
+          },
+          {
+            "category": "api",
+            "op": "prepare",
+            "group": "feature · depth 10-49",
+            "count": 47,
+            "p50_ms": 28.479,
+            "p95_ms": 40.329,
+            "p99_ms": 45.955,
+            "max_ms": 45.955,
+            "mean_ms": 28.48221276595745
+          },
+          {
+            "category": "api",
+            "op": "prepare",
+            "group": "feature · depth 50-99",
+            "count": 17,
+            "p50_ms": 31.981,
+            "p95_ms": 43.964,
+            "p99_ms": 43.964,
+            "max_ms": 43.964,
+            "mean_ms": 33.74835294117647
+          },
+          {
+            "category": "api",
+            "op": "prepare",
+            "group": "growth · depth 0-9",
+            "count": 3,
+            "p50_ms": 21.491,
+            "p95_ms": 21.522,
+            "p99_ms": 21.522,
+            "max_ms": 21.522,
+            "mean_ms": 21.33833333333333
+          },
+          {
+            "category": "api",
+            "op": "prepare",
+            "group": "growth · depth 10-49",
+            "count": 32,
+            "p50_ms": 27.23,
+            "p95_ms": 43.658,
+            "p99_ms": 48.185,
+            "max_ms": 48.185,
+            "mean_ms": 29.00696875
+          },
+          {
+            "category": "api",
+            "op": "prepare",
+            "group": "main · depth 0-9",
+            "count": 8,
+            "p50_ms": 24.917,
+            "p95_ms": 33.211,
+            "p99_ms": 33.211,
+            "max_ms": 33.211,
+            "mean_ms": 25.780375
+          },
+          {
+            "category": "api",
+            "op": "prepare",
+            "group": "main · depth 10-49",
+            "count": 34,
+            "p50_ms": 26.437,
+            "p95_ms": 38.527,
+            "p99_ms": 40.626,
+            "max_ms": 40.626,
+            "mean_ms": 27.33191176470588
+          },
+          {
+            "category": "api",
+            "op": "prepare",
+            "group": "main · depth 50-99",
+            "count": 12,
+            "p50_ms": 35.548,
+            "p95_ms": 43.597,
+            "p99_ms": 43.597,
+            "max_ms": 43.597,
+            "mean_ms": 36.97375
+          },
+          {
+            "category": "api",
+            "op": "state_read_head",
+            "group": "bulk · depth 0-9",
+            "count": 2,
+            "p50_ms": 17.182,
+            "p95_ms": 19.664,
+            "p99_ms": 19.664,
+            "max_ms": 19.664,
+            "mean_ms": 18.423
+          },
+          {
+            "category": "api",
+            "op": "state_read_head",
+            "group": "churn · depth 0-9",
+            "count": 3,
+            "p50_ms": 21.504,
+            "p95_ms": 25.098,
+            "p99_ms": 25.098,
+            "max_ms": 25.098,
+            "mean_ms": 22.202333333333332
+          },
+          {
+            "category": "api",
+            "op": "state_read_head",
+            "group": "churn · depth 10-49",
+            "count": 32,
+            "p50_ms": 25.481,
+            "p95_ms": 36.525,
+            "p99_ms": 36.721,
+            "max_ms": 36.721,
+            "mean_ms": 27.14296875
+          },
+          {
+            "category": "api",
+            "op": "state_read_head",
+            "group": "feature · depth 10-49",
+            "count": 47,
+            "p50_ms": 26.035,
+            "p95_ms": 38.621,
+            "p99_ms": 39.151,
+            "max_ms": 39.151,
+            "mean_ms": 26.749042553191487
+          },
+          {
+            "category": "api",
+            "op": "state_read_head",
+            "group": "feature · depth 50-99",
+            "count": 17,
+            "p50_ms": 31.201,
+            "p95_ms": 37.039,
+            "p99_ms": 37.039,
+            "max_ms": 37.039,
+            "mean_ms": 31.688176470588235
+          },
+          {
+            "category": "api",
+            "op": "state_read_head",
+            "group": "growth · depth 0-9",
+            "count": 3,
+            "p50_ms": 20.331,
+            "p95_ms": 22.157,
+            "p99_ms": 22.157,
+            "max_ms": 22.157,
+            "mean_ms": 20.902
+          },
+          {
+            "category": "api",
+            "op": "state_read_head",
+            "group": "growth · depth 10-49",
+            "count": 32,
+            "p50_ms": 26.24,
+            "p95_ms": 41.079,
+            "p99_ms": 44.638,
+            "max_ms": 44.638,
+            "mean_ms": 27.594625
+          },
+          {
+            "category": "api",
+            "op": "state_read_head",
+            "group": "main · depth 0-9",
+            "count": 8,
+            "p50_ms": 22.137,
+            "p95_ms": 25.22,
+            "p99_ms": 25.22,
+            "max_ms": 25.22,
+            "mean_ms": 22.2945
+          },
+          {
+            "category": "api",
+            "op": "state_read_head",
+            "group": "main · depth 10-49",
+            "count": 34,
+            "p50_ms": 25.277,
+            "p95_ms": 29.948,
+            "p99_ms": 43.539,
+            "max_ms": 43.539,
+            "mean_ms": 25.75435294117647
+          },
+          {
+            "category": "api",
+            "op": "state_read_head",
+            "group": "main · depth 50-99",
+            "count": 12,
+            "p50_ms": 32.314,
+            "p95_ms": 38.016,
+            "p99_ms": 38.016,
+            "max_ms": 38.016,
+            "mean_ms": 32.853833333333334
+          },
+          {
+            "category": "api",
+            "op": "state_read_head",
+            "group": "merge · depth 10-49",
+            "count": 7,
+            "p50_ms": 27.667,
+            "p95_ms": 28.758,
+            "p99_ms": 28.758,
+            "max_ms": 28.758,
+            "mean_ms": 27.69085714285714
+          },
+          {
+            "category": "api",
+            "op": "state_read_head",
+            "group": "merge · depth 50-99",
+            "count": 8,
+            "p50_ms": 30.181,
+            "p95_ms": 42.378,
+            "p99_ms": 42.378,
+            "max_ms": 42.378,
+            "mean_ms": 32.499
+          },
+          {
+            "category": "api",
+            "op": "state_read_historical",
+            "group": "bulk · depth 0-9",
+            "count": 3,
+            "p50_ms": 19.485,
+            "p95_ms": 21.565,
+            "p99_ms": 21.565,
+            "max_ms": 21.565,
+            "mean_ms": 19.144333333333332
+          },
+          {
+            "category": "api",
+            "op": "state_read_historical",
+            "group": "churn · depth 0-9",
+            "count": 3,
+            "p50_ms": 21.341,
+            "p95_ms": 25.349,
+            "p99_ms": 25.349,
+            "max_ms": 25.349,
+            "mean_ms": 22.636333333333333
+          },
+          {
+            "category": "api",
+            "op": "state_read_historical",
+            "group": "churn · depth 10-49",
+            "count": 33,
+            "p50_ms": 25.379,
+            "p95_ms": 29.728,
+            "p99_ms": 37.022,
+            "max_ms": 37.022,
+            "mean_ms": 25.668
+          },
+          {
+            "category": "api",
+            "op": "state_read_historical",
+            "group": "feature · depth 10-49",
+            "count": 47,
+            "p50_ms": 25.807,
+            "p95_ms": 37.515,
+            "p99_ms": 51.683,
+            "max_ms": 51.683,
+            "mean_ms": 27.67817021276596
+          },
+          {
+            "category": "api",
+            "op": "state_read_historical",
+            "group": "feature · depth 50-99",
+            "count": 19,
+            "p50_ms": 32.487,
+            "p95_ms": 50.103,
+            "p99_ms": 50.103,
+            "max_ms": 50.103,
+            "mean_ms": 36.005105263157894
+          },
+          {
+            "category": "api",
+            "op": "state_read_historical",
+            "group": "growth · depth 0-9",
+            "count": 3,
+            "p50_ms": 20.764,
+            "p95_ms": 21.493,
+            "p99_ms": 21.493,
+            "max_ms": 21.493,
+            "mean_ms": 20.886
+          },
+          {
+            "category": "api",
+            "op": "state_read_historical",
+            "group": "growth · depth 10-49",
+            "count": 33,
+            "p50_ms": 24.868,
+            "p95_ms": 40.571,
+            "p99_ms": 40.665,
+            "max_ms": 40.665,
+            "mean_ms": 25.89284848484849
+          },
+          {
+            "category": "api",
+            "op": "state_read_historical",
+            "group": "main · depth 0-9",
+            "count": 10,
+            "p50_ms": 20.874,
+            "p95_ms": 27.893,
+            "p99_ms": 27.893,
+            "max_ms": 27.893,
+            "mean_ms": 22.1557
+          },
+          {
+            "category": "api",
+            "op": "state_read_historical",
+            "group": "main · depth 10-49",
+            "count": 35,
+            "p50_ms": 26.153,
+            "p95_ms": 36.621,
+            "p99_ms": 37.357,
+            "max_ms": 37.357,
+            "mean_ms": 27.338428571428572
+          },
+          {
+            "category": "api",
+            "op": "state_read_historical",
+            "group": "main · depth 50-99",
+            "count": 13,
+            "p50_ms": 34.642,
+            "p95_ms": 42.056,
+            "p99_ms": 42.056,
+            "max_ms": 42.056,
+            "mean_ms": 35.90746153846154
+          },
+          {
+            "category": "api",
+            "op": "state_read_historical",
+            "group": "merge · depth 10-49",
+            "count": 10,
+            "p50_ms": 29.672,
+            "p95_ms": 31.873,
+            "p99_ms": 31.873,
+            "max_ms": 31.873,
+            "mean_ms": 29.3429
+          },
+          {
+            "category": "api",
+            "op": "state_read_historical",
+            "group": "merge · depth 50-99",
+            "count": 8,
+            "p50_ms": 30.806,
+            "p95_ms": 52.546,
+            "p99_ms": 52.546,
+            "max_ms": 52.546,
+            "mean_ms": 33.744625
+          }
+        ],
+        "series": [
+          {
+            "op": "prepare",
+            "kind": "bulk",
+            "depth": 0,
+            "quads": 5000,
+            "fold_ops": 5000,
+            "bytes": 356,
+            "ms": 41.582
+          },
+          {
+            "op": "state_read_head",
+            "kind": "bulk",
+            "depth": 0,
+            "quads": 5000,
+            "fold_ops": 5000,
+            "bytes": 238327,
+            "ms": 17.182
+          },
+          {
+            "op": "prepare",
+            "kind": "bulk",
+            "depth": 1,
+            "quads": 6100,
+            "fold_ops": 6100,
+            "bytes": 356,
+            "ms": 30.264
+          },
+          {
+            "op": "state_read_head",
+            "kind": "bulk",
+            "depth": 1,
+            "quads": 6100,
+            "fold_ops": 6100,
+            "bytes": 292617,
+            "ms": 19.664
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 2,
+            "quads": 6098,
+            "fold_ops": 6104,
+            "bytes": 356,
+            "ms": 24.19
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 2,
+            "quads": 6098,
+            "fold_ops": 6104,
+            "bytes": 292524,
+            "ms": 25.22
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 3,
+            "quads": 6097,
+            "fold_ops": 6109,
+            "bytes": 356,
+            "ms": 25.468
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 3,
+            "quads": 6097,
+            "fold_ops": 6109,
+            "bytes": 292478,
+            "ms": 22.322
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 4,
+            "quads": 6095,
+            "fold_ops": 6113,
+            "bytes": 356,
+            "ms": 25.825
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 4,
+            "quads": 6095,
+            "fold_ops": 6113,
+            "bytes": 292387,
+            "ms": 21.362
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 5,
+            "quads": 6095,
+            "fold_ops": 6115,
+            "bytes": 356,
+            "ms": 33.211
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 5,
+            "quads": 6095,
+            "fold_ops": 6115,
+            "bytes": 292387,
+            "ms": 20.599
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 6,
+            "quads": 6094,
+            "fold_ops": 6116,
+            "bytes": 356,
+            "ms": 22.014
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 6,
+            "quads": 6094,
+            "fold_ops": 6116,
+            "bytes": 292341,
+            "ms": 22.283
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 7,
+            "quads": 6093,
+            "fold_ops": 6119,
+            "bytes": 356,
+            "ms": 24.917
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 7,
+            "quads": 6093,
+            "fold_ops": 6119,
+            "bytes": 292296,
+            "ms": 20.396
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 8,
+            "quads": 6093,
+            "fold_ops": 6121,
+            "bytes": 356,
+            "ms": 26.171
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 8,
+            "quads": 6093,
+            "fold_ops": 6121,
+            "bytes": 292297,
+            "ms": 24.037
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 9,
+            "quads": 6095,
+            "fold_ops": 6129,
+            "bytes": 357,
+            "ms": 24.447
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 9,
+            "quads": 6095,
+            "fold_ops": 6129,
+            "bytes": 292394,
+            "ms": 22.137
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 10,
+            "quads": 6096,
+            "fold_ops": 6134,
+            "bytes": 357,
+            "ms": 22.394
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 10,
+            "quads": 6096,
+            "fold_ops": 6134,
+            "bytes": 292443,
+            "ms": 23.265
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 11,
+            "quads": 6094,
+            "fold_ops": 6140,
+            "bytes": 357,
+            "ms": 27.542
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 11,
+            "quads": 6094,
+            "fold_ops": 6140,
+            "bytes": 292352,
+            "ms": 23.812
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 12,
+            "quads": 6092,
+            "fold_ops": 6144,
+            "bytes": 357,
+            "ms": 23.026
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 12,
+            "quads": 6092,
+            "fold_ops": 6144,
+            "bytes": 292262,
+            "ms": 22.194
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 13,
+            "quads": 6092,
+            "fold_ops": 6146,
+            "bytes": 357,
+            "ms": 22.093
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 13,
+            "quads": 6092,
+            "fold_ops": 6146,
+            "bytes": 292262,
+            "ms": 24.413
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 14,
+            "quads": 6094,
+            "fold_ops": 6154,
+            "bytes": 357,
+            "ms": 25.253
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 14,
+            "quads": 6094,
+            "fold_ops": 6154,
+            "bytes": 292359,
+            "ms": 22.077
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 15,
+            "quads": 6092,
+            "fold_ops": 6162,
+            "bytes": 357,
+            "ms": 28.945
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 15,
+            "quads": 6092,
+            "fold_ops": 6162,
+            "bytes": 292268,
+            "ms": 25.565
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 16,
+            "quads": 6092,
+            "fold_ops": 6166,
+            "bytes": 357,
+            "ms": 38.527
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 16,
+            "quads": 6092,
+            "fold_ops": 6166,
+            "bytes": 292269,
+            "ms": 22.0
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 17,
+            "quads": 6092,
+            "fold_ops": 6172,
+            "bytes": 357,
+            "ms": 25.017
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 17,
+            "quads": 6092,
+            "fold_ops": 6172,
+            "bytes": 292270,
+            "ms": 22.339
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 18,
+            "quads": 6092,
+            "fold_ops": 6176,
+            "bytes": 357,
+            "ms": 22.885
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 18,
+            "quads": 6092,
+            "fold_ops": 6176,
+            "bytes": 292273,
+            "ms": 21.668
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 19,
+            "quads": 6093,
+            "fold_ops": 6181,
+            "bytes": 357,
+            "ms": 23.22
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 19,
+            "quads": 6093,
+            "fold_ops": 6181,
+            "bytes": 292322,
+            "ms": 21.945
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 20,
+            "quads": 6091,
+            "fold_ops": 6187,
+            "bytes": 357,
+            "ms": 23.608
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 20,
+            "quads": 6091,
+            "fold_ops": 6187,
+            "bytes": 292233,
+            "ms": 24.154
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 21,
+            "quads": 6089,
+            "fold_ops": 6189,
+            "bytes": 357,
+            "ms": 23.315
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 21,
+            "quads": 6089,
+            "fold_ops": 6189,
+            "bytes": 292139,
+            "ms": 26.665
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 12,
+            "quads": 6095,
+            "fold_ops": 6143,
+            "bytes": 357,
+            "ms": 42.321
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 12,
+            "quads": 6095,
+            "fold_ops": 6143,
+            "bytes": 292400,
+            "ms": 20.812
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 12,
+            "quads": 6095,
+            "fold_ops": 6145,
+            "bytes": 357,
+            "ms": 23.061
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 12,
+            "quads": 6095,
+            "fold_ops": 6145,
+            "bytes": 292400,
+            "ms": 20.968
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 7,
+            "quads": 6099,
+            "fold_ops": 6121,
+            "bytes": 357,
+            "ms": 21.002
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 7,
+            "quads": 6099,
+            "fold_ops": 6121,
+            "bytes": 292594,
+            "ms": 20.331
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 7,
+            "quads": 6094,
+            "fold_ops": 6118,
+            "bytes": 357,
+            "ms": 21.045
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 7,
+            "quads": 6094,
+            "fold_ops": 6118,
+            "bytes": 292341,
+            "ms": 21.504
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 13,
+            "quads": 6097,
+            "fold_ops": 6147,
+            "bytes": 357,
+            "ms": 22.49
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 13,
+            "quads": 6097,
+            "fold_ops": 6147,
+            "bytes": 292496,
+            "ms": 22.595
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 13,
+            "quads": 6094,
+            "fold_ops": 6148,
+            "bytes": 357,
+            "ms": 22.634
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 13,
+            "quads": 6094,
+            "fold_ops": 6148,
+            "bytes": 292352,
+            "ms": 20.996
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 8,
+            "quads": 6103,
+            "fold_ops": 6125,
+            "bytes": 357,
+            "ms": 21.522
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 8,
+            "quads": 6103,
+            "fold_ops": 6125,
+            "bytes": 292798,
+            "ms": 20.218
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 8,
+            "quads": 6094,
+            "fold_ops": 6124,
+            "bytes": 357,
+            "ms": 21.062
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 8,
+            "quads": 6094,
+            "fold_ops": 6124,
+            "bytes": 292341,
+            "ms": 20.005
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 14,
+            "quads": 6095,
+            "fold_ops": 6149,
+            "bytes": 357,
+            "ms": 22.282
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 14,
+            "quads": 6095,
+            "fold_ops": 6149,
+            "bytes": 292400,
+            "ms": 22.475
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 14,
+            "quads": 6095,
+            "fold_ops": 6149,
+            "bytes": 357,
+            "ms": 22.067
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 14,
+            "quads": 6095,
+            "fold_ops": 6149,
+            "bytes": 292400,
+            "ms": 21.985
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 9,
+            "quads": 6109,
+            "fold_ops": 6131,
+            "bytes": 357,
+            "ms": 21.491
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 9,
+            "quads": 6109,
+            "fold_ops": 6131,
+            "bytes": 293100,
+            "ms": 22.157
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 9,
+            "quads": 6094,
+            "fold_ops": 6128,
+            "bytes": 357,
+            "ms": 38.727
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 9,
+            "quads": 6094,
+            "fold_ops": 6128,
+            "bytes": 292341,
+            "ms": 25.098
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 15,
+            "quads": 6095,
+            "fold_ops": 6153,
+            "bytes": 357,
+            "ms": 24.984
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 15,
+            "quads": 6095,
+            "fold_ops": 6153,
+            "bytes": 292400,
+            "ms": 21.407
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 15,
+            "quads": 6092,
+            "fold_ops": 6152,
+            "bytes": 357,
+            "ms": 22.661
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 15,
+            "quads": 6092,
+            "fold_ops": 6152,
+            "bytes": 292256,
+            "ms": 21.515
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 10,
+            "quads": 6115,
+            "fold_ops": 6137,
+            "bytes": 357,
+            "ms": 22.39
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 10,
+            "quads": 6115,
+            "fold_ops": 6137,
+            "bytes": 293402,
+            "ms": 20.979
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 10,
+            "quads": 6094,
+            "fold_ops": 6130,
+            "bytes": 357,
+            "ms": 23.41
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 10,
+            "quads": 6094,
+            "fold_ops": 6130,
+            "bytes": 292341,
+            "ms": 27.058
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 16,
+            "quads": 6093,
+            "fold_ops": 6155,
+            "bytes": 357,
+            "ms": 25.247
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 16,
+            "quads": 6093,
+            "fold_ops": 6155,
+            "bytes": 292304,
+            "ms": 24.15
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 16,
+            "quads": 6090,
+            "fold_ops": 6154,
+            "bytes": 357,
+            "ms": 24.738
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 16,
+            "quads": 6090,
+            "fold_ops": 6154,
+            "bytes": 292160,
+            "ms": 23.155
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 11,
+            "quads": 6120,
+            "fold_ops": 6142,
+            "bytes": 357,
+            "ms": 22.098
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 11,
+            "quads": 6120,
+            "fold_ops": 6142,
+            "bytes": 293655,
+            "ms": 22.539
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 11,
+            "quads": 6094,
+            "fold_ops": 6136,
+            "bytes": 357,
+            "ms": 23.144
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 11,
+            "quads": 6094,
+            "fold_ops": 6136,
+            "bytes": 292341,
+            "ms": 22.092
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 17,
+            "quads": 6093,
+            "fold_ops": 6157,
+            "bytes": 357,
+            "ms": 28.579
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 17,
+            "quads": 6093,
+            "fold_ops": 6157,
+            "bytes": 292304,
+            "ms": 23.579
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 17,
+            "quads": 6090,
+            "fold_ops": 6158,
+            "bytes": 357,
+            "ms": 23.442
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 17,
+            "quads": 6090,
+            "fold_ops": 6158,
+            "bytes": 292160,
+            "ms": 22.904
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 12,
+            "quads": 6125,
+            "fold_ops": 6147,
+            "bytes": 357,
+            "ms": 43.658
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 12,
+            "quads": 6125,
+            "fold_ops": 6147,
+            "bytes": 293908,
+            "ms": 37.179
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 12,
+            "quads": 6094,
+            "fold_ops": 6140,
+            "bytes": 357,
+            "ms": 31.916
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 12,
+            "quads": 6094,
+            "fold_ops": 6140,
+            "bytes": 292341,
+            "ms": 21.495
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 18,
+            "quads": 6093,
+            "fold_ops": 6161,
+            "bytes": 357,
+            "ms": 29.761
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 18,
+            "quads": 6093,
+            "fold_ops": 6161,
+            "bytes": 292304,
+            "ms": 28.918
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 18,
+            "quads": 6091,
+            "fold_ops": 6159,
+            "bytes": 357,
+            "ms": 33.275
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 18,
+            "quads": 6091,
+            "fold_ops": 6159,
+            "bytes": 292208,
+            "ms": 23.728
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 13,
+            "quads": 6130,
+            "fold_ops": 6152,
+            "bytes": 357,
+            "ms": 23.552
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 13,
+            "quads": 6130,
+            "fold_ops": 6152,
+            "bytes": 294161,
+            "ms": 21.664
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 13,
+            "quads": 6094,
+            "fold_ops": 6144,
+            "bytes": 357,
+            "ms": 22.318
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 13,
+            "quads": 6094,
+            "fold_ops": 6144,
+            "bytes": 292341,
+            "ms": 25.034
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 19,
+            "quads": 6096,
+            "fold_ops": 6166,
+            "bytes": 357,
+            "ms": 23.933
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 19,
+            "quads": 6096,
+            "fold_ops": 6166,
+            "bytes": 292448,
+            "ms": 23.24
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 19,
+            "quads": 6089,
+            "fold_ops": 6163,
+            "bytes": 357,
+            "ms": 30.956
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 19,
+            "quads": 6089,
+            "fold_ops": 6163,
+            "bytes": 292112,
+            "ms": 23.869
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 14,
+            "quads": 6136,
+            "fold_ops": 6158,
+            "bytes": 357,
+            "ms": 27.727
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 14,
+            "quads": 6136,
+            "fold_ops": 6158,
+            "bytes": 294463,
+            "ms": 25.166
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 14,
+            "quads": 6094,
+            "fold_ops": 6148,
+            "bytes": 357,
+            "ms": 29.473
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 14,
+            "quads": 6094,
+            "fold_ops": 6148,
+            "bytes": 292341,
+            "ms": 21.846
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 20,
+            "quads": 6096,
+            "fold_ops": 6168,
+            "bytes": 357,
+            "ms": 26.78
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 20,
+            "quads": 6096,
+            "fold_ops": 6168,
+            "bytes": 292448,
+            "ms": 22.594
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 20,
+            "quads": 6088,
+            "fold_ops": 6166,
+            "bytes": 357,
+            "ms": 23.956
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 20,
+            "quads": 6088,
+            "fold_ops": 6166,
+            "bytes": 292064,
+            "ms": 22.635
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 15,
+            "quads": 6139,
+            "fold_ops": 6161,
+            "bytes": 357,
+            "ms": 26.16
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 15,
+            "quads": 6139,
+            "fold_ops": 6161,
+            "bytes": 294618,
+            "ms": 27.585
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 15,
+            "quads": 6094,
+            "fold_ops": 6150,
+            "bytes": 357,
+            "ms": 27.77
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 15,
+            "quads": 6094,
+            "fold_ops": 6150,
+            "bytes": 292341,
+            "ms": 22.244
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 21,
+            "quads": 6095,
+            "fold_ops": 6173,
+            "bytes": 357,
+            "ms": 25.498
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 21,
+            "quads": 6095,
+            "fold_ops": 6173,
+            "bytes": 292400,
+            "ms": 22.485
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 21,
+            "quads": 6088,
+            "fold_ops": 6170,
+            "bytes": 357,
+            "ms": 23.919
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 21,
+            "quads": 6088,
+            "fold_ops": 6170,
+            "bytes": 292064,
+            "ms": 25.53
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 16,
+            "quads": 6142,
+            "fold_ops": 6164,
+            "bytes": 357,
+            "ms": 27.837
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 16,
+            "quads": 6142,
+            "fold_ops": 6164,
+            "bytes": 294771,
+            "ms": 34.857
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 16,
+            "quads": 6094,
+            "fold_ops": 6156,
+            "bytes": 357,
+            "ms": 29.405
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 16,
+            "quads": 6094,
+            "fold_ops": 6156,
+            "bytes": 292341,
+            "ms": 25.584
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 22,
+            "quads": 6094,
+            "fold_ops": 6176,
+            "bytes": 357,
+            "ms": 29.224
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 22,
+            "quads": 6094,
+            "fold_ops": 6176,
+            "bytes": 292352,
+            "ms": 26.556
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 22,
+            "quads": 6088,
+            "fold_ops": 6172,
+            "bytes": 357,
+            "ms": 23.766
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 22,
+            "quads": 6088,
+            "fold_ops": 6172,
+            "bytes": 292064,
+            "ms": 22.83
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 17,
+            "quads": 6148,
+            "fold_ops": 6170,
+            "bytes": 357,
+            "ms": 24.342
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 17,
+            "quads": 6148,
+            "fold_ops": 6170,
+            "bytes": 295072,
+            "ms": 22.519
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 17,
+            "quads": 6094,
+            "fold_ops": 6162,
+            "bytes": 357,
+            "ms": 24.636
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 17,
+            "quads": 6094,
+            "fold_ops": 6162,
+            "bytes": 292341,
+            "ms": 28.911
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 23,
+            "quads": 6095,
+            "fold_ops": 6183,
+            "bytes": 357,
+            "ms": 29.79
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 23,
+            "quads": 6095,
+            "fold_ops": 6183,
+            "bytes": 292400,
+            "ms": 26.035
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 23,
+            "quads": 6089,
+            "fold_ops": 6173,
+            "bytes": 357,
+            "ms": 26.242
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 23,
+            "quads": 6089,
+            "fold_ops": 6173,
+            "bytes": 292112,
+            "ms": 24.521
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 18,
+            "quads": 6152,
+            "fold_ops": 6174,
+            "bytes": 357,
+            "ms": 24.3
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 18,
+            "quads": 6152,
+            "fold_ops": 6174,
+            "bytes": 295276,
+            "ms": 22.383
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 18,
+            "quads": 6094,
+            "fold_ops": 6164,
+            "bytes": 357,
+            "ms": 23.861
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 18,
+            "quads": 6094,
+            "fold_ops": 6164,
+            "bytes": 292341,
+            "ms": 25.298
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 24,
+            "quads": 6096,
+            "fold_ops": 6188,
+            "bytes": 357,
+            "ms": 29.507
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 24,
+            "quads": 6096,
+            "fold_ops": 6188,
+            "bytes": 292448,
+            "ms": 27.339
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 24,
+            "quads": 6090,
+            "fold_ops": 6178,
+            "bytes": 357,
+            "ms": 32.35
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 24,
+            "quads": 6090,
+            "fold_ops": 6178,
+            "bytes": 292160,
+            "ms": 25.546
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 19,
+            "quads": 6158,
+            "fold_ops": 6180,
+            "bytes": 357,
+            "ms": 28.52
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 19,
+            "quads": 6158,
+            "fold_ops": 6180,
+            "bytes": 295578,
+            "ms": 29.584
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 19,
+            "quads": 6094,
+            "fold_ops": 6168,
+            "bytes": 357,
+            "ms": 35.733
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 19,
+            "quads": 6094,
+            "fold_ops": 6168,
+            "bytes": 292341,
+            "ms": 30.445
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 25,
+            "quads": 6096,
+            "fold_ops": 6190,
+            "bytes": 357,
+            "ms": 26.101
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 25,
+            "quads": 6096,
+            "fold_ops": 6190,
+            "bytes": 292448,
+            "ms": 29.066
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 25,
+            "quads": 6091,
+            "fold_ops": 6179,
+            "bytes": 357,
+            "ms": 26.925
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 25,
+            "quads": 6091,
+            "fold_ops": 6179,
+            "bytes": 292208,
+            "ms": 39.09
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 20,
+            "quads": 6164,
+            "fold_ops": 6186,
+            "bytes": 357,
+            "ms": 37.856
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 20,
+            "quads": 6164,
+            "fold_ops": 6186,
+            "bytes": 295880,
+            "ms": 32.298
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 20,
+            "quads": 6094,
+            "fold_ops": 6174,
+            "bytes": 357,
+            "ms": 26.808
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 20,
+            "quads": 6094,
+            "fold_ops": 6174,
+            "bytes": 292341,
+            "ms": 22.868
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 26,
+            "quads": 6097,
+            "fold_ops": 6193,
+            "bytes": 357,
+            "ms": 24.361
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 26,
+            "quads": 6097,
+            "fold_ops": 6193,
+            "bytes": 292496,
+            "ms": 27.481
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 26,
+            "quads": 6090,
+            "fold_ops": 6182,
+            "bytes": 357,
+            "ms": 25.898
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 26,
+            "quads": 6090,
+            "fold_ops": 6182,
+            "bytes": 292160,
+            "ms": 23.276
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 21,
+            "quads": 6169,
+            "fold_ops": 6191,
+            "bytes": 357,
+            "ms": 25.51
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 21,
+            "quads": 6169,
+            "fold_ops": 6191,
+            "bytes": 296133,
+            "ms": 23.2
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 21,
+            "quads": 6094,
+            "fold_ops": 6176,
+            "bytes": 357,
+            "ms": 31.414
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 21,
+            "quads": 6094,
+            "fold_ops": 6176,
+            "bytes": 292341,
+            "ms": 31.656
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 22,
+            "quads": 6175,
+            "fold_ops": 6197,
+            "bytes": 357,
+            "ms": 26.689
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 22,
+            "quads": 6175,
+            "fold_ops": 6197,
+            "bytes": 296435,
+            "ms": 23.983
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 22,
+            "quads": 6094,
+            "fold_ops": 6178,
+            "bytes": 357,
+            "ms": 32.236
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 22,
+            "quads": 6094,
+            "fold_ops": 6178,
+            "bytes": 292341,
+            "ms": 33.997
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 23,
+            "quads": 6179,
+            "fold_ops": 6201,
+            "bytes": 357,
+            "ms": 28.618
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 23,
+            "quads": 6179,
+            "fold_ops": 6201,
+            "bytes": 296639,
+            "ms": 41.079
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 23,
+            "quads": 6094,
+            "fold_ops": 6180,
+            "bytes": 357,
+            "ms": 35.128
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 23,
+            "quads": 6094,
+            "fold_ops": 6180,
+            "bytes": 292341,
+            "ms": 29.922
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 24,
+            "quads": 6184,
+            "fold_ops": 6206,
+            "bytes": 357,
+            "ms": 27.111
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 24,
+            "quads": 6184,
+            "fold_ops": 6206,
+            "bytes": 296891,
+            "ms": 24.148
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 24,
+            "quads": 6094,
+            "fold_ops": 6182,
+            "bytes": 357,
+            "ms": 23.843
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 24,
+            "quads": 6094,
+            "fold_ops": 6182,
+            "bytes": 292341,
+            "ms": 25.193
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 25,
+            "quads": 6189,
+            "fold_ops": 6211,
+            "bytes": 357,
+            "ms": 26.941
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 25,
+            "quads": 6189,
+            "fold_ops": 6211,
+            "bytes": 297144,
+            "ms": 23.113
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 25,
+            "quads": 6094,
+            "fold_ops": 6184,
+            "bytes": 357,
+            "ms": 24.563
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 25,
+            "quads": 6094,
+            "fold_ops": 6184,
+            "bytes": 292341,
+            "ms": 23.469
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 26,
+            "quads": 6192,
+            "fold_ops": 6214,
+            "bytes": 357,
+            "ms": 24.203
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 26,
+            "quads": 6192,
+            "fold_ops": 6214,
+            "bytes": 297299,
+            "ms": 24.12
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 26,
+            "quads": 6094,
+            "fold_ops": 6188,
+            "bytes": 357,
+            "ms": 24.836
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 26,
+            "quads": 6094,
+            "fold_ops": 6188,
+            "bytes": 292341,
+            "ms": 25.31
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 27,
+            "quads": 6195,
+            "fold_ops": 6217,
+            "bytes": 357,
+            "ms": 42.168
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 27,
+            "quads": 6195,
+            "fold_ops": 6217,
+            "bytes": 297454,
+            "ms": 25.793
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 27,
+            "quads": 6094,
+            "fold_ops": 6190,
+            "bytes": 357,
+            "ms": 27.809
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 27,
+            "quads": 6094,
+            "fold_ops": 6190,
+            "bytes": 292341,
+            "ms": 36.721
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 28,
+            "quads": 6199,
+            "fold_ops": 6221,
+            "bytes": 357,
+            "ms": 29.901
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 28,
+            "quads": 6199,
+            "fold_ops": 6221,
+            "bytes": 297658,
+            "ms": 28.999
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 28,
+            "quads": 6094,
+            "fold_ops": 6192,
+            "bytes": 357,
+            "ms": 25.473
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 28,
+            "quads": 6094,
+            "fold_ops": 6192,
+            "bytes": 292341,
+            "ms": 25.293
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 29,
+            "quads": 6204,
+            "fold_ops": 6226,
+            "bytes": 357,
+            "ms": 26.297
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 29,
+            "quads": 6204,
+            "fold_ops": 6226,
+            "bytes": 297911,
+            "ms": 26.609
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 29,
+            "quads": 6094,
+            "fold_ops": 6196,
+            "bytes": 357,
+            "ms": 25.643
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 29,
+            "quads": 6094,
+            "fold_ops": 6196,
+            "bytes": 292341,
+            "ms": 24.523
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 30,
+            "quads": 6209,
+            "fold_ops": 6231,
+            "bytes": 357,
+            "ms": 25.268
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 30,
+            "quads": 6209,
+            "fold_ops": 6231,
+            "bytes": 298164,
+            "ms": 24.761
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 30,
+            "quads": 6094,
+            "fold_ops": 6200,
+            "bytes": 358,
+            "ms": 28.753
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 30,
+            "quads": 6094,
+            "fold_ops": 6200,
+            "bytes": 292341,
+            "ms": 24.43
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 31,
+            "quads": 6214,
+            "fold_ops": 6236,
+            "bytes": 358,
+            "ms": 28.437
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 31,
+            "quads": 6214,
+            "fold_ops": 6236,
+            "bytes": 298417,
+            "ms": 44.638
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 31,
+            "quads": 6094,
+            "fold_ops": 6206,
+            "bytes": 358,
+            "ms": 31.335
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 31,
+            "quads": 6094,
+            "fold_ops": 6206,
+            "bytes": 292341,
+            "ms": 27.884
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 32,
+            "quads": 6220,
+            "fold_ops": 6242,
+            "bytes": 358,
+            "ms": 35.253
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 32,
+            "quads": 6220,
+            "fold_ops": 6242,
+            "bytes": 298719,
+            "ms": 33.939
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 32,
+            "quads": 6094,
+            "fold_ops": 6210,
+            "bytes": 358,
+            "ms": 28.029
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 32,
+            "quads": 6094,
+            "fold_ops": 6210,
+            "bytes": 292341,
+            "ms": 26.053
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 33,
+            "quads": 6225,
+            "fold_ops": 6247,
+            "bytes": 358,
+            "ms": 29.446
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 33,
+            "quads": 6225,
+            "fold_ops": 6247,
+            "bytes": 298972,
+            "ms": 26.24
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 33,
+            "quads": 6094,
+            "fold_ops": 6216,
+            "bytes": 358,
+            "ms": 27.658
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 33,
+            "quads": 6094,
+            "fold_ops": 6216,
+            "bytes": 292341,
+            "ms": 34.335
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 34,
+            "quads": 6229,
+            "fold_ops": 6251,
+            "bytes": 358,
+            "ms": 28.96
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 34,
+            "quads": 6229,
+            "fold_ops": 6251,
+            "bytes": 299176,
+            "ms": 25.779
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 34,
+            "quads": 6094,
+            "fold_ops": 6220,
+            "bytes": 358,
+            "ms": 27.79
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 34,
+            "quads": 6094,
+            "fold_ops": 6220,
+            "bytes": 292341,
+            "ms": 31.229
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 35,
+            "quads": 6232,
+            "fold_ops": 6254,
+            "bytes": 358,
+            "ms": 29.829
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 35,
+            "quads": 6232,
+            "fold_ops": 6254,
+            "bytes": 299331,
+            "ms": 25.9
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 35,
+            "quads": 6094,
+            "fold_ops": 6224,
+            "bytes": 358,
+            "ms": 27.234
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 35,
+            "quads": 6094,
+            "fold_ops": 6224,
+            "bytes": 292341,
+            "ms": 25.481
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 36,
+            "quads": 6237,
+            "fold_ops": 6259,
+            "bytes": 358,
+            "ms": 27.23
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 36,
+            "quads": 6237,
+            "fold_ops": 6259,
+            "bytes": 299584,
+            "ms": 28.57
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 36,
+            "quads": 6094,
+            "fold_ops": 6230,
+            "bytes": 358,
+            "ms": 26.865
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 36,
+            "quads": 6094,
+            "fold_ops": 6230,
+            "bytes": 292341,
+            "ms": 25.214
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 37,
+            "quads": 6241,
+            "fold_ops": 6263,
+            "bytes": 358,
+            "ms": 28.281
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 37,
+            "quads": 6241,
+            "fold_ops": 6263,
+            "bytes": 299788,
+            "ms": 27.451
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 37,
+            "quads": 6094,
+            "fold_ops": 6236,
+            "bytes": 358,
+            "ms": 27.718
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 37,
+            "quads": 6094,
+            "fold_ops": 6236,
+            "bytes": 292341,
+            "ms": 25.221
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 38,
+            "quads": 6244,
+            "fold_ops": 6266,
+            "bytes": 358,
+            "ms": 26.367
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 38,
+            "quads": 6244,
+            "fold_ops": 6266,
+            "bytes": 299943,
+            "ms": 26.424
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 38,
+            "quads": 6094,
+            "fold_ops": 6240,
+            "bytes": 358,
+            "ms": 49.232
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 38,
+            "quads": 6094,
+            "fold_ops": 6240,
+            "bytes": 292341,
+            "ms": 29.834
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 39,
+            "quads": 6250,
+            "fold_ops": 6272,
+            "bytes": 358,
+            "ms": 48.185
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 39,
+            "quads": 6250,
+            "fold_ops": 6272,
+            "bytes": 300245,
+            "ms": 28.396
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 39,
+            "quads": 6094,
+            "fold_ops": 6244,
+            "bytes": 358,
+            "ms": 32.21
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 39,
+            "quads": 6094,
+            "fold_ops": 6244,
+            "bytes": 292341,
+            "ms": 27.438
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 40,
+            "quads": 6256,
+            "fold_ops": 6278,
+            "bytes": 358,
+            "ms": 27.904
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 40,
+            "quads": 6256,
+            "fold_ops": 6278,
+            "bytes": 300547,
+            "ms": 26.804
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 40,
+            "quads": 6094,
+            "fold_ops": 6248,
+            "bytes": 358,
+            "ms": 27.811
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 40,
+            "quads": 6094,
+            "fold_ops": 6248,
+            "bytes": 292341,
+            "ms": 25.972
+          },
+          {
+            "op": "prepare",
+            "kind": "growth",
+            "depth": 41,
+            "quads": 6262,
+            "fold_ops": 6284,
+            "bytes": 358,
+            "ms": 27.185
+          },
+          {
+            "op": "state_read_head",
+            "kind": "growth",
+            "depth": 41,
+            "quads": 6262,
+            "fold_ops": 6284,
+            "bytes": 300849,
+            "ms": 26.329
+          },
+          {
+            "op": "prepare",
+            "kind": "churn",
+            "depth": 41,
+            "quads": 6094,
+            "fold_ops": 6252,
+            "bytes": 358,
+            "ms": 28.704
+          },
+          {
+            "op": "state_read_head",
+            "kind": "churn",
+            "depth": 41,
+            "quads": 6094,
+            "fold_ops": 6252,
+            "bytes": 292341,
+            "ms": 36.525
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 22,
+            "quads": 6087,
+            "fold_ops": 6195,
+            "bytes": 358,
+            "ms": 32.703
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 22,
+            "quads": 6087,
+            "fold_ops": 6195,
+            "bytes": 292029,
+            "ms": 29.948
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 23,
+            "quads": 6088,
+            "fold_ops": 6198,
+            "bytes": 358,
+            "ms": 25.402
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 23,
+            "quads": 6088,
+            "fold_ops": 6198,
+            "bytes": 292076,
+            "ms": 26.093
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 24,
+            "quads": 6088,
+            "fold_ops": 6202,
+            "bytes": 358,
+            "ms": 26.137
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 24,
+            "quads": 6088,
+            "fold_ops": 6202,
+            "bytes": 292078,
+            "ms": 23.017
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 25,
+            "quads": 6087,
+            "fold_ops": 6207,
+            "bytes": 358,
+            "ms": 24.483
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 25,
+            "quads": 6087,
+            "fold_ops": 6207,
+            "bytes": 292033,
+            "ms": 24.953
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 26,
+            "quads": 6085,
+            "fold_ops": 6213,
+            "bytes": 358,
+            "ms": 28.122
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 26,
+            "quads": 6085,
+            "fold_ops": 6213,
+            "bytes": 291942,
+            "ms": 25.214
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 27,
+            "quads": 6084,
+            "fold_ops": 6216,
+            "bytes": 358,
+            "ms": 26.437
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 27,
+            "quads": 6084,
+            "fold_ops": 6216,
+            "bytes": 291895,
+            "ms": 24.649
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 28,
+            "quads": 6085,
+            "fold_ops": 6217,
+            "bytes": 358,
+            "ms": 25.748
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 28,
+            "quads": 6085,
+            "fold_ops": 6217,
+            "bytes": 291943,
+            "ms": 24.613
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 29,
+            "quads": 6089,
+            "fold_ops": 6223,
+            "bytes": 358,
+            "ms": 27.971
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 29,
+            "quads": 6089,
+            "fold_ops": 6223,
+            "bytes": 292131,
+            "ms": 25.95
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 30,
+            "quads": 6091,
+            "fold_ops": 6231,
+            "bytes": 358,
+            "ms": 28.172
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 30,
+            "quads": 6091,
+            "fold_ops": 6231,
+            "bytes": 292230,
+            "ms": 26.324
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 31,
+            "quads": 6090,
+            "fold_ops": 6232,
+            "bytes": 358,
+            "ms": 26.459
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 31,
+            "quads": 6090,
+            "fold_ops": 6232,
+            "bytes": 292183,
+            "ms": 25.15
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 32,
+            "quads": 6091,
+            "fold_ops": 6239,
+            "bytes": 358,
+            "ms": 27.117
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 32,
+            "quads": 6091,
+            "fold_ops": 6239,
+            "bytes": 292233,
+            "ms": 25.594
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 33,
+            "quads": 6090,
+            "fold_ops": 6246,
+            "bytes": 358,
+            "ms": 25.83
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 33,
+            "quads": 6090,
+            "fold_ops": 6246,
+            "bytes": 292189,
+            "ms": 27.609
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 34,
+            "quads": 6092,
+            "fold_ops": 6250,
+            "bytes": 358,
+            "ms": 26.534
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 34,
+            "quads": 6092,
+            "fold_ops": 6250,
+            "bytes": 292283,
+            "ms": 25.277
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 35,
+            "quads": 6092,
+            "fold_ops": 6252,
+            "bytes": 358,
+            "ms": 26.432
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 35,
+            "quads": 6092,
+            "fold_ops": 6252,
+            "bytes": 292287,
+            "ms": 25.435
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 36,
+            "quads": 6093,
+            "fold_ops": 6253,
+            "bytes": 358,
+            "ms": 27.459
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 36,
+            "quads": 6093,
+            "fold_ops": 6253,
+            "bytes": 292335,
+            "ms": 29.166
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 37,
+            "quads": 6094,
+            "fold_ops": 6258,
+            "bytes": 358,
+            "ms": 40.626
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 37,
+            "quads": 6094,
+            "fold_ops": 6258,
+            "bytes": 292385,
+            "ms": 26.838
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 38,
+            "quads": 6094,
+            "fold_ops": 6260,
+            "bytes": 358,
+            "ms": 28.762
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 38,
+            "quads": 6094,
+            "fold_ops": 6260,
+            "bytes": 292386,
+            "ms": 25.575
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 39,
+            "quads": 6095,
+            "fold_ops": 6263,
+            "bytes": 358,
+            "ms": 27.386
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 39,
+            "quads": 6095,
+            "fold_ops": 6263,
+            "bytes": 292436,
+            "ms": 25.737
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 40,
+            "quads": 6096,
+            "fold_ops": 6266,
+            "bytes": 358,
+            "ms": 26.321
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 40,
+            "quads": 6096,
+            "fold_ops": 6266,
+            "bytes": 292484,
+            "ms": 27.63
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 41,
+            "quads": 6097,
+            "fold_ops": 6267,
+            "bytes": 358,
+            "ms": 31.533
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 41,
+            "quads": 6097,
+            "fold_ops": 6267,
+            "bytes": 292530,
+            "ms": 27.374
+          },
+          {
+            "op": "merge_preview",
+            "kind": "main",
+            "depth": 41,
+            "quads": 6097,
+            "fold_ops": 6267,
+            "bytes": 753,
+            "ms": 139.26
+          },
+          {
+            "op": "state_read_head",
+            "kind": "merge",
+            "depth": 42,
+            "quads": 6100,
+            "fold_ops": 6316,
+            "bytes": 292674,
+            "ms": 27.267
+          },
+          {
+            "op": "merge_preview",
+            "kind": "merge",
+            "depth": 42,
+            "quads": 6100,
+            "fold_ops": 6316,
+            "bytes": 754,
+            "ms": 116.611
+          },
+          {
+            "op": "state_read_head",
+            "kind": "merge",
+            "depth": 43,
+            "quads": 6096,
+            "fold_ops": 6358,
+            "bytes": 292482,
+            "ms": 27.66
+          },
+          {
+            "op": "merge_preview",
+            "kind": "merge",
+            "depth": 43,
+            "quads": 6096,
+            "fold_ops": 6358,
+            "bytes": 481,
+            "ms": 17.478
+          },
+          {
+            "op": "merge_preview",
+            "kind": "feature",
+            "depth": 26,
+            "quads": 6097,
+            "fold_ops": 6193,
+            "bytes": 753,
+            "ms": 128.309
+          },
+          {
+            "op": "state_read_head",
+            "kind": "merge",
+            "depth": 27,
+            "quads": 6096,
+            "fold_ops": 6360,
+            "bytes": 292482,
+            "ms": 26.062
+          },
+          {
+            "op": "merge_preview",
+            "kind": "merge",
+            "depth": 43,
+            "quads": 6096,
+            "fold_ops": 6358,
+            "bytes": 559,
+            "ms": 128.641
+          },
+          {
+            "op": "merge_preview",
+            "kind": "merge",
+            "depth": 43,
+            "quads": 6096,
+            "fold_ops": 6358,
+            "bytes": 476,
+            "ms": 14.679
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 44,
+            "quads": 6093,
+            "fold_ops": 6365,
+            "bytes": 358,
+            "ms": 28.315
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 44,
+            "quads": 6093,
+            "fold_ops": 6365,
+            "bytes": 292338,
+            "ms": 27.124
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 45,
+            "quads": 6093,
+            "fold_ops": 6367,
+            "bytes": 358,
+            "ms": 30.132
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 45,
+            "quads": 6093,
+            "fold_ops": 6367,
+            "bytes": 292338,
+            "ms": 28.097
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 46,
+            "quads": 6094,
+            "fold_ops": 6372,
+            "bytes": 358,
+            "ms": 30.254
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 46,
+            "quads": 6094,
+            "fold_ops": 6372,
+            "bytes": 292386,
+            "ms": 28.359
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 47,
+            "quads": 6095,
+            "fold_ops": 6375,
+            "bytes": 358,
+            "ms": 30.026
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 47,
+            "quads": 6095,
+            "fold_ops": 6375,
+            "bytes": 292434,
+            "ms": 28.258
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 48,
+            "quads": 6094,
+            "fold_ops": 6376,
+            "bytes": 358,
+            "ms": 28.479
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 48,
+            "quads": 6094,
+            "fold_ops": 6376,
+            "bytes": 292386,
+            "ms": 28.002
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 49,
+            "quads": 6094,
+            "fold_ops": 6382,
+            "bytes": 358,
+            "ms": 30.417
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 49,
+            "quads": 6094,
+            "fold_ops": 6382,
+            "bytes": 292386,
+            "ms": 29.594
+          },
+          {
+            "op": "merge_preview",
+            "kind": "merge",
+            "depth": 43,
+            "quads": 6096,
+            "fold_ops": 6358,
+            "bytes": 751,
+            "ms": 140.087
+          },
+          {
+            "op": "state_read_head",
+            "kind": "merge",
+            "depth": 44,
+            "quads": 6094,
+            "fold_ops": 6382,
+            "bytes": 292386,
+            "ms": 27.871
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 45,
+            "quads": 6096,
+            "fold_ops": 6400,
+            "bytes": 358,
+            "ms": 28.904
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 45,
+            "quads": 6096,
+            "fold_ops": 6400,
+            "bytes": 292482,
+            "ms": 37.293
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 45,
+            "quads": 6092,
+            "fold_ops": 6400,
+            "bytes": 358,
+            "ms": 32.669
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 45,
+            "quads": 6092,
+            "fold_ops": 6400,
+            "bytes": 292290,
+            "ms": 29.711
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 46,
+            "quads": 6097,
+            "fold_ops": 6405,
+            "bytes": 358,
+            "ms": 29.981
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 46,
+            "quads": 6097,
+            "fold_ops": 6405,
+            "bytes": 292530,
+            "ms": 31.726
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 46,
+            "quads": 6091,
+            "fold_ops": 6401,
+            "bytes": 358,
+            "ms": 35.055
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 46,
+            "quads": 6091,
+            "fold_ops": 6401,
+            "bytes": 292242,
+            "ms": 29.67
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 47,
+            "quads": 6097,
+            "fold_ops": 6409,
+            "bytes": 358,
+            "ms": 31.315
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 47,
+            "quads": 6097,
+            "fold_ops": 6409,
+            "bytes": 292530,
+            "ms": 32.606
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 47,
+            "quads": 6092,
+            "fold_ops": 6408,
+            "bytes": 358,
+            "ms": 31.348
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 47,
+            "quads": 6092,
+            "fold_ops": 6408,
+            "bytes": 292290,
+            "ms": 28.102
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 48,
+            "quads": 6096,
+            "fold_ops": 6412,
+            "bytes": 358,
+            "ms": 31.412
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 48,
+            "quads": 6096,
+            "fold_ops": 6412,
+            "bytes": 292482,
+            "ms": 39.151
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 48,
+            "quads": 6091,
+            "fold_ops": 6411,
+            "bytes": 358,
+            "ms": 45.955
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 48,
+            "quads": 6091,
+            "fold_ops": 6411,
+            "bytes": 292242,
+            "ms": 38.621
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 49,
+            "quads": 6095,
+            "fold_ops": 6419,
+            "bytes": 358,
+            "ms": 40.329
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 49,
+            "quads": 6095,
+            "fold_ops": 6419,
+            "bytes": 292434,
+            "ms": 30.675
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 49,
+            "quads": 6094,
+            "fold_ops": 6418,
+            "bytes": 358,
+            "ms": 31.733
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 49,
+            "quads": 6094,
+            "fold_ops": 6418,
+            "bytes": 292386,
+            "ms": 32.042
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 50,
+            "quads": 6096,
+            "fold_ops": 6426,
+            "bytes": 358,
+            "ms": 43.376
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 50,
+            "quads": 6096,
+            "fold_ops": 6426,
+            "bytes": 292482,
+            "ms": 31.201
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 50,
+            "quads": 6094,
+            "fold_ops": 6420,
+            "bytes": 358,
+            "ms": 35.145
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 50,
+            "quads": 6094,
+            "fold_ops": 6420,
+            "bytes": 292386,
+            "ms": 34.156
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 51,
+            "quads": 6096,
+            "fold_ops": 6428,
+            "bytes": 358,
+            "ms": 35.636
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 51,
+            "quads": 6096,
+            "fold_ops": 6428,
+            "bytes": 292482,
+            "ms": 31.774
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 51,
+            "quads": 6094,
+            "fold_ops": 6422,
+            "bytes": 358,
+            "ms": 31.981
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 51,
+            "quads": 6094,
+            "fold_ops": 6422,
+            "bytes": 292386,
+            "ms": 36.846
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 52,
+            "quads": 6095,
+            "fold_ops": 6435,
+            "bytes": 358,
+            "ms": 29.383
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 52,
+            "quads": 6095,
+            "fold_ops": 6435,
+            "bytes": 292434,
+            "ms": 28.868
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 52,
+            "quads": 6093,
+            "fold_ops": 6427,
+            "bytes": 358,
+            "ms": 31.879
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 52,
+            "quads": 6093,
+            "fold_ops": 6427,
+            "bytes": 292338,
+            "ms": 31.6
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 53,
+            "quads": 6097,
+            "fold_ops": 6439,
+            "bytes": 358,
+            "ms": 32.031
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 53,
+            "quads": 6097,
+            "fold_ops": 6439,
+            "bytes": 292530,
+            "ms": 29.869
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 53,
+            "quads": 6092,
+            "fold_ops": 6430,
+            "bytes": 358,
+            "ms": 31.273
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 53,
+            "quads": 6092,
+            "fold_ops": 6430,
+            "bytes": 292290,
+            "ms": 29.333
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 54,
+            "quads": 6098,
+            "fold_ops": 6442,
+            "bytes": 358,
+            "ms": 31.522
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 54,
+            "quads": 6098,
+            "fold_ops": 6442,
+            "bytes": 292578,
+            "ms": 31.129
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 54,
+            "quads": 6093,
+            "fold_ops": 6433,
+            "bytes": 358,
+            "ms": 31.09
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 54,
+            "quads": 6093,
+            "fold_ops": 6433,
+            "bytes": 292338,
+            "ms": 37.039
+          },
+          {
+            "op": "merge_preview",
+            "kind": "merge",
+            "depth": 44,
+            "quads": 6094,
+            "fold_ops": 6382,
+            "bytes": 752,
+            "ms": 154.803
+          },
+          {
+            "op": "state_read_head",
+            "kind": "merge",
+            "depth": 45,
+            "quads": 6098,
+            "fold_ops": 6442,
+            "bytes": 292578,
+            "ms": 27.667
+          },
+          {
+            "op": "merge_preview",
+            "kind": "merge",
+            "depth": 45,
+            "quads": 6098,
+            "fold_ops": 6442,
+            "bytes": 3784,
+            "ms": 140.622
+          },
+          {
+            "op": "merge_preview",
+            "kind": "merge",
+            "depth": 45,
+            "quads": 6098,
+            "fold_ops": 6442,
+            "bytes": 3975,
+            "ms": 146.72
+          },
+          {
+            "op": "merge_preview",
+            "kind": "merge",
+            "depth": 45,
+            "quads": 6098,
+            "fold_ops": 6442,
+            "bytes": 3975,
+            "ms": 143.499
+          },
+          {
+            "op": "merge_preview",
+            "kind": "merge",
+            "depth": 45,
+            "quads": 6098,
+            "fold_ops": 6442,
+            "bytes": 3969,
+            "ms": 159.179
+          },
+          {
+            "op": "state_read_head",
+            "kind": "merge",
+            "depth": 46,
+            "quads": 6105,
+            "fold_ops": 6481,
+            "bytes": 292914,
+            "ms": 28.551
+          },
+          {
+            "op": "merge_preview",
+            "kind": "merge",
+            "depth": 46,
+            "quads": 6105,
+            "fold_ops": 6481,
+            "bytes": 481,
+            "ms": 33.229
+          },
+          {
+            "op": "merge_preview",
+            "kind": "feature",
+            "depth": 54,
+            "quads": 6098,
+            "fold_ops": 6442,
+            "bytes": 752,
+            "ms": 147.005
+          },
+          {
+            "op": "state_read_head",
+            "kind": "merge",
+            "depth": 55,
+            "quads": 6105,
+            "fold_ops": 6481,
+            "bytes": 292914,
+            "ms": 29.673
+          },
+          {
+            "op": "merge_preview",
+            "kind": "feature",
+            "depth": 54,
+            "quads": 6093,
+            "fold_ops": 6433,
+            "bytes": 752,
+            "ms": 157.774
+          },
+          {
+            "op": "state_read_head",
+            "kind": "merge",
+            "depth": 55,
+            "quads": 6105,
+            "fold_ops": 6485,
+            "bytes": 292914,
+            "ms": 29.827
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 56,
+            "quads": 6106,
+            "fold_ops": 6486,
+            "bytes": 358,
+            "ms": 31.535
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 56,
+            "quads": 6106,
+            "fold_ops": 6486,
+            "bytes": 292962,
+            "ms": 33.631
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 57,
+            "quads": 6107,
+            "fold_ops": 6493,
+            "bytes": 358,
+            "ms": 32.534
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 57,
+            "quads": 6107,
+            "fold_ops": 6493,
+            "bytes": 293010,
+            "ms": 30.104
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 58,
+            "quads": 6107,
+            "fold_ops": 6495,
+            "bytes": 358,
+            "ms": 31.793
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 58,
+            "quads": 6107,
+            "fold_ops": 6495,
+            "bytes": 293010,
+            "ms": 30.246
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 47,
+            "quads": 6105,
+            "fold_ops": 6483,
+            "bytes": 358,
+            "ms": 32.278
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 47,
+            "quads": 6105,
+            "fold_ops": 6483,
+            "bytes": 292915,
+            "ms": 43.539
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 48,
+            "quads": 6103,
+            "fold_ops": 6489,
+            "bytes": 358,
+            "ms": 31.548
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 48,
+            "quads": 6103,
+            "fold_ops": 6489,
+            "bytes": 292819,
+            "ms": 29.866
+          },
+          {
+            "op": "merge_preview",
+            "kind": "main",
+            "depth": 48,
+            "quads": 6103,
+            "fold_ops": 6489,
+            "bytes": 746,
+            "ms": 155.942
+          },
+          {
+            "op": "state_read_head",
+            "kind": "merge",
+            "depth": 49,
+            "quads": 6105,
+            "fold_ops": 6503,
+            "bytes": 292915,
+            "ms": 28.758
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 27,
+            "quads": 6090,
+            "fold_ops": 6186,
+            "bytes": 358,
+            "ms": 25.592
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 27,
+            "quads": 6090,
+            "fold_ops": 6186,
+            "bytes": 292160,
+            "ms": 26.894
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 50,
+            "quads": 6105,
+            "fold_ops": 6507,
+            "bytes": 358,
+            "ms": 35.235
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 50,
+            "quads": 6105,
+            "fold_ops": 6507,
+            "bytes": 292915,
+            "ms": 30.285
+          },
+          {
+            "op": "merge_preview",
+            "kind": "main",
+            "depth": 50,
+            "quads": 6105,
+            "fold_ops": 6507,
+            "bytes": 1208,
+            "ms": 137.586
+          },
+          {
+            "op": "merge_preview",
+            "kind": "main",
+            "depth": 50,
+            "quads": 6105,
+            "fold_ops": 6507,
+            "bytes": 1399,
+            "ms": 127.654
+          },
+          {
+            "op": "state_read_head",
+            "kind": "merge",
+            "depth": 51,
+            "quads": 6105,
+            "fold_ops": 6507,
+            "bytes": 292915,
+            "ms": 29.957
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 50,
+            "quads": 6095,
+            "fold_ops": 6383,
+            "bytes": 358,
+            "ms": 31.86
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 50,
+            "quads": 6095,
+            "fold_ops": 6383,
+            "bytes": 292434,
+            "ms": 28.507
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 51,
+            "quads": 6094,
+            "fold_ops": 6384,
+            "bytes": 358,
+            "ms": 33.625
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 51,
+            "quads": 6094,
+            "fold_ops": 6384,
+            "bytes": 292386,
+            "ms": 31.562
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 52,
+            "quads": 6101,
+            "fold_ops": 6513,
+            "bytes": 358,
+            "ms": 43.597
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 52,
+            "quads": 6101,
+            "fold_ops": 6513,
+            "bytes": 292729,
+            "ms": 30.808
+          },
+          {
+            "op": "merge_preview",
+            "kind": "main",
+            "depth": 52,
+            "quads": 6101,
+            "fold_ops": 6513,
+            "bytes": 563,
+            "ms": 154.792
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 59,
+            "quads": 6109,
+            "fold_ops": 6501,
+            "bytes": 358,
+            "ms": 43.964
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 59,
+            "quads": 6109,
+            "fold_ops": 6501,
+            "bytes": 293106,
+            "ms": 31.656
+          },
+          {
+            "op": "prepare",
+            "kind": "feature",
+            "depth": 56,
+            "quads": 6104,
+            "fold_ops": 6486,
+            "bytes": 358,
+            "ms": 35.095
+          },
+          {
+            "op": "state_read_head",
+            "kind": "feature",
+            "depth": 56,
+            "quads": 6104,
+            "fold_ops": 6486,
+            "bytes": 292866,
+            "ms": 31.178
+          },
+          {
+            "op": "merge_preview",
+            "kind": "feature",
+            "depth": 59,
+            "quads": 6109,
+            "fold_ops": 6501,
+            "bytes": 747,
+            "ms": 163.426
+          },
+          {
+            "op": "state_read_head",
+            "kind": "merge",
+            "depth": 60,
+            "quads": 6108,
+            "fold_ops": 6502,
+            "bytes": 293058,
+            "ms": 30.807
+          },
+          {
+            "op": "merge_preview",
+            "kind": "feature",
+            "depth": 56,
+            "quads": 6104,
+            "fold_ops": 6486,
+            "bytes": 747,
+            "ms": 150.547
+          },
+          {
+            "op": "state_read_head",
+            "kind": "merge",
+            "depth": 57,
+            "quads": 6108,
+            "fold_ops": 6506,
+            "bytes": 293058,
+            "ms": 35.803
+          },
+          {
+            "op": "merge_preview",
+            "kind": "merge",
+            "depth": 60,
+            "quads": 6108,
+            "fold_ops": 6502,
+            "bytes": 688,
+            "ms": 39.292
+          },
+          {
+            "op": "merge_preview",
+            "kind": "merge",
+            "depth": 60,
+            "quads": 6108,
+            "fold_ops": 6502,
+            "bytes": 745,
+            "ms": 157.802
+          },
+          {
+            "op": "merge_preview",
+            "kind": "merge",
+            "depth": 60,
+            "quads": 6108,
+            "fold_ops": 6502,
+            "bytes": 749,
+            "ms": 167.241
+          },
+          {
+            "op": "state_read_head",
+            "kind": "merge",
+            "depth": 61,
+            "quads": 6108,
+            "fold_ops": 6502,
+            "bytes": 293058,
+            "ms": 31.366
+          },
+          {
+            "op": "merge_preview",
+            "kind": "main",
+            "depth": 52,
+            "quads": 6101,
+            "fold_ops": 6513,
+            "bytes": 758,
+            "ms": 131.062
+          },
+          {
+            "op": "state_read_head",
+            "kind": "merge",
+            "depth": 53,
+            "quads": 6269,
+            "fold_ops": 6681,
+            "bytes": 301237,
+            "ms": 30.181
+          },
+          {
+            "op": "merge_preview",
+            "kind": "merge",
+            "depth": 53,
+            "quads": 6269,
+            "fold_ops": 6681,
+            "bytes": 757,
+            "ms": 154.701
+          },
+          {
+            "op": "state_read_head",
+            "kind": "merge",
+            "depth": 54,
+            "quads": 6269,
+            "fold_ops": 6813,
+            "bytes": 301237,
+            "ms": 42.378
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 55,
+            "quads": 6267,
+            "fold_ops": 6815,
+            "bytes": 358,
+            "ms": 38.701
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 55,
+            "quads": 6267,
+            "fold_ops": 6815,
+            "bytes": 301143,
+            "ms": 33.221
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 56,
+            "quads": 6267,
+            "fold_ops": 6817,
+            "bytes": 358,
+            "ms": 35.548
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 56,
+            "quads": 6267,
+            "fold_ops": 6817,
+            "bytes": 301143,
+            "ms": 30.422
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 57,
+            "quads": 6269,
+            "fold_ops": 6823,
+            "bytes": 358,
+            "ms": 33.054
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 57,
+            "quads": 6269,
+            "fold_ops": 6823,
+            "bytes": 301241,
+            "ms": 30.598
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 58,
+            "quads": 6269,
+            "fold_ops": 6825,
+            "bytes": 358,
+            "ms": 41.177
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 58,
+            "quads": 6269,
+            "fold_ops": 6825,
+            "bytes": 301241,
+            "ms": 38.016
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 59,
+            "quads": 6270,
+            "fold_ops": 6832,
+            "bytes": 358,
+            "ms": 37.935
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 59,
+            "quads": 6270,
+            "fold_ops": 6832,
+            "bytes": 301294,
+            "ms": 33.747
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 60,
+            "quads": 6271,
+            "fold_ops": 6833,
+            "bytes": 358,
+            "ms": 34.492
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 60,
+            "quads": 6271,
+            "fold_ops": 6833,
+            "bytes": 301341,
+            "ms": 31.318
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 61,
+            "quads": 6273,
+            "fold_ops": 6839,
+            "bytes": 358,
+            "ms": 33.196
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 61,
+            "quads": 6273,
+            "fold_ops": 6839,
+            "bytes": 301452,
+            "ms": 33.619
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 62,
+            "quads": 6272,
+            "fold_ops": 6840,
+            "bytes": 358,
+            "ms": 38.761
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 62,
+            "quads": 6272,
+            "fold_ops": 6840,
+            "bytes": 301404,
+            "ms": 36.514
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 63,
+            "quads": 6271,
+            "fold_ops": 6845,
+            "bytes": 358,
+            "ms": 36.973
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 63,
+            "quads": 6271,
+            "fold_ops": 6845,
+            "bytes": 301359,
+            "ms": 33.384
+          },
+          {
+            "op": "prepare",
+            "kind": "main",
+            "depth": 64,
+            "quads": 6271,
+            "fold_ops": 6849,
+            "bytes": 358,
+            "ms": 35.016
+          },
+          {
+            "op": "state_read_head",
+            "kind": "main",
+            "depth": 64,
+            "quads": 6271,
+            "fold_ops": 6849,
+            "bytes": 301377,
+            "ms": 32.314
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 7,
+            "quads": 6094,
+            "fold_ops": 6118,
+            "bytes": 292341,
+            "ms": 25.349
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 16,
+            "quads": 6094,
+            "fold_ops": 6156,
+            "bytes": 292341,
+            "ms": 25.561
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 17,
+            "quads": 6094,
+            "fold_ops": 6162,
+            "bytes": 292341,
+            "ms": 24.104
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 18,
+            "quads": 6094,
+            "fold_ops": 6164,
+            "bytes": 292341,
+            "ms": 23.404
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 19,
+            "quads": 6094,
+            "fold_ops": 6168,
+            "bytes": 292341,
+            "ms": 22.971
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 20,
+            "quads": 6094,
+            "fold_ops": 6174,
+            "bytes": 292341,
+            "ms": 22.585
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 21,
+            "quads": 6094,
+            "fold_ops": 6176,
+            "bytes": 292341,
+            "ms": 23.568
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 22,
+            "quads": 6094,
+            "fold_ops": 6178,
+            "bytes": 292341,
+            "ms": 23.113
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 23,
+            "quads": 6094,
+            "fold_ops": 6180,
+            "bytes": 292341,
+            "ms": 24.086
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 24,
+            "quads": 6094,
+            "fold_ops": 6182,
+            "bytes": 292341,
+            "ms": 23.513
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 25,
+            "quads": 6094,
+            "fold_ops": 6184,
+            "bytes": 292341,
+            "ms": 23.935
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 8,
+            "quads": 6094,
+            "fold_ops": 6124,
+            "bytes": 292341,
+            "ms": 21.341
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 26,
+            "quads": 6094,
+            "fold_ops": 6188,
+            "bytes": 292341,
+            "ms": 37.022
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 27,
+            "quads": 6094,
+            "fold_ops": 6190,
+            "bytes": 292341,
+            "ms": 29.424
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 28,
+            "quads": 6094,
+            "fold_ops": 6192,
+            "bytes": 292341,
+            "ms": 29.728
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 29,
+            "quads": 6094,
+            "fold_ops": 6196,
+            "bytes": 292341,
+            "ms": 24.914
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 30,
+            "quads": 6094,
+            "fold_ops": 6200,
+            "bytes": 292341,
+            "ms": 25.379
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 31,
+            "quads": 6094,
+            "fold_ops": 6206,
+            "bytes": 292341,
+            "ms": 24.984
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 32,
+            "quads": 6094,
+            "fold_ops": 6210,
+            "bytes": 292341,
+            "ms": 25.394
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 33,
+            "quads": 6094,
+            "fold_ops": 6216,
+            "bytes": 292341,
+            "ms": 25.52
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 34,
+            "quads": 6094,
+            "fold_ops": 6220,
+            "bytes": 292341,
+            "ms": 25.554
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 35,
+            "quads": 6094,
+            "fold_ops": 6224,
+            "bytes": 292341,
+            "ms": 25.596
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 9,
+            "quads": 6094,
+            "fold_ops": 6128,
+            "bytes": 292341,
+            "ms": 21.219
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 36,
+            "quads": 6094,
+            "fold_ops": 6230,
+            "bytes": 292341,
+            "ms": 27.053
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 37,
+            "quads": 6094,
+            "fold_ops": 6236,
+            "bytes": 292341,
+            "ms": 25.511
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 38,
+            "quads": 6094,
+            "fold_ops": 6240,
+            "bytes": 292341,
+            "ms": 27.994
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 39,
+            "quads": 6094,
+            "fold_ops": 6244,
+            "bytes": 292341,
+            "ms": 28.85
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 40,
+            "quads": 6094,
+            "fold_ops": 6248,
+            "bytes": 292341,
+            "ms": 26.939
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 41,
+            "quads": 6094,
+            "fold_ops": 6252,
+            "bytes": 292341,
+            "ms": 27.389
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 10,
+            "quads": 6094,
+            "fold_ops": 6130,
+            "bytes": 292341,
+            "ms": 24.441
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 11,
+            "quads": 6094,
+            "fold_ops": 6136,
+            "bytes": 292341,
+            "ms": 24.499
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 12,
+            "quads": 6094,
+            "fold_ops": 6140,
+            "bytes": 292341,
+            "ms": 26.988
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 13,
+            "quads": 6094,
+            "fold_ops": 6144,
+            "bytes": 292341,
+            "ms": 23.905
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 14,
+            "quads": 6094,
+            "fold_ops": 6148,
+            "bytes": 292341,
+            "ms": 21.775
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 15,
+            "quads": 6094,
+            "fold_ops": 6150,
+            "bytes": 292341,
+            "ms": 22.639
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 12,
+            "quads": 6095,
+            "fold_ops": 6143,
+            "bytes": 292400,
+            "ms": 21.873
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 21,
+            "quads": 6095,
+            "fold_ops": 6173,
+            "bytes": 292400,
+            "ms": 30.425
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 22,
+            "quads": 6094,
+            "fold_ops": 6176,
+            "bytes": 292352,
+            "ms": 32.212
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 23,
+            "quads": 6095,
+            "fold_ops": 6183,
+            "bytes": 292400,
+            "ms": 28.06
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 24,
+            "quads": 6096,
+            "fold_ops": 6188,
+            "bytes": 292448,
+            "ms": 25.064
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 25,
+            "quads": 6096,
+            "fold_ops": 6190,
+            "bytes": 292448,
+            "ms": 25.607
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 26,
+            "quads": 6097,
+            "fold_ops": 6193,
+            "bytes": 292496,
+            "ms": 23.905
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 13,
+            "quads": 6097,
+            "fold_ops": 6147,
+            "bytes": 292496,
+            "ms": 21.414
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 14,
+            "quads": 6095,
+            "fold_ops": 6149,
+            "bytes": 292400,
+            "ms": 22.513
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 15,
+            "quads": 6095,
+            "fold_ops": 6153,
+            "bytes": 292400,
+            "ms": 22.148
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 16,
+            "quads": 6093,
+            "fold_ops": 6155,
+            "bytes": 292304,
+            "ms": 23.316
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 17,
+            "quads": 6093,
+            "fold_ops": 6157,
+            "bytes": 292304,
+            "ms": 23.963
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 18,
+            "quads": 6093,
+            "fold_ops": 6161,
+            "bytes": 292304,
+            "ms": 22.656
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 19,
+            "quads": 6096,
+            "fold_ops": 6166,
+            "bytes": 292448,
+            "ms": 22.754
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 20,
+            "quads": 6096,
+            "fold_ops": 6168,
+            "bytes": 292448,
+            "ms": 23.851
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 12,
+            "quads": 6095,
+            "fold_ops": 6145,
+            "bytes": 292400,
+            "ms": 21.942
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 21,
+            "quads": 6088,
+            "fold_ops": 6170,
+            "bytes": 292064,
+            "ms": 22.809
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 22,
+            "quads": 6088,
+            "fold_ops": 6172,
+            "bytes": 292064,
+            "ms": 23.619
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 23,
+            "quads": 6089,
+            "fold_ops": 6173,
+            "bytes": 292112,
+            "ms": 24.121
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 24,
+            "quads": 6090,
+            "fold_ops": 6178,
+            "bytes": 292160,
+            "ms": 33.595
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 25,
+            "quads": 6091,
+            "fold_ops": 6179,
+            "bytes": 292208,
+            "ms": 37.515
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 26,
+            "quads": 6090,
+            "fold_ops": 6182,
+            "bytes": 292160,
+            "ms": 27.935
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 27,
+            "quads": 6090,
+            "fold_ops": 6186,
+            "bytes": 292160,
+            "ms": 24.408
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 13,
+            "quads": 6094,
+            "fold_ops": 6148,
+            "bytes": 292352,
+            "ms": 23.481
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 14,
+            "quads": 6095,
+            "fold_ops": 6149,
+            "bytes": 292400,
+            "ms": 21.815
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 15,
+            "quads": 6092,
+            "fold_ops": 6152,
+            "bytes": 292256,
+            "ms": 25.807
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 16,
+            "quads": 6090,
+            "fold_ops": 6154,
+            "bytes": 292160,
+            "ms": 25.975
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 17,
+            "quads": 6090,
+            "fold_ops": 6158,
+            "bytes": 292160,
+            "ms": 24.476
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 18,
+            "quads": 6091,
+            "fold_ops": 6159,
+            "bytes": 292208,
+            "ms": 24.292
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 19,
+            "quads": 6089,
+            "fold_ops": 6163,
+            "bytes": 292112,
+            "ms": 22.488
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 20,
+            "quads": 6088,
+            "fold_ops": 6166,
+            "bytes": 292064,
+            "ms": 22.798
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 45,
+            "quads": 6096,
+            "fold_ops": 6400,
+            "bytes": 292482,
+            "ms": 28.894
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 54,
+            "quads": 6098,
+            "fold_ops": 6442,
+            "bytes": 292578,
+            "ms": 45.97
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 56,
+            "quads": 6106,
+            "fold_ops": 6486,
+            "bytes": 292962,
+            "ms": 46.68
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 57,
+            "quads": 6107,
+            "fold_ops": 6493,
+            "bytes": 293010,
+            "ms": 38.149
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 58,
+            "quads": 6107,
+            "fold_ops": 6495,
+            "bytes": 293010,
+            "ms": 37.301
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 59,
+            "quads": 6109,
+            "fold_ops": 6501,
+            "bytes": 293106,
+            "ms": 35.268
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 46,
+            "quads": 6097,
+            "fold_ops": 6405,
+            "bytes": 292530,
+            "ms": 29.101
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 47,
+            "quads": 6097,
+            "fold_ops": 6409,
+            "bytes": 292530,
+            "ms": 29.481
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 48,
+            "quads": 6096,
+            "fold_ops": 6412,
+            "bytes": 292482,
+            "ms": 28.026
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 49,
+            "quads": 6095,
+            "fold_ops": 6419,
+            "bytes": 292434,
+            "ms": 28.452
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 50,
+            "quads": 6096,
+            "fold_ops": 6426,
+            "bytes": 292482,
+            "ms": 32.448
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 51,
+            "quads": 6096,
+            "fold_ops": 6428,
+            "bytes": 292482,
+            "ms": 29.26
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 52,
+            "quads": 6095,
+            "fold_ops": 6435,
+            "bytes": 292434,
+            "ms": 28.991
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 53,
+            "quads": 6097,
+            "fold_ops": 6439,
+            "bytes": 292530,
+            "ms": 48.59
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 45,
+            "quads": 6092,
+            "fold_ops": 6400,
+            "bytes": 292290,
+            "ms": 36.154
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 54,
+            "quads": 6093,
+            "fold_ops": 6433,
+            "bytes": 292338,
+            "ms": 50.103
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 56,
+            "quads": 6104,
+            "fold_ops": 6486,
+            "bytes": 292866,
+            "ms": 45.045
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 46,
+            "quads": 6091,
+            "fold_ops": 6401,
+            "bytes": 292242,
+            "ms": 31.298
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 47,
+            "quads": 6092,
+            "fold_ops": 6408,
+            "bytes": 292290,
+            "ms": 30.276
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 48,
+            "quads": 6091,
+            "fold_ops": 6411,
+            "bytes": 292242,
+            "ms": 31.744
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 49,
+            "quads": 6094,
+            "fold_ops": 6418,
+            "bytes": 292386,
+            "ms": 29.269
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 50,
+            "quads": 6094,
+            "fold_ops": 6420,
+            "bytes": 292386,
+            "ms": 29.297
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 51,
+            "quads": 6094,
+            "fold_ops": 6422,
+            "bytes": 292386,
+            "ms": 32.449
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 52,
+            "quads": 6093,
+            "fold_ops": 6427,
+            "bytes": 292338,
+            "ms": 30.384
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 53,
+            "quads": 6092,
+            "fold_ops": 6430,
+            "bytes": 292290,
+            "ms": 29.898
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 44,
+            "quads": 6093,
+            "fold_ops": 6365,
+            "bytes": 292338,
+            "ms": 38.922
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 45,
+            "quads": 6093,
+            "fold_ops": 6367,
+            "bytes": 292338,
+            "ms": 34.882
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 46,
+            "quads": 6094,
+            "fold_ops": 6372,
+            "bytes": 292386,
+            "ms": 31.552
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 47,
+            "quads": 6095,
+            "fold_ops": 6375,
+            "bytes": 292434,
+            "ms": 30.795
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 48,
+            "quads": 6094,
+            "fold_ops": 6376,
+            "bytes": 292386,
+            "ms": 51.683
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 49,
+            "quads": 6094,
+            "fold_ops": 6382,
+            "bytes": 292386,
+            "ms": 33.508
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 50,
+            "quads": 6095,
+            "fold_ops": 6383,
+            "bytes": 292434,
+            "ms": 30.197
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 51,
+            "quads": 6094,
+            "fold_ops": 6384,
+            "bytes": 292386,
+            "ms": 28.152
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 7,
+            "quads": 6099,
+            "fold_ops": 6121,
+            "bytes": 292594,
+            "ms": 20.401
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 16,
+            "quads": 6142,
+            "fold_ops": 6164,
+            "bytes": 294771,
+            "ms": 21.693
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 17,
+            "quads": 6148,
+            "fold_ops": 6170,
+            "bytes": 295072,
+            "ms": 21.979
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 18,
+            "quads": 6152,
+            "fold_ops": 6174,
+            "bytes": 295276,
+            "ms": 23.26
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 19,
+            "quads": 6158,
+            "fold_ops": 6180,
+            "bytes": 295578,
+            "ms": 22.987
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 20,
+            "quads": 6164,
+            "fold_ops": 6186,
+            "bytes": 295880,
+            "ms": 23.819
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 21,
+            "quads": 6169,
+            "fold_ops": 6191,
+            "bytes": 296133,
+            "ms": 24.11
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 22,
+            "quads": 6175,
+            "fold_ops": 6197,
+            "bytes": 296435,
+            "ms": 23.313
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 23,
+            "quads": 6179,
+            "fold_ops": 6201,
+            "bytes": 296639,
+            "ms": 24.868
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 24,
+            "quads": 6184,
+            "fold_ops": 6206,
+            "bytes": 296891,
+            "ms": 24.278
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 25,
+            "quads": 6189,
+            "fold_ops": 6211,
+            "bytes": 297144,
+            "ms": 40.665
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 8,
+            "quads": 6103,
+            "fold_ops": 6125,
+            "bytes": 292798,
+            "ms": 21.493
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 26,
+            "quads": 6192,
+            "fold_ops": 6214,
+            "bytes": 297299,
+            "ms": 24.841
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 27,
+            "quads": 6195,
+            "fold_ops": 6217,
+            "bytes": 297454,
+            "ms": 23.886
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 28,
+            "quads": 6199,
+            "fold_ops": 6221,
+            "bytes": 297658,
+            "ms": 24.24
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 29,
+            "quads": 6204,
+            "fold_ops": 6226,
+            "bytes": 297911,
+            "ms": 24.692
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 30,
+            "quads": 6209,
+            "fold_ops": 6231,
+            "bytes": 298164,
+            "ms": 24.543
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 31,
+            "quads": 6214,
+            "fold_ops": 6236,
+            "bytes": 298417,
+            "ms": 26.852
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 32,
+            "quads": 6220,
+            "fold_ops": 6242,
+            "bytes": 298719,
+            "ms": 25.488
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 33,
+            "quads": 6225,
+            "fold_ops": 6247,
+            "bytes": 298972,
+            "ms": 25.073
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 34,
+            "quads": 6229,
+            "fold_ops": 6251,
+            "bytes": 299176,
+            "ms": 25.399
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 35,
+            "quads": 6232,
+            "fold_ops": 6254,
+            "bytes": 299331,
+            "ms": 26.022
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 9,
+            "quads": 6109,
+            "fold_ops": 6131,
+            "bytes": 293100,
+            "ms": 20.764
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 36,
+            "quads": 6237,
+            "fold_ops": 6259,
+            "bytes": 299584,
+            "ms": 25.912
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 37,
+            "quads": 6241,
+            "fold_ops": 6263,
+            "bytes": 299788,
+            "ms": 25.85
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 38,
+            "quads": 6244,
+            "fold_ops": 6266,
+            "bytes": 299943,
+            "ms": 25.833
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 39,
+            "quads": 6250,
+            "fold_ops": 6272,
+            "bytes": 300245,
+            "ms": 27.207
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 40,
+            "quads": 6256,
+            "fold_ops": 6278,
+            "bytes": 300547,
+            "ms": 26.879
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 41,
+            "quads": 6262,
+            "fold_ops": 6284,
+            "bytes": 300849,
+            "ms": 26.706
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 10,
+            "quads": 6115,
+            "fold_ops": 6137,
+            "bytes": 293402,
+            "ms": 21.282
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 11,
+            "quads": 6120,
+            "fold_ops": 6142,
+            "bytes": 293655,
+            "ms": 21.009
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 12,
+            "quads": 6125,
+            "fold_ops": 6147,
+            "bytes": 293908,
+            "ms": 40.571
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 13,
+            "quads": 6130,
+            "fold_ops": 6152,
+            "bytes": 294161,
+            "ms": 34.92
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 14,
+            "quads": 6136,
+            "fold_ops": 6158,
+            "bytes": 294463,
+            "ms": 23.52
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 15,
+            "quads": 6139,
+            "fold_ops": 6161,
+            "bytes": 294618,
+            "ms": 25.213
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "bulk",
+            "depth": 1,
+            "quads": 6100,
+            "fold_ops": 6100,
+            "bytes": 292617,
+            "ms": 21.565
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "bulk",
+            "depth": 0,
+            "quads": 5000,
+            "fold_ops": 5000,
+            "bytes": 238327,
+            "ms": 16.383
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 2,
+            "quads": 6098,
+            "fold_ops": 6104,
+            "bytes": 292524,
+            "ms": 20.094
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 11,
+            "quads": 6094,
+            "fold_ops": 6140,
+            "bytes": 292352,
+            "ms": 22.086
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 12,
+            "quads": 6092,
+            "fold_ops": 6144,
+            "bytes": 292262,
+            "ms": 22.899
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 13,
+            "quads": 6092,
+            "fold_ops": 6146,
+            "bytes": 292262,
+            "ms": 27.354
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 14,
+            "quads": 6094,
+            "fold_ops": 6154,
+            "bytes": 292359,
+            "ms": 34.966
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 15,
+            "quads": 6092,
+            "fold_ops": 6162,
+            "bytes": 292268,
+            "ms": 26.806
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 16,
+            "quads": 6092,
+            "fold_ops": 6166,
+            "bytes": 292269,
+            "ms": 23.204
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 17,
+            "quads": 6092,
+            "fold_ops": 6172,
+            "bytes": 292270,
+            "ms": 24.116
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 18,
+            "quads": 6092,
+            "fold_ops": 6176,
+            "bytes": 292273,
+            "ms": 23.631
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 19,
+            "quads": 6093,
+            "fold_ops": 6181,
+            "bytes": 292322,
+            "ms": 23.493
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 20,
+            "quads": 6091,
+            "fold_ops": 6187,
+            "bytes": 292233,
+            "ms": 25.23
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 3,
+            "quads": 6097,
+            "fold_ops": 6109,
+            "bytes": 292478,
+            "ms": 27.893
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 21,
+            "quads": 6089,
+            "fold_ops": 6189,
+            "bytes": 292139,
+            "ms": 36.621
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 22,
+            "quads": 6087,
+            "fold_ops": 6195,
+            "bytes": 292029,
+            "ms": 37.357
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 23,
+            "quads": 6088,
+            "fold_ops": 6198,
+            "bytes": 292076,
+            "ms": 24.984
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 24,
+            "quads": 6088,
+            "fold_ops": 6202,
+            "bytes": 292078,
+            "ms": 25.064
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 25,
+            "quads": 6087,
+            "fold_ops": 6207,
+            "bytes": 292033,
+            "ms": 25.641
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 26,
+            "quads": 6085,
+            "fold_ops": 6213,
+            "bytes": 291942,
+            "ms": 27.174
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 27,
+            "quads": 6084,
+            "fold_ops": 6216,
+            "bytes": 291895,
+            "ms": 24.46
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 28,
+            "quads": 6085,
+            "fold_ops": 6217,
+            "bytes": 291943,
+            "ms": 26.251
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 29,
+            "quads": 6089,
+            "fold_ops": 6223,
+            "bytes": 292131,
+            "ms": 24.873
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 30,
+            "quads": 6091,
+            "fold_ops": 6231,
+            "bytes": 292230,
+            "ms": 25.217
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 4,
+            "quads": 6095,
+            "fold_ops": 6113,
+            "bytes": 292387,
+            "ms": 22.193
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 31,
+            "quads": 6090,
+            "fold_ops": 6232,
+            "bytes": 292183,
+            "ms": 26.43
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 32,
+            "quads": 6091,
+            "fold_ops": 6239,
+            "bytes": 292233,
+            "ms": 25.921
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 33,
+            "quads": 6090,
+            "fold_ops": 6246,
+            "bytes": 292189,
+            "ms": 26.153
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 34,
+            "quads": 6092,
+            "fold_ops": 6250,
+            "bytes": 292283,
+            "ms": 26.95
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 35,
+            "quads": 6092,
+            "fold_ops": 6252,
+            "bytes": 292287,
+            "ms": 26.436
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 36,
+            "quads": 6093,
+            "fold_ops": 6253,
+            "bytes": 292335,
+            "ms": 27.451
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 37,
+            "quads": 6094,
+            "fold_ops": 6258,
+            "bytes": 292385,
+            "ms": 25.99
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 38,
+            "quads": 6094,
+            "fold_ops": 6260,
+            "bytes": 292386,
+            "ms": 31.893
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 39,
+            "quads": 6095,
+            "fold_ops": 6263,
+            "bytes": 292436,
+            "ms": 33.722
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 40,
+            "quads": 6096,
+            "fold_ops": 6266,
+            "bytes": 292484,
+            "ms": 31.32
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 5,
+            "quads": 6095,
+            "fold_ops": 6115,
+            "bytes": 292387,
+            "ms": 20.529
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 41,
+            "quads": 6097,
+            "fold_ops": 6267,
+            "bytes": 292530,
+            "ms": 32.86
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 47,
+            "quads": 6105,
+            "fold_ops": 6483,
+            "bytes": 292915,
+            "ms": 31.16
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 48,
+            "quads": 6103,
+            "fold_ops": 6489,
+            "bytes": 292819,
+            "ms": 33.498
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 50,
+            "quads": 6105,
+            "fold_ops": 6507,
+            "bytes": 292915,
+            "ms": 30.028
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 52,
+            "quads": 6101,
+            "fold_ops": 6513,
+            "bytes": 292729,
+            "ms": 29.222
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 55,
+            "quads": 6267,
+            "fold_ops": 6815,
+            "bytes": 301143,
+            "ms": 41.933
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 56,
+            "quads": 6267,
+            "fold_ops": 6817,
+            "bytes": 301143,
+            "ms": 42.056
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 57,
+            "quads": 6269,
+            "fold_ops": 6823,
+            "bytes": 301241,
+            "ms": 36.43
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 58,
+            "quads": 6269,
+            "fold_ops": 6825,
+            "bytes": 301241,
+            "ms": 41.111
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 59,
+            "quads": 6270,
+            "fold_ops": 6832,
+            "bytes": 301294,
+            "ms": 39.134
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 6,
+            "quads": 6094,
+            "fold_ops": 6116,
+            "bytes": 292341,
+            "ms": 23.919
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 60,
+            "quads": 6271,
+            "fold_ops": 6833,
+            "bytes": 301341,
+            "ms": 34.467
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 61,
+            "quads": 6273,
+            "fold_ops": 6839,
+            "bytes": 301452,
+            "ms": 31.92
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 62,
+            "quads": 6272,
+            "fold_ops": 6840,
+            "bytes": 301404,
+            "ms": 32.135
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 63,
+            "quads": 6271,
+            "fold_ops": 6845,
+            "bytes": 301359,
+            "ms": 34.642
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 64,
+            "quads": 6271,
+            "fold_ops": 6849,
+            "bytes": 301377,
+            "ms": 41.089
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 7,
+            "quads": 6093,
+            "fold_ops": 6119,
+            "bytes": 292296,
+            "ms": 22.327
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 8,
+            "quads": 6093,
+            "fold_ops": 6121,
+            "bytes": 292297,
+            "ms": 20.714
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 9,
+            "quads": 6095,
+            "fold_ops": 6129,
+            "bytes": 292394,
+            "ms": 20.874
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 10,
+            "quads": 6096,
+            "fold_ops": 6134,
+            "bytes": 292443,
+            "ms": 22.254
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "merge",
+            "depth": 42,
+            "quads": 6100,
+            "fold_ops": 6316,
+            "bytes": 292674,
+            "ms": 28.3
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "merge",
+            "depth": 55,
+            "quads": 6105,
+            "fold_ops": 6481,
+            "bytes": 292914,
+            "ms": 30.591
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "merge",
+            "depth": 55,
+            "quads": 6105,
+            "fold_ops": 6485,
+            "bytes": 292914,
+            "ms": 29.42
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "merge",
+            "depth": 49,
+            "quads": 6105,
+            "fold_ops": 6503,
+            "bytes": 292915,
+            "ms": 29.672
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "merge",
+            "depth": 51,
+            "quads": 6105,
+            "fold_ops": 6507,
+            "bytes": 292915,
+            "ms": 32.239
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "merge",
+            "depth": 60,
+            "quads": 6108,
+            "fold_ops": 6502,
+            "bytes": 293058,
+            "ms": 30.242
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "merge",
+            "depth": 57,
+            "quads": 6108,
+            "fold_ops": 6506,
+            "bytes": 293058,
+            "ms": 30.806
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "merge",
+            "depth": 61,
+            "quads": 6108,
+            "fold_ops": 6502,
+            "bytes": 293058,
+            "ms": 52.546
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "merge",
+            "depth": 53,
+            "quads": 6269,
+            "fold_ops": 6681,
+            "bytes": 301237,
+            "ms": 31.463
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "merge",
+            "depth": 43,
+            "quads": 6096,
+            "fold_ops": 6358,
+            "bytes": 292482,
+            "ms": 31.085
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "merge",
+            "depth": 54,
+            "quads": 6269,
+            "fold_ops": 6813,
+            "bytes": 301237,
+            "ms": 32.65
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "merge",
+            "depth": 27,
+            "quads": 6096,
+            "fold_ops": 6360,
+            "bytes": 292482,
+            "ms": 24.53
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "merge",
+            "depth": 44,
+            "quads": 6094,
+            "fold_ops": 6382,
+            "bytes": 292386,
+            "ms": 30.289
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "merge",
+            "depth": 45,
+            "quads": 6098,
+            "fold_ops": 6442,
+            "bytes": 292578,
+            "ms": 30.867
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "merge",
+            "depth": 46,
+            "quads": 6105,
+            "fold_ops": 6481,
+            "bytes": 292914,
+            "ms": 28.53
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "bulk",
+            "depth": 1,
+            "quads": 6100,
+            "fold_ops": 6100,
+            "bytes": 292617,
+            "ms": 19.485
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 64,
+            "quads": 6271,
+            "fold_ops": 6849,
+            "bytes": 301377,
+            "ms": 32.63
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 11,
+            "quads": 6094,
+            "fold_ops": 6140,
+            "bytes": 292352,
+            "ms": 23.38
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "merge",
+            "depth": 42,
+            "quads": 6100,
+            "fold_ops": 6316,
+            "bytes": 292674,
+            "ms": 27.839
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "merge",
+            "depth": 44,
+            "quads": 6094,
+            "fold_ops": 6382,
+            "bytes": 292386,
+            "ms": 31.873
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "merge",
+            "depth": 46,
+            "quads": 6105,
+            "fold_ops": 6481,
+            "bytes": 292914,
+            "ms": 30.444
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 6,
+            "quads": 6094,
+            "fold_ops": 6116,
+            "bytes": 292341,
+            "ms": 20.345
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "growth",
+            "depth": 41,
+            "quads": 6262,
+            "fold_ops": 6284,
+            "bytes": 300849,
+            "ms": 27.554
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "main",
+            "depth": 6,
+            "quads": 6094,
+            "fold_ops": 6116,
+            "bytes": 292341,
+            "ms": 22.669
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "churn",
+            "depth": 41,
+            "quads": 6094,
+            "fold_ops": 6252,
+            "bytes": 292341,
+            "ms": 28.706
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 59,
+            "quads": 6109,
+            "fold_ops": 6501,
+            "bytes": 293106,
+            "ms": 33.428
+          },
+          {
+            "op": "state_read_historical",
+            "kind": "feature",
+            "depth": 56,
+            "quads": 6104,
+            "fold_ops": 6486,
+            "bytes": 292866,
+            "ms": 32.487
+          }
+        ]
+      },
+      "resources": {
+        "harness_peak_rss_kib": 67376,
+        "db_bytes_before": 9219219,
+        "db_bytes_after": 11390099,
+        "immutable_objects_bytes_after": 376832,
+        "immutable_objects_logical_bytes_after": 435576,
+        "annotations": {
+          "phases": "harness-build 0s;dataset-validate 14s;stack-build-and-start 15s;benchmark-run 27s;",
+          "postgres_peak_memory": "135 MiB (memory.current sampled every 0.5 s)",
+          "server_peak_memory": "45 MiB (memory.current sampled every 0.5 s)"
+        }
+      }
+    }
+  ]
+}

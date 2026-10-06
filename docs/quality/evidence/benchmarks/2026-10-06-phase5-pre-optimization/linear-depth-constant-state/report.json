@@ -1,0 +1,158 @@
+{
+  "run": "b6ac551ad",
+  "environment": {
+    "cpu_model": "Intel(R) Core(TM) i7-4930K CPU @ 3.40GHz",
+    "cpus": 12,
+    "mem_total_kib": 16319204,
+    "kernel": "5.10.0-44-amd64",
+    "postgres_version": "PostgreSQL 17.2 (Debian 17.2-1.pgdg120+1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 12.2.0-14) 12.2.0, 64-bit",
+    "postgres_max_connections": "100",
+    "postgres_shared_buffers": "128MB",
+    "replicas": [
+      "http://127.0.0.1:8080"
+    ]
+  },
+  "constant_state": true,
+  "samples": 20,
+  "depths": [
+    {
+      "depth": 1,
+      "commit_samples": 1,
+      "quads_in_state": 1,
+      "prepare": {
+        "op": "prepare",
+        "bucket": "ok",
+        "count": 1,
+        "p50_ms": 10.827,
+        "p95_ms": 10.827,
+        "p99_ms": 10.827,
+        "max_ms": 10.827,
+        "mean_ms": 10.827
+      },
+      "accept": {
+        "op": "accept",
+        "bucket": "ok",
+        "count": 1,
+        "p50_ms": 16.942,
+        "p95_ms": 16.942,
+        "p99_ms": 16.942,
+        "max_ms": 16.942,
+        "mean_ms": 16.942
+      },
+      "ref_read": {
+        "op": "ref_read",
+        "bucket": "ok",
+        "count": 20,
+        "p50_ms": 0.584,
+        "p95_ms": 0.905,
+        "p99_ms": 0.98,
+        "max_ms": 0.98,
+        "mean_ms": 0.63575
+      },
+      "state_read": {
+        "op": "state_read",
+        "bucket": "ok",
+        "count": 20,
+        "p50_ms": 0.851,
+        "p95_ms": 1.373,
+        "p99_ms": 1.501,
+        "max_ms": 1.501,
+        "mean_ms": 0.94265
+      }
+    },
+    {
+      "depth": 100,
+      "commit_samples": 20,
+      "quads_in_state": 1,
+      "prepare": {
+        "op": "prepare",
+        "bucket": "ok",
+        "count": 20,
+        "p50_ms": 18.909,
+        "p95_ms": 22.895,
+        "p99_ms": 25.978,
+        "max_ms": 25.978,
+        "mean_ms": 19.73665
+      },
+      "accept": {
+        "op": "accept",
+        "bucket": "ok",
+        "count": 20,
+        "p50_ms": 3.555,
+        "p95_ms": 4.315,
+        "p99_ms": 4.523,
+        "max_ms": 4.523,
+        "mean_ms": 3.6536999999999997
+      },
+      "ref_read": {
+        "op": "ref_read",
+        "bucket": "ok",
+        "count": 20,
+        "p50_ms": 0.736,
+        "p95_ms": 0.872,
+        "p99_ms": 0.912,
+        "max_ms": 0.912,
+        "mean_ms": 0.7483
+      },
+      "state_read": {
+        "op": "state_read",
+        "bucket": "ok",
+        "count": 20,
+        "p50_ms": 20.402,
+        "p95_ms": 23.287,
+        "p99_ms": 26.647,
+        "max_ms": 26.647,
+        "mean_ms": 20.79205
+      }
+    },
+    {
+      "depth": 1000,
+      "commit_samples": 20,
+      "quads_in_state": 1,
+      "prepare": {
+        "op": "prepare",
+        "bucket": "ok",
+        "count": 20,
+        "p50_ms": 179.387,
+        "p95_ms": 189.055,
+        "p99_ms": 202.384,
+        "max_ms": 202.384,
+        "mean_ms": 180.23025
+      },
+      "accept": {
+        "op": "accept",
+        "bucket": "ok",
+        "count": 20,
+        "p50_ms": 4.051,
+        "p95_ms": 5.064,
+        "p99_ms": 9.343,
+        "max_ms": 9.343,
+        "mean_ms": 4.36895
+      },
+      "ref_read": {
+        "op": "ref_read",
+        "bucket": "ok",
+        "count": 20,
+        "p50_ms": 0.767,
+        "p95_ms": 0.911,
+        "p99_ms": 0.926,
+        "max_ms": 0.926,
+        "mean_ms": 0.7878999999999999
+      },
+      "state_read": {
+        "op": "state_read",
+        "bucket": "ok",
+        "count": 20,
+        "p50_ms": 187.785,
+        "p95_ms": 198.317,
+        "p99_ms": 199.885,
+        "max_ms": 199.885,
+        "mean_ms": 189.7233
+      }
+    }
+  ],
+  "total_commits": 1000,
+  "build_seconds": 103.841638985,
+  "errors": [],
+  "passed": true
+}

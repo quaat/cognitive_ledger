@@ -194,6 +194,14 @@
 - Residual write authority of the runtime identity (ADR-0016): it can fabricate a consistent forward ref move with its audit rows or pre-seed idempotency results within its tenants. Closing it needs `SECURITY DEFINER` write functions (with pinned `search_path`) as the only write path, and ideally a cargo feature gate so `ledger-server` cannot link the migrating constructors (`connect_and_migrate`, `from_pool`, `with_ref`).
 - `mark_superseded` has no idempotency record; a retry after a lost response reports `LINEAGE_MISMATCH`. Give it a scope/key if it becomes an API operation. PostgreSQL 17's `transaction_timeout` would bound a workflow transaction that keeps issuing statements; consider it once PG17 is the floor.
 - Identical prepares whose content, actor and microsecond `recorded_at` coincide under two different keys collide on `proposals_candidate_unique`; reported as `LINEAGE_MISMATCH` (not a 500) — acceptable, extremely unlikely.
+- **Intermittent hang (observed 2026-10-06, hosted `ci-integration` run 37524260391,
+  first attempt).** `pg_graphs_migration::upgrade_refuses_graphs_without_a_derivable_owner`
+  stalled for 36 minutes until cancelled; the rerun passed.
+  - The test runs a migration that is expected to fail on a pool. The item below (advisory
+    lock kept after a failed migration) is the suspected, unconfirmed cause.
+  - `ci-integration` has no `timeout-minutes` and the suites no per-test timeout, so a hang
+    costs up to the 6-hour default.
+  - Add a job timeout and run that migration on a dedicated connection.
 - Failed sqlx migration runs keep their advisory lock on the pooled connection; library constructors that migrate on a caller's pool inherit this. Run migrations on a dedicated connection or through the explicit `schema` entry points from a fresh process.
 - Evaluate `cargo-deny`, SBOM, and container scanning with classified findings (`cargo audit` is now a blocking gate via `scripts/check-supply-chain.sh`; its single exception, RUSTSEC-2023-0071 for the lockfile-only `rsa` under `sqlx-mysql`, is re-proven on every run and must be deleted when sqlx/rsa move).
 - Third-party GitHub Actions are pinned by commit SHA (Plan 0005 slice 2); bumping them is a deliberate change with the release name in the comment. The distroless runtime base is pinned by digest and must be refreshed when the classified container findings gain fixes (`docs/quality/security.md`).

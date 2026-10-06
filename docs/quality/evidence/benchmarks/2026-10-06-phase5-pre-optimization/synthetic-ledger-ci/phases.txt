@@ -1,0 +1,5 @@
+harness-build 0s
+dataset-validate 14s
+stack-build-and-start 15s
+benchmark-run 27s
+verify 4s

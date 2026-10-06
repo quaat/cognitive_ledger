@@ -973,6 +973,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ledger-bench"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "jsonwebtoken",
+ "ledger-core",
+ "ledger-rdf",
+ "ledger-store",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "sqlx",
+ "tokio",
+]
+
+[[package]]
 name = "ledger-core"
 version = "0.1.0"
 dependencies = [

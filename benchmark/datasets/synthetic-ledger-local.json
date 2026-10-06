@@ -1,0 +1,29 @@
+{
+  "dataset": "synthetic-ledger-local",
+  "kind": "generated",
+  "source": "apps/ledger-bench/src/synthetic.rs (generated; no external data)",
+  "source_version": "synthetic-ledger-gen/3",
+  "license": "Apache-2.0 (project-owned generated data)",
+  "generator": "ledger-bench synthetic",
+  "generator_version": "synthetic-ledger-gen/3",
+  "seed": "0x5eed000110ca1000",
+  "params": {
+    "churn": 300,
+    "conflicts": 20,
+    "contested": 40,
+    "convergent": 4,
+    "entities": 2000,
+    "fast": 20,
+    "feature": 100,
+    "growth": 300,
+    "main_mid": 200,
+    "main_post": 200,
+    "main_pre": 200,
+    "meta_entities": 200,
+    "predicates": 6,
+    "sample_every": 50,
+    "verify_all_history": false
+  },
+  "commits": 1530,
+  "output_checksum": "sha256:9f678bd99c3d04af61e3ed41680862891d0ea3510556666479899658d5c35cfd"
+}

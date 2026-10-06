@@ -1739,6 +1739,15 @@ orphan cleanup
 
 Only implement optimizations justified by measurements.
 
+> **Roadmap reconciliation (2026-10-06, recorded in Plan 0010).** Phase 6 begins with a
+> measurement foundation, **Phase 6A**: a reproducible benchmark subsystem
+> (`docs/benchmarks/`, `apps/ledger-bench`, the `ci-benchmark` PR job). Its first dataset,
+> `synthetic-ledger-ci`, is a correctness oracle for the production API. Phase 6A also
+> records a pre-optimization baseline of the unchanged Phase-5 implementation. No
+> checkpoint, cache or change index is built in 6A. The checkpoint ADR and the deliverables
+> below follow from those measurements, together with the reduced BEAR-B dataset (M3 of
+> the benchmark plan).
+
 Gate:
 
 ```text
