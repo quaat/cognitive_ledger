@@ -137,8 +137,13 @@ Classification (ADR-0024 defines merge base and ancestry):
 - apply is an acceptance of that proposal with the merge-specific staleness checks
   (ADR-0024), under the **target** branch's policy.
 
-**No empty integrations.** A merge whose merged state equals the target's state is
-classified `NO_CHANGE` and creates nothing. Examples: a fast-forward to a source with the
+**Empty integrations only when they record a decision.** A merge whose merged state
+equals the target's state, **and whose source contributed no net change from the base**, is
+classified `NO_CHANGE` and creates nothing. If the source did change something but the
+merged state still equals the target's, an empty integration commit records that
+resolution; see ADR-0024, "No-change". This was amended after the implementation review,
+because a silent no-op could let a later merge reapply what was set aside. The paragraph
+below describes the `NO_CHANGE` part. Examples: a fast-forward to a source with the
 same state, every source change already present, or `take-target` resolving every
 difference. This keeps ADR-0008's rule that an empty effective delta on a protected ref
 produces no commit, and it makes two-way synchronization reach a fixed point:

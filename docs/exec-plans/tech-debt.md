@@ -116,6 +116,45 @@
 - Merge-base, merge, conflicts, checkpoints and GC of deleted branches are Phase 5+ (product plan).
 - Activating a raw-imported graph (`bootstrap`/`importing` → `active`) adopts its refs as branches, but the imported heads still have no ref events (Phase-1 import semantics), so `ledger-admin verify` reports the ref-version and lifecycle-position checks for that graph. The audited import/activation command (P1.5 blocker above) must write the import's ref events before activation.
 
+## Phase 5 (Plan 0009) residuals and accepted risk
+
+- Merge ancestry walks compute full ancestor sets of both heads in memory, bounded by the
+  visit limit (100 000) and a 10 s deadline. Very long-lived branches eventually hit the
+  limit (`RESOURCE_LIMIT`, never a wrong answer). Generation numbers and checkpoints are
+  Phase 6.
+- Each preview reconstructs three full states (base, target, source), bounded by the
+  reconstruction limits and the expensive-operation slot. Incremental diff (`change_index`)
+  is deferred until measurements require it (product plan §15).
+- The structural slot key `(graph, subject, predicate)` conservatively flags multi-valued
+  predicates (for example, two different `rdf:type` additions) as conflicts. A per-quad
+  strategy would be a new algorithm id (ADR-0024).
+- Criss-cross histories need an explicit `base`. Virtual merge-base synthesis needs a
+  later ADR.
+- Every `propose` persists an immutable candidate, proposal and merge row, with no GC in
+  v1. Re-proposing after staleness adds rows; superseded merge proposals are retired by
+  `reject`.
+- Fast-forward-class merges create an integration commit rather than moving the target to
+  the source commit (ADR-0023). Ref equality between target and source after a merge is not
+  provided; option B (a database-verified descendant jump) would need its own ADR and
+  migration.
+- The Virtual A-Box-dependent merge validation is qualified against the protocol-conformant
+  fake validator. The live Sculpin service remains an external prerequisite (Phase 8).
+- Merge computation runs inline on an async worker and holds the base, target, source and
+  merged states plus the summary diffs at once (roughly 6–8 times one state's budget at
+  the limits). It is bounded by the 3-slot admission weight and the reconstruction limits.
+  Computing keys only for the changed quads, starting from T, and running under
+  `spawn_blocking` are measured-later optimizations. The admission semaphore is global,
+  not per tenant.
+- The conflict report is capped at 1 000 keys × 64 quads per side, not by bytes: a report
+  can be large when single quads are huge (each is bounded by the state limits). Add a byte
+  budget with a report-level truncation flag.
+- The preview token binds the chosen strategy even when no slot conflicts, so previewing
+  with `abort` and proposing with `union` is `MERGE_STALE`. This is intended and documented;
+  normalizing it would be a token v2.
+- Live Fluree merge differential: deferred (BUSL-1.1 approval pending). It has not been run
+  and is not counted; the ledger-dag and ledger-merge property suites against independent
+  reference models replace it internally.
+
 ## Later-phase work and accepted residual risk (does not block Phase 2 or the P1.5 gate)
 
 - Design a stable skolemization/import protocol and hostile-input limits around the standards N-Quads parser.

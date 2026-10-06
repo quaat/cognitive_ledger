@@ -294,6 +294,11 @@ impl Ancestry {
     pub fn is_empty(&self) -> bool {
         self.parents.is_empty()
     }
+    /// The commits of this ancestry that `other` does not contain, ascending by id.
+    pub fn difference(&self, other: &Ancestry) -> Vec<CommitId> {
+        let set: BTreeSet<&CommitId> = self.parents.keys().filter(|c| !other.contains(c)).collect();
+        set.into_iter().cloned().collect()
+    }
 }
 
 /// The ancestry of `head`: every reachable commit with its parents (one bounded traversal).
@@ -417,13 +422,27 @@ pub async fn analyze<P: ParentProvider + ?Sized>(
     source: &CommitId,
     limits: TraversalLimits,
 ) -> Result<Analysis, DagError<P::Error>> {
+    Ok(analyze_with_ancestries(provider, target, source, limits)
+        .await?
+        .0)
+}
+
+/// [`analyze`], also returning the target's and the source's ancestries (for callers that
+/// need the commits one side has and the other lacks, without walking again).
+pub async fn analyze_with_ancestries<P: ParentProvider + ?Sized>(
+    provider: &P,
+    target: &CommitId,
+    source: &CommitId,
+    limits: TraversalLimits,
+) -> Result<(Analysis, Ancestry, Ancestry), DagError<P::Error>> {
     let t = ancestry(provider, target, limits).await?;
     if target == source {
-        return Ok(Analysis {
+        let analysis = Analysis {
             relation: Relation::Equal,
             ahead: 0,
             behind: 0,
-        });
+        };
+        return Ok((analysis, t.clone(), t));
     }
     let s = ancestry(provider, source, limits).await?;
     let (ahead, behind) = counts(&t, &s);
@@ -434,11 +453,12 @@ pub async fn analyze<P: ParentProvider + ?Sized>(
     } else {
         Relation::Divergent(classify_base(best_common_ancestors(&t, &s)))
     };
-    Ok(Analysis {
+    let analysis = Analysis {
         relation,
         ahead,
         behind,
-    })
+    };
+    Ok((analysis, t, s))
 }
 
 /// An in-memory, `HashMap`-backed [`ParentProvider`] for tests (including other crates'

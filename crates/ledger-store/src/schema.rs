@@ -944,6 +944,7 @@ pub const EXPECTED_NOT_NULL: &[(&str, &[&str])] = &[
             "conflict_count",
             "merged_state_digest",
             "preview_token",
+            "source_parties",
             "created_at",
         ],
     ),
@@ -1178,7 +1179,6 @@ const EXPECTED_CONSTRAINTS: &[ExpectedConstraint] = &[
         &["proposal_id", "graph_id", "branch", "candidate_commit"],
     ),
     uq("merge_proposals", &["candidate_commit"]),
-    uq("merge_proposals", &["preview_token"]),
     fk(
         "merge_proposals",
         &["graph_id", "target_head"],
@@ -2808,6 +2808,7 @@ const RUNTIME_TABLE_MODEL: &[TablePrivileges] = &[
             "conflict_count",
             "merged_state_digest",
             "preview_token",
+            "source_parties",
         ],
         update_columns: &[],
     },

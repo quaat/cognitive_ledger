@@ -21,12 +21,15 @@ CREATE TABLE merge_proposals (
     conflict_count      INTEGER     NOT NULL,
     merged_state_digest TEXT        NOT NULL,
     preview_token       TEXT        NOT NULL,
+    -- The accountable parties (principal ids and delegators) who proposed the commits the
+    -- source has and the target lacks; `require_distinct_reviewer` on the target keeps them
+    -- (and the merge proposer) from applying their own content (ADR-0024).
+    source_parties      TEXT[]      NOT NULL,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT merge_proposals_pkey PRIMARY KEY (proposal_id),
     CONSTRAINT merge_proposals_proposal_fk FOREIGN KEY (proposal_id, graph_id, target_branch, candidate_commit)
         REFERENCES proposals (proposal_id, graph_id, branch, candidate_commit),
     CONSTRAINT merge_proposals_candidate_unique UNIQUE (candidate_commit),
-    CONSTRAINT merge_proposals_token_unique UNIQUE (preview_token),
     CONSTRAINT merge_proposals_target_head_fk FOREIGN KEY (graph_id, target_head) REFERENCES commit_index (graph_id, id),
     CONSTRAINT merge_proposals_source_head_fk FOREIGN KEY (graph_id, source_head) REFERENCES commit_index (graph_id, id),
     CONSTRAINT merge_proposals_base_fk FOREIGN KEY (graph_id, merge_base) REFERENCES commit_index (graph_id, id),
@@ -46,6 +49,9 @@ CREATE TABLE merge_proposals (
     CONSTRAINT merge_proposals_digest_format CHECK (merged_state_digest ~ '^sha256:[0-9a-f]{64}$')
 );
 CREATE INDEX merge_proposals_by_target ON merge_proposals (graph_id, target_branch);
+-- Not unique: the token is a confirmation digest of a preview; a rejected merge may be
+-- proposed again from the same preview (ADR-0024).
+CREATE INDEX merge_proposals_by_token ON merge_proposals (preview_token);
 
 DROP TRIGGER IF EXISTS merge_proposals_write_once ON merge_proposals;
 CREATE TRIGGER merge_proposals_write_once BEFORE UPDATE OR DELETE ON merge_proposals
@@ -223,7 +229,7 @@ BEGIN
                    'reason, correlation_id) ON TABLE public.branch_events TO %s', r);
     EXECUTE pg_catalog.format('GRANT INSERT (proposal_id, graph_id, target_branch, candidate_commit, target_head, '
                    'source_branch, source_head, merge_base, base_explicit, classification, strategy, '
-                   'merge_algorithm, conflict_count, merged_state_digest, preview_token) '
+                   'merge_algorithm, conflict_count, merged_state_digest, preview_token, source_parties) '
                    'ON TABLE public.merge_proposals TO %s', r);
     EXECUTE pg_catalog.format('GRANT INSERT (context_id, graph_id, tenant_id, candidate_commit, candidate_state_digest, '
                    'base_kb_id, base_kb_revision, ontology_id, ontology_version, shapes_id, shapes_version, '

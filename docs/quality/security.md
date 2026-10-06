@@ -79,6 +79,32 @@ Preserve object digest verification and atomic ref updates. Never commit secrets
   like ref history since Phase 1; deployments mapping personal identifiers into principal ids
   must treat branch history as personal data.
 
+## Merge authorization and integrity (Phase 5, ADR-0023/0024)
+- **Capabilities**:
+  - `read`: preview (side-effect free, bounded: expensive-operation slot, traversal visit
+    limit and deadline, reconstruction limits on every state);
+  - `propose`: propose (persists a proposal on the target);
+  - `review`: apply.
+
+  The **target** branch's policy is authoritative: the deployment validation floor,
+  `require_validation` and `require_distinct_reviewer` (merge proposer vs applier as
+  accountable parties). A source branch's weaker policy never applies.
+- **Tenancy**: every merge route is graph- and tenant-scoped like the rest. Ancestry is
+  walked only within the graph, so an explicit `base` naming another graph's commit is not
+  a best common ancestor and fails with `INVALID_MERGE_BASE`.
+- **Database facts (migration 0013)**:
+  - a merge row is write-once, and its candidate must be the integration commit
+    `[target, source]` of its proposal;
+  - only a `merge` ref event may install a merge candidate, and an `advance` never does;
+  - an accepted decision on a merge candidate must reference a `merge` event;
+  - migration 0009's direct-first-parent movement rule is unchanged.
+- **Apply locking**: both refs are locked in branch-name order (target `FOR UPDATE`, source
+  `FOR SHARE`), so opposite merges serialize and can never create a criss-cross through
+  concurrency.
+- **Preview token**: it confirms what the client previewed and is recomputable on any
+  replica; it is not an authenticator. Authorization comes from the capability checks
+  above, and integrity from the stored merge row compared under lock.
+
 ## Semantic validation boundary (Phase 2, ADR-0014/0018/0019)
 - Capabilities: `validate` (`ledger.validate`) requests a validation of a prepared candidate;
   it grants no power over refs (`review` accepts/rejects). Proposers cannot validate;

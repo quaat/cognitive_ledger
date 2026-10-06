@@ -428,6 +428,12 @@ async fn runtime_identity_serves_the_workflow_but_cannot_touch_schema_or_history
         "DELETE FROM decision_validations",
         "ALTER TABLE validation_records DISABLE TRIGGER validation_records_write_once",
         "DROP TABLE decision_validations",
+        // Phase 5 (0013): merge rows are insert-only for the runtime.
+        "UPDATE merge_proposals SET strategy = 'union'",
+        "DELETE FROM merge_proposals",
+        "ALTER TABLE merge_proposals DISABLE TRIGGER merge_proposals_lineage",
+        "ALTER TABLE ref_events DISABLE TRIGGER ref_events_kind",
+        "DROP TRIGGER decisions_merge_kind ON decisions",
     ] {
         assert_denied(rt, sql).await;
     }
@@ -440,6 +446,8 @@ async fn runtime_identity_serves_the_workflow_but_cannot_touch_schema_or_history
         "INSERT INTO refs (graph_id, branch, head, version, updated_at) VALUES ('x', 'y', 'z', 1, now())",
         "INSERT INTO branch_events (graph_id, branch, tenant_id, lifecycle_version, operation, status_after, head, ref_version, principal_id, principal_type, recorded_at) VALUES ('x','y','t',2,'deleted','deleted','z',1,'p','agent', now())",
         "INSERT INTO projection_outbox (graph_id, branch, commit_id, ref_version, event_kind, ref_event_id, delivered_at) VALUES ('x','y','z',1,'ref_advanced',1, now())",
+        // Back-dating a merge row is not granted (0013).
+        "INSERT INTO merge_proposals (proposal_id, graph_id, target_branch, candidate_commit, target_head, source_branch, source_head, merge_base, base_explicit, classification, strategy, merge_algorithm, conflict_count, merged_state_digest, preview_token, source_parties, created_at) VALUES (1,'x','y','z','t','s','h','b',false,'divergent','abort','structural-slot/v1',0,'d','k','{}', now())",
         "INSERT INTO decisions (proposal_id, graph_id, branch, candidate_commit, decision, tenant_id, principal_id, principal_type, reason, validation_ids, decided_at) VALUES (1,'x','y','z','rejected','t','p','agent','r','{}', now())",
         // Back-dating the audit timestamp of a validation record or context is not granted.
         "INSERT INTO validation_records (validation_id, graph_id, tenant_id, candidate_commit, candidate_state_digest, context_id, validator_service_id, validator_service_version, validator_configuration_version, outcome, violation_count, report_digest, recorded_at, principal_id, principal_type, canonical_bytes, created_at) VALUES ('x','y','t','z','d','c','s','v','c','conforms',0,'r',now(),'p','agent','\\x00', now())",

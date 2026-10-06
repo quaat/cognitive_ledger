@@ -115,7 +115,7 @@ for target in "dump|${OWNER_IN_NET}/restored_dump?sslmode=disable|${RUNTIME_IN_N
   docker exec "${PG_CID}" psql -U ledger -d ledger -tAc "SELECT graph_id||'|'||branch||'|'||new_version||'|'||new_head FROM ref_events ORDER BY 1" >"${OUT}/events-live.txt"
   # Audit rows below the snapshot must exist identically in the live database (decisions,
   # outbox, idempotency results, proposals): a restore may only be a prefix, never differ.
-  ROWS_SQL="SELECT 'd|'||decision_id||'|'||coalesce(proposal_id::text,'')||'|'||decision||'|'||coalesce(ref_event_id::text,'') FROM decisions UNION ALL SELECT 'o|'||outbox_id||'|'||ref_event_id||'|'||commit_id||'|'||ref_version FROM projection_outbox UNION ALL SELECT 'i|'||md5(row_to_json(i)::text) FROM idempotency i UNION ALL SELECT 'p|'||proposal_id||'|'||graph_id||'|'||candidate_commit FROM proposals UNION ALL SELECT 'b|'||md5(row_to_json(b)::text) FROM branches b UNION ALL SELECT 'e|'||md5(row_to_json(e)::text) FROM branch_events e ORDER BY 1"
+  ROWS_SQL="SELECT 'd|'||decision_id||'|'||coalesce(proposal_id::text,'')||'|'||decision||'|'||coalesce(ref_event_id::text,'') FROM decisions UNION ALL SELECT 'o|'||outbox_id||'|'||ref_event_id||'|'||commit_id||'|'||ref_version FROM projection_outbox UNION ALL SELECT 'i|'||md5(row_to_json(i)::text) FROM idempotency i UNION ALL SELECT 'p|'||proposal_id||'|'||graph_id||'|'||candidate_commit FROM proposals UNION ALL SELECT 'b|'||md5(row_to_json(b)::text) FROM branches b UNION ALL SELECT 'e|'||md5(row_to_json(e)::text) FROM branch_events e UNION ALL SELECT 'm|'||md5(row_to_json(m)::text) FROM merge_proposals m ORDER BY 1"
   if [ "${name}" = dump ]; then docker exec "${PG_CID}" psql -U ledger -d restored_dump -tAc "${ROWS_SQL}" >"${OUT}/rows-${name}.txt"; else docker exec "${BBNAME}" psql -U ledger -d ledger -tAc "${ROWS_SQL}" >"${OUT}/rows-${name}.txt"; fi
   docker exec "${PG_CID}" psql -U ledger -d ledger -tAc "${ROWS_SQL}" >"${OUT}/rows-live.txt"
   if [ "${name}" = dump ]; then BEFORE=${DUMP_BEFORE}; else BEFORE=${BB_BEFORE}; fi
@@ -190,7 +190,10 @@ PY
   BRANCH_SQL="SELECT string_agg(branch||':'||status||':'||lifecycle_version, ',' ORDER BY branch) FROM branches WHERE graph_id = '${BRANCH_GRAPH}' AND branch LIKE 'backup/%'"
   if [ "${name}" = dump ]; then GOT=$(psql_q restored_dump "${BRANCH_SQL}"); else GOT=$(docker exec "${BBNAME}" psql -U ledger -d ledger -tAc "${BRANCH_SQL}"); fi
   [ "${GOT}" = "backup/b0:active:1,backup/b1:deleted:2,backup/b2:active:3,backup/b3:active:1" ] || { echo "FAIL: ${name}: restored branches ${GOT}" >&2; exit 1; }
-  echo "${name}: branches restored with lifecycle (${GOT})"
+  MERGE_SQL="SELECT count(*) FROM merge_proposals m JOIN ref_events e ON e.new_head = m.candidate_commit AND e.operation = 'merge' WHERE m.graph_id = '${BRANCH_GRAPH}' AND m.target_branch = 'backup/b0'"
+  if [ "${name}" = dump ]; then MGOT=$(psql_q restored_dump "${MERGE_SQL}"); else MGOT=$(docker exec "${BBNAME}" psql -U ledger -d ledger -tAc "${MERGE_SQL}"); fi
+  [ "${MGOT}" = 1 ] || { echo "FAIL: ${name}: the merge (proposal row + merge event) was not restored" >&2; exit 1; }
+  echo "${name}: branches restored with lifecycle (${GOT}); merge proposal and merge event restored"
 done | tee "${OUT}/checks.log"
 grep -q "^dump: .* exact prefix.*present identically" "${OUT}/checks.log" && grep -q "^basebackup: .* exact prefix.*present identically" "${OUT}/checks.log" \
   && grep -q "^dump: .* states identical" "${OUT}/checks.log" && grep -q "^basebackup: .* states identical" "${OUT}/checks.log" \

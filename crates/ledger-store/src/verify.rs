@@ -175,6 +175,11 @@ const CHECKS: &[(&str, &str)] = &[
                    AND p.position = 0 AND p.parent_id = pr.expected_head))",
     ),
     (
+        "every merge proposal's target head is its proposal's expected head",
+        "SELECT m.proposal_id::text FROM merge_proposals m JOIN proposals pr USING (proposal_id) \
+         WHERE pr.expected_head IS DISTINCT FROM m.target_head",
+    ),
+    (
         "every merge-apply result names a merge event",
         "SELECT i.idempotency_id::text FROM idempotency i WHERE i.operation = 'merge_apply' AND NOT EXISTS ( \
              SELECT 1 FROM decisions d JOIN ref_events e ON e.event_id = d.ref_event_id \
@@ -370,54 +375,119 @@ pub async fn run(pool: &PgPool) -> Result<Report, LedgerError> {
     Ok(report)
 }
 
-/// Every merge row agrees with immutable history (ADR-0024): the candidate reconstructs to
-/// the recorded merged-state digest, and the recorded preview token recomputes from the row.
+/// Every merge row agrees with immutable history, recomputed independently (ADR-0024): the
+/// recorded classification and base follow from the DAG (fast-forward: the target head is an
+/// ancestor of the source head; divergent: the base is the unique best common ancestor, or an
+/// explicitly chosen one of several); the three-way merge of the recorded base/target/source
+/// states under the recorded strategy has the recorded digest; the integration commit
+/// reconstructs to exactly that state; the token recomputes. A row that cannot be checked
+/// (missing objects, limits) counts as a violation — verify never aborts on it.
 async fn verify_merge_rows(pool: &PgPool) -> Result<CheckResult, LedgerError> {
-    use ledger_merge::{Classification, PreviewIdentity, Strategy};
-    let mut conn = pool.acquire().await.map_err(db_error)?;
-    let rows = sqlx::query(
-        "SELECT proposal_id, graph_id, target_branch, candidate_commit, target_head, source_branch, \
-         source_head, merge_base, classification, strategy, merged_state_digest, preview_token \
-         FROM merge_proposals ORDER BY proposal_id",
-    )
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(db_error)?;
+    use ledger_dag::{MergeBase, Relation, TraversalLimits};
+    use ledger_merge::{Classification, PreviewIdentity, Strategy, three_way};
+    let ids: Vec<i64> =
+        sqlx::query_scalar("SELECT proposal_id FROM merge_proposals ORDER BY proposal_id")
+            .fetch_all(pool)
+            .await
+            .map_err(db_error)?;
     let mut bad = Vec::new();
-    for row in &rows {
-        let get = |c: &str| row.try_get::<String, _>(c).map_err(db_error);
-        let id: i64 = row.try_get("proposal_id").map_err(db_error)?;
-        let candidate: ledger_core::CommitId = get("candidate_commit")?.parse()?;
-        let digest: ledger_core::ContentId = get("merged_state_digest")?.parse()?;
-        let state = crate::postgres_workflow::WorkflowRepository::state_at_on(
-            &mut conn,
-            &candidate,
-            &crate::ReconstructionLimits::DEVELOPMENT,
-        )
-        .await?;
-        let token = PreviewIdentity {
-            graph: ledger_core::GraphId::new(get("graph_id")?)?,
-            source_branch: get("source_branch")?,
-            source_head: get("source_head")?.parse()?,
-            target_branch: get("target_branch")?,
-            target_head: get("target_head")?.parse()?,
-            merge_base: get("merge_base")?.parse()?,
-            classification: if get("classification")? == "fast_forward" {
-                Classification::FastForward
+    for id in ids {
+        let mut conn = pool.acquire().await.map_err(db_error)?;
+        let checked: Result<bool, LedgerError> = async {
+            let row = sqlx::query(
+                "SELECT graph_id, target_branch, candidate_commit, target_head, source_branch, \
+                 source_head, merge_base, base_explicit, classification, strategy, \
+                 merged_state_digest, preview_token FROM merge_proposals WHERE proposal_id = $1",
+            )
+            .bind(id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(db_error)?;
+            let get = |c: &str| row.try_get::<String, _>(c).map_err(db_error);
+            let graph = ledger_core::GraphId::new(get("graph_id")?)?;
+            let commit =
+                |c: &str| -> Result<ledger_core::CommitId, LedgerError> { get(c)?.parse() };
+            let (candidate, target, source, base) = (
+                commit("candidate_commit")?,
+                commit("target_head")?,
+                commit("source_head")?,
+                commit("merge_base")?,
+            );
+            let explicit: bool = row.try_get("base_explicit").map_err(db_error)?;
+            let fast_forward = get("classification")? == "fast_forward";
+            let strategy = Strategy::parse(&get("strategy")?)
+                .ok_or_else(|| LedgerError::Storage("unknown merge strategy".into()))?;
+            let digest: ledger_core::ContentId = get("merged_state_digest")?.parse()?;
+            let token = get("preview_token")?;
+            let analysis = {
+                let provider = crate::postgres_branches::GraphParents {
+                    conn: tokio::sync::Mutex::new(&mut *conn),
+                    graph: graph.clone(),
+                };
+                ledger_dag::analyze(&provider, &target, &source, TraversalLimits::DEFAULT)
+                    .await
+                    .map_err(|e| LedgerError::Storage(format!("ancestry: {e}")))?
+            };
+            let lineage_ok = match (&analysis.relation, fast_forward) {
+                (Relation::FastForward, true) => base == target,
+                (Relation::Divergent(MergeBase::Unique(b)), false) => *b == base,
+                (Relation::Divergent(MergeBase::Ambiguous(c)), false) => {
+                    explicit && c.contains(&base)
+                }
+                _ => false,
+            };
+            let limits = &crate::ReconstructionLimits::DEVELOPMENT;
+            let b =
+                crate::postgres_workflow::WorkflowRepository::state_at_on(&mut conn, &base, limits)
+                    .await?;
+            let t = crate::postgres_workflow::WorkflowRepository::state_at_on(
+                &mut conn, &target, limits,
+            )
+            .await?;
+            let s = crate::postgres_workflow::WorkflowRepository::state_at_on(
+                &mut conn, &source, limits,
+            )
+            .await?;
+            let i = crate::postgres_workflow::WorkflowRepository::state_at_on(
+                &mut conn, &candidate, limits,
+            )
+            .await?;
+            let strategy = if fast_forward {
+                Strategy::Abort
             } else {
-                Classification::Divergent
-            },
-            strategy: Strategy::parse(&get("strategy")?)
-                .ok_or_else(|| LedgerError::Storage("unknown merge strategy".into()))?,
-            merged_state_digest: digest.clone(),
+                strategy
+            };
+            let Some(merged) = three_way(&b.state, &t.state, &s.state, strategy).merged else {
+                return Ok(false);
+            };
+            let recomputed = PreviewIdentity {
+                graph,
+                source_branch: get("source_branch")?,
+                source_head: source,
+                target_branch: get("target_branch")?,
+                target_head: target,
+                merge_base: base,
+                classification: if fast_forward {
+                    Classification::FastForward
+                } else {
+                    Classification::Divergent
+                },
+                strategy,
+                merged_state_digest: digest.clone(),
+            }
+            .token();
+            Ok(lineage_ok
+                && ledger_rdf::state_digest(&merged) == digest
+                && i.state == merged
+                && recomputed == token)
         }
-        .token();
-        if ledger_rdf::state_digest(&state.state) != digest || token != get("preview_token")? {
+        .await;
+        if !matches!(checked, Ok(true)) {
             bad.push(id.to_string());
         }
     }
     Ok(CheckResult {
-        name: "every merge proposal reconstructs to its digest and recomputes its token",
+        name: "every merge proposal recomputes from the DAG and immutable states",
         violations: i64::try_from(bad.len()).unwrap_or(i64::MAX),
         sample: bad.into_iter().take(3).collect(),
     })

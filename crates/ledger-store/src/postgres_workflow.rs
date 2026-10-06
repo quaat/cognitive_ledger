@@ -583,7 +583,7 @@ impl WorkflowRepository {
         self
     }
 
-    fn fail_at(&self, point: FailPoint) -> Result<(), LedgerError> {
+    pub(crate) fn fail_at(&self, point: FailPoint) -> Result<(), LedgerError> {
         if self.failpoint == Some(point) {
             return Err(LedgerError::Storage(format!(
                 "injected failure at {point:?}"

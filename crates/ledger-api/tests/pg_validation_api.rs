@@ -2518,6 +2518,60 @@ async fn a_validated_merge_onto_main_binds_the_merged_state_in_its_semantic_envi
         )
         .await;
     assert_eq!(e["code"].as_str(), Some("VALIDATION_STALE"), "{status} {e}");
+    // The deployment floor (RequireValidation): no validation cited → refused.
+    let (status, e) = h
+        .call(
+            "POST",
+            &path,
+            &reviewer,
+            Some("mg-a-none"),
+            Some(json!({"proposal_id": pr["proposal_id"], "preview_token": token_v})),
+        )
+        .await;
+    assert_eq!(
+        (status, e["code"].as_str()),
+        (StatusCode::CONFLICT, Some("VALIDATION_REQUIRED")),
+        "{e}"
+    );
+    // A validation of another candidate (the source tip) never validates the merge.
+    let (_, vs) = h.validate(&g, &agent, &s1, "mg-vs", pin("D-A")).await;
+    let (status, e) = h
+        .call(
+            "POST",
+            &path,
+            &reviewer,
+            Some("mg-a-src"),
+            Some(apply(&vs, &vs)),
+        )
+        .await;
+    assert_eq!(
+        (status, e["code"].as_str()),
+        (StatusCode::CONFLICT, Some("LINEAGE_MISMATCH")),
+        "{e}"
+    );
+    // Apply needs review; another tenant sees no graph.
+    let proposer_only = token("tenant-mg", "p-only", &["ledger.read", "ledger.propose"]);
+    let (status, _) = h
+        .call(
+            "POST",
+            &path,
+            &proposer_only,
+            Some("mg-a-po"),
+            Some(apply(&va, &va)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let other = token("tenant-other", "x", &ROLES);
+    let (status, _) = h
+        .call(
+            "POST",
+            &path,
+            &other,
+            Some("mg-a-ot"),
+            Some(apply(&va, &va)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
     // Conforming in its own environment: applied onto main.
     let (status, a) = h
         .call(
@@ -2582,5 +2636,4 @@ async fn a_validated_merge_onto_main_binds_the_merged_state_in_its_semantic_envi
         )
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    let _ = s1;
 }

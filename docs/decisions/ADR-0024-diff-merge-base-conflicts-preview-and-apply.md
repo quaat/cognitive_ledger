@@ -94,11 +94,20 @@ comparison.
 are listed in detail, each with at most 64 quads per side and a `truncated` flag per side;
 the total count is always given.
 
-**No-change.** If `M` equals T's state, the merge is classified `NO_CHANGE` and creates
-nothing (ADR-0023 amendment). This covers fast-forward with equal states and divergent
-merges whose result is the target state. It stops two-way synchronization from producing
-an endless chain of empty integration commits, and it respects ADR-0008's
-no-empty-commit rule.
+**No-change.** The merge is classified `NO_CHANGE` and creates nothing only if **both**
+hold:
+- M equals T's state;
+- the source contributed no net change from the base, i.e. `diff(B, S)` is empty.
+
+This covers a fast-forward to a source with an equal state, and a source whose changes net
+to nothing. It stops two-way synchronization from producing an endless chain of empty
+integration commits.
+
+If the source did change something but M still equals T, an **empty integration commit** is
+recorded. Examples: a conflict resolved by `take-target`, a convergent change, or a change
+the target already has. The resolution then becomes part of history, and a later merge can
+never silently reapply what was set aside. This is the explicit-workflow exception of
+ADR-0008, made deliberately by the merge proposer (implementation review, invariant P1).
 
 ### Three operations: preview (read), propose (persist), apply (accept)
 
@@ -132,13 +141,16 @@ required.
   1. checks the stored result again under the idempotency advisory lock;
   2. locks the target branch `FOR SHARE` (`BRANCH_DELETED` if it is deleted);
   3. re-reads both heads and both branch statuses; on any change it returns `MERGE_STALE`;
-  4. checks the prepare limits (`depth(T) + 1`, and the size of M);
+  4. relies on the preview for the prepare limits (`depth(T) + 1`, and the size of M), which
+     are checked before the transaction; it reuses the patch computed by the preview, so
+     nothing is reconstructed while the transaction holds its locks;
   5. persists:
      - the integration commit `I` (parents `[T, S]`, patch `diff(T, M)`, envelope per
        ADR-0023);
      - the proposal on the target (`expected_head = T`, `requested_patch_id =
        effective_patch_id = I.patch`, because a merge has no separately requested patch);
-     - the write-once `merge_proposals` row.
+     - the write-once `merge_proposals` row, including `source_parties`: the principals and
+       delegators who proposed the commits the source has and the target lacks.
 
 **`POST /v1/graphs/{graph}/merges/apply`** — body `{proposal, token, validation_id?,
 semantic_environment_id?, reason?}`, `review` capability, `Idempotency-Key` required. It is
@@ -161,9 +173,14 @@ merge row or two parents. Ordinary `reject` may close a merge proposal. In one t
 4. The **target** branch's policy is authoritative:
    - the deployment floor;
    - `require_validation`;
-   - `require_distinct_reviewer`, comparing merge proposer and applier as accountable
-     parties;
-   - protection.
+   - `require_distinct_reviewer`: the applier must be a party distinct from the merge
+     proposer **and** from every party in `source_parties`, so a merge cannot carry
+     self-reviewed source work into a four-eyes target (implementation review,
+     semantic-integration P1).
+
+   Protection is not an extra gate at apply. `protected` selects the strict delta policy,
+   which the exact merge patch `diff(T, M)` always satisfies, and applying needs `review`,
+   as accepting does on any branch.
 
    A weaker source policy never applies. Validation binding is the ordinary ADR-0019
    binding on the merge candidate: a conforming, unsuperseded validation of this candidate,
@@ -242,7 +259,9 @@ criss-cross is created by concurrency.
     `proposals_identity`;
   - `target_head`, `source_branch`, `source_head`, `merge_base`, `base_explicit`,
     `classification`, `strategy`, `merge_algorithm`, `conflict_count`,
-    `merged_state_digest`, `preview_token` (UNIQUE), `created_at`.
+    `merged_state_digest`, `preview_token` (indexed, **not** unique: a rejected merge may be
+    proposed again from the same preview, and two proposals of one preview are allowed;
+    implementation review, storage P1), `source_parties`, `created_at`.
 
   Further constraints:
   - FKs `(graph_id, source_head)` and `(graph_id, merge_base)` to `commit_index`, and
@@ -273,8 +292,12 @@ criss-cross is created by concurrency.
     - both directions of the merge/advance rules;
     - parent 0 of every candidate equals the proposal's `expected_head`;
     - `merge_apply` results point to `merge` events;
-    - offline recomputation of the token and of the merged-state digest from the
-      reconstructed candidate.
+    - an independent offline recomputation for every merge row. It re-walks the ancestry
+      to confirm the classification and the base (or an explicit choice among several best
+      common ancestors), re-runs the three-way merge of the recorded base, target and
+      source states, and checks that the integration commit reconstructs to exactly that
+      state with the recorded digest and token. A row that cannot be checked counts as a
+      violation and never aborts the run.
 - **Grants.** The runtime grant is re-issued with column-level INSERT and SELECT on
   `merge_proposals`. The projector is unchanged.
 
@@ -296,6 +319,34 @@ criss-cross is created by concurrency.
 | Idempotency of outcomes that persist nothing (invariant, storage) | not recorded; stated |
 | `requested_patch_id` is NOT NULL (invariant) | equals the effective patch |
 | Conflict report unbounded in bytes (invariant, architecture) | 64 quads per side, with `truncated` |
+
+## Implementation-review amendments (2026-10-06)
+Seven independent reviews of the implementation (DAG, RDF semantics, storage/concurrency,
+semantic validation, security, tests, projection) found no P0. Their P1s are resolved as
+follows:
+- **Re-proposing after a rejection** returned a 500, because the preview token was unique.
+  The token is now non-unique, and every other propose collision maps to `MERGE_STALE`.
+- **`NO_CHANGE` could drop a conflict resolution from history.** The new rule records empty
+  integrations whenever the source changed something (above).
+- **Four-eyes through a merge.** `source_parties` was added and is enforced at apply.
+- **An already decided proposal looked stale.** Apply reports the terminal decision before
+  any staleness check.
+- **A lost propose response retried after a branch moved** looked stale. Propose re-checks
+  the stored result before answering `MERGE_STALE`. Completed proposes also replay before
+  the API takes any admission permit.
+- **Admission.** A merge preview or propose takes 3 expensive-operation slots (never more
+  than the configured total), because it rebuilds three or four states.
+- **Missing forced races.** All the races listed under "Concurrency" are now forced
+  interleavings in `pg_merge`, together with crash atomicity at every merge stage
+  (failpoints) and raw-SQL refusals by the 0013 triggers. Every new `verify` check has a
+  tampering test.
+- **A target deleted and restored between preview and apply** is not stale. Its head is
+  unchanged, and history only moves forward (0009), so the merge integrates exactly what was
+  previewed onto an active target. This is decided; neither the token nor the merge row
+  binds the branch lifecycle version.
+- **The preview token is per strategy.** Even when no slot conflicts, a preview with one
+  strategy does not confirm a propose with another (`MERGE_STALE`); normalizing that would
+  change the v1 bytes.
 
 ## Alternatives considered
 - **Object-level conflict key** `(graph, subject, predicate, object)`: this silently unions

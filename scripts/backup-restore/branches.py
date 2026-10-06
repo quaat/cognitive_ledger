@@ -77,4 +77,13 @@ for i in (1, 2):
     expect(s == 200 and d["event"]["status"] == "deleted", f"delete b{i}: {s} {d}")
 s, r = call("POST", f"/v1/graphs/{GRAPH}/branches/restore", f"bk-{run}-r2", {"name": "backup/b2"})
 expect(s == 200 and r["event"]["head"] == heads["backup/b2"], f"restore b2: {s} {r}")
-print(f"branches on {GRAPH}: backup/b0 (from root) .. backup/b3 with one commit each; b1 deleted; b2 deleted and restored")
+# A merge between two of them (Phase 5): backup/b3 integrated into backup/b0.
+mbody = {"source": "backup/b3", "target": "backup/b0"}
+s, p = call("POST", f"/v1/graphs/{GRAPH}/merges/preview", None, mbody)
+expect(s == 200 and p["classification"] == "divergent", f"merge preview: {s} {p}")
+s, pr = call("POST", f"/v1/graphs/{GRAPH}/merges/propose", f"bk-{run}-mp", dict(mbody, preview_token=p["preview_token"]))
+expect(s == 201, f"merge propose: {s} {pr}")
+s, a = call("POST", f"/v1/graphs/{GRAPH}/merges/apply", f"bk-{run}-ma",
+            {"proposal_id": pr["proposal_id"], "preview_token": p["preview_token"], "reason": "backup regression"})
+expect(s == 200 and a["head"] == pr["candidate"], f"merge apply: {s} {a}")
+print(f"branches on {GRAPH}: backup/b0 (from root) .. backup/b3 with one commit each; b1 deleted; b2 deleted and restored; b3 merged into b0")

@@ -358,9 +358,11 @@ fn preview_token_is_injective_normalized_and_stable() {
         assert!(seen.insert(v.token()), "{v:?}");
     }
     // Length prefixes keep field boundaries: moving bytes between adjacent fields differs.
+    // graph_id and source_branch are adjacent fields: moving a byte between them changes
+    // the token only because of the length prefixes.
     let shifted = PreviewIdentity {
-        source_branch: "agent/task-1".into(),
-        target_branch: "7main".into(),
+        graph: GraphId::new("graph-1a").unwrap(),
+        source_branch: "gent/task-17".into(),
         ..id.clone()
     };
     assert_ne!(shifted.token(), token);
@@ -378,4 +380,37 @@ fn preview_token_is_injective_normalized_and_stable() {
         .token()
     );
     assert!(id.canonical_bytes().starts_with(PREVIEW_TOKEN_V1_HEADER));
+}
+
+#[test]
+fn edge_cases_empty_states_and_delete_versus_delete() {
+    let empty = BTreeSet::new();
+    for strategy in ALL {
+        let r = three_way(&empty, &empty, &empty, strategy);
+        assert_eq!((r.merged, r.conflict_count), (Some(BTreeSet::new()), 0));
+    }
+    // B = {x, y}; target deletes y, source deletes x (different slots): both deletions merge.
+    let x = "<urn:x> <urn:p> \"1\" .";
+    let y = "<urn:y> <urn:p> \"1\" .";
+    let r = three_way(&st(&[x, y]), &st(&[x]), &st(&[y]), Strategy::Abort);
+    assert_eq!(r.merged, Some(BTreeSet::new()));
+    // Same slot, one side deletes one value, the other side the other: a conflict; union
+    // keeps what either side still has.
+    let a = "<urn:s> <urn:p> \"a\" .";
+    let b = "<urn:s> <urn:p> \"b\" .";
+    let r = three_way(&st(&[a, b]), &st(&[a]), &st(&[b]), Strategy::Union);
+    assert_eq!((r.conflict_count, r.merged), (1, Some(st(&[a, b]))));
+    // Exact patch: every add absent from the target, every delete present.
+    let (t, m) = (st(&[a]), st(&[b, x]));
+    let d = diff(&t, &m);
+    assert!(d.adds.iter().all(|q| !t.contains(q)) && d.deletes.iter().all(|q| t.contains(q)));
+    // Typed and language-tagged literals and escapes share the slot key of their subject and
+    // predicate, and stay distinct quads.
+    let typed = st(&[
+        "<urn:s> <urn:p> \"1\"^^<http://www.w3.org/2001/XMLSchema#integer> .",
+        "<urn:s> <urn:p> \"1\"@en .",
+        "<urn:s> <urn:p> \"a\\\"quoted\\\" line\" .",
+    ]);
+    let keys: BTreeSet<_> = typed.iter().map(Quad::structural_key).collect();
+    assert_eq!((typed.len(), keys.len()), (3, 1));
 }

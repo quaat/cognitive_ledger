@@ -356,19 +356,20 @@ async fn fast_forward_integrates_the_source_state_with_one_audited_commit() {
         .await,
         Err(LedgerError::MergeNothingToDo(_))
     ));
-    // Applying the same proposal again under a new key: already decided.
-    assert!(matches!(
-        apply(
-            &store,
-            &g,
-            proposed.proposal_id,
-            &token,
-            "reviewer",
-            "ff-apply-2"
-        )
-        .await,
-        Err(LedgerError::MergeStale(_) | LedgerError::LineageMismatch(_))
-    ));
+    // Applying the same proposal again under a new key: reported as decided (not stale).
+    let again = apply(
+        &store,
+        &g,
+        proposed.proposal_id,
+        &token,
+        "reviewer",
+        "ff-apply-2",
+    )
+    .await;
+    assert!(
+        matches!(&again, Err(LedgerError::LineageMismatch(m)) if m.contains("terminal decision (accepted")),
+        "{again:?}"
+    );
     verify_clean(&store).await;
 }
 
@@ -528,8 +529,7 @@ async fn conflicts_abort_or_resolve_by_strategy_only() {
         assert_eq!(p.class, MergeClass::Divergent, "{strategy:?}");
         // B was deleted only by the source (main kept it unchanged): it goes, in every
         // strategy; the conflicting slot follows the strategy.
-        let mut want: BTreeSet<Quad> = slot.iter().map(|s| q(s)).collect();
-        want.extend(std::iter::empty());
+        let want: BTreeSet<Quad> = slot.iter().map(|s| q(s)).collect();
         assert_eq!(
             p.merged_state_digest.clone().unwrap(),
             ledger_rdf::state_digest(&want),
@@ -836,16 +836,21 @@ async fn criss_cross_needs_an_explicit_best_common_ancestor() {
     let p = preview(&store, &g, &spec("y", "x", MergeStrategy::Abort)).await;
     let mut want = vec![x1.clone(), y1.clone()];
     want.sort();
-    // Both branches have the same state, so with an explicit base it is no change; without
-    // one it is reported ambiguous.
+    // Without a base the history is reported ambiguous. Both branches have the same state;
+    // with base x1 the source side still changed something relative to that base (y's
+    // commit), so the merge records an empty integration (ADR-0023: the resolution is kept
+    // in history) whose merged state is exactly the target state.
     assert_eq!(p.class, MergeClass::AmbiguousMergeBase(want));
     let explicit = MergeSpec {
         base: Some(x1.clone()),
         ..spec("y", "x", MergeStrategy::Abort)
     };
+    let (xh, _) = head(&store, &g, "x").await;
+    let e = preview(&store, &g, &explicit).await;
+    assert_eq!(e.class, MergeClass::Divergent);
     assert_eq!(
-        preview(&store, &g, &explicit).await.class,
-        MergeClass::NoChange
+        e.merged_state_digest.unwrap(),
+        ledger_rdf::state_digest(&state(&store, &xh).await)
     );
     let wrong = MergeSpec {
         base: Some(c1.clone()),
@@ -961,6 +966,20 @@ async fn opposite_merges_serialize_and_never_create_a_criss_cross() {
             .any(|r| matches!(r, Err(LedgerError::MergeStale(_)))),
         "{results:?}"
     );
+    // Exactly one merge event across both branches; the loser's branch did not move.
+    let merges: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ref_events WHERE graph_id = $1 AND operation = 'merge'",
+    )
+    .bind(g.as_str())
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(merges, 1);
+    let versions = (
+        head(&store, &g, "alpha").await.1,
+        head(&store, &g, "beta").await.1,
+    );
+    assert!(versions == (2, 3) || versions == (3, 2), "{versions:?}");
     // No criss-cross: the next merge between them has a unique base (or is contained).
     let next = preview(&store, &g, &ab).await.class;
     assert!(
@@ -1070,4 +1089,1128 @@ async fn apply_racing_a_target_acceptance_or_itself_moves_the_target_once() {
         }
         verify_clean(&store).await;
     }
+}
+
+// ---- strategies applied, recorded resolutions, policy, staleness (review follow-ups) --------
+
+/// A fresh graph with main C1 = {x (slot s), b}, a branch, and the conflicting changes main
+/// X->Y and branch X->Z (plus the branch deleting b); returns (graph, c1).
+async fn conflicting(store: &PostgresLedgerStore, name: &str) -> (GraphId, CommitId) {
+    let g = graph(store).await;
+    let x = "<urn:s> <urn:p> \"X\" .";
+    let c1 = change(store, &g, "main", None, &[x, B], &[]).await;
+    branch(store, &g, name, BranchPolicy::default()).await;
+    change(
+        store,
+        &g,
+        "main",
+        Some(c1.clone()),
+        &["<urn:s> <urn:p> \"Y\" ."],
+        &[x],
+    )
+    .await;
+    change(
+        store,
+        &g,
+        name,
+        Some(c1.clone()),
+        &["<urn:s> <urn:p> \"Z\" ."],
+        &[x, B],
+    )
+    .await;
+    (g, c1)
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn every_strategy_persists_applies_and_reconstructs_exactly() {
+    let store = store().await;
+    for (strategy, slot) in [
+        (MergeStrategy::TakeTarget, vec!["<urn:s> <urn:p> \"Y\" ."]),
+        (MergeStrategy::TakeSource, vec!["<urn:s> <urn:p> \"Z\" ."]),
+        (
+            MergeStrategy::Union,
+            vec!["<urn:s> <urn:p> \"Y\" .", "<urn:s> <urn:p> \"Z\" ."],
+        ),
+    ] {
+        let (g, _) = conflicting(&store, "agent/st").await;
+        let sp = spec("agent/st", "main", strategy);
+        let p = preview(&store, &g, &sp).await;
+        let token = p.preview_token.clone().unwrap();
+        let pr = propose(&store, &g, &sp, &token, "s-propose").await.unwrap();
+        assert_eq!(
+            (pr.strategy.as_str(), pr.conflict_count),
+            (strategy.as_str(), 1)
+        );
+        apply(&store, &g, pr.proposal_id, &token, "reviewer", "s-apply")
+            .await
+            .unwrap();
+        let (main, _) = head(&store, &g, "main").await;
+        // B was deleted by the source only (main kept it): it goes in every strategy.
+        let want: BTreeSet<Quad> = slot.iter().map(|s| q(s)).collect();
+        assert_eq!(state(&store, &main).await, want, "{strategy:?}");
+        assert_eq!(
+            ledger_rdf::state_digest(&want),
+            p.merged_state_digest.unwrap(),
+            "{strategy:?}"
+        );
+        verify_clean(&store).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn a_resolution_that_keeps_the_target_state_is_still_recorded_and_never_reapplied() {
+    // Base k={a}; target k={b}; source k={c}. take-target keeps the target state: an empty
+    // integration commit records the resolution (it is not NO_CHANGE: the source changed).
+    let store = store().await;
+    let g = graph(&store).await;
+    let a = "<urn:k> <urn:p> \"a\" .";
+    let c1 = change(&store, &g, "main", None, &[a], &[]).await;
+    branch(&store, &g, "agent/rs", BranchPolicy::default()).await;
+    let t2 = change(
+        &store,
+        &g,
+        "main",
+        Some(c1.clone()),
+        &["<urn:k> <urn:p> \"b\" ."],
+        &[a],
+    )
+    .await;
+    change(
+        &store,
+        &g,
+        "agent/rs",
+        Some(c1.clone()),
+        &["<urn:k> <urn:p> \"c\" ."],
+        &[a],
+    )
+    .await;
+    let sp = spec("agent/rs", "main", MergeStrategy::TakeTarget);
+    let p = preview(&store, &g, &sp).await;
+    assert_eq!(p.class, MergeClass::Divergent);
+    let token = p.preview_token.unwrap();
+    let pr = propose(&store, &g, &sp, &token, "rs-propose")
+        .await
+        .unwrap();
+    apply(&store, &g, pr.proposal_id, &token, "reviewer", "rs-apply")
+        .await
+        .unwrap();
+    let (main, _) = head(&store, &g, "main").await;
+    assert_eq!(state(&store, &main).await, state(&store, &t2).await);
+    // The target later goes back to {a}: the old source change is NOT silently reapplied —
+    // the source is contained now.
+    change(
+        &store,
+        &g,
+        "main",
+        Some(main.clone()),
+        &[a],
+        &["<urn:k> <urn:p> \"b\" ."],
+    )
+    .await;
+    assert_eq!(
+        preview(&store, &g, &spec("agent/rs", "main", MergeStrategy::Abort))
+            .await
+            .class,
+        MergeClass::AlreadyContained
+    );
+    // A source with no net change from the base is NO_CHANGE and creates nothing.
+    let g2 = graph(&store).await;
+    let d1 = change(&store, &g2, "main", None, &[a], &[]).await;
+    branch(&store, &g2, "agent/noop", BranchPolicy::default()).await;
+    let n1 = change(&store, &g2, "agent/noop", Some(d1.clone()), &[B], &[]).await;
+    change(&store, &g2, "agent/noop", Some(n1), &[], &[B]).await;
+    change(
+        &store,
+        &g2,
+        "main",
+        Some(d1),
+        &["<urn:m> <urn:p> \"1\" ."],
+        &[],
+    )
+    .await;
+    assert_eq!(
+        preview(
+            &store,
+            &g2,
+            &spec("agent/noop", "main", MergeStrategy::Abort)
+        )
+        .await
+        .class,
+        MergeClass::NoChange
+    );
+    verify_clean(&store).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn delete_versus_modify_of_one_slot_conflicts() {
+    let store = store().await;
+    let g = graph(&store).await;
+    let t = "<urn:t> <urn:p> \"X\" .";
+    let c1 = change(&store, &g, "main", None, &[t, A], &[]).await;
+    branch(&store, &g, "agent/dm", BranchPolicy::default()).await;
+    change(&store, &g, "main", Some(c1.clone()), &[], &[t]).await;
+    change(
+        &store,
+        &g,
+        "agent/dm",
+        Some(c1.clone()),
+        &["<urn:t> <urn:p> \"W\" ."],
+        &[t],
+    )
+    .await;
+    let p = preview(&store, &g, &spec("agent/dm", "main", MergeStrategy::Abort)).await;
+    assert_eq!((p.class, p.conflict_count), (MergeClass::Conflicted, 1));
+    let c = &p.conflicts[0];
+    assert_eq!(
+        (
+            c.key.subject.as_str(),
+            c.key.predicate.as_str(),
+            c.key.graph.as_ref()
+        ),
+        ("<urn:t>", "<urn:p>", None)
+    );
+    assert_eq!(
+        (
+            c.base.quads.clone(),
+            c.target.quads.clone(),
+            c.source.quads.clone()
+        ),
+        (vec![q(t)], vec![], vec![q("<urn:t> <urn:p> \"W\" .")])
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn distinct_reviewer_on_the_target_excludes_the_merge_proposer_and_the_source_authors() {
+    let store = store().await;
+    let g = graph(&store).await;
+    let c1 = change(&store, &g, "main", None, &[A], &[]).await;
+    store
+        .workflows()
+        .create_branch(
+            &CreateBranchRequest {
+                scope: scope(&g, "cb-four"),
+                name: "four-eyes".into(),
+                source: "main".into(),
+                from_commit: None,
+                policy: BranchPolicy {
+                    protected: false,
+                    require_validation: false,
+                    require_distinct_reviewer: true,
+                },
+            },
+            limits(),
+        )
+        .await
+        .unwrap();
+    branch(&store, &g, "agent/lax", BranchPolicy::default()).await;
+    // The content on the lax source is proposed (and self-accepted) by "curator".
+    change(&store, &g, "agent/lax", Some(c1.clone()), &[B], &[]).await;
+    let sp = spec("agent/lax", "four-eyes", MergeStrategy::Abort);
+    let token = preview(&store, &g, &sp).await.preview_token.unwrap();
+    // The merge itself is proposed by "mechanic".
+    let pr = store
+        .workflows()
+        .merge_propose(
+            &ProposeMergeRequest {
+                scope: scope_as("mechanic", &g, "fe-propose", "fe-propose"),
+                spec: sp.clone(),
+                preview_token: token.clone(),
+                message: String::new(),
+                evidence_refs: vec![],
+            },
+            limits(),
+        )
+        .await
+        .unwrap();
+    for who in ["mechanic", "curator"] {
+        let r = apply(
+            &store,
+            &g,
+            pr.proposal_id,
+            &token,
+            who,
+            &format!("fe-{who}"),
+        )
+        .await;
+        assert!(
+            matches!(r, Err(LedgerError::BranchPolicyViolation(_))),
+            "{who}: {r:?}"
+        );
+    }
+    apply(
+        &store,
+        &g,
+        pr.proposal_id,
+        &token,
+        "reviewer",
+        "fe-reviewer",
+    )
+    .await
+    .unwrap();
+    verify_clean(&store).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn a_rejected_merge_can_be_proposed_again_and_duplicate_proposals_are_clean() {
+    let store = store().await;
+    let g = graph(&store).await;
+    let c1 = change(&store, &g, "main", None, &[A], &[]).await;
+    branch(&store, &g, "agent/rj", BranchPolicy::default()).await;
+    change(&store, &g, "agent/rj", Some(c1.clone()), &[B], &[]).await;
+    let sp = spec("agent/rj", "main", MergeStrategy::Abort);
+    let token = preview(&store, &g, &sp).await.preview_token.unwrap();
+    let first = propose(&store, &g, &sp, &token, "rj-1").await.unwrap();
+    store
+        .workflows()
+        .reject(&ledger_store::RejectRequest {
+            scope: scope_as("reviewer", &g, "rj-reject", "rj-reject"),
+            branch: "main".into(),
+            candidate: first.candidate.clone(),
+            reason: "not now".into(),
+            validation_id: None,
+        })
+        .await
+        .unwrap();
+    // The rejected proposal names its decision; the same preview can be proposed again.
+    let r = apply(
+        &store,
+        &g,
+        first.proposal_id,
+        &token,
+        "reviewer",
+        "rj-apply-1",
+    )
+    .await;
+    assert!(
+        matches!(&r, Err(LedgerError::LineageMismatch(m)) if m.contains("terminal decision (rejected")),
+        "{r:?}"
+    );
+    let second = propose(&store, &g, &sp, &token, "rj-2").await.unwrap();
+    let third = propose(&store, &g, &sp, &token, "rj-3").await.unwrap();
+    assert_ne!(second.candidate, third.candidate);
+    assert_eq!(second.preview_token, third.preview_token);
+    apply(
+        &store,
+        &g,
+        second.proposal_id,
+        &token,
+        "reviewer",
+        "rj-apply-2",
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        apply(
+            &store,
+            &g,
+            third.proposal_id,
+            &token,
+            "reviewer",
+            "rj-apply-3"
+        )
+        .await,
+        Err(LedgerError::MergeStale(_))
+    ));
+    verify_clean(&store).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn refused_merges_write_nothing_and_deleted_branches_refuse() {
+    let store = store().await;
+    let g = graph(&store).await;
+    let c1 = change(&store, &g, "main", None, &[A], &[]).await;
+    branch(&store, &g, "agent/rf", BranchPolicy::default()).await;
+    branch(&store, &g, "doomed", BranchPolicy::default()).await;
+    let s1 = change(&store, &g, "agent/rf", Some(c1.clone()), &[B], &[]).await;
+    let sp = spec("agent/rf", "main", MergeStrategy::Abort);
+    // Preview, then the source moves: propose is stale and writes nothing.
+    let token = preview(&store, &g, &sp).await.preview_token.unwrap();
+    change(
+        &store,
+        &g,
+        "agent/rf",
+        Some(s1),
+        &["<urn:q> <urn:p> \"1\" ."],
+        &[],
+    )
+    .await;
+    let before = counts(&store, &g).await;
+    assert!(matches!(
+        propose(&store, &g, &sp, &token, "rf-1").await,
+        Err(LedgerError::MergeStale(_))
+    ));
+    assert_eq!(counts(&store, &g).await, before);
+    // Equal heads, same branch, unknown branch, a base where nothing is merged.
+    let eq = preview(&store, &g, &spec("doomed", "main", MergeStrategy::Abort)).await;
+    assert_eq!(eq.class, MergeClass::AlreadyEqual);
+    assert!(matches!(
+        store
+            .workflows()
+            .merge_preview(
+                &tenant(),
+                &g,
+                &spec("main", "main", MergeStrategy::Abort),
+                limits()
+            )
+            .await,
+        Err(LedgerError::InvalidIdentifier { .. })
+    ));
+    assert!(matches!(
+        store
+            .workflows()
+            .merge_preview(
+                &tenant(),
+                &g,
+                &spec("nope", "main", MergeStrategy::Abort),
+                limits()
+            )
+            .await,
+        Err(LedgerError::BranchNotFound(_))
+    ));
+    let with_base = MergeSpec {
+        base: Some(c1.clone()),
+        ..spec("doomed", "main", MergeStrategy::Abort)
+    };
+    assert!(matches!(
+        store
+            .workflows()
+            .merge_preview(&tenant(), &g, &with_base, limits())
+            .await,
+        Err(LedgerError::InvalidMergeBase(_))
+    ));
+    // Another tenant: unknown graph.
+    assert!(matches!(
+        store
+            .workflows()
+            .merge_preview(&TenantId::new("tenant-b").unwrap(), &g, &sp, limits())
+            .await,
+        Err(LedgerError::UnknownGraph(_))
+    ));
+    // Propose, then the TARGET is deleted: apply is refused as deleted.
+    let doomed = spec("agent/rf", "doomed", MergeStrategy::Abort);
+    let token = preview(&store, &g, &doomed).await.preview_token.unwrap();
+    let pr = propose(&store, &g, &doomed, &token, "rf-2").await.unwrap();
+    store
+        .workflows()
+        .delete_branch(&BranchLifecycleRequest {
+            scope: scope(&g, "del-doomed"),
+            name: "doomed".into(),
+            reason: None,
+        })
+        .await
+        .unwrap();
+    let before = counts(&store, &g).await;
+    assert!(matches!(
+        apply(&store, &g, pr.proposal_id, &token, "reviewer", "rf-apply").await,
+        Err(LedgerError::BranchDeleted(_))
+    ));
+    assert_eq!(counts(&store, &g).await, before);
+    // …and a preview onto a deleted target is refused as well.
+    assert!(matches!(
+        store
+            .workflows()
+            .merge_preview(&tenant(), &g, &doomed, limits())
+            .await,
+        Err(LedgerError::BranchDeleted(_))
+    ));
+    verify_clean(&store).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn a_merge_writes_exactly_one_ordinary_outbox_row_and_branch_merges_are_not_backlog() {
+    let store = store().await;
+    let g = graph(&store).await;
+    let c1 = change(&store, &g, "main", None, &[A], &[]).await;
+    branch(&store, &g, "agent/ob", BranchPolicy::default()).await;
+    branch(&store, &g, "side", BranchPolicy::default()).await;
+    change(&store, &g, "agent/ob", Some(c1.clone()), &[B], &[]).await;
+    for target in ["main", "side"] {
+        let sp = spec("agent/ob", target, MergeStrategy::Abort);
+        let token = preview(&store, &g, &sp).await.preview_token.unwrap();
+        let pr = propose(&store, &g, &sp, &token, &format!("ob-{target}"))
+            .await
+            .unwrap();
+        let ap = apply(
+            &store,
+            &g,
+            pr.proposal_id,
+            &token,
+            "reviewer",
+            &format!("oba-{target}"),
+        )
+        .await
+        .unwrap();
+        let row: (String, String, i64, String) = sqlx::query_as(
+            "SELECT branch, commit_id, ref_version, event_kind FROM projection_outbox WHERE outbox_id = $1",
+        )
+        .bind(ap.outbox_id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            row,
+            (
+                target.to_owned(),
+                pr.candidate.to_string(),
+                ap.ref_version,
+                "ref_advanced".to_owned()
+            )
+        );
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM projection_outbox WHERE ref_event_id = $1")
+                .bind(ap.ref_event_id)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(rows, 1);
+    }
+    // The non-main merge's row is not an (unconfigured) projection backlog.
+    let side_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM projection_outbox WHERE graph_id = $1 AND branch = 'side' AND delivered_at IS NULL",
+    )
+    .bind(g.as_str())
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(side_rows, 1);
+    let unconfigured_main: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM projection_outbox WHERE delivered_at IS NULL AND branch = 'main' \
+         AND NOT EXISTS (SELECT 1 FROM projection_state s WHERE s.graph_id = projection_outbox.graph_id \
+         AND s.branch = projection_outbox.branch AND s.status <> 'disabled')",
+    )
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        ledger_store::ProjectionRepository::new(store.pool().clone())
+            .unconfigured_pending()
+            .await
+            .unwrap(),
+        unconfigured_main
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn a_crash_at_any_merge_stage_leaves_nothing_and_the_retry_succeeds() {
+    use ledger_store::FailPoint;
+    let store = store().await;
+    let g = graph(&store).await;
+    let c1 = change(&store, &g, "main", None, &[A], &[]).await;
+    branch(&store, &g, "agent/fp", BranchPolicy::default()).await;
+    change(&store, &g, "agent/fp", Some(c1.clone()), &[B], &[]).await;
+    let sp = spec("agent/fp", "main", MergeStrategy::Abort);
+    let token = preview(&store, &g, &sp).await.preview_token.unwrap();
+    let request = |key: &str| ProposeMergeRequest {
+        scope: scope(&g, key),
+        spec: sp.clone(),
+        preview_token: token.clone(),
+        message: "integrate".into(),
+        evidence_refs: vec![],
+    };
+    for point in [FailPoint::AfterDecision, FailPoint::BeforeCommit] {
+        let before = counts(&store, &g).await;
+        let failing = store.workflows().clone().with_failpoint(point);
+        assert!(
+            failing
+                .merge_propose(&request("fp-p"), limits())
+                .await
+                .is_err(),
+            "{point:?}"
+        );
+        assert_eq!(counts(&store, &g).await, before, "{point:?}");
+    }
+    let pr = store
+        .workflows()
+        .merge_propose(&request("fp-p"), limits())
+        .await
+        .unwrap();
+    let apply_request = || ApplyMergeRequest {
+        scope: scope_as("reviewer", &g, "fp-a", "fp-a"),
+        proposal_id: pr.proposal_id,
+        preview_token: token.clone(),
+        reason: None,
+        validation: ValidationPolicy::NoValidation,
+    };
+    for point in [
+        FailPoint::AfterRefUpdate,
+        FailPoint::AfterRefEvent,
+        FailPoint::AfterDecision,
+        FailPoint::AfterOutbox,
+        FailPoint::BeforeCommit,
+    ] {
+        let before = counts(&store, &g).await;
+        let failing = store.workflows().clone().with_failpoint(point);
+        assert!(
+            failing.merge_apply(&apply_request()).await.is_err(),
+            "{point:?}"
+        );
+        assert_eq!(counts(&store, &g).await, before, "{point:?}");
+        assert_eq!(head(&store, &g, "main").await, (c1.clone(), 1), "{point:?}");
+    }
+    let ap = store
+        .workflows()
+        .merge_apply(&apply_request())
+        .await
+        .unwrap();
+    assert_eq!(ap.head, pr.candidate);
+    verify_clean(&store).await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn the_database_refuses_raw_merge_writes() {
+    let store = store().await;
+    let g = graph(&store).await;
+    let c1 = change(&store, &g, "main", None, &[A], &[]).await;
+    branch(&store, &g, "agent/db", BranchPolicy::default()).await;
+    let s1 = change(&store, &g, "agent/db", Some(c1.clone()), &[B], &[]).await;
+    let sp = spec("agent/db", "main", MergeStrategy::Abort);
+    let token = preview(&store, &g, &sp).await.preview_token.unwrap();
+    let pr = propose(&store, &g, &sp, &token, "db-propose")
+        .await
+        .unwrap();
+    let pool = store.pool();
+    let refused = |sql: String| async move {
+        match sqlx::query(&sql).execute(pool).await {
+            Err(sqlx::Error::Database(d)) => {
+                format!("{} {}", d.code().unwrap_or_default(), d.message())
+            }
+            other => panic!("{sql} must be refused: {other:?}"),
+        }
+    };
+    // Write-once merge rows.
+    assert!(
+        refused(format!(
+            "UPDATE merge_proposals SET strategy = 'union' WHERE proposal_id = {}",
+            pr.proposal_id
+        ))
+        .await
+        .starts_with("23000")
+    );
+    assert!(
+        refused(format!(
+            "DELETE FROM merge_proposals WHERE proposal_id = {}",
+            pr.proposal_id
+        ))
+        .await
+        .starts_with("23000")
+    );
+    // A merge row for an ordinary (single-parent) candidate is not an integration commit.
+    let ordinary = store
+        .workflows()
+        .prepare(&PrepareRequest {
+            scope: scope(&g, "db-ord"),
+            branch: "main".into(),
+            expected_head: Some(c1.clone()),
+            requested: Patch::new([Operation {
+                kind: OperationKind::Add,
+                quad: q("<urn:o> <urn:p> \"1\" ."),
+            }])
+            .unwrap(),
+            activity: "cognitive-correction".into(),
+            event_time: None,
+            evidence_refs: vec![],
+            source_system: None,
+            message: "ordinary".into(),
+        })
+        .await
+        .unwrap();
+    let prop_id: i64 =
+        sqlx::query_scalar("SELECT proposal_id FROM proposals WHERE candidate_commit = $1")
+            .bind(ordinary.candidate.to_string())
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let m = refused(format!(
+        "INSERT INTO merge_proposals (proposal_id, graph_id, target_branch, candidate_commit, target_head, source_branch, \
+         source_head, merge_base, base_explicit, classification, strategy, merge_algorithm, conflict_count, \
+         merged_state_digest, preview_token, source_parties) VALUES ({prop_id}, '{g}', 'main', '{}', '{c1}', 'agent/db', \
+         '{s1}', '{c1}', false, 'fast_forward', 'abort', 'structural-slot/v1', 0, 'sha256:{z}', 'sha256:{z}', '{{}}')",
+        ordinary.candidate,
+        z = "0".repeat(64)
+    ))
+    .await;
+    assert!(m.contains("is not the integration commit"), "{m}");
+    // An accepted decision on a merge candidate must reference a merge event.
+    let advance_event: i64 = sqlx::query_scalar(
+        "SELECT event_id FROM ref_events WHERE graph_id = $1 AND branch = 'main' AND new_version = 1",
+    )
+    .bind(g.as_str())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let m = refused(format!(
+        "INSERT INTO decisions (proposal_id, graph_id, branch, candidate_commit, decision, tenant_id, principal_id, \
+         principal_type, validation_ids, ref_event_id) VALUES ({}, '{g}', 'main', '{}', 'accepted', 'tenant-a', \
+         'urn:it:raw', 'agent', '{{}}', {advance_event})",
+        pr.proposal_id, pr.candidate
+    ))
+    .await;
+    assert!(m.contains("must be accepted through a merge event"), "{m}");
+    // The idempotency shape binds merge operations to their result kinds.
+    let m = refused(format!(
+        "INSERT INTO idempotency (tenant_id, principal_id, principal_type, graph_id, operation, idempotency_key, \
+         request_digest, result_kind, result_commit) VALUES ('tenant-a', 'urn:it:raw', 'agent', '{g}', \
+         'merge_propose', 'raw-k', 'sha256:{z}', 'accepted', '{c1}')",
+        z = "0".repeat(64)
+    ))
+    .await;
+    assert!(m.starts_with("23514"), "{m}");
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn an_explicit_base_resolves_a_criss_cross_and_is_recorded() {
+    let store = store().await;
+    let g = graph(&store).await;
+    let c1 = change(&store, &g, "main", None, &[A], &[]).await;
+    for b in ["x", "y"] {
+        branch(&store, &g, b, BranchPolicy::default()).await;
+    }
+    let x1 = change(
+        &store,
+        &g,
+        "x",
+        Some(c1.clone()),
+        &["<urn:x> <urn:p> \"1\" ."],
+        &[],
+    )
+    .await;
+    change(
+        &store,
+        &g,
+        "y",
+        Some(c1.clone()),
+        &["<urn:y> <urn:p> \"1\" ."],
+        &[],
+    )
+    .await;
+    let run = |src: &'static str, tgt: &'static str, key: &'static str| {
+        let (store, g) = (&store, &g);
+        async move {
+            let sp = spec(src, tgt, MergeStrategy::Abort);
+            let t = preview(store, g, &sp).await.preview_token.unwrap();
+            let pr = propose(store, g, &sp, &t, key).await.unwrap();
+            apply(
+                store,
+                g,
+                pr.proposal_id,
+                &t,
+                "reviewer",
+                &format!("{key}-a"),
+            )
+            .await
+            .unwrap();
+        }
+    };
+    run("y", "x", "cx-1").await;
+    store
+        .workflows()
+        .create_branch(
+            &CreateBranchRequest {
+                scope: scope(&g, "cb-w2"),
+                name: "w".into(),
+                source: "x".into(),
+                from_commit: Some(x1.clone()),
+                policy: BranchPolicy::default(),
+            },
+            limits(),
+        )
+        .await
+        .unwrap();
+    run("w", "y", "cx-2").await;
+    // Make the two sides differ again so the merge is not NO_CHANGE.
+    let (yh, _) = head(&store, &g, "y").await;
+    change(
+        &store,
+        &g,
+        "y",
+        Some(yh),
+        &["<urn:y2> <urn:p> \"2\" ."],
+        &[],
+    )
+    .await;
+    assert!(matches!(
+        preview(&store, &g, &spec("y", "x", MergeStrategy::Abort))
+            .await
+            .class,
+        MergeClass::AmbiguousMergeBase(_)
+    ));
+    let explicit = MergeSpec {
+        base: Some(x1.clone()),
+        ..spec("y", "x", MergeStrategy::Abort)
+    };
+    let p = preview(&store, &g, &explicit).await;
+    assert_eq!(
+        (p.class.clone(), p.base_explicit),
+        (MergeClass::Divergent, true)
+    );
+    let t = p.preview_token.unwrap();
+    let pr = propose(&store, &g, &explicit, &t, "cx-3").await.unwrap();
+    apply(&store, &g, pr.proposal_id, &t, "reviewer", "cx-3a")
+        .await
+        .unwrap();
+    let recorded: (String, bool) = sqlx::query_as(
+        "SELECT merge_base, base_explicit FROM merge_proposals WHERE proposal_id = $1",
+    )
+    .bind(pr.proposal_id)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(recorded, (x1.to_string(), true));
+    verify_clean(&store).await;
+}
+
+// ---- forced races (ADR-0024 concurrency list) -------------------------------------------------
+
+/// An owner transaction holding the branch rows of `branches` exclusively.
+async fn hold_branch_rows(
+    pool: &sqlx::PgPool,
+    g: &GraphId,
+    branches: &[&str],
+) -> (sqlx::Transaction<'static, sqlx::Postgres>, i32) {
+    let mut tx = pool.begin().await.unwrap();
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    for b in branches {
+        sqlx::query("SELECT 1 FROM branches WHERE graph_id = $1 AND branch = $2 FOR UPDATE")
+            .bind(g.as_str())
+            .bind(*b)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+    }
+    (tx, pid)
+}
+
+/// A proposed merge `source -> target` on a fresh graph (target = main at C1, source one
+/// commit ahead): (graph, c1, source head, proposal id, token).
+async fn proposed_merge(
+    store: &PostgresLedgerStore,
+    source: &str,
+) -> (GraphId, CommitId, CommitId, i64, String) {
+    let g = graph(store).await;
+    let c1 = change(store, &g, "main", None, &[A], &[]).await;
+    branch(store, &g, source, BranchPolicy::default()).await;
+    let s1 = change(store, &g, source, Some(c1.clone()), &[B], &[]).await;
+    let sp = spec(source, "main", MergeStrategy::Abort);
+    let token = preview(store, &g, &sp).await.preview_token.unwrap();
+    let pr = propose(store, &g, &sp, &token, "race-propose")
+        .await
+        .unwrap();
+    (g, c1, s1, pr.proposal_id, token)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn apply_racing_a_source_acceptance_integrates_the_head_it_locked() {
+    let store = Arc::new(store().await);
+    let pool = store.pool().clone();
+    for apply_first in [true, false] {
+        let (g, _c1, s1, proposal, token) = proposed_merge(&store, "src").await;
+        let next = store
+            .workflows()
+            .prepare(&PrepareRequest {
+                scope: scope(&g, "sa-prep"),
+                branch: "src".into(),
+                expected_head: Some(s1.clone()),
+                requested: Patch::new([Operation {
+                    kind: OperationKind::Add,
+                    quad: q("<urn:sa> <urn:p> \"1\" ."),
+                }])
+                .unwrap(),
+                activity: "cognitive-correction".into(),
+                event_time: None,
+                evidence_refs: vec![],
+                source_system: None,
+                message: "source moves".into(),
+            })
+            .await
+            .unwrap()
+            .candidate;
+        let (hold, pid) = hold_refs(&pool, &g, &["src"]).await;
+        let merge = {
+            let (s, g, t) = (store.clone(), g.clone(), token.clone());
+            move || {
+                tokio::spawn(
+                    async move { apply(&s, &g, proposal, &t, "reviewer", "sa-apply").await },
+                )
+            }
+        };
+        let accept = {
+            let (s, g, c, h) = (store.clone(), g.clone(), next.clone(), s1.clone());
+            move || {
+                tokio::spawn(async move {
+                    s.workflows()
+                        .accept(&AcceptRequest {
+                            scope: scope(&g, "sa-accept"),
+                            branch: "src".into(),
+                            expected_head: Some(h),
+                            candidate: c,
+                            reason: None,
+                            validation: ValidationPolicy::NoValidation,
+                        })
+                        .await
+                })
+            }
+        };
+        let (m, a) = if apply_first {
+            let m = merge();
+            until_waiting(&pool, pid, 1).await;
+            let a = accept();
+            until_waiting(&pool, pid, 2).await;
+            (m, a)
+        } else {
+            let a = accept();
+            until_waiting(&pool, pid, 1).await;
+            let m = merge();
+            until_waiting(&pool, pid, 2).await;
+            (m, a)
+        };
+        hold.commit().await.unwrap();
+        let (m, a) = (m.await.unwrap(), a.await.unwrap());
+        // The source acceptance always lands (a merge only reads its source).
+        a.unwrap();
+        if apply_first {
+            let applied = m.unwrap();
+            let parents: Vec<String> = sqlx::query_scalar(
+                "SELECT parent_id FROM commit_parents WHERE commit_id = $1 ORDER BY position",
+            )
+            .bind(applied.head.to_string())
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(parents[1], s1.to_string(), "integrated the head it locked");
+        } else {
+            assert!(matches!(m, Err(LedgerError::MergeStale(_))), "{m:?}");
+        }
+        verify_clean(&store).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn two_applies_of_one_proposal_land_once() {
+    let store = Arc::new(store().await);
+    let pool = store.pool().clone();
+    let (g, c1, _s1, proposal, token) = proposed_merge(&store, "twice").await;
+    let (hold, pid) = hold_refs(&pool, &g, &["main"]).await;
+    let spawn = |key: &'static str| {
+        let (s, g, t) = (store.clone(), g.clone(), token.clone());
+        tokio::spawn(async move { apply(&s, &g, proposal, &t, "reviewer", key).await })
+    };
+    let a = spawn("tw-1");
+    until_waiting(&pool, pid, 1).await;
+    let b = spawn("tw-2");
+    until_waiting(&pool, pid, 2).await;
+    hold.commit().await.unwrap();
+    let results = [a.await.unwrap(), b.await.unwrap()];
+    assert_eq!(
+        results.iter().filter(|r| r.is_ok()).count(),
+        1,
+        "{results:?}"
+    );
+    assert!(
+        results.iter().any(
+            |r| matches!(r, Err(LedgerError::LineageMismatch(m)) if m.contains("terminal decision"))
+        ),
+        "{results:?}"
+    );
+    assert_eq!(head(&store, &g, "main").await.1, 2);
+    let _ = c1;
+    verify_clean(&store).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn apply_racing_the_deletion_of_its_target_never_lands_on_a_tombstone() {
+    let store = Arc::new(store().await);
+    let pool = store.pool().clone();
+    for apply_first in [true, false] {
+        let g = graph(&store).await;
+        let c1 = change(&store, &g, "main", None, &[A], &[]).await;
+        branch(&store, &g, "tgt", BranchPolicy::default()).await;
+        branch(&store, &g, "src", BranchPolicy::default()).await;
+        change(&store, &g, "src", Some(c1.clone()), &[B], &[]).await;
+        let sp = spec("src", "tgt", MergeStrategy::Abort);
+        let token = preview(&store, &g, &sp).await.preview_token.unwrap();
+        let pr = propose(&store, &g, &sp, &token, "td-propose")
+            .await
+            .unwrap();
+        let (hold, pid) = hold_branch_rows(&pool, &g, &["tgt"]).await;
+        let merge = {
+            let (s, g, t) = (store.clone(), g.clone(), token.clone());
+            move || {
+                tokio::spawn(async move {
+                    apply(&s, &g, pr.proposal_id, &t, "reviewer", "td-apply").await
+                })
+            }
+        };
+        let delete = {
+            let (s, g) = (store.clone(), g.clone());
+            move || {
+                tokio::spawn(async move {
+                    s.workflows()
+                        .delete_branch(&BranchLifecycleRequest {
+                            scope: scope(&g, "td-delete"),
+                            name: "tgt".into(),
+                            reason: None,
+                        })
+                        .await
+                })
+            }
+        };
+        let (m, d) = if apply_first {
+            let m = merge();
+            until_waiting(&pool, pid, 1).await;
+            let d = delete();
+            until_waiting(&pool, pid, 2).await;
+            (m, d)
+        } else {
+            let d = delete();
+            until_waiting(&pool, pid, 1).await;
+            let m = merge();
+            until_waiting(&pool, pid, 2).await;
+            (m, d)
+        };
+        hold.commit().await.unwrap();
+        let (m, d) = (m.await.unwrap(), d.await.unwrap().unwrap());
+        let (tgt_head, version) = head(&store, &g, "tgt").await;
+        if apply_first {
+            assert_eq!(m.unwrap().head, tgt_head);
+            assert_eq!(
+                (d.event.head, version),
+                (tgt_head, 2),
+                "tombstone at the merge head"
+            );
+        } else {
+            assert!(matches!(m, Err(LedgerError::BranchDeleted(_))), "{m:?}");
+            assert_eq!((tgt_head, version), (c1.clone(), 1));
+        }
+        verify_clean(&store).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn a_three_branch_merge_ring_serializes_without_deadlock_or_criss_cross() {
+    let store = Arc::new(store().await);
+    let pool = store.pool().clone();
+    let g = graph(&store).await;
+    let c1 = change(&store, &g, "main", None, &[A], &[]).await;
+    for b in ["ra", "rb", "rc"] {
+        branch(&store, &g, b, BranchPolicy::default()).await;
+        change(
+            &store,
+            &g,
+            b,
+            Some(c1.clone()),
+            &[&format!("<urn:{b}> <urn:p> \"1\" .")],
+            &[],
+        )
+        .await;
+    }
+    let mut proposals = Vec::new();
+    for (src, tgt) in [("rb", "ra"), ("rc", "rb"), ("ra", "rc")] {
+        let sp = spec(src, tgt, MergeStrategy::Abort);
+        let t = preview(&store, &g, &sp).await.preview_token.unwrap();
+        let pr = propose(&store, &g, &sp, &t, &format!("ring-{src}-{tgt}"))
+            .await
+            .unwrap();
+        proposals.push((pr.proposal_id, t));
+    }
+    let (hold, pid) = hold_refs(&pool, &g, &["ra", "rb", "rc"]).await;
+    let mut tasks = Vec::new();
+    for (n, (p, t)) in proposals.into_iter().enumerate() {
+        let (s, g) = (store.clone(), g.clone());
+        tasks.push(tokio::spawn(async move {
+            apply(&s, &g, p, &t, "reviewer", &format!("ring-a{n}")).await
+        }));
+        until_waiting(&pool, pid, n as i64 + 1).await;
+    }
+    hold.commit().await.unwrap();
+    let mut ok = 0;
+    for t in tasks {
+        match t.await.unwrap() {
+            Ok(_) => ok += 1,
+            Err(LedgerError::MergeStale(_)) => {}
+            Err(e) => panic!("unexpected ring outcome {e}"),
+        }
+    }
+    assert!((1..=2).contains(&ok), "{ok}");
+    for (a, b) in [("ra", "rb"), ("rb", "rc"), ("rc", "ra")] {
+        let class = preview(&store, &g, &spec(a, b, MergeStrategy::Abort))
+            .await
+            .class;
+        assert!(
+            !matches!(class, MergeClass::AmbiguousMergeBase(_)),
+            "{a}/{b}: {class:?}"
+        );
+    }
+    verify_clean(&store).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn a_propose_paused_while_the_target_moves_is_stale() {
+    let store = Arc::new(store().await);
+    let pool = store.pool().clone();
+    let g = graph(&store).await;
+    let c1 = change(&store, &g, "main", None, &[A], &[]).await;
+    branch(&store, &g, "agent/pz", BranchPolicy::default()).await;
+    change(&store, &g, "agent/pz", Some(c1.clone()), &[B], &[]).await;
+    let sp = spec("agent/pz", "main", MergeStrategy::Abort);
+    let token = preview(&store, &g, &sp).await.preview_token.unwrap();
+    // Hold the propose request's own idempotency lock: it computes its preview lock-free and
+    // then waits at the start of its transaction.
+    let mut hold = pool.begin().await.unwrap();
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *hold)
+        .await
+        .unwrap();
+    let key = format!(
+        "tenant-a\u{1f}urn:it:curator\u{1f}agent\u{1f}\u{1f}{}\u{1f}merge_propose\u{1f}pz-propose",
+        g.as_str()
+    );
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(ledger_store::lock_key(&format!("idempotency:{key}")))
+        .execute(&mut *hold)
+        .await
+        .unwrap();
+    let task = {
+        let (s, g, sp, t) = (store.clone(), g.clone(), sp.clone(), token.clone());
+        tokio::spawn(async move { propose(&s, &g, &sp, &t, "pz-propose").await })
+    };
+    until_waiting(&pool, pid, 1).await;
+    change(
+        &store,
+        &g,
+        "main",
+        Some(c1.clone()),
+        &["<urn:pz> <urn:p> \"1\" ."],
+        &[],
+    )
+    .await;
+    hold.commit().await.unwrap();
+    assert!(matches!(
+        task.await.unwrap(),
+        Err(LedgerError::MergeStale(_))
+    ));
+    let merges: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM merge_proposals WHERE graph_id = $1")
+            .bind(g.as_str())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(merges, 0);
 }

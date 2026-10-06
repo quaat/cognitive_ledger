@@ -37,7 +37,8 @@ fn preview_token_vectors_are_stable() {
             merge_base: commit("merge_base"),
             classification: match field(&json, "classification") {
                 "fast_forward" => Classification::FastForward,
-                _ => Classification::Divergent,
+                "divergent" => Classification::Divergent,
+                other => panic!("unknown classification {other}"),
             },
             strategy: Strategy::parse(field(&json, "strategy")).unwrap(),
             merged_state_digest: ContentId::from_str(field(&json, "merged_state_digest")).unwrap(),
@@ -52,5 +53,5 @@ fn preview_token_vectors_are_stable() {
         assert_eq!(bytes, hex.trim(), "{}", path.display());
         assert_eq!(id.token(), token.trim(), "{}", path.display());
     }
-    assert_eq!(n, 4, "expected exactly 4 preview-token vectors");
+    assert_eq!(n, 6, "expected exactly 6 preview-token vectors");
 }

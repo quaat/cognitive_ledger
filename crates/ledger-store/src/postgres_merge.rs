@@ -18,8 +18,8 @@
 use crate::db_error;
 use crate::postgres_branches::GraphParents;
 use crate::postgres_workflow::{
-    Operation, RequestScope, StoredResult, ValidationPolicy, WorkflowRepository, validate_reason,
-    validate_scope_fn,
+    FailPoint, Operation, RequestScope, StoredResult, ValidationPolicy, WorkflowRepository,
+    validate_reason, validate_scope_fn,
 };
 use ledger_core::{AnyCommit, CommitId, CommitV2, ContentId, GraphId, LedgerError, TenantId};
 use ledger_dag::{MergeBase, Relation, TraversalLimits};
@@ -102,8 +102,12 @@ pub struct MergePreview {
     pub merged_state_digest: Option<ContentId>,
     /// Present exactly when a candidate would result (`FastForward` / `Divergent`).
     pub preview_token: Option<String>,
-    /// The merged state (internal: what propose persists).
-    merged: Option<BTreeSet<Quad>>,
+    /// The exact patch from the target state to the merged state (internal: what propose
+    /// persists, so it never reconstructs again under its locks).
+    patch: Option<ledger_rdf::Patch>,
+    /// Commits the source has and the target lacks (internal: their proposers become the
+    /// merge's `source_parties`).
+    source_only: Vec<CommitId>,
 }
 
 /// `propose`: persist the integration candidate of a still-current preview.
@@ -166,11 +170,12 @@ struct MergeRow {
     conflict_count: i32,
     merged_state_digest: ContentId,
     preview_token: String,
+    source_parties: Vec<String>,
 }
 
 const MERGE_ROW_COLUMNS: &str = "proposal_id, target_branch, candidate_commit, target_head, \
      source_branch, source_head, merge_base, classification, strategy, conflict_count, \
-     merged_state_digest, preview_token";
+     merged_state_digest, preview_token, source_parties";
 
 fn merge_row(row: &sqlx::postgres::PgRow) -> Result<MergeRow, LedgerError> {
     let get = |c: &str| row.try_get::<String, _>(c).map_err(db_error);
@@ -187,6 +192,7 @@ fn merge_row(row: &sqlx::postgres::PgRow) -> Result<MergeRow, LedgerError> {
         conflict_count: row.try_get("conflict_count").map_err(db_error)?,
         merged_state_digest: get("merged_state_digest")?.parse()?,
         preview_token: get("preview_token")?,
+        source_parties: row.try_get("source_parties").map_err(db_error)?,
     })
 }
 
@@ -276,10 +282,11 @@ impl WorkflowRepository {
                 conn: Mutex::new(&mut *conn),
                 graph: graph.clone(),
             };
-            ledger_dag::analyze(&provider, &target_head, &source_head, limits)
+            ledger_dag::analyze_with_ancestries(&provider, &target_head, &source_head, limits)
                 .await
                 .map_err(dag_error)?
         };
+        let (analysis, target_ancestry, source_ancestry) = analysis;
         let mut preview = MergePreview {
             class: MergeClass::AlreadyEqual,
             source_head: source_head.clone(),
@@ -295,9 +302,17 @@ impl WorkflowRepository {
             strategy: spec.strategy,
             merged_state_digest: None,
             preview_token: None,
-            merged: None,
+            patch: None,
+            source_only: source_ancestry.difference(&target_ancestry),
         };
+        // An explicit base only means something for a divergent merge.
+        let base_given = spec.base.is_some();
         let (classification, base) = match analysis.relation {
+            Relation::Equal | Relation::SourceContained if base_given => {
+                return Err(LedgerError::InvalidMergeBase(
+                    "nothing to merge: a base cannot be chosen".into(),
+                ));
+            }
             Relation::Equal => return Ok(preview),
             Relation::SourceContained => {
                 preview.class = MergeClass::AlreadyContained;
@@ -331,6 +346,11 @@ impl WorkflowRepository {
                     return Ok(preview);
                 }
             },
+            Relation::Divergent(MergeBase::Unrelated) if base_given => {
+                return Err(LedgerError::InvalidMergeBase(
+                    "the branches share no history".into(),
+                ));
+            }
             Relation::Divergent(MergeBase::Unrelated) => {
                 preview.class = MergeClass::UnrelatedHistories;
                 return Ok(preview);
@@ -355,7 +375,16 @@ impl WorkflowRepository {
             preview.class = MergeClass::Conflicted;
             return Ok(preview);
         };
-        if ledger_merge::is_no_change(&target.state, &merged) {
+        // Nothing to record only when the source contributed no net change from the base:
+        // then the merged state is the target state and later merges cannot lose anything.
+        // If the source did change something but the merged state still equals the target
+        // (a conflict resolved by `take-target`, a convergent change, a change already
+        // present), an empty integration commit is recorded, so the resolution is part of
+        // history and a later merge never reapplies what was set aside (ADR-0023; the
+        // explicit-workflow exception of ADR-0008).
+        if ledger_merge::is_no_change(&target.state, &merged)
+            && preview.source_delta == DeltaSummary::default()
+        {
             preview.class = MergeClass::NoChange;
             return Ok(preview);
         }
@@ -383,7 +412,7 @@ impl WorkflowRepository {
             .token(),
         );
         preview.merged_state_digest = Some(digest);
-        preview.merged = Some(merged);
+        preview.patch = Some(diff(&target.state, &merged).to_patch());
         Ok(preview)
     }
 
@@ -439,6 +468,23 @@ impl WorkflowRepository {
         row.as_ref().map(merge_row).transpose()
     }
 
+    /// The stored result of a completed propose for this scope, if any (a cheap replay the
+    /// API answers before taking admission permits; `IDEMPOTENCY_CONFLICT` if the key was used
+    /// with another request).
+    pub async fn stored_merge_proposal(
+        &self,
+        scope: &RequestScope,
+    ) -> Result<Option<MergeProposed>, LedgerError> {
+        validate_scope_fn(scope)?;
+        let mut conn = self.pool.acquire().await.map_err(db_error)?;
+        match Self::stored_result(&mut conn, scope, Operation::MergePropose).await? {
+            Some(stored) => Ok(Some(
+                Self::replay_merge_proposed(&mut conn, stored, scope).await?,
+            )),
+            None => Ok(None),
+        }
+    }
+
     /// Persist the integration candidate of a still-current preview (ADR-0024 propose).
     pub async fn merge_propose(
         &self,
@@ -486,14 +532,22 @@ impl WorkflowRepository {
             }
         }
         if preview.preview_token.as_deref() != Some(request.preview_token.as_str()) {
+            // A lost response retried while the original commits and a branch then moves:
+            // the original result replays rather than reporting it stale.
+            let mut conn = self.pool.acquire().await.map_err(db_error)?;
+            if let Some(stored) =
+                Self::stored_result(&mut conn, scope, Operation::MergePropose).await?
+            {
+                return Self::replay_merge_proposed(&mut conn, stored, scope).await;
+            }
             return Err(LedgerError::MergeStale(
                 "the merge no longer matches the previewed token; preview again".into(),
             ));
         }
-        let merged = preview
-            .merged
-            .as_ref()
-            .expect("a candidate class has a state");
+        let patch = preview
+            .patch
+            .clone()
+            .expect("a candidate class has a patch");
         let base = preview
             .merge_base
             .clone()
@@ -524,10 +578,28 @@ impl WorkflowRepository {
             ));
         }
 
+        // The proposers of the commits the source has and the target lacks: with the merge
+        // proposer they are the parties `require_distinct_reviewer` keeps from applying.
+        let source_only: Vec<String> = preview
+            .source_only
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let source_parties: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT party FROM ( \
+                 SELECT principal_id AS party FROM proposals WHERE graph_id = $1 AND candidate_commit = ANY($2) \
+                 UNION SELECT on_behalf_of FROM proposals \
+                  WHERE graph_id = $1 AND candidate_commit = ANY($2) AND on_behalf_of IS NOT NULL) p \
+             ORDER BY party",
+        )
+        .bind(scope.graph.as_str())
+        .bind(&source_only)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_error)?;
+
         // The integration commit (ADR-0023 envelope): parents [target, source], the exact
-        // patch from the target state to the merged state.
-        let target_state = Self::state_at_on(&mut tx, &preview.target_head, &self.limits).await?;
-        let patch = diff(&target_state.state, merged).to_patch();
+        // patch from the target state to the merged state (computed by the preview).
         let patch_id = patch.id();
         crate::postgres_immutable::publish_object(&mut tx, &patch_id.0, &patch.canonical_bytes())
             .await?;
@@ -573,6 +645,7 @@ impl WorkflowRepository {
             ),
             _ => db_error(e),
         })?;
+        self.fail_at(FailPoint::AfterDecision)?;
         let digest = preview
             .merged_state_digest
             .clone()
@@ -580,8 +653,9 @@ impl WorkflowRepository {
         sqlx::query(
             "INSERT INTO merge_proposals (proposal_id, graph_id, target_branch, candidate_commit, \
              target_head, source_branch, source_head, merge_base, base_explicit, classification, \
-             strategy, merge_algorithm, conflict_count, merged_state_digest, preview_token) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+             strategy, merge_algorithm, conflict_count, merged_state_digest, preview_token, \
+             source_parties) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
         )
         .bind(proposal_id)
         .bind(scope.graph.as_str())
@@ -598,9 +672,16 @@ impl WorkflowRepository {
         .bind(i32::try_from(preview.conflict_count).unwrap_or(i32::MAX))
         .bind(digest.to_string())
         .bind(&request.preview_token)
+        .bind(&source_parties)
         .execute(&mut *tx)
         .await
-        .map_err(db_error)?;
+        .map_err(|e| match &e {
+            sqlx::Error::Database(d) if d.is_unique_violation() => LedgerError::MergeStale(
+                "an identical integration candidate was proposed concurrently; preview again"
+                    .into(),
+            ),
+            _ => db_error(e),
+        })?;
         Self::record_result(
             &mut tx,
             scope,
@@ -613,6 +694,7 @@ impl WorkflowRepository {
             None,
         )
         .await?;
+        self.fail_at(FailPoint::BeforeCommit)?;
         let row = Self::load_merge_row(&mut tx, &scope.graph, proposal_id)
             .await?
             .ok_or_else(|| LedgerError::Storage("merge row vanished".into()))?;
@@ -755,6 +837,21 @@ impl WorkflowRepository {
         if target_branch.status != "active" {
             return Err(LedgerError::BranchDeleted(row.target_branch.clone()));
         }
+        // An already-decided proposal is reported as decided, not as stale (after an applied
+        // merge the target head is the candidate itself, which would otherwise look stale).
+        let decided: Option<(i64, String)> = sqlx::query_as(
+            "SELECT decision_id, decision FROM decisions WHERE candidate_commit = $1",
+        )
+        .bind(row.candidate.to_string())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        if let Some((decision_id, decision)) = decided {
+            return Err(LedgerError::LineageMismatch(format!(
+                "merge proposal {} already has a terminal decision ({decision}, decision {decision_id})",
+                row.proposal_id
+            )));
+        }
         let source_current = source_ref.map(|(h, _)| h);
         if target_head != row.target_head
             || source_current.as_ref() != Some(&row.source_head)
@@ -778,7 +875,26 @@ impl WorkflowRepository {
         )
         .await?;
         if target_branch.require_distinct_reviewer {
+            // Distinct from the merge proposer, and from everyone who proposed the source
+            // content being integrated: a merge never launders self-reviewed work into a
+            // four-eyes target (ADR-0024).
             Self::require_distinct_parties(&mut tx, proposal.proposal_id, scope).await?;
+            let actor = scope.principal.actor();
+            let applier = [
+                Some(actor.principal_id.as_str().to_owned()),
+                actor.on_behalf_of.as_ref().map(|p| p.as_str().to_owned()),
+            ];
+            if applier
+                .iter()
+                .flatten()
+                .any(|a| row.source_parties.contains(a))
+            {
+                return Err(LedgerError::BranchPolicyViolation(
+                    "this branch requires a reviewer distinct from the authors of the merged \
+                     source changes"
+                        .into(),
+                ));
+            }
         }
         let cited = self
             .cite_validation(&mut tx, scope, &row.candidate, &request.validation)
@@ -810,6 +926,7 @@ impl WorkflowRepository {
                 "locked target ref disappeared during merge".into(),
             ));
         }
+        self.fail_at(FailPoint::AfterRefUpdate)?;
         let actor = scope.principal.actor();
         let ref_event_id: i64 = sqlx::query_scalar(
             "INSERT INTO ref_events (graph_id, branch, old_head, new_head, old_version, new_version, \
@@ -831,6 +948,7 @@ impl WorkflowRepository {
         .fetch_one(&mut *tx)
         .await
         .map_err(db_error)?;
+        self.fail_at(FailPoint::AfterRefEvent)?;
         let decision_id: i64 = sqlx::query_scalar(
             "INSERT INTO decisions (proposal_id, graph_id, branch, candidate_commit, decision, \
              tenant_id, principal_id, principal_type, on_behalf_of, reason, validation_ids, ref_event_id, \
@@ -862,6 +980,7 @@ impl WorkflowRepository {
             )
             .await?;
         }
+        self.fail_at(FailPoint::AfterDecision)?;
         let outbox_id: i64 = sqlx::query_scalar(
             "INSERT INTO projection_outbox (graph_id, branch, commit_id, ref_version, event_kind, ref_event_id) \
              VALUES ($1, $2, $3, $4, 'ref_advanced', $5) RETURNING outbox_id",
@@ -874,6 +993,7 @@ impl WorkflowRepository {
         .fetch_one(&mut *tx)
         .await
         .map_err(db_error)?;
+        self.fail_at(FailPoint::AfterOutbox)?;
         Self::record_result(
             &mut tx,
             scope,
@@ -886,6 +1006,7 @@ impl WorkflowRepository {
             None,
         )
         .await?;
+        self.fail_at(FailPoint::BeforeCommit)?;
         tx.commit().await.map_err(db_error)?;
         Ok(MergeApplied {
             decision_id,

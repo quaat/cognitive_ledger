@@ -1983,6 +1983,16 @@ pub struct BranchLogResponse {
 /// Ancestry walks of a merge are bounded like a historical branch point.
 const MERGE_MAX_VISITED: usize = 100_000;
 const MERGE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+/// Expensive-operation slots one merge preview or propose takes (three to four state
+/// reconstructions instead of one).
+const MERGE_PERMITS: u32 = 3;
+
+/// [`MERGE_PERMITS`], never more than the configured total (a deployment with fewer slots
+/// still runs merges, one at a time).
+fn merge_permits(state: &AppState) -> u32 {
+    let total = u32::try_from(state.0.limits.max_concurrent_expensive).unwrap_or(u32::MAX);
+    MERGE_PERMITS.min(total).max(1)
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2233,14 +2243,20 @@ async fn merge_preview(
         body.base.as_ref(),
         &correlation,
     )?;
-    let _permit = state.0.expensive.try_acquire().map_err(|_| {
-        ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "RESOURCE_LIMIT",
-            "too many concurrent expensive operations; retry later",
-            &correlation,
-        )
-    })?;
+    // A merge preview reconstructs three states (and a propose four): it takes
+    // `MERGE_PERMITS` expensive slots, so merges cannot crowd out single-state reads.
+    let _permit = state
+        .0
+        .expensive
+        .try_acquire_many(merge_permits(&state))
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "RESOURCE_LIMIT",
+                "too many concurrent expensive operations; retry later",
+                &correlation,
+            )
+        })?;
     let limits = ledger_store::TraversalLimits {
         max_visited: MERGE_MAX_VISITED,
         deadline: Some(std::time::Instant::now() + MERGE_DEADLINE),
@@ -2328,14 +2344,29 @@ async fn merge_propose(
         message: body.message.unwrap_or_default(),
         evidence_refs: body.evidence_refs,
     };
-    let _permit = state.0.expensive.try_acquire().map_err(|_| {
-        ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "RESOURCE_LIMIT",
-            "too many concurrent expensive operations; retry later",
-            &correlation,
-        )
-    })?;
+    // A completed propose replays before any admission permit is taken.
+    if let Some(p) = state
+        .0
+        .store
+        .workflows()
+        .stored_merge_proposal(&request.scope)
+        .await
+        .map_err(|e| ApiError::from_ledger(e, &correlation))?
+    {
+        return Ok((StatusCode::OK, Json(propose_response(p, correlation))));
+    }
+    let _permit = state
+        .0
+        .expensive
+        .try_acquire_many(merge_permits(&state))
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "RESOURCE_LIMIT",
+                "too many concurrent expensive operations; retry later",
+                &correlation,
+            )
+        })?;
     let limits = ledger_store::TraversalLimits {
         max_visited: MERGE_MAX_VISITED,
         deadline: Some(std::time::Instant::now() + MERGE_DEADLINE),
@@ -2352,23 +2383,24 @@ async fn merge_propose(
     } else {
         StatusCode::CREATED
     };
-    Ok((
-        status,
-        Json(MergeProposeResponse {
-            proposal_id: p.proposal_id,
-            candidate: p.candidate,
-            target_head: p.target_head,
-            source_head: p.source_head,
-            merge_base: p.merge_base,
-            classification: p.classification,
-            strategy: p.strategy,
-            conflict_count: p.conflict_count,
-            merged_state_digest: p.merged_state_digest,
-            preview_token: p.preview_token,
-            replayed: p.replayed,
-            correlation_id: correlation,
-        }),
-    ))
+    Ok((status, Json(propose_response(p, correlation))))
+}
+
+fn propose_response(p: ledger_store::MergeProposed, correlation: String) -> MergeProposeResponse {
+    MergeProposeResponse {
+        proposal_id: p.proposal_id,
+        candidate: p.candidate,
+        target_head: p.target_head,
+        source_head: p.source_head,
+        merge_base: p.merge_base,
+        classification: p.classification,
+        strategy: p.strategy,
+        conflict_count: p.conflict_count,
+        merged_state_digest: p.merged_state_digest,
+        preview_token: p.preview_token,
+        replayed: p.replayed,
+        correlation_id: correlation,
+    }
 }
 
 async fn merge_apply(
