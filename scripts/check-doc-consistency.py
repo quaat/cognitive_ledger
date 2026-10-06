@@ -10,7 +10,7 @@ authoritative source; prose either avoids the literal or must match it.
 - Benchmark docs that name a synthetic generator version name the current one
   (`GENERATOR_VERSION` in apps/ledger-bench/src/synthetic.rs), and every committed synthetic
   manifest records it.
-- The required-CI-checks recommendation lists every workflow under .github/workflows that
+- The required-CI-checks recommendation lists every job (check name) of the workflows that
   gates pull requests.
 """
 import json, pathlib, re, sys
@@ -47,13 +47,34 @@ for manifest in (root / "benchmark/datasets").glob("synthetic-*.json"):
     if (json.loads(manifest.read_text()).get("generator") or {}).get("version") != generator:
         errors.append(f"{manifest.relative_to(root)}: generator.version is not {generator}")
 
-gating = sorted(p.stem for p in (root / ".github/workflows").glob("ci-*.yml")
-                if re.search(r"^\s*pull_request:", p.read_text(), re.M))
+def top_level_block(text, key):
+    """The lines of a top-level YAML key's block (flow or block form)."""
+    m = re.search(rf"^{key}:(.*(?:\n(?:[ \t]+.*|[ \t]*))*)", text, re.M)
+    return m.group(1) if m else ""
+
+
+def check_names(text):
+    """Status-check contexts of a workflow: each job's `name:`, else its id."""
+    names, job = [], None
+    for line in top_level_block(text, "jobs").splitlines():
+        if m := re.match(r"^  ([A-Za-z0-9_-]+):\s*$", line):
+            job = m.group(1)
+            names.append(job)
+        elif job and (m := re.match(r"^    name:\s*['\"]?([^'\"#]+?)['\"]?\s*(#.*)?$", line)):
+            names[-1] = m.group(1)
+    return names
+
+
+# Required checks are matched by job (check-run) name, not workflow file name.
+gating = sorted(name for p in (root / ".github/workflows").glob("*.y*ml")
+                for text in [p.read_text()]
+                if re.search(r"\bpull_request\b", top_level_block(text, "on"))
+                for name in check_names(text))
 debt = (root / "docs/exec-plans/tech-debt.md").read_text()
 rule = re.search(r"required CI checks \(([^)]*)\)", debt)
 listed = sorted(c.strip() for c in rule.group(1).split(",")) if rule else []
 if listed != gating:
-    errors.append(f"tech-debt.md required CI checks {listed} differ from the PR-gating workflows {gating}")
+    errors.append(f"tech-debt.md required CI checks {listed} differ from the PR-gating jobs {gating}")
 
 if errors:
     print("\n".join(errors), file=sys.stderr)

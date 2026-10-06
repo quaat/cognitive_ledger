@@ -19,7 +19,9 @@
 //! lineage*. The IC files after version 1 are a separately materialized lineage. It drops
 //! stale values the changesets never delete, and disagrees with both. This dataset follows
 //! the changeset lineage, where two independent representations agree exactly:
-//! - the **oracle** is TB's per-version membership, the full versions;
+//! - the **oracle** is TB's per-version membership, the full versions. TB and CB are two
+//!   encodings of one lineage (BEAR likely derived TB from the changesets): their agreement
+//!   proves the extraction reads both consistently, not that the lineage is "true";
 //! - the **hard cross-check**, at every step, is that CB's net change equals TB's difference
 //!   and that no-op churn (in both CB files) is present in both versions;
 //! - the **anchor** is that TB version 0 equals IC file 1.
@@ -40,7 +42,7 @@ use crate::{
     manifest::{Extraction, Manifest, Output},
     workload::{
         CommitStep, Expected, HistoryFact, Label, Provenance, Step, Workload, oracle_digest,
-        workload_checksum,
+        statement_ref, workload_checksum,
     },
 };
 use ledger_rdf::{Quad, RdfError};
@@ -51,6 +53,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 pub const EXTRACTION_ALGORITHM: &str = "BEAR-B day: TB/CB changeset lineage, anchored at IC version 1, canonical N-Quads, 12-version max-change window";
@@ -103,7 +106,19 @@ fn file_name(url: &str) -> Result<String, String> {
 
 /// Local cache name of a source file (role-prefixed: the publisher reuses file names).
 fn cached_name(role: &str, url: &str) -> Result<String, String> {
+    if role.is_empty() || !role.bytes().all(|b| b.is_ascii_lowercase() || b == b'-') {
+        return Err(format!(
+            "source role {role:?} must be lowercase letters and dashes"
+        ));
+    }
     Ok(format!("{role}--{}", file_name(url)?))
+}
+
+/// A sibling temporary name (`<name>.part`), renamed into place only after verification.
+fn part_path(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".part");
+    path.with_file_name(name)
 }
 
 /// The committed manifest's pinned source, without requiring the extraction and output
@@ -114,6 +129,13 @@ fn source_manifest(ctx: &Context, id: &str) -> Result<Manifest, String> {
         std::fs::read_to_string(&path).map_err(|e| format!("manifest {}: {e}", path.display()))?;
     let m: Manifest =
         serde_json::from_str(&text).map_err(|e| format!("manifest {}: {e}", path.display()))?;
+    if m.dataset != id {
+        return Err(format!(
+            "manifest {} names dataset {:?}, not {id:?}",
+            path.display(),
+            m.dataset
+        ));
+    }
     let mut probe = m.clone();
     // Check the source section with placeholders for the derived ones.
     probe.extraction.get_or_insert(Extraction {
@@ -139,8 +161,24 @@ pub async fn fetch(ctx: &Context, id: &str) -> Result<Vec<String>, String> {
     let source = manifest.source.as_ref().ok_or("not an extracted dataset")?;
     let dir = source_dir(ctx, id);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    // Redirects only to https on the pinned URL's own host (integrity is pinned anyway; this
+    // keeps the download from wandering to other hosts or to plain http).
     let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(1800))
+        .connect_timeout(Duration::from_secs(30))
+        // A stalled transfer fails instead of holding a CI runner until the job timeout.
+        .read_timeout(Duration::from_secs(120))
+        .timeout(Duration::from_secs(1800))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            let same_host = attempt
+                .previous()
+                .first()
+                .is_some_and(|first| first.host_str() == attempt.url().host_str());
+            if attempt.url().scheme() == "https" && same_host && attempt.previous().len() < 5 {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
         .build()
         .map_err(|e| e.to_string())?;
     let mut log = Vec::new();
@@ -153,22 +191,7 @@ pub async fn fetch(ctx: &Context, id: &str) -> Result<Vec<String>, String> {
             log.push(format!("{}: cached and verified", f.role));
             continue;
         }
-        let mut response = http
-            .get(&f.url)
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-            .map_err(|e| format!("{}: {e}", f.url))?;
-        let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
-            body.extend_from_slice(&chunk);
-            if body.len() as u64 > f.bytes {
-                return Err(format!(
-                    "{}: larger than the pinned {} bytes",
-                    f.url, f.bytes
-                ));
-            }
-        }
+        let body = download(&http, &f.url, f.bytes).await?;
         let (size, digest) = (body.len() as u64, sha256_hex(&body));
         if size != f.bytes || digest != f.sha256 {
             return Err(format!(
@@ -176,7 +199,7 @@ pub async fn fetch(ctx: &Context, id: &str) -> Result<Vec<String>, String> {
                 f.url, f.bytes, f.sha256
             ));
         }
-        let part = path.with_extension("part");
+        let part = part_path(&path);
         let mut file = std::fs::File::create(&part).map_err(|e| e.to_string())?;
         file.write_all(&body).map_err(|e| e.to_string())?;
         file.sync_all().map_err(|e| e.to_string())?;
@@ -184,6 +207,60 @@ pub async fn fetch(ctx: &Context, id: &str) -> Result<Vec<String>, String> {
         log.push(format!("{}: downloaded {size} bytes, verified", f.role));
     }
     Ok(log)
+}
+
+/// Download attempts per file; transient failures back off for 5 s, then 20 s.
+const FETCH_ATTEMPTS: u32 = 3;
+
+/// Download one pinned file, retrying only transient failures: transport errors (connect,
+/// timeout, reset) and HTTP 429/5xx. Any other status, and a body larger than the pin, fail at
+/// once. Integrity is checked by the caller and is never retried.
+async fn download(http: &reqwest::Client, url: &str, cap: u64) -> Result<Vec<u8>, String> {
+    let mut attempt = 1;
+    loop {
+        let failure = match http.get(url).send().await {
+            Ok(r) if r.status().is_success() => match read_capped(r, url, cap).await {
+                Ok(body) => return Ok(body),
+                Err(Transfer::Fatal(e)) => return Err(e),
+                Err(Transfer::Transient(e)) => e,
+            },
+            Ok(r) if r.status().as_u16() == 429 || r.status().is_server_error() => {
+                format!("{url}: HTTP {}", r.status())
+            }
+            Ok(r) => return Err(format!("{url}: HTTP {}", r.status())),
+            Err(e) => format!("{url}: {e}"),
+        };
+        if attempt == FETCH_ATTEMPTS {
+            return Err(format!("{failure} (after {FETCH_ATTEMPTS} attempts)"));
+        }
+        let wait = Duration::from_secs(5 * 4u64.pow(attempt - 1));
+        eprintln!("fetch: {failure}; retrying in {} s", wait.as_secs());
+        tokio::time::sleep(wait).await;
+        attempt += 1;
+    }
+}
+
+enum Transfer {
+    Fatal(String),
+    Transient(String),
+}
+
+async fn read_capped(mut r: reqwest::Response, url: &str, cap: u64) -> Result<Vec<u8>, Transfer> {
+    let mut body = Vec::new();
+    loop {
+        match r.chunk().await {
+            Ok(Some(chunk)) => {
+                body.extend_from_slice(&chunk);
+                if body.len() as u64 > cap {
+                    return Err(Transfer::Fatal(format!(
+                        "{url}: larger than the pinned {cap} bytes"
+                    )));
+                }
+            }
+            Ok(None) => return Ok(body),
+            Err(e) => return Err(Transfer::Transient(format!("{url}: {e}"))),
+        }
+    }
 }
 
 /// Read every pinned source file from the cache, verifying size and SHA-256.
@@ -221,20 +298,32 @@ pub fn verified_sources(
 struct Normalizer {
     blank_nodes: u64,
     invalid: Vec<String>,
+    /// Source lines whose canonical form differs from the source spelling (bounds what the
+    /// shared canonicalizer could mask).
+    rewritten: u64,
+    /// Repeated lines inside one IC or CB file.
+    duplicates: u64,
 }
 
 impl Normalizer {
     /// The canonical N-Quads line of one source triple (the form the ledger returns).
     fn canonical(&mut self, line: &str) -> Option<String> {
         match line.parse::<Quad>() {
-            Ok(q) => Some(q.as_str().to_owned()),
+            Ok(q) => {
+                if q.as_str() != line.trim() {
+                    self.rewritten += 1;
+                }
+                Some(q.as_str().to_owned())
+            }
             Err(RdfError::BlankNode) => {
                 self.blank_nodes += 1;
                 None
             }
             Err(e) => {
                 if self.invalid.len() < 3 {
-                    self.invalid.push(format!("{e}: {line}"));
+                    // Third-party statements are named by hash, never printed (CI logs).
+                    self.invalid
+                        .push(format!("{e}: {}", statement_ref(line, true)));
                 }
                 self.invalid.push(String::new());
                 None
@@ -243,10 +332,18 @@ impl Normalizer {
     }
 
     fn set(&mut self, text: &str) -> BTreeSet<String> {
-        text.lines()
+        let mut out = BTreeSet::new();
+        for l in text
+            .lines()
             .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
-            .filter_map(|l| self.canonical(l))
-            .collect()
+        {
+            if let Some(c) = self.canonical(l)
+                && !out.insert(c)
+            {
+                self.duplicates += 1;
+            }
+        }
+        out
     }
 
     fn finish(&self) -> Result<(), String> {
@@ -255,6 +352,12 @@ impl Normalizer {
                 "{} source statements contain blank nodes: deterministic skolemization must be \
                  implemented and reviewed before this source can be used",
                 self.blank_nodes
+            ));
+        }
+        if self.duplicates > 0 {
+            return Err(format!(
+                "{} repeated statements inside one source file",
+                self.duplicates
             ));
         }
         if !self.invalid.is_empty() {
@@ -306,6 +409,11 @@ pub fn prepare(ctx: &Context, id: &str) -> Result<(String, u64, Extraction), Str
     };
     let (ic_files, ic_report) = tar_regular_files(&ic_tar, ic_name, ENTRY_CAP, TAR_TOTAL_CAP)?;
     let versions = ic_files.len();
+    if versions < WINDOW {
+        return Err(format!(
+            "IC holds {versions} versions; the window needs {WINDOW}"
+        ));
+    }
     for (i, name) in ic_files.keys().enumerate() {
         if *name != format!("{:06}.nt.gz", i + 1) {
             return Err(format!(
@@ -369,7 +477,10 @@ pub fn prepare(ctx: &Context, id: &str) -> Result<(String, u64, Extraction), Str
     for line in tb_text.lines().filter(|l| !l.trim().is_empty()) {
         if line.starts_with(TB_GRAPH) {
             if !line.contains("> <http://www.w3.org/2002/07/owl#versionInfo> ") {
-                return Err(format!("unexpected TB metadata statement: {line}"));
+                return Err(format!(
+                    "unexpected TB metadata statement {}",
+                    statement_ref(line, true)
+                ));
             }
             metadata += 1;
             continue;
@@ -378,7 +489,7 @@ pub fn prepare(ctx: &Context, id: &str) -> Result<(String, u64, Extraction), Str
         let (triple, graph) = line
             .strip_suffix(" .")
             .and_then(|l| l.rsplit_once(' '))
-            .ok_or_else(|| format!("unexpected TB statement: {line}"))?;
+            .ok_or_else(|| format!("unexpected TB statement {}", statement_ref(line, true)))?;
         let list = graph
             .strip_prefix(TB_GRAPH)
             .and_then(|g| g.strip_suffix('>'))
@@ -402,7 +513,8 @@ pub fn prepare(ctx: &Context, id: &str) -> Result<(String, u64, Extraction), Str
             split_lines += 1;
             if !entry.is_disjoint(&vs) {
                 return Err(format!(
-                    "TB lists overlapping versions for one triple: {triple}"
+                    "TB lists overlapping versions for one triple {}",
+                    statement_ref(triple, true)
                 ));
             }
         }
@@ -415,12 +527,16 @@ pub fn prepare(ctx: &Context, id: &str) -> Result<(String, u64, Extraction), Str
         let Some(canonical) = norm.canonical(&format!("{triple} .")) else {
             continue;
         };
-        if let Some(prev) = membership.get_mut(&canonical) {
+        if membership.contains_key(&canonical) {
             collisions += 1;
-            prev.extend(vs);
-        } else {
-            membership.insert(canonical, vs);
         }
+        membership.entry(canonical).or_default().extend(vs);
+    }
+    // Two source spellings with one canonical form would merge silently: refused.
+    if collisions > 0 {
+        return Err(format!(
+            "{collisions} distinct TB spellings normalize to one canonical statement"
+        ));
     }
     counts.insert("tb_statements".into(), tb_lines);
     counts.insert("tb_version_metadata_statements".into(), metadata);
@@ -516,9 +632,18 @@ pub fn prepare(ctx: &Context, id: &str) -> Result<(String, u64, Extraction), Str
         prev = next;
     }
     for k in start..start + WINDOW {
-        divergence += state(k)
-            .symmetric_difference(&ic(k + 1, &mut norm)?)
-            .count() as u64;
+        let (tb, icv) = (state(k), ic(k + 1, &mut norm)?);
+        // The IC lineage only drops statements the changesets keep: IC ⊆ TB at every
+        // selected version (verified on the source). A violation means the documented
+        // relation between the two lineages no longer holds.
+        if !icv.is_subset(&tb) {
+            return Err(format!(
+                "IC file {:06} holds {} statements outside TB v{k}: the documented lineage relation does not hold",
+                k + 1,
+                icv.difference(&tb).count()
+            ));
+        }
+        divergence += tb.difference(&icv).count() as u64;
     }
     norm.finish()?;
     let prepared = Prepared { start, base, steps };
@@ -537,6 +662,7 @@ pub fn prepare(ctx: &Context, id: &str) -> Result<(String, u64, Extraction), Str
     counts.insert("triples_first_version".into(), prepared.base.len() as u64);
     counts.insert("triples_last_version".into(), prev.len() as u64);
     counts.insert("ic_lineage_divergence_in_window".into(), divergence);
+    counts.insert("canonicalization_rewrites".into(), norm.rewritten);
 
     let extraction = Extraction {
         algorithm: EXTRACTION_ALGORITHM.into(),
@@ -574,7 +700,7 @@ pub fn prepare(ctx: &Context, id: &str) -> Result<(String, u64, Extraction), Str
     }
     let path = artifact_path(ctx, id);
     std::fs::create_dir_all(path.parent().expect("has parent")).map_err(|e| e.to_string())?;
-    let part = path.with_extension("part");
+    let part = part_path(&path);
     std::fs::write(&part, &bytes).map_err(|e| e.to_string())?;
     std::fs::rename(&part, &path).map_err(|e| e.to_string())?;
     Ok((sha256_hex(&bytes), bytes.len() as u64, extraction))
@@ -718,7 +844,9 @@ fn chunks(dels: &BTreeSet<String>, adds: &BTreeSet<String>) -> Vec<(Vec<String>,
         .chain(adds.iter().map(|q| (false, q)))
         .collect();
     for (is_delete, q) in ops {
-        if d.len() + a.len() == MAX_OPS_PER_COMMIT || bytes + q.len() > MAX_BYTES_PER_COMMIT {
+        let full =
+            d.len() + a.len() == MAX_OPS_PER_COMMIT || bytes + q.len() > MAX_BYTES_PER_COMMIT;
+        if full && (!d.is_empty() || !a.is_empty()) {
             out.push((std::mem::take(&mut d), std::mem::take(&mut a)));
             bytes = 0;
         }
@@ -825,6 +953,7 @@ fn workload(p: &Prepared) -> Workload {
         diff_pairs,
         verify_all_history: true,
         history_facts: history_facts(p, &versions),
+        redact_statements: true,
     }
 }
 
@@ -848,7 +977,7 @@ fn history_facts(p: &Prepared, versions: &[Label]) -> Vec<HistoryFact> {
                 out.push(HistoryFact {
                     quad: q.clone(),
                     present: vec![versions[j].clone(), versions[l].clone()],
-                    absent: vec![versions[j + 1].clone()],
+                    absent: (j + 1..l).map(|v| versions[v].clone()).collect(),
                 });
                 if out.len() == MAX_HISTORY_FACTS {
                     break 'outer;

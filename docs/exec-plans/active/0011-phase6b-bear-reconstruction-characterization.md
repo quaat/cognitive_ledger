@@ -43,7 +43,9 @@ bottleneck. The evidence decides; checkpoints are not assumed.
    - Add a typed, versioned external-dataset manifest.
    - Build an offline lifecycle: fetch → verify → prepare → verify → run, with safe
      archive handling.
-   - Extract deterministically, cross-checking the full versions against the change sets.
+   - Extract deterministically from the TB/CB lineage: TB (time-annotated versions) is the
+     oracle, and every CB step is cross-checked against it. IC's divergent lineage is a
+     checked, counted relation (IC ⊆ TB), not the oracle; see Decisions.
    - Use the source versions as the oracle.
    - Add it to the `ci` profile only within the CI envelope.
 3. **Reconstruction diagnostic profile (`recon`, outside PR CI).** Depth × state sweeps.
@@ -104,18 +106,62 @@ Every item of the Phase-6B gate in the task holds, the recommendation is written
 **stops**: no checkpoint implementation.
 
 ## Work
-- [ ] Hygiene: runbook, generator version, doc-consistency check, CI timeout, dedicated-connection migration tests, required checks
-- [ ] BEAR-B source verification and first reviewed download (SHA-256, size, date)
-- [ ] External manifest v2 with negative tests
-- [ ] Lifecycle commands (fetch, verify, prepare, verify, clean) with safe archive handling
-- [ ] Extraction with the CB cross-check; oracle; `bear-b-ci` runs
-- [ ] `recon` profile; PostgreSQL instrumentation override; cold arm; CPU and memory
+- [x] Hygiene: runbook, generator version, doc-consistency check, CI timeout, dedicated-connection migration tests, required checks
+- [x] BEAR-B source verification and first reviewed download (SHA-256, size, date)
+- [x] External manifest v2 with negative tests
+- [x] Lifecycle commands (fetch, verify, prepare, verify, clean) with safe archive handling
+- [x] Extraction with the CB cross-check; oracle; `bear-b-ci` runs
+- [x] `recon` profile; PostgreSQL instrumentation override; cold arm; CPU and memory
 - [ ] `bear-b-ci` in `ci` if within budget
-- [ ] Production-qualification matrix
+- [x] Production-qualification matrix ([production-qualification.md](../../quality/production-qualification.md))
 - [ ] Reviews; gates; evidence; recommendation; stop
 
 ## Decisions
+1. **The BEAR-B oracle is the TB/CB lineage, not IC** (owner review requested).
+   - The three BEAR-B day encodings do not describe one history. IC(1) plus the cumulative
+     CB changesets equals TB at all 89 versions (88 steps). From version 2 on, the IC files
+     also drop stale values that no changeset deletes.
+   - IC ⊆ TB holds at every version; the extractor fails if it does not.
+   - The extractor takes TB as the oracle and hard-checks two things:
+     - anchor TB(v0) == IC(1);
+     - at every step, CB's net change == TB's version difference. Changeset no-op churn is
+       allowed only where both versions contain it.
+   - IC's divergence inside the window is pinned as a manifest count
+     (`ic_lineage_divergence_in_window`).
+   - TB and CB are two encodings of one lineage (BEAR likely derived TB from the
+     changesets). Their agreement shows that the extraction reads both consistently, not
+     that the lineage is "true".
+2. **Window**: the 12 consecutive day versions with the most adds plus deletes, lowest start
+   on ties. That is v22..=v33: 36,645 → 41,316 triples, 9,384 adds, 4,713 deletes, 199
+   reappearances. The ingest is 19 commits (≤ 5,000 operations and ≤ 1.4 MB each).
+3. **Archive handling in memory** (gzip capped at 512 MiB, minimal ustar reader, regular
+   files only, no archive path ever written). A streaming design was not needed at 34 MB
+   compressed.
+4. **No third-party data in the repository or in uploaded results.**
+   - Only the manifest (hashes, counts) is committed.
+   - Failure details name BEAR statements by `stmt:<sha256 prefix>` (`redact_statements`).
+   - The prepared artifact lives in the local or CI cache only.
+5. **Instrumentation is benchmark-only.** `benchmark/compose.instrumented.yaml` enables
+   `pg_stat_statements` (schema `bench_stats`) and `track_io_timing`. Every recon result
+   records that override. Production defaults are unchanged.
+6. **Cold means database-restart cold** (`docker restart` of PostgreSQL: shared buffers
+   empty, OS page cache warm). No OS-cold claim is made.
+7. **The pg_graphs_migration hang: cause unknown, the fix is defensive** (tech-debt entry).
 
 ## Discoveries
+- **BEAR-B lineage.** Encoding facts:
+  - IC and CB/TB diverge as described in Decisions 1.
+  - 13 TB triples are written across 733 annotation lines with disjoint version lists.
+    They are merged, and overlapping lists fail.
+  - Normalization rewrote 3,207 source spellings to canonical N-Quads with 0 collisions. The
+    count bounds what the shared canonicalizer could mask.
+- **A failed sqlx migration keeps its advisory lock on the connection it ran on.** sqlx
+  0.8 does not unlock on error. A pooled connection carries the lock into later use;
+  `a_failed_migration_keeps_its_advisory_lock_on_a_pooled_connection_only` pins this.
+- **Required status checks are job names**, not workflow names. The tech-debt
+  recommendation and `check-doc-consistency.py` were corrected.
+- **Stale documentation found by review:**
+  - `deployment.md` contradicted ADR-0017 on PITR;
+  - tech-debt claimed that zero DB timeouts were accepted, but the server rejects them.
 
 ## Evidence

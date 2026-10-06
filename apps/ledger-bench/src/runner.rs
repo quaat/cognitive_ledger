@@ -29,7 +29,7 @@ use crate::{
     result::{Correctness, Failure, SeriesPoint},
     workload::{
         CommitStep, Expected, Label, MergeStep, PreviewExpect, State, Step, Workload,
-        first_parent_chain, oracle_digest,
+        first_parent_chain, oracle_digest, statement_ref,
     },
 };
 use ledger_core::{AnyCommit, CommitId, GraphId, ImmutableStore, TenantId};
@@ -88,7 +88,7 @@ pub struct RunData {
 /// `ledger_materialized_state(C) == expected_state(C)` on the raw API list: strings only,
 /// strictly ascending (canonical order, no duplicates), then count and the oracle digest.
 /// `None` when it holds; otherwise a diagnostic.
-pub fn state_mismatch(e: &Expected, raw: &[Value]) -> Option<String> {
+pub fn state_mismatch(e: &Expected, raw: &[Value], redact: bool) -> Option<String> {
     let mut lines = Vec::with_capacity(raw.len());
     for q in raw {
         match q.as_str() {
@@ -115,15 +115,17 @@ pub fn state_mismatch(e: &Expected, raw: &[Value]) -> Option<String> {
     );
     if let Some(full) = &e.state {
         let actual: BTreeSet<&str> = lines.iter().copied().collect();
-        let missing: Vec<&String> = full
+        let missing: Vec<String> = full
             .iter()
             .filter(|q| !actual.contains(q.as_str()))
             .take(3)
+            .map(|q| statement_ref(q, redact))
             .collect();
-        let extra: Vec<&&str> = actual
+        let extra: Vec<String> = actual
             .iter()
             .filter(|q| !full.contains(**q))
             .take(3)
+            .map(|q| statement_ref(q, redact))
             .collect();
         detail.push_str(&format!("; missing {missing:?}; unexpected {extra:?}"));
     }
@@ -400,7 +402,7 @@ impl Runner<'_> {
         }
         self.sample("api", op, Some(label), t, Some(bytes));
         let raw = v["quads"].as_array().cloned().unwrap_or_default();
-        let mismatch = state_mismatch(&self.w.expected[label], &raw);
+        let mismatch = state_mismatch(&self.w.expected[label], &raw, self.w.redact_statements);
         self.check(family, label, mismatch.is_none(), || {
             mismatch.unwrap_or_default()
         });
@@ -659,7 +661,7 @@ impl Runner<'_> {
                     || {
                         format!(
                             "{} expected {} at {label}",
-                            f.quad,
+                            statement_ref(&f.quad, self.w.redact_statements),
                             if want { "present" } else { "absent" }
                         )
                     },
@@ -953,7 +955,7 @@ mod tests {
     #[test]
     fn a_wrong_state_reply_is_a_failure() {
         let e = expected(&[A, B]);
-        assert!(state_mismatch(&e, &[json!(A), json!(B)]).is_none());
+        assert!(state_mismatch(&e, &[json!(A), json!(B)], false).is_none());
         for (reply, why) in [
             (vec![json!(A)], "missing"),
             (vec![json!(A), json!(B), json!(C)], "unexpected"),
@@ -962,9 +964,19 @@ mod tests {
             (vec![json!(A), json!(A), json!(B)], "ascending"),
             (vec![json!(A), json!(1)], "non-string"),
         ] {
-            let m = state_mismatch(&e, &reply).expect("must fail");
+            let m = state_mismatch(&e, &reply, false).expect("must fail");
             assert!(m.contains(why), "{why}: {m}");
         }
+    }
+
+    #[test]
+    fn third_party_statements_are_redacted_in_failure_details() {
+        let e = expected(&[A, B]);
+        let m = state_mismatch(&e, &[json!(A), json!(C)], true).unwrap();
+        assert!(
+            !m.contains("urn:b") && !m.contains("urn:c") && m.contains("stmt:"),
+            "{m}"
+        );
     }
 
     fn preview(classification: &'static str) -> PreviewExpect {

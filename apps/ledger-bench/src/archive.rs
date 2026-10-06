@@ -10,18 +10,23 @@
 //!
 //! No archive content is ever executed.
 
-use flate2::read::GzDecoder;
+use flate2::bufread::GzDecoder;
 use std::{collections::BTreeMap, io::Read};
 
-/// Decompress a gzip member, refusing more than `cap` output bytes.
+/// Decompress exactly one gzip member, refusing more than `cap` output bytes and any data
+/// after the member (a second member or trailing bytes could hide content).
 pub fn gunzip_capped(compressed: &[u8], cap: u64) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
-    GzDecoder::new(compressed)
+    let mut decoder = GzDecoder::new(compressed);
+    (&mut decoder)
         .take(cap + 1)
         .read_to_end(&mut out)
         .map_err(|e| format!("gzip: {e}"))?;
     if out.len() as u64 > cap {
         return Err(format!("gzip output exceeds the {cap}-byte cap"));
+    }
+    if !decoder.into_inner().is_empty() {
+        return Err("data after the gzip member".into());
     }
     Ok(out)
 }
@@ -62,10 +67,12 @@ pub fn tar_regular_files(
     let mut report = TarReport::default();
     let mut total = 0u64;
     let mut at = 0usize;
+    let mut ended = false;
     while at + 512 <= tar.len() {
         let h = &tar[at..at + 512];
         if h.iter().all(|b| *b == 0) {
-            break; // end-of-archive marker
+            ended = true; // end-of-archive marker
+            break;
         }
         let stored = octal(&h[148..156])?;
         let sum: u64 = h
@@ -135,6 +142,9 @@ pub fn tar_regular_files(
             report.non_regular_skipped += 1;
         }
         at = data_start + usize::try_from(padded).map_err(|_| "tar entry too large")?;
+    }
+    if !ended {
+        return Err("tar archive has no end-of-archive marker (truncated)".into());
     }
     Ok((out, report))
 }
@@ -226,6 +236,28 @@ mod tests {
             tar_regular_files(&t[..700], |_| true, 1000, 1000)
                 .unwrap_err()
                 .contains("truncated")
+        );
+    }
+
+    #[test]
+    fn a_missing_end_marker_and_trailing_gzip_data_are_refused() {
+        let t = tar(&[("a", b"1", b'0')]);
+        assert!(
+            tar_regular_files(&t[..1024], |_| true, 10, 100)
+                .unwrap_err()
+                .contains("end-of-archive")
+        );
+        let mut e = GzEncoder::new(Vec::new(), Compression::default());
+        e.write_all(b"one").unwrap();
+        let mut gz = e.finish().unwrap();
+        assert_eq!(gunzip_capped(&gz, 10).unwrap(), b"one");
+        let mut e = GzEncoder::new(Vec::new(), Compression::default());
+        e.write_all(b"hidden").unwrap();
+        gz.extend(e.finish().unwrap());
+        assert!(
+            gunzip_capped(&gz, 100)
+                .unwrap_err()
+                .contains("after the gzip member")
         );
     }
 

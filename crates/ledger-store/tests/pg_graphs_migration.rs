@@ -71,6 +71,17 @@ async fn fresh_database(prefix: &str) -> (String, PgPool) {
 const MIGRATION_DEADLINE: Duration = Duration::from_secs(120);
 
 /// Advisory locks held in the current database (by any session).
+/// Every test here creates databases and runs migrations; the binary once hung (cause
+/// unknown, Plan 0011). A whole-test deadline turns any recurrence into a failure that names
+/// the test instead of a CI job timeout.
+const TEST_DEADLINE: Duration = Duration::from_secs(300);
+
+async fn bounded(test: impl std::future::Future<Output = ()>) {
+    tokio::time::timeout(TEST_DEADLINE, test)
+        .await
+        .expect("the test exceeded its deadline (see TEST_DEADLINE)");
+}
+
 async fn advisory_locks(pool: &PgPool) -> i64 {
     sqlx::query_scalar(
         "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' \
@@ -252,310 +263,322 @@ fn v2(graph: &str, patch: &PatchId, message: &str) -> AnyCommit {
 #[tokio::test]
 #[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
 async fn graph_id_is_globally_unique_and_tenant_binding_is_immutable() {
-    let _ = IGNORE;
-    let store = PostgresImmutableStore::connect_and_migrate(&database_url(), V1Binding::Reject)
-        .await
-        .unwrap();
-    let graphs = PgGraphs::new(store.pool().clone());
-    let graph = unique("g");
+    bounded(async {
+        let _ = IGNORE;
+        let store = PostgresImmutableStore::connect_and_migrate(&database_url(), V1Binding::Reject)
+            .await
+            .unwrap();
+        let graphs = PgGraphs::new(store.pool().clone());
+        let graph = unique("g");
 
-    // 1. Same graph_id under different tenants fails.
-    graphs
-        .create(&new_graph(&graph, "tenant-a", None))
-        .await
-        .unwrap();
-    assert!(matches!(
-        graphs.create(&new_graph(&graph, "tenant-b", None)).await,
-        Err(LedgerError::GraphAlreadyExists(_))
-    ));
-    assert!(matches!(
-        graphs.create(&new_graph(&graph, "tenant-a", None)).await,
-        Err(LedgerError::GraphAlreadyExists(_))
-    ));
-    let raw_duplicate = sqlx::query(
-        "INSERT INTO graphs (graph_id, tenant_id, status) VALUES ($1, 'tenant-b', 'active')",
-    )
-    .bind(&graph)
-    .execute(store.pool())
-    .await;
-    assert_eq!(sqlstate(raw_duplicate), UNIQUE_VIOLATION);
-
-    // 2. tenant_id (and graph_id) cannot change; metadata/status can.
-    let tenant_update = sqlx::query("UPDATE graphs SET tenant_id = 'tenant-b' WHERE graph_id = $1")
+        // 1. Same graph_id under different tenants fails.
+        graphs
+            .create(&new_graph(&graph, "tenant-a", None))
+            .await
+            .unwrap();
+        assert!(matches!(
+            graphs.create(&new_graph(&graph, "tenant-b", None)).await,
+            Err(LedgerError::GraphAlreadyExists(_))
+        ));
+        assert!(matches!(
+            graphs.create(&new_graph(&graph, "tenant-a", None)).await,
+            Err(LedgerError::GraphAlreadyExists(_))
+        ));
+        let raw_duplicate = sqlx::query(
+            "INSERT INTO graphs (graph_id, tenant_id, status) VALUES ($1, 'tenant-b', 'active')",
+        )
         .bind(&graph)
         .execute(store.pool())
         .await;
-    match tenant_update {
-        Err(sqlx::Error::Database(e)) => {
-            assert_eq!(e.code().as_deref(), Some(INTEGRITY_VIOLATION));
-            assert!(
-                e.message().contains("tenant_id is immutable"),
-                "{}",
-                e.message()
-            );
+        assert_eq!(sqlstate(raw_duplicate), UNIQUE_VIOLATION);
+
+        // 2. tenant_id (and graph_id) cannot change; metadata/status can.
+        let tenant_update =
+            sqlx::query("UPDATE graphs SET tenant_id = 'tenant-b' WHERE graph_id = $1")
+                .bind(&graph)
+                .execute(store.pool())
+                .await;
+        match tenant_update {
+            Err(sqlx::Error::Database(e)) => {
+                assert_eq!(e.code().as_deref(), Some(INTEGRITY_VIOLATION));
+                assert!(
+                    e.message().contains("tenant_id is immutable"),
+                    "{}",
+                    e.message()
+                );
+            }
+            other => panic!("tenant binding must be immutable: {other:?}"),
         }
-        other => panic!("tenant binding must be immutable: {other:?}"),
-    }
-    let rename = sqlx::query("UPDATE graphs SET graph_id = $2 WHERE graph_id = $1")
+        let rename = sqlx::query("UPDATE graphs SET graph_id = $2 WHERE graph_id = $1")
+            .bind(&graph)
+            .bind(unique("renamed"))
+            .execute(store.pool())
+            .await;
+        assert_eq!(sqlstate(rename), INTEGRITY_VIOLATION);
+        // ON CONFLICT DO UPDATE is an UPDATE path too, and the trigger covers it.
+        let upsert = sqlx::query(
+            "INSERT INTO graphs (graph_id, tenant_id, status) VALUES ($1, 'tenant-z', 'active') \
+         ON CONFLICT (graph_id) DO UPDATE SET tenant_id = EXCLUDED.tenant_id",
+        )
         .bind(&graph)
-        .bind(unique("renamed"))
         .execute(store.pool())
         .await;
-    assert_eq!(sqlstate(rename), INTEGRITY_VIOLATION);
-    // ON CONFLICT DO UPDATE is an UPDATE path too, and the trigger covers it.
-    let upsert = sqlx::query(
-        "INSERT INTO graphs (graph_id, tenant_id, status) VALUES ($1, 'tenant-z', 'active') \
-         ON CONFLICT (graph_id) DO UPDATE SET tenant_id = EXCLUDED.tenant_id",
-    )
-    .bind(&graph)
-    .execute(store.pool())
-    .await;
-    assert_eq!(sqlstate(upsert), INTEGRITY_VIOLATION);
-    sqlx::query("UPDATE graphs SET status = 'archived', purpose = 'closed' WHERE graph_id = $1")
+        assert_eq!(sqlstate(upsert), INTEGRITY_VIOLATION);
+        sqlx::query(
+            "UPDATE graphs SET status = 'archived', purpose = 'closed' WHERE graph_id = $1",
+        )
         .bind(&graph)
         .execute(store.pool())
         .await
         .unwrap();
-    let record = graphs
-        .get(&GraphId::new(&graph).unwrap())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(record.status, GraphStatus::Archived);
-    assert_eq!(record.tenant_id.as_str(), "tenant-a");
+        let record = graphs
+            .get(&GraphId::new(&graph).unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.status, GraphStatus::Archived);
+        assert_eq!(record.tenant_id.as_str(), "tenant-a");
 
-    // 3. Two graphs under one tenant may reference the same KB.
-    let kb = unique("urn:exodus:kb");
-    graphs
-        .create(&new_graph(&unique("g1"), "tenant-c", Some(&kb)))
-        .await
-        .unwrap();
-    graphs
-        .create(&new_graph(&unique("g2"), "tenant-c", Some(&kb)))
-        .await
-        .unwrap();
-    let row = sqlx::query("SELECT count(*) AS n FROM graphs WHERE knowledge_base_id = $1")
-        .bind(&kb)
-        .fetch_one(store.pool())
-        .await
-        .unwrap();
-    let n: i64 = row.get("n");
-    assert_eq!(n, 2);
+        // 3. Two graphs under one tenant may reference the same KB.
+        let kb = unique("urn:exodus:kb");
+        graphs
+            .create(&new_graph(&unique("g1"), "tenant-c", Some(&kb)))
+            .await
+            .unwrap();
+        graphs
+            .create(&new_graph(&unique("g2"), "tenant-c", Some(&kb)))
+            .await
+            .unwrap();
+        let row = sqlx::query("SELECT count(*) AS n FROM graphs WHERE knowledge_base_id = $1")
+            .bind(&kb)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        let n: i64 = row.get("n");
+        assert_eq!(n, 2);
+    })
+    .await;
 }
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
 async fn refs_and_commits_cannot_reference_unknown_graphs_and_graphs_with_history_cannot_be_deleted()
  {
-    let store = PostgresImmutableStore::connect_and_migrate(&database_url(), V1Binding::Reject)
-        .await
-        .unwrap();
-    let pool = store.pool();
-    let unknown = unique("nograph");
+    bounded(async {
+        let store = PostgresImmutableStore::connect_and_migrate(&database_url(), V1Binding::Reject)
+            .await
+            .unwrap();
+        let pool = store.pool();
+        let unknown = unique("nograph");
 
-    // 5. refs cannot reference an unknown graph.
-    let dangling_ref =
-        sqlx::query("INSERT INTO refs (graph_id, branch, head) VALUES ($1, 'main', $2)")
-            .bind(&unknown)
-            .bind("sha256:0000000000000000000000000000000000000000000000000000000000000000")
-            .execute(pool)
-            .await;
-    assert_eq!(sqlstate(dangling_ref), FK_VIOLATION);
+        // 5. refs cannot reference an unknown graph.
+        let dangling_ref =
+            sqlx::query("INSERT INTO refs (graph_id, branch, head) VALUES ($1, 'main', $2)")
+                .bind(&unknown)
+                .bind("sha256:0000000000000000000000000000000000000000000000000000000000000000")
+                .execute(pool)
+                .await;
+        assert_eq!(sqlstate(dangling_ref), FK_VIOLATION);
 
-    // 6. commit_index cannot reference an unknown graph (FK), and 8. the store refuses a
-    //    v2 commit whose graph does not exist before writing anything.
-    let p = patch(&unique("fk"));
-    store
-        .put_content(&p.id().0, &p.canonical_bytes())
-        .await
-        .unwrap();
-    let commit = v2(&unknown, &p.id(), "graphless");
-    assert!(matches!(
-        store.put_commit(&commit).await,
-        Err(LedgerError::UnknownGraph(_))
-    ));
-    assert!(
-        !store.exists(&commit.id().unwrap().0).await.unwrap(),
-        "refused before any write"
-    );
-    let raw_index = sqlx::query(
-        "INSERT INTO commit_index (id, graph_id, version, patch_id, parent_count) \
+        // 6. commit_index cannot reference an unknown graph (FK), and 8. the store refuses a
+        //    v2 commit whose graph does not exist before writing anything.
+        let p = patch(&unique("fk"));
+        store
+            .put_content(&p.id().0, &p.canonical_bytes())
+            .await
+            .unwrap();
+        let commit = v2(&unknown, &p.id(), "graphless");
+        assert!(matches!(
+            store.put_commit(&commit).await,
+            Err(LedgerError::UnknownGraph(_))
+        ));
+        assert!(
+            !store.exists(&commit.id().unwrap().0).await.unwrap(),
+            "refused before any write"
+        );
+        let raw_index = sqlx::query(
+            "INSERT INTO commit_index (id, graph_id, version, patch_id, parent_count) \
          VALUES ($1, $2, 2, $3, 0)",
-    )
-    .bind(p.id().to_string()) // any existing object id works for the FK on id
-    .bind(&unknown)
-    .bind(p.id().to_string())
-    .execute(pool)
-    .await;
-    assert_eq!(
-        sqlstate(raw_index),
-        FK_VIOLATION,
-        "commit_index.graph_id FK must hold"
-    );
+        )
+        .bind(p.id().to_string()) // any existing object id works for the FK on id
+        .bind(&unknown)
+        .bind(p.id().to_string())
+        .execute(pool)
+        .await;
+        assert_eq!(
+            sqlstate(raw_index),
+            FK_VIOLATION,
+            "commit_index.graph_id FK must hold"
+        );
 
-    // 7. A graph with a ref or an indexed commit cannot be deleted; an empty one can.
-    let graphs = PgGraphs::new(pool.clone());
-    let with_ref = unique("withref");
-    graphs
-        .create(&new_graph(&with_ref, "tenant-a", None))
-        .await
-        .unwrap();
-    let anchor = store
-        .put_commit(&v2(&with_ref, &p.id(), "anchor"))
-        .await
-        .unwrap();
-    // Raw ref writes are legal only on bootstrap/importing graphs since migration 0009.
-    sqlx::query("UPDATE graphs SET status = 'importing' WHERE graph_id = $1")
-        .bind(&with_ref)
-        .execute(pool)
-        .await
-        .unwrap();
-    sqlx::query("INSERT INTO refs (graph_id, branch, head) VALUES ($1, 'main', $2)")
-        .bind(&with_ref)
-        .bind(anchor.to_string())
-        .execute(pool)
-        .await
-        .unwrap();
-    assert_eq!(
-        sqlstate(
-            sqlx::query("DELETE FROM graphs WHERE graph_id = $1")
-                .bind(&with_ref)
-                .execute(pool)
-                .await
-        ),
-        FK_VIOLATION
-    );
-    let with_commit = unique("withcommit");
-    graphs
-        .create(&new_graph(&with_commit, "tenant-a", None))
-        .await
-        .unwrap();
-    store
-        .put_commit(&v2(&with_commit, &p.id(), "anchor"))
-        .await
-        .unwrap();
-    assert_eq!(
-        sqlstate(
-            sqlx::query("DELETE FROM graphs WHERE graph_id = $1")
-                .bind(&with_commit)
-                .execute(pool)
-                .await
-        ),
-        FK_VIOLATION
-    );
-    let empty = unique("empty");
-    graphs
-        .create(&new_graph(&empty, "tenant-a", None))
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM graphs WHERE graph_id = $1")
-        .bind(&empty)
-        .execute(pool)
-        .await
-        .unwrap();
-    // The bootstrap graph: give it a ref of our own first so this holds regardless of
-    // which other suites ran before, then confirm it cannot be deleted.
-    let bootstrap_anchor = store
-        .put_commit(&v2("default", &p.id(), "bootstrap anchor"))
-        .await
-        .unwrap();
-    sqlx::query("INSERT INTO refs (graph_id, branch, head) VALUES ('default', $1, $2)")
-        .bind(unique("bootstrap-anchor"))
-        .bind(bootstrap_anchor.to_string())
-        .execute(pool)
-        .await
-        .unwrap();
-    assert_eq!(
-        sqlstate(
-            sqlx::query("DELETE FROM graphs WHERE graph_id = 'default'")
-                .execute(pool)
-                .await
-        ),
-        FK_VIOLATION
-    );
+        // 7. A graph with a ref or an indexed commit cannot be deleted; an empty one can.
+        let graphs = PgGraphs::new(pool.clone());
+        let with_ref = unique("withref");
+        graphs
+            .create(&new_graph(&with_ref, "tenant-a", None))
+            .await
+            .unwrap();
+        let anchor = store
+            .put_commit(&v2(&with_ref, &p.id(), "anchor"))
+            .await
+            .unwrap();
+        // Raw ref writes are legal only on bootstrap/importing graphs since migration 0009.
+        sqlx::query("UPDATE graphs SET status = 'importing' WHERE graph_id = $1")
+            .bind(&with_ref)
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO refs (graph_id, branch, head) VALUES ($1, 'main', $2)")
+            .bind(&with_ref)
+            .bind(anchor.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlstate(
+                sqlx::query("DELETE FROM graphs WHERE graph_id = $1")
+                    .bind(&with_ref)
+                    .execute(pool)
+                    .await
+            ),
+            FK_VIOLATION
+        );
+        let with_commit = unique("withcommit");
+        graphs
+            .create(&new_graph(&with_commit, "tenant-a", None))
+            .await
+            .unwrap();
+        store
+            .put_commit(&v2(&with_commit, &p.id(), "anchor"))
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlstate(
+                sqlx::query("DELETE FROM graphs WHERE graph_id = $1")
+                    .bind(&with_commit)
+                    .execute(pool)
+                    .await
+            ),
+            FK_VIOLATION
+        );
+        let empty = unique("empty");
+        graphs
+            .create(&new_graph(&empty, "tenant-a", None))
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM graphs WHERE graph_id = $1")
+            .bind(&empty)
+            .execute(pool)
+            .await
+            .unwrap();
+        // The bootstrap graph: give it a ref of our own first so this holds regardless of
+        // which other suites ran before, then confirm it cannot be deleted.
+        let bootstrap_anchor = store
+            .put_commit(&v2("default", &p.id(), "bootstrap anchor"))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO refs (graph_id, branch, head) VALUES ('default', $1, $2)")
+            .bind(unique("bootstrap-anchor"))
+            .bind(bootstrap_anchor.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlstate(
+                sqlx::query("DELETE FROM graphs WHERE graph_id = 'default'")
+                    .execute(pool)
+                    .await
+            ),
+            FK_VIOLATION
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
 async fn immutable_tables_are_write_once_and_ref_identity_is_immutable() {
-    let store = PostgresImmutableStore::connect_and_migrate(&database_url(), V1Binding::Reject)
-        .await
-        .unwrap();
-    let pool = store.pool();
-    let graph = unique("wo");
-    PgGraphs::new(pool.clone())
-        .create(&new_graph(&graph, "tenant-a", None))
-        .await
-        .unwrap();
-    let p = patch(&unique("wo"));
-    store
-        .put_content(&p.id().0, &p.canonical_bytes())
-        .await
-        .unwrap();
-    let genesis = store
-        .put_commit(&v2(&graph, &p.id(), "genesis"))
-        .await
-        .unwrap();
-    let AnyCommit::V2(mut child) = v2(&graph, &p.id(), "child") else {
-        unreachable!()
-    };
-    child.parents = vec![genesis.clone()];
-    let child_id = store.put_commit(&AnyCommit::V2(child)).await.unwrap();
+    bounded(async {
+        let store = PostgresImmutableStore::connect_and_migrate(&database_url(), V1Binding::Reject)
+            .await
+            .unwrap();
+        let pool = store.pool();
+        let graph = unique("wo");
+        PgGraphs::new(pool.clone())
+            .create(&new_graph(&graph, "tenant-a", None))
+            .await
+            .unwrap();
+        let p = patch(&unique("wo"));
+        store
+            .put_content(&p.id().0, &p.canonical_bytes())
+            .await
+            .unwrap();
+        let genesis = store
+            .put_commit(&v2(&graph, &p.id(), "genesis"))
+            .await
+            .unwrap();
+        let AnyCommit::V2(mut child) = v2(&graph, &p.id(), "child") else {
+            unreachable!()
+        };
+        child.parents = vec![genesis.clone()];
+        let child_id = store.put_commit(&AnyCommit::V2(child)).await.unwrap();
 
-    for statement in [
-        "UPDATE immutable_objects SET bytes = 'x' WHERE id = $1",
-        "DELETE FROM immutable_objects WHERE id = $1",
-        "UPDATE commit_index SET version = 1 WHERE id = $1",
-        "UPDATE commit_index SET graph_id = 'default' WHERE id = $1",
-        "DELETE FROM commit_index WHERE id = $1",
-        "UPDATE commit_parents SET parent_id = $1 WHERE commit_id = $1",
-        "DELETE FROM commit_parents WHERE commit_id = $1",
-    ] {
-        let result = sqlx::query(statement)
-            .bind(child_id.to_string())
+        for statement in [
+            "UPDATE immutable_objects SET bytes = 'x' WHERE id = $1",
+            "DELETE FROM immutable_objects WHERE id = $1",
+            "UPDATE commit_index SET version = 1 WHERE id = $1",
+            "UPDATE commit_index SET graph_id = 'default' WHERE id = $1",
+            "DELETE FROM commit_index WHERE id = $1",
+            "UPDATE commit_parents SET parent_id = $1 WHERE commit_id = $1",
+            "DELETE FROM commit_parents WHERE commit_id = $1",
+        ] {
+            let result = sqlx::query(statement)
+                .bind(child_id.to_string())
+                .execute(pool)
+                .await;
+            assert_eq!(sqlstate(result), INTEGRITY_VIOLATION, "{statement}");
+        }
+        // refs: head moves, identity does not.
+        let branch = unique("wo-ref");
+        // Raw ref writes are legal only on bootstrap/importing graphs since migration 0009.
+        sqlx::query("UPDATE graphs SET status = 'importing' WHERE graph_id = $1")
+            .bind(&graph)
             .execute(pool)
-            .await;
-        assert_eq!(sqlstate(result), INTEGRITY_VIOLATION, "{statement}");
-    }
-    // refs: head moves, identity does not.
-    let branch = unique("wo-ref");
-    // Raw ref writes are legal only on bootstrap/importing graphs since migration 0009.
-    sqlx::query("UPDATE graphs SET status = 'importing' WHERE graph_id = $1")
-        .bind(&graph)
-        .execute(pool)
-        .await
-        .unwrap();
-    sqlx::query("INSERT INTO refs (graph_id, branch, head) VALUES ($1, $2, $3)")
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO refs (graph_id, branch, head) VALUES ($1, $2, $3)")
+            .bind(&graph)
+            .bind(&branch)
+            .bind(genesis.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE refs SET head = $3, version = version + 1 WHERE graph_id = $1 AND branch = $2",
+        )
         .bind(&graph)
         .bind(&branch)
-        .bind(genesis.to_string())
+        .bind(child_id.to_string())
         .execute(pool)
         .await
         .unwrap();
-    sqlx::query(
-        "UPDATE refs SET head = $3, version = version + 1 WHERE graph_id = $1 AND branch = $2",
-    )
-    .bind(&graph)
-    .bind(&branch)
-    .bind(child_id.to_string())
-    .execute(pool)
-    .await
-    .unwrap();
-    let rename =
-        sqlx::query("UPDATE refs SET branch = 'renamed' WHERE graph_id = $1 AND branch = $2")
-            .bind(&graph)
-            .bind(&branch)
-            .execute(pool)
-            .await;
-    assert_eq!(sqlstate(rename), INTEGRITY_VIOLATION);
-    let rehome =
-        sqlx::query("UPDATE refs SET graph_id = 'default' WHERE graph_id = $1 AND branch = $2")
-            .bind(&graph)
-            .bind(&branch)
-            .execute(pool)
-            .await;
-    assert_eq!(sqlstate(rehome), INTEGRITY_VIOLATION);
-    assert_eq!(store.verify_commits(&[genesis, child_id]).await.unwrap(), 2);
+        let rename =
+            sqlx::query("UPDATE refs SET branch = 'renamed' WHERE graph_id = $1 AND branch = $2")
+                .bind(&graph)
+                .bind(&branch)
+                .execute(pool)
+                .await;
+        assert_eq!(sqlstate(rename), INTEGRITY_VIOLATION);
+        let rehome =
+            sqlx::query("UPDATE refs SET graph_id = 'default' WHERE graph_id = $1 AND branch = $2")
+                .bind(&graph)
+                .bind(&branch)
+                .execute(pool)
+                .await;
+        assert_eq!(sqlstate(rehome), INTEGRITY_VIOLATION);
+        assert_eq!(store.verify_commits(&[genesis, child_id]).await.unwrap(), 2);
+    })
+    .await;
 }
 
 /// The ADR-0012 gate check must *fail* on every tampered column, not just pass on healthy
@@ -563,6 +586,7 @@ async fn immutable_tables_are_write_once_and_ref_identity_is_immutable() {
 #[tokio::test]
 #[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
 async fn verify_commit_index_detects_every_tampered_column() {
+    bounded(async {
     let (_url, pool) = fresh_database("ledger_tamper").await;
     let store = PostgresImmutableStore::from_pool(pool.clone(), V1Binding::Reject)
         .await
@@ -766,214 +790,224 @@ async fn verify_commit_index_detects_every_tampered_column() {
         }
         other => panic!("{other:?}"),
     }
+    })
+    .await;
 }
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
 async fn upgrade_from_bootstrap_state_converges_with_clean_install() {
-    // 4. Upgrade path: deploy 0001 only, write the bootstrap ref, then deploy 0002–0003 and
-    //    write bootstrap v1 history under 'default' as the pre-graph store would have, then
-    //    upgrade fully. Compare the resulting schema with a clean install.
-    let (_up_url, up) = fresh_database("ledger_up").await;
-    migrator_up_to(1).run(&up).await.unwrap();
-    // The bootstrap ref points at the v1 commit the pre-0004 store had written; since
-    // 0006 the ref FK requires exactly that (a fake head would fail the upgrade guard).
-    let p = patch("bootstrap");
-    let legacy = AnyCommit::V1(Commit {
-        parents: vec![],
-        patch: p.id(),
-        author: "urn:agent:bootstrap".into(),
-        message: "pre-upgrade".into(),
-        event_time: "e".into(),
-        recorded_time: "r".into(),
-    });
-    let legacy_bytes = legacy.canonical_bytes().unwrap();
-    let legacy_id = legacy.id().unwrap();
-    let head_string = legacy_id.to_string();
-    let head = head_string.as_str();
-    sqlx::query("INSERT INTO refs (graph_id, branch, head) VALUES ('default', 'main', $1)")
-        .bind(head)
-        .execute(&up)
-        .await
-        .unwrap();
-    migrator_up_to(3).run(&up).await.unwrap();
-    for (id, bytes) in [
-        (p.id().0.to_string(), p.canonical_bytes()),
-        (legacy_id.to_string(), legacy_bytes),
-    ] {
-        sqlx::query("INSERT INTO immutable_objects (id, bytes) VALUES ($1, $2)")
-            .bind(id)
-            .bind(bytes)
+    bounded(async {
+        // 4. Upgrade path: deploy 0001 only, write the bootstrap ref, then deploy 0002–0003 and
+        //    write bootstrap v1 history under 'default' as the pre-graph store would have, then
+        //    upgrade fully. Compare the resulting schema with a clean install.
+        let (_up_url, up) = fresh_database("ledger_up").await;
+        migrator_up_to(1).run(&up).await.unwrap();
+        // The bootstrap ref points at the v1 commit the pre-0004 store had written; since
+        // 0006 the ref FK requires exactly that (a fake head would fail the upgrade guard).
+        let p = patch("bootstrap");
+        let legacy = AnyCommit::V1(Commit {
+            parents: vec![],
+            patch: p.id(),
+            author: "urn:agent:bootstrap".into(),
+            message: "pre-upgrade".into(),
+            event_time: "e".into(),
+            recorded_time: "r".into(),
+        });
+        let legacy_bytes = legacy.canonical_bytes().unwrap();
+        let legacy_id = legacy.id().unwrap();
+        let head_string = legacy_id.to_string();
+        let head = head_string.as_str();
+        sqlx::query("INSERT INTO refs (graph_id, branch, head) VALUES ('default', 'main', $1)")
+            .bind(head)
             .execute(&up)
             .await
             .unwrap();
-    }
-    sqlx::query(
-        "INSERT INTO commit_index (id, graph_id, version, patch_id, parent_count) \
+        migrator_up_to(3).run(&up).await.unwrap();
+        for (id, bytes) in [
+            (p.id().0.to_string(), p.canonical_bytes()),
+            (legacy_id.to_string(), legacy_bytes),
+        ] {
+            sqlx::query("INSERT INTO immutable_objects (id, bytes) VALUES ($1, $2)")
+                .bind(id)
+                .bind(bytes)
+                .execute(&up)
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO commit_index (id, graph_id, version, patch_id, parent_count) \
          VALUES ($1, 'default', 1, $2, 0)",
-    )
-    .bind(legacy_id.to_string())
-    .bind(p.id().to_string())
-    .execute(&up)
-    .await
-    .unwrap();
-
-    sqlx::migrate!("../../migrations").run(&up).await.unwrap();
-
-    // 9. Bootstrap history remains valid after upgrade: the ref, the index row, and the
-    //    backfilled graph row all agree, and the derived index re-verifies.
-    let row = sqlx::query("SELECT tenant_id, status FROM graphs WHERE graph_id = 'default'")
-        .fetch_one(&up)
+        )
+        .bind(legacy_id.to_string())
+        .bind(p.id().to_string())
+        .execute(&up)
         .await
         .unwrap();
-    let tenant: String = row.get("tenant_id");
-    let status: String = row.get("status");
-    assert_eq!(
-        (tenant.as_str(), status.as_str()),
-        ("bootstrap", "bootstrap")
-    );
-    let row = sqlx::query("SELECT head FROM refs WHERE graph_id = 'default' AND branch = 'main'")
-        .fetch_one(&up)
-        .await
-        .unwrap();
-    let stored_head: String = row.get("head");
-    assert_eq!(stored_head, head);
-    let store = PostgresImmutableStore::from_pool(
-        up.clone(),
-        V1Binding::BindTo(GraphId::new("default").unwrap()),
-    )
-    .await
-    .unwrap();
-    assert_eq!(store.verify_commit_index().await.unwrap(), 1);
-    assert_eq!(
-        store.put_commit(&legacy).await.unwrap(),
-        legacy_id,
-        "idempotent re-publication"
-    );
 
-    let (_clean_url, clean) = fresh_database("ledger_clean").await;
-    sqlx::migrate!("../../migrations")
-        .run(&clean)
-        .await
-        .unwrap();
-    let row = sqlx::query("SELECT status FROM graphs WHERE graph_id = 'default'")
-        .fetch_one(&clean)
-        .await
-        .unwrap();
-    let status: String = row.get("status");
-    assert_eq!(
-        status, "bootstrap",
-        "clean install also carries the bootstrap graph"
-    );
+        sqlx::migrate!("../../migrations").run(&up).await.unwrap();
 
-    let upgraded = schema_snapshot(&up).await;
-    let fresh = schema_snapshot(&clean).await;
-    assert!(upgraded.contains("constraint refs.refs_graph_fk"));
-    assert!(upgraded.contains("constraint commit_index.commit_index_graph_fk"));
-    assert!(upgraded.contains("trigger graphs.graphs_identity_immutable"));
-    assert!(upgraded.contains("constraint refs.refs_head_fk"));
-    assert!(upgraded.contains("trigger refs.refs_version_monotonic"));
-    let row =
-        sqlx::query("SELECT version FROM refs WHERE graph_id = 'default' AND branch = 'main'")
+        // 9. Bootstrap history remains valid after upgrade: the ref, the index row, and the
+        //    backfilled graph row all agree, and the derived index re-verifies.
+        let row = sqlx::query("SELECT tenant_id, status FROM graphs WHERE graph_id = 'default'")
             .fetch_one(&up)
             .await
             .unwrap();
-    let version: i64 = row.get("version");
-    assert_eq!(version, 1, "existing refs start at version 1 after upgrade");
-    assert_eq!(upgraded, fresh, "upgrade and clean install must converge");
+        let tenant: String = row.get("tenant_id");
+        let status: String = row.get("status");
+        assert_eq!(
+            (tenant.as_str(), status.as_str()),
+            ("bootstrap", "bootstrap")
+        );
+        let row =
+            sqlx::query("SELECT head FROM refs WHERE graph_id = 'default' AND branch = 'main'")
+                .fetch_one(&up)
+                .await
+                .unwrap();
+        let stored_head: String = row.get("head");
+        assert_eq!(stored_head, head);
+        let store = PostgresImmutableStore::from_pool(
+            up.clone(),
+            V1Binding::BindTo(GraphId::new("default").unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(store.verify_commit_index().await.unwrap(), 1);
+        assert_eq!(
+            store.put_commit(&legacy).await.unwrap(),
+            legacy_id,
+            "idempotent re-publication"
+        );
+
+        let (_clean_url, clean) = fresh_database("ledger_clean").await;
+        sqlx::migrate!("../../migrations")
+            .run(&clean)
+            .await
+            .unwrap();
+        let row = sqlx::query("SELECT status FROM graphs WHERE graph_id = 'default'")
+            .fetch_one(&clean)
+            .await
+            .unwrap();
+        let status: String = row.get("status");
+        assert_eq!(
+            status, "bootstrap",
+            "clean install also carries the bootstrap graph"
+        );
+
+        let upgraded = schema_snapshot(&up).await;
+        let fresh = schema_snapshot(&clean).await;
+        assert!(upgraded.contains("constraint refs.refs_graph_fk"));
+        assert!(upgraded.contains("constraint commit_index.commit_index_graph_fk"));
+        assert!(upgraded.contains("trigger graphs.graphs_identity_immutable"));
+        assert!(upgraded.contains("constraint refs.refs_head_fk"));
+        assert!(upgraded.contains("trigger refs.refs_version_monotonic"));
+        let row =
+            sqlx::query("SELECT version FROM refs WHERE graph_id = 'default' AND branch = 'main'")
+                .fetch_one(&up)
+                .await
+                .unwrap();
+        let version: i64 = row.get("version");
+        assert_eq!(version, 1, "existing refs start at version 1 after upgrade");
+        assert_eq!(upgraded, fresh, "upgrade and clean install must converge");
+    })
+    .await;
 }
 
 #[tokio::test]
 #[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
 async fn upgrade_refuses_graphs_without_a_derivable_owner() {
-    let (url, pool) = fresh_database("ledger_unknown").await;
-    migrator_up_to(3).run(&pool).await.unwrap();
-    sqlx::query("INSERT INTO refs (graph_id, branch, head) VALUES ('team-alpha', 'main', $1)")
-        .bind("sha256:2222222222222222222222222222222222222222222222222222222222222222")
-        .execute(&pool)
-        .await
-        .unwrap();
-    // The commit_index half of the guard: an indexed commit under an unknown graph.
-    let p = patch("unknown-graph");
-    sqlx::query("INSERT INTO immutable_objects (id, bytes) VALUES ($1, $2)")
-        .bind(p.id().to_string())
-        .bind(p.canonical_bytes())
-        .execute(&pool)
-        .await
-        .unwrap();
-    let stray = AnyCommit::V1(Commit {
-        parents: vec![],
-        patch: p.id(),
-        author: "a".into(),
-        message: "stray".into(),
-        event_time: "e".into(),
-        recorded_time: "r".into(),
-    });
-    sqlx::query("INSERT INTO immutable_objects (id, bytes) VALUES ($1, $2)")
-        .bind(stray.id().unwrap().to_string())
-        .bind(stray.canonical_bytes().unwrap())
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query(
-        "INSERT INTO commit_index (id, graph_id, version, patch_id, parent_count) \
+    bounded(async {
+        let (url, pool) = fresh_database("ledger_unknown").await;
+        migrator_up_to(3).run(&pool).await.unwrap();
+        sqlx::query("INSERT INTO refs (graph_id, branch, head) VALUES ('team-alpha', 'main', $1)")
+            .bind("sha256:2222222222222222222222222222222222222222222222222222222222222222")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // The commit_index half of the guard: an indexed commit under an unknown graph.
+        let p = patch("unknown-graph");
+        sqlx::query("INSERT INTO immutable_objects (id, bytes) VALUES ($1, $2)")
+            .bind(p.id().to_string())
+            .bind(p.canonical_bytes())
+            .execute(&pool)
+            .await
+            .unwrap();
+        let stray = AnyCommit::V1(Commit {
+            parents: vec![],
+            patch: p.id(),
+            author: "a".into(),
+            message: "stray".into(),
+            event_time: "e".into(),
+            recorded_time: "r".into(),
+        });
+        sqlx::query("INSERT INTO immutable_objects (id, bytes) VALUES ($1, $2)")
+            .bind(stray.id().unwrap().to_string())
+            .bind(stray.canonical_bytes().unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO commit_index (id, graph_id, version, patch_id, parent_count) \
          VALUES ($1, 'team-beta', 1, $2, 0)",
-    )
-    .bind(stray.id().unwrap().to_string())
-    .bind(p.id().to_string())
-    .execute(&pool)
-    .await
-    .unwrap();
-    let error = migrate_expecting_failure(&url, sqlx::migrate!("../../migrations"), &pool).await;
-    let message = error.to_string();
-    assert!(message.contains("team-alpha, team-beta"), "{message}");
-    assert!(message.contains("no derivable tenant owner"), "{message}");
-    let row = sqlx::query("SELECT max(version) AS v FROM _sqlx_migrations")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    let applied: i64 = row.get("v");
-    assert_eq!(applied, 3, "nothing past 0003 was recorded as applied");
-    // Nothing from 0004 was applied: no graphs table, no FK, refs untouched.
-    let graphs_table = sqlx::query("SELECT to_regclass('public.graphs')::text AS t")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    let t: Option<String> = graphs_table.get("t");
-    assert_eq!(
-        t, None,
-        "failed migration must not leave a partial graphs table"
-    );
-    let row = sqlx::query("SELECT count(*) AS n FROM refs WHERE graph_id = 'team-alpha'")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    let n: i64 = row.get("n");
-    assert_eq!(n, 1);
-    // The operator remedy: remove (or import) the unowned rows, then the upgrade proceeds.
-    sqlx::query("DELETE FROM refs WHERE graph_id = 'team-alpha'")
+        )
+        .bind(stray.id().unwrap().to_string())
+        .bind(p.id().to_string())
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query("DELETE FROM commit_index WHERE graph_id = 'team-beta'")
-        .execute(&pool)
+        let error =
+            migrate_expecting_failure(&url, sqlx::migrate!("../../migrations"), &pool).await;
+        let message = error.to_string();
+        assert!(message.contains("team-alpha, team-beta"), "{message}");
+        assert!(message.contains("no derivable tenant owner"), "{message}");
+        let row = sqlx::query("SELECT max(version) AS v FROM _sqlx_migrations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let applied: i64 = row.get("v");
+        assert_eq!(applied, 3, "nothing past 0003 was recorded as applied");
+        // Nothing from 0004 was applied: no graphs table, no FK, refs untouched.
+        let graphs_table = sqlx::query("SELECT to_regclass('public.graphs')::text AS t")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let t: Option<String> = graphs_table.get("t");
+        assert_eq!(
+            t, None,
+            "failed migration must not leave a partial graphs table"
+        );
+        let row = sqlx::query("SELECT count(*) AS n FROM refs WHERE graph_id = 'team-alpha'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let n: i64 = row.get("n");
+        assert_eq!(n, 1);
+        // The operator remedy: remove (or import) the unowned rows, then the upgrade proceeds.
+        sqlx::query("DELETE FROM refs WHERE graph_id = 'team-alpha'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM commit_index WHERE graph_id = 'team-beta'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // The failed run's lock ended with its dedicated connection: the retry (on the same
+        // pool, as an operator re-running `ledger-admin migrate`) proceeds, bounded.
+        tokio::time::timeout(
+            MIGRATION_DEADLINE,
+            sqlx::migrate!("../../migrations").run(&pool),
+        )
         .await
+        .expect("the retried migration must not wait on a stale lock")
         .unwrap();
-    // The failed run's lock ended with its dedicated connection: the retry (on the same
-    // pool, as an operator re-running `ledger-admin migrate`) proceeds, bounded.
-    tokio::time::timeout(
-        MIGRATION_DEADLINE,
-        sqlx::migrate!("../../migrations").run(&pool),
-    )
-    .await
-    .expect("the retried migration must not wait on a stale lock")
-    .unwrap();
-    let t: Option<String> = sqlx::query("SELECT to_regclass('public.graphs')::text AS t")
-        .fetch_one(&pool)
-        .await
-        .unwrap()
-        .get("t");
-    assert_eq!(t.as_deref(), Some("graphs"));
+        let t: Option<String> = sqlx::query("SELECT to_regclass('public.graphs')::text AS t")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get("t");
+        assert_eq!(t.as_deref(), Some("graphs"));
+    })
+    .await;
 }
 
 /// Migration 0007 binds every existing idempotency row to its proposal's complete actor
@@ -982,6 +1016,7 @@ async fn upgrade_refuses_graphs_without_a_derivable_owner() {
 #[tokio::test]
 #[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
 async fn migration_0007_backfills_actor_scope_and_refuses_unbound_or_mismatched_rows() {
+    bounded(async {
     use ledger_core::{AuthenticatedPrincipal, PrincipalId, PrincipalType, TenantId};
     use ledger_store::{PrepareRequest, RequestScope, WorkflowRepository};
 
@@ -1270,6 +1305,8 @@ async fn migration_0007_backfills_actor_scope_and_refuses_unbound_or_mismatched_
         "{error}"
     );
     pool.close().await;
+    })
+    .await;
 }
 
 /// Characterizes the hazard `migrate_expecting_failure` avoids (tech-debt): a failed sqlx
@@ -1281,35 +1318,38 @@ async fn migration_0007_backfills_actor_scope_and_refuses_unbound_or_mismatched_
 #[tokio::test]
 #[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
 async fn a_failed_migration_keeps_its_advisory_lock_on_a_pooled_connection_only() {
-    let unowned_ref = |pool: PgPool| async move {
-        sqlx::query("INSERT INTO refs (graph_id, branch, head) VALUES ('team-x', 'main', $1)")
-            .bind("sha256:2222222222222222222222222222222222222222222222222222222222222222")
-            .execute(&pool)
-            .await
-            .unwrap();
-    };
-    // On a pool: the lock outlives the failed run on an idle pooled connection.
-    let (_url, pool) = fresh_database("ledger_lock_pool").await;
-    migrator_up_to(3).run(&pool).await.unwrap();
-    unowned_ref(pool.clone()).await;
-    let failed = tokio::time::timeout(
-        MIGRATION_DEADLINE,
-        sqlx::migrate!("../../migrations").run(&pool),
-    )
-    .await
-    .expect("bounded");
-    assert!(failed.is_err(), "migration 0004 refuses the unowned ref");
-    assert!(
-        advisory_locks(&pool).await > 0,
-        "the failed pooled run left its advisory lock held"
-    );
-    pool.close().await;
+    bounded(async {
+        let unowned_ref = |pool: PgPool| async move {
+            sqlx::query("INSERT INTO refs (graph_id, branch, head) VALUES ('team-x', 'main', $1)")
+                .bind("sha256:2222222222222222222222222222222222222222222222222222222222222222")
+                .execute(&pool)
+                .await
+                .unwrap();
+        };
+        // On a pool: the lock outlives the failed run on an idle pooled connection.
+        let (_url, pool) = fresh_database("ledger_lock_pool").await;
+        migrator_up_to(3).run(&pool).await.unwrap();
+        unowned_ref(pool.clone()).await;
+        let failed = tokio::time::timeout(
+            MIGRATION_DEADLINE,
+            sqlx::migrate!("../../migrations").run(&pool),
+        )
+        .await
+        .expect("bounded");
+        assert!(failed.is_err(), "migration 0004 refuses the unowned ref");
+        assert!(
+            advisory_locks(&pool).await > 0,
+            "the failed pooled run left its advisory lock held"
+        );
+        pool.close().await;
 
-    // On a dedicated connection: closing it releases the lock (asserted inside).
-    let (url, pool) = fresh_database("ledger_lock_dedicated").await;
-    migrator_up_to(3).run(&pool).await.unwrap();
-    unowned_ref(pool.clone()).await;
-    migrate_expecting_failure(&url, sqlx::migrate!("../../migrations"), &pool).await;
-    assert_eq!(advisory_locks(&pool).await, 0);
-    pool.close().await;
+        // On a dedicated connection: closing it releases the lock (asserted inside).
+        let (url, pool) = fresh_database("ledger_lock_dedicated").await;
+        migrator_up_to(3).run(&pool).await.unwrap();
+        unowned_ref(pool.clone()).await;
+        migrate_expecting_failure(&url, sqlx::migrate!("../../migrations"), &pool).await;
+        assert_eq!(advisory_locks(&pool).await, 0);
+        pool.close().await;
+    })
+    .await;
 }

@@ -316,7 +316,13 @@ async fn build(
         next_value += 1;
         let new = quad(e, values[e]);
         let id = client
-            .commit(&graph, "main", ids.last(), &[old.clone()], &[new.clone()])
+            .commit(
+                &graph,
+                "main",
+                ids.last(),
+                std::slice::from_ref(&old),
+                std::slice::from_ref(&new),
+            )
             .await?;
         current.remove(&old);
         current.insert(new);
@@ -444,13 +450,10 @@ async fn close_window(
 fn point(
     h: &History,
     depth: usize,
-    category: &str,
-    op: &str,
-    cache: &str,
+    (category, op, cache): (&str, &str, &str),
     micros: &mut [u64],
     response_bytes: Option<usize>,
-    pg: Option<PgDelta>,
-    cpu: Option<CpuDelta>,
+    (pg, cpu): (Option<PgDelta>, Option<CpuDelta>),
 ) -> ReconPoint {
     let s = stats(category, op, cache, micros);
     let (_, bytes, _, fold_ops) = h.expected[depth];
@@ -647,13 +650,10 @@ async fn run_inner(cfg: &ReconConfig, result: &mut ReconResult) -> Result<(), St
             result.points.push(point(
                 h,
                 depth,
-                "api",
-                "state_read",
-                "warm",
+                ("api", "state_read", "warm"),
                 &mut samples,
                 Some(bytes),
-                pg,
-                cpu,
+                (pg, cpu),
             ));
 
             // Direct store reconstruction (same production fold, no HTTP).
@@ -687,13 +687,10 @@ async fn run_inner(cfg: &ReconConfig, result: &mut ReconResult) -> Result<(), St
             result.points.push(point(
                 h,
                 depth,
-                "persisted",
-                "store_reconstruct",
-                "warm",
+                ("persisted", "store_reconstruct", "warm"),
                 &mut samples,
                 None,
-                pg,
-                cpu,
+                (pg, cpu),
             ));
 
             // The fold's CPU work alone, on prefetched objects.
@@ -717,13 +714,10 @@ async fn run_inner(cfg: &ReconConfig, result: &mut ReconResult) -> Result<(), St
             result.points.push(point(
                 h,
                 depth,
-                "algorithm",
-                "fold_cpu",
-                "warm",
+                ("algorithm", "fold_cpu", "warm"),
                 &mut samples,
                 None,
-                None,
-                None,
+                (None, None),
             ));
 
             // Prepare at this depth: a branch at the commit, then prepares (not accepted).
@@ -766,13 +760,10 @@ async fn run_inner(cfg: &ReconConfig, result: &mut ReconResult) -> Result<(), St
             result.points.push(point(
                 h,
                 depth,
-                "api",
-                "prepare",
-                "warm",
+                ("api", "prepare", "warm"),
                 &mut samples,
                 None,
-                pg,
-                cpu,
+                (pg, cpu),
             ));
 
             // Merge shapes at this depth: x at the commit, y one commit ahead → x is
@@ -844,13 +835,10 @@ async fn run_inner(cfg: &ReconConfig, result: &mut ReconResult) -> Result<(), St
                 result.points.push(point(
                     h,
                     depth,
-                    "api",
-                    op,
-                    "warm",
+                    ("api", op, "warm"),
                     &mut samples,
                     None,
-                    pg,
-                    cpu,
+                    (pg, cpu),
                 ));
             }
 
@@ -902,13 +890,10 @@ async fn run_inner(cfg: &ReconConfig, result: &mut ReconResult) -> Result<(), St
                     result.points.push(point(
                         h,
                         depth,
-                        category,
-                        op,
-                        "db-restart-cold",
+                        (category, op, "db-restart-cold"),
                         &mut samples,
                         None,
-                        pg,
-                        None,
+                        (pg, None),
                     ));
                 }
             }

@@ -45,6 +45,7 @@
     },
     "range": "day versions v22..=v33 (0-based TB numbering; IC files 000023..000034) of v0..=v88",
     "counts": {
+      "canonicalization_rewrites": 3207,
       "cb_noop_churn_statements": 733,
       "cb_steps_cross_checked": 88,
       "ic_lineage_divergence_in_window": 30784,
@@ -68,7 +69,7 @@
   "output": {
     "commits": 19,
     "workload_checksum": "sha256:3c5db35a5609982aeb554cee298e3ee3aa3d8206efc7e6b9c49a700100cf095a",
-    "artifact_sha256": "5dfc64f0ce0d795d21d35bc6b7ee513d60e05f4685f99a08f83bd41e668b3d50",
-    "artifact_bytes": 8532551
+    "artifact_sha256": "3f2a35fad44f527ebb192407d4468ae438c1f6bf2d51222ebce790c482631075",
+    "artifact_bytes": 8532584
   }
 }

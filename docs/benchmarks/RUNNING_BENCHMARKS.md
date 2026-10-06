@@ -9,9 +9,35 @@ time, because the integration, stress and benchmark harnesses share those ports.
 ## Commands
 
 ```bash
-./scripts/benchmark.sh ci       # the PR profile: synthetic-ledger-ci
+./scripts/benchmark.sh ci       # the PR profile: synthetic-ledger-ci + bear-b-ci
 ./scripts/benchmark.sh local    # deeper baseline: synthetic-ledger-local (~10–20 min)
+./scripts/benchmark.sh bear     # bear-b-ci alone
+./scripts/benchmark-recon.sh    # reconstruction characterization (≥ 1 h; outside PR CI)
 ```
+
+### Extracted datasets: fetch → prepare → run
+`scripts/benchmark.sh` runs these steps itself for the `ci` and `bear` profiles. By hand:
+
+```bash
+cargo run --release -p ledger-bench -- fetch bear-b-ci     # network: pinned SHA-256 and size
+cargo run --release -p ledger-bench -- prepare bear-b-ci   # offline extraction and cross-checks
+cargo run --release -p ledger-bench -- validate --profile bear
+cargo run --release -p ledger-bench -- clean bear-b-ci [--all]   # artifact; --all also the sources
+```
+
+- The cache is `target/benchmark-cache/<dataset>/{source,prepared}` (`--cache` changes it).
+- `validate` and `run` never download. A missing, stale or mismatching cache is exit 3.
+- `fetch` re-verifies cached files and skips them when they match.
+- In CI, `actions/cache` keeps the sources keyed by the manifest; `fetch` and `prepare` verify
+  them again after a restore.
+
+### Reconstruction characterization
+`scripts/benchmark-recon.sh` layers `benchmark/compose.instrumented.yaml` over the stack.
+That benchmark-only override preloads `pg_stat_statements`, enables `track_io_timing` and
+creates the extension in schema `bench_stats`; production defaults are unchanged. The
+script then runs `ledger-bench recon` and ends with `ledger-admin verify`. Output:
+`target/benchmark/<UTC>-recon/{recon.json,recon.md}`. See [METRICS.md](METRICS.md#reconstruction-characterization)
+for what each operation isolates.
 
 The script:
 1. builds `ledger-bench` (release);

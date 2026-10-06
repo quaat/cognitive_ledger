@@ -151,9 +151,10 @@ it after every end-to-end scenario.
   the restore point (last restored version per ref), rebuild any projection (Phase 3
   consumers may have projected commits that no longer exist), and expect clients holding a
   lost head to receive `HEAD_CHANGED`; idempotency keys issued after the snapshot will run
-  fresh. The physical backup has no WAL archive here, so the recovery point is the backup
-  time; whether PITR/WAL archiving is required is an open deployment decision recorded in
-  `docs/exec-plans/tech-debt.md`.
+  fresh. The qualification script's physical backup has no WAL archive, so its recovery
+  point is the backup time. Production requires WAL archiving/PITR (ADR-0017), and the
+  deployment must supply evidence of that configuration; this repository does not provide
+  it.
 - **Failure recovery:** a killed replica is restarted; a killed PostgreSQL recovers from
   its WAL and running replicas reconnect without restart (`/ready` returns 200 again).
   After any recovery run `ledger-admin verify`; clients retry ambiguous requests with their

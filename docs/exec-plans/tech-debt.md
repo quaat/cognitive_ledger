@@ -8,7 +8,7 @@
 - Migration 0009 aborts on a corrupt `immutable_objects` row with a raw `23514` naming no ids (the README convention is guards that name rows); the runbook says to run `verify` first. Add a pre-check guard that lists offending ids, and document the `ACCESS EXCLUSIVE` hashing window. Also: a graph moved from `importing` to `active` after raw ref moves has no `ref_events` for them and fails the verifier's version-equals-events check permanently — activation needs an audited path (Phase 4 admin flow).
 - Fault injection (Plan 0005 slice 4): the lost-response-after-COMMIT case is deterministic only in the `FailPoint` unit test; at the HTTP level random SIGKILLs hit the sub-millisecond COMMIT-to-response window by chance (0–3 observations per run). A `fault-injection` cargo feature that aborts the process right after the workflow transaction commits — compiled only into a separate qualification image, never into the runtime image — would make it deterministic.
 
-- Repository governance (observed 2026-10-06): the GitHub `main` branch has no branch protection or ruleset. Before a production release, enable a ruleset requiring a pull request, the required CI checks (ci-benchmark, ci-fast, ci-fuzz, ci-integration, ci-security), a review, and no direct pushes to `main`. `ci-benchmark` is the Phase-6A correctness gate (the dataset manifests, the oracle assertions and `ledger-admin verify`); its timings never gate. `scripts/check-doc-consistency.py` keeps this list equal to the PR-gating workflows. Not changed automatically (repository policy is the owner's).
+- Repository governance (observed 2026-10-06): the GitHub `main` branch has no branch protection or ruleset. Before a production release, enable a ruleset requiring a pull request, the required CI checks (benchmark-ci, container, dependency-review, docker, fast, fuzz, supply-chain), a review, and no direct pushes to `main`. `ci-benchmark` is the Phase-6A correctness gate (the dataset manifests, the oracle assertions and `ledger-admin verify`); its timings never gate. `scripts/check-doc-consistency.py` keeps this list equal to the jobs of the PR-gating workflows (rulesets match check names, i.e. job names, not workflow file names). Not changed automatically (repository policy is the owner's).
 
 ## Phase 2 (Plan 0006) external prerequisites and residuals
 
@@ -189,23 +189,29 @@
 - `tenant_id` on audit rows now means both the actor's tenant and the graph's tenant (composite FKs); a cross-tenant platform operator acting on a graph cannot be recorded. Decide before Phase 4/5 admin flows.
 - Any `read`-capable principal of a tenant can reconstruct the state of prepared, rejected or superseded candidates (they are indexed commits of the graph); intended for review, documented in security.md.
 - The expensive-operation semaphore is now tested under a blocked database (`pg_api::expensive_operations_are_admission_controlled_under_a_slow_database`); a live Entra ID issuer test remains pending (above). Under 1,000 concurrent clients the admission control rejects most prepare attempts immediately (`503 RESOURCE_LIMIT`, see the stress evidence); a queue with a bounded wait instead of immediate rejection is a possible later refinement, not a defect.
-- Test hygiene: `pg_api` creates the cluster-wide test role `ledger_rt_api` and never drops it; `pg_least_privilege` drops its role only on success. Development clusters only; add teardown when the suites get a shared fixture. `LEDGER_DB_*_TIMEOUT_MS=0` is accepted and disables that timeout in PostgreSQL — require ≥ 1 or document the opt-out. Qualification scripts pass development DSNs and the dev HS256 secret as process arguments (visible in `ps`/`docker inspect`); acceptable only because every value is labelled development-only.
+- Test hygiene: `pg_api` creates the cluster-wide test role `ledger_rt_api` and never drops it; `pg_least_privilege` drops its role only on success. Development clusters only; add teardown when the suites get a shared fixture. Qualification scripts pass development DSNs and the dev HS256 secret as process arguments (visible in `ps`/`docker inspect`); acceptable only because every value is labelled development-only.
 - OIDC rotation latency (Plan 0005 slice 5): with the production refresh policy (60 s minimum interval) a token under a `kid` published after the last JWKS fetch is refused with `401 UNAUTHENTICATED` until the interval elapses (pinned by `pg_api::two_replicas_share_one_key_source_and_replay_identically_across_rotation`, step 6). Acceptable because issuers publish keys ahead of use; if an issuer ever rotates keys and uses them immediately, return a retryable 503 for unknown `kid` during the throttle window instead.
 - Residual write authority of the runtime identity (ADR-0016): it can fabricate a consistent forward ref move with its audit rows or pre-seed idempotency results within its tenants. Closing it needs `SECURITY DEFINER` write functions (with pinned `search_path`) as the only write path, and ideally a cargo feature gate so `ledger-server` cannot link the migrating constructors (`connect_and_migrate`, `from_pool`, `with_ref`).
 - `mark_superseded` has no idempotency record; a retry after a lost response reports `LINEAGE_MISMATCH`. Give it a scope/key if it becomes an API operation. PostgreSQL 17's `transaction_timeout` would bound a workflow transaction that keeps issuing statements; consider it once PG17 is the floor.
 - Identical prepares whose content, actor and microsecond `recorded_at` coincide under two different keys collide on `proposals_candidate_unique`; reported as `LINEAGE_MISMATCH` (not a 500) — acceptable, extremely unlikely.
-- **Intermittent hang, mitigated (Plan 0011).** Observed 2026-10-06 in hosted
-  `ci-integration` run 37524260391, first attempt:
+- **Intermittent hang: cause unknown, defensive fix (Plan 0011).** Observed 2026-10-06 in
+  hosted `ci-integration` run 37524260391, first attempt:
   `pg_graphs_migration::upgrade_refuses_graphs_without_a_derivable_owner` stalled for 36
   minutes; the rerun passed.
-  - Every expected-failure migration in that suite now runs on a dedicated connection that
-    is closed afterwards (`migrate_expecting_failure`). It is bounded to 120 s, and the
-    suite asserts that no advisory lock remains.
-  - `a_failed_migration_keeps_its_advisory_lock_on_a_pooled_connection_only` establishes
-    the mechanism: a failed pooled run does leave the lock held.
-  - `ci-integration` now has `timeout-minutes: 30`.
-  - The original hang did not reproduce in 25 local runs (15 isolated, 10 full-suite), so
-    the causal link is unproven. The fix is consistent with the suspected cause.
+  - The cause is **unknown**. The suspected mechanism is a failed sqlx run keeping its
+    advisory lock on a pooled connection. `a_failed_migration_keeps_its_advisory_lock_on_a_pooled_connection_only`
+    shows that this mechanism exists. However, the stalled test already closed its pool after
+    the failure, so the evidence does not establish the link.
+  - Defensive changes:
+    - every expected-failure migration in `pg_graphs_migration`, `pg_fs_migration` and
+      `pg_least_privilege` runs on a dedicated connection that is closed afterwards;
+    - `migrate_expecting_failure` is bounded to 120 s and asserts that no advisory lock
+      remains;
+    - every `pg_graphs_migration` test has a 300 s whole-test deadline, so a recurrence fails
+      by name;
+    - `ci-integration` has `timeout-minutes: 30`.
+  - The hang did not reproduce in local repeated runs (counts in Plan 0011 Evidence). Keep
+    this entry open until hosted runs have stayed clean over a longer period.
 - Failed sqlx migration runs keep their advisory lock on the pooled connection; library constructors that migrate on a caller's pool inherit this. Run migrations on a dedicated connection or through the explicit `schema` entry points from a fresh process.
 - Evaluate `cargo-deny`, SBOM, and container scanning with classified findings (`cargo audit` is now a blocking gate via `scripts/check-supply-chain.sh`; its single exception, RUSTSEC-2023-0071 for the lockfile-only `rsa` under `sqlx-mysql`, is re-proven on every run and must be deleted when sqlx/rsa move).
 - Third-party GitHub Actions are pinned by commit SHA (Plan 0005 slice 2); bumping them is a deliberate change with the release name in the comment. The distroless runtime base is pinned by digest and must be refreshed when the classified container findings gain fixes (`docs/quality/security.md`).

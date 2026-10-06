@@ -21,7 +21,8 @@ These are gates: any failure makes the run fail. They are reported per family in
 | first-parent history | `GET …/branches/log` equals the oracle's parent-0 chain |
 | commit parents | the persisted envelope's parents (`ImmutableStore::get_commit`, owner identity) equal the oracle's DAG; integration commits are `[target, source]` |
 | commit provenance | the persisted activity, message, evidence references and source system equal what the dataset attached |
-| dataset validity | the computed manifest equals the committed manifest (exit 3 otherwise) |
+| history fact (appear / disappear / reappear) | for `bear-b-ci`: source statements' membership at version boundaries (absent, present, absent again, present again), checked in ledger-materialized states |
+| dataset validity | the computed manifest equals the committed manifest (exit 3 otherwise); for extracted datasets also the pinned source SHA-256 and size and the prepared artifact's SHA-256 |
 | verify | `ledger-admin verify` reports `VERIFY OK` after the run (script) |
 
 ## Performance observations
@@ -60,6 +61,36 @@ These are **not gates in Phase 6A.**
 - **Not captured in Phase 6A:** server CPU time, cold-versus-warm cache separation, and
   PostgreSQL query counts and bytes read. These need `pg_stat_statements` or `track_io_timing`
   in a dedicated configuration, and are listed as the next measurements in Plan 0010.
+
+## Reconstruction characterization
+`ledger-bench recon` (`sculpin-ledger-bench-recon/v1`; outside PR CI) builds
+constant-state linear histories, with 1, 1,000 and 10,000 quads by default, to depth 5,000
+through the API. It then measures each (state size, depth) point serially, on a quiet stack.
+
+| op (category) | isolates |
+|---|---|
+| `state_read` (`api`) | the full public read: HTTP, the server's reconstruction, JSON encoding, transfer and client decoding |
+| `store_reconstruct` (`persisted`) | the same production fold (`WorkflowRepository::reconstruct`) in-process, without HTTP |
+| `fold_cpu` (`algorithm`) | the fold's CPU work only (SHA-256 re-hash, decoding, set application) on prefetched objects. An estimate of the non-I/O share; not the production code path |
+| `prepare` (`api`) | prepare at that depth (a branch at the commit), which reconstructs the parent |
+| `merge_preview_contained` (`api`) | a preview that returns after the ancestry walk of both sides, with no reconstruction: merge ancestry traversal alone |
+| `merge_preview_divergent` (`api`) | ancestry plus three reconstructions at about that depth |
+
+Per point it records:
+- p50 (p95/p99 only with n ≥ 20) and the mean;
+- response bytes;
+- fold operations and canonical state bytes;
+- per operation from `pg_stat_statements`: calls, rows, shared block hits and reads,
+  temporary blocks, block read time (`track_io_timing`) and execution time. These are
+  PostgreSQL's 8 KiB buffer statistics, not physical disk bytes, and the window is reset per
+  batch;
+- per operation: cgroup `cpu.stat` CPU of the server and PostgreSQL containers, plus
+  `memory.current` after the batch.
+
+The cache condition is either `warm` (after warm-up) or `db-restart-cold`: the first
+operation after PostgreSQL was restarted and the server reported ready again. The OS page
+cache is never dropped, so no OS-cold condition is claimed. Results record that PostgreSQL
+ran the benchmark-only instrumentation configuration.
 
 ## Methodology notes
 - **Everything is warm.** Each head read follows the prepare/accept that just folded the

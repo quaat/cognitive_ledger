@@ -472,7 +472,11 @@ async fn runtime_identity_serves_the_workflow_but_cannot_touch_schema_or_history
         .execute(&f.owner)
         .await
         .unwrap();
-    let err = schema::migrate_all(rt).await.unwrap_err();
+    // On a dedicated connection: a failed sqlx run keeps its advisory lock on the connection
+    // it ran on, so it must not be a pooled one that later work reuses.
+    let mut conn = PgConnection::connect(&f.runtime_db_url).await.unwrap();
+    let err = schema::migrate_all_on(&mut conn).await.unwrap_err();
+    let _ = conn.close().await;
     assert!(
         matches!(&err, LedgerError::Storage(m) if m.contains("permission denied") || m.contains("must be owner")),
         "{err:?}"

@@ -227,11 +227,12 @@ pub fn markdown(r: &BenchResult) -> String {
         let text = |v: &serde_json::Value| v.as_str().unwrap_or("?").to_owned();
         let origin = if m["kind"] == "extracted" {
             format!(
-                "Extracted from {} ({}, {}); license: {}; range: {}; artifact sha256 `{}`",
+                "Extracted from {} ({}, {}); license: {}; attribution: {}; range: {}; artifact sha256 `{}`",
                 text(&m["source"]["title"]),
                 text(&m["source"]["publisher"]),
                 text(&m["source"]["source_version"]),
                 text(&m["source"]["license"]),
+                text(&m["source"]["attribution"]),
                 text(&m["extraction"]["range"]),
                 text(&m["output"]["artifact_sha256"])
             )
