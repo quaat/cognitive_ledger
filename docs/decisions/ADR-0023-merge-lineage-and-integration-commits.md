@@ -123,7 +123,7 @@ Classification (ADR-0024 defines merge base and ancestry):
 |---|---|---|
 | `ALREADY_EQUAL` | target head = source head | nothing; no commit, no event |
 | `ALREADY_CONTAINED` | source head is an ancestor of target head | nothing; no commit, no event |
-| `NO_CHANGE` | the merged state (below) equals the target state | nothing; no commit, no event |
+| `NO_CHANGE` | the merged state (below) equals the target state **and** the source has no net change from the base | nothing; no commit, no event (otherwise an empty integration commit records the resolution) |
 | `FAST_FORWARD` | target head is an ancestor of source head | integration commit, state = source state |
 | `DIVERGENT` | neither | three-way merge from the unique merge base; integration commit, state = merged state |
 

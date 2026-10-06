@@ -85,6 +85,52 @@ carried into Phase 8 / production qualification.
   `decisions_one_per_candidate` / `proposals_candidate_unique` and verify's
   one-decision-per-event invariant, and would accept intermediate states never validated
   under the target's policy (ADR-0023).
+- Implementation reviews (DAG, RDF diff/conflicts, storage/concurrency, semantic
+  validation, security/idempotency, tests, projection; 2026-10-06): no P0. P1s fixed in
+  `ad75e17`: a UNIQUE preview token made a rejected merge un-re-proposable (500); a silent
+  `NO_CHANGE` lost a take-target/convergent resolution, so a later merge could reapply what
+  was set aside (rule amended: empty integration commit unless the source has no net
+  change from the base); four-eyes could be laundered through a merge (the target's
+  distinct-reviewer rule now also excludes the proposers of the source-only commits,
+  `merge_proposals.source_parties`); forced merge races were missing; the
+  `ledger-store -> ledger-merge` `Cargo.lock` entry was uncommitted (fixed in `4ab6251`).
+  P2s fixed: decided-before-stale reporting, propose lost-response replay, preview patch
+  reuse under locks, independent verify recomputation, weighted admission (3 slots),
+  pre-permit replay. Remaining P2s are in tech-debt (inline compute memory and per-tenant
+  fairness, conflict-report byte budget, per-strategy token).
 
 ## Evidence
-(filled as gates run)
+Code under test: `ad75e17` (implementation and review fixes). Every gate below ran on 2026-10-06
+on this workstation; nothing is reported that did not run.
+- `check-fast` (fmt, clippy, unit and property tests, the 6 merge-preview token goldens
+  plus the Python reference, 26 request goldens plus the Python reference): exit 0.
+- `check-supply-chain`: advisories, bans, licenses and sources ok; SBOMs generated.
+- PostgreSQL 17 and 15 (`--ignored` suites): `ledger-store` 120 passed per version (including
+  `pg_merge` 24: strategies, recorded resolutions, delete vs modify, distinct parties,
+  reject then re-propose, refusals write nothing, crash atomicity at every merge failpoint,
+  raw-SQL refusals by the 0013 triggers, and forced races — opposite applies, apply vs
+  source accept in both orders, two applies of one proposal, apply vs target deletion in
+  both orders, a three-branch ring, propose paused while the target moves; and `pg_verify`
+  per-check merge tampering); `ledger-api` 35 passed per version (validated merge with
+  Virtual A-Box environment change, `VALIDATION_REQUIRED`, `LINEAGE_MISMATCH`, 403, 404).
+  0 failed.
+- Property DAG suite: `ledger-dag` merge base against the cubic reference oracle (100
+  seeds plus fixtures: linear, fork, nested fork, diamond, repeated merge, criss-cross,
+  deep, missing parent, cycle); `ledger-merge` three-way properties (600 seeds); both run
+  in `check-fast`.
+- `test-integration.sh`: `INTEGRATION OK`; merge of `agent/it-task` into `main` as `[C2, B1]`
+  (preview read-only, ordinary accept refused, apply), projected by the unchanged Phase-3
+  projector (marker v3, verify CONSISTENT), repeat contained; `VERIFY OK`.
+- `upgrade-p5.sh`: `UPGRADE-P5 OK` (previous release `5216bce`, schema 12 → 13; run
+  `target/upgrade-p5/20261006T074003Z`): pre-upgrade rows byte-identical, 0001–0012
+  untouched, every recorded key replays identically, a branch created by the previous
+  release merged into `main` and projected, version skew refused, clean and upgraded 0013
+  identical.
+- `backup-restore.sh`: `BACKUP RESTORE OK` (`target/backup/20261006T074045Z`); dump and
+  basebackup both restore the merge proposal and merge event; the drift refusals hold.
+- `stress-branches.sh`: `BRANCH STRESS GATE OK` (`target/stress-branches/20261006T074208Z`),
+  including the new verify check "every merge proposal recomputes from the DAG and
+  immutable states (0 violations)".
+- Not run: live Fluree differential (BUSL-1.1 approval pending; not counted), live Sculpin
+  semantic service (validation uses the Phase-2 contract with a fake validator), hosted CI
+  (recorded after push).
