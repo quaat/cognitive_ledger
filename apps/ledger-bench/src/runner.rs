@@ -631,6 +631,44 @@ impl Runner<'_> {
         Ok(())
     }
 
+    /// Appearing, disappearing and reappearing statements at version boundaries.
+    async fn verify_history_facts(&mut self) -> Result<(), String> {
+        let mut cache: BTreeMap<Label, BTreeSet<String>> = BTreeMap::new();
+        for f in self.w.history_facts.clone() {
+            for (label, want) in f
+                .present
+                .iter()
+                .map(|l| (l, true))
+                .chain(f.absent.iter().map(|l| (l, false)))
+            {
+                if !cache.contains_key(label) {
+                    let raw = self
+                        .read_and_check("historical reconstruction", label, "state_read_historical")
+                        .await?;
+                    let set = raw
+                        .iter()
+                        .filter_map(|q| q.as_str().map(str::to_owned))
+                        .collect();
+                    cache.insert(label.clone(), set);
+                }
+                let has = cache[label].contains(&f.quad);
+                self.check(
+                    "history fact (appear / disappear / reappear)",
+                    label,
+                    has == want,
+                    || {
+                        format!(
+                            "{} expected {} at {label}",
+                            f.quad,
+                            if want { "present" } else { "absent" }
+                        )
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
     async fn verify_diffs(&mut self) -> Result<(), String> {
         for (a, b) in self.w.diff_pairs.clone() {
             let ra = self
@@ -827,6 +865,7 @@ pub async fn run(w: &Workload, dataset: &str, cfg: &Config) -> RunData {
         let started = Instant::now();
         r.verify_heads_and_logs().await?;
         r.verify_history().await?;
+        r.verify_history_facts().await?;
         phases.insert(
             "historical reconstruction checks".to_owned(),
             started.elapsed().as_millis(),

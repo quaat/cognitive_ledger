@@ -1134,6 +1134,7 @@ pub fn generate(p: &Params) -> Workload {
         final_heads,
         diff_pairs,
         verify_all_history: p.verify_all_history,
+        history_facts: Vec::new(),
     }
 }
 

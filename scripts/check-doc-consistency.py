@@ -44,8 +44,8 @@ for doc in (root / "docs/benchmarks").glob("*.md"):
         if hit != generator:
             errors.append(f"{doc.relative_to(root)}: names {hit}, the generator is {generator}")
 for manifest in (root / "benchmark/datasets").glob("synthetic-*.json"):
-    if json.loads(manifest.read_text()).get("generator_version") != generator:
-        errors.append(f"{manifest.relative_to(root)}: generator_version is not {generator}")
+    if (json.loads(manifest.read_text()).get("generator") or {}).get("version") != generator:
+        errors.append(f"{manifest.relative_to(root)}: generator.version is not {generator}")
 
 gating = sorted(p.stem for p in (root / ".github/workflows").glob("ci-*.yml")
                 if re.search(r"^\s*pull_request:", p.read_text(), re.M))

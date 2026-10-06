@@ -15,7 +15,7 @@ recomputes the manifest and refuses to run when any field differs (see
 
 ## `synthetic-ledger-ci` / `synthetic-ledger-local` (implemented)
 
-Generator: `apps/ledger-bench/src/synthetic.rs`. Its version (`GENERATOR_VERSION`) is recorded in each manifest's `generator_version`, the authoritative value. It is a
+Generator: `apps/ledger-bench/src/synthetic.rs`. Its version (`GENERATOR_VERSION`) is recorded in each manifest's `generator.version`, the authoritative value. It is a
 single SplitMix64 stream from the seed in the manifest. The data is project-owned and
 generated on every run; nothing is committed except the manifest.
 

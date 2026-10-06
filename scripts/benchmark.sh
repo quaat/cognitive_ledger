@@ -5,7 +5,7 @@
 # before the stack starts; correctness assertions fail the run, timings are observations.
 # After the run, `ledger-admin verify` must report VERIFY OK.
 #
-# Usage: scripts/benchmark.sh [profile]   (profiles: ci (default), local)
+# Usage: scripts/benchmark.sh [profile]   (profiles: ci (default), local, bear)
 # Output: target/benchmark/<UTC>-<profile>/{result.json,report.md,phases.txt,verify.log,...}
 # Network: image build and crate downloads happen before the run; the run itself talks only
 # to loopback (the ledger and PostgreSQL).
@@ -28,9 +28,19 @@ T0=$(date +%s)
 
 cargo build --locked --release -p ledger-bench
 phase harness-build
-# Fail fast on an invalid dataset (no stack needed). Every profile's manifests are checked,
-# not only the one being run, so a drifting `local` manifest also fails the PR job.
-for p in ci local; do ./target/release/ledger-bench validate --profile "$p"; done
+# Extracted datasets: fetch (the only networked step; pinned size and SHA-256, cached) and
+# prepare (offline extraction with the source cross-checks) before anything else.
+case "${PROFILE}" in
+  ci|bear)
+    ./target/release/ledger-bench fetch bear-b-ci
+    ./target/release/ledger-bench prepare bear-b-ci
+    ;;
+esac
+phase dataset-fetch-and-prepare
+# Fail fast on an invalid dataset (no stack needed): the profile being run, plus the
+# synthetic `local` manifest, so a drifting `local` manifest also fails the PR job.
+./target/release/ledger-bench validate --profile "${PROFILE}"
+[ "${PROFILE}" = local ] || ./target/release/ledger-bench validate --profile local
 phase dataset-validate
 
 "${COMPOSE[@]}" config --quiet

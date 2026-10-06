@@ -115,6 +115,15 @@ pub struct Expected {
     pub provenance: Provenance,
 }
 
+/// A statement's membership at version boundaries (appearing, disappearing, reappearing),
+/// checked against ledger-materialized states.
+#[derive(Clone, Debug, Serialize)]
+pub struct HistoryFact {
+    pub quad: String,
+    pub present: Vec<Label>,
+    pub absent: Vec<Label>,
+}
+
 /// A complete dataset workload.
 #[derive(Clone, Debug)]
 pub struct Workload {
@@ -126,6 +135,7 @@ pub struct Workload {
     pub diff_pairs: Vec<(Label, Label)>,
     /// Reconstruct every commit again after the run (otherwise only retained ones).
     pub verify_all_history: bool,
+    pub history_facts: Vec<HistoryFact>,
 }
 
 impl Workload {
@@ -183,6 +193,10 @@ pub fn workload_checksum(w: &Workload) -> String {
     }
     for (a, b) in &w.diff_pairs {
         h.update(format!("diff {a} {b}\n").as_bytes());
+    }
+    for f in &w.history_facts {
+        h.update(serde_json::to_vec(f).expect("serializable history fact"));
+        h.update(b"\n");
     }
     format!("sha256:{}", hex::encode(h.finalize()))
 }
