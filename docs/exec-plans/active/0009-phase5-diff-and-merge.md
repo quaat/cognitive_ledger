@@ -161,7 +161,7 @@ not run.
 |---|---|
 | `check-fast` (fmt, clippy `-D warnings` all features, unit and property tests, architecture incl. the `test-hooks` guard, doc links) | exit 0; 212 tests passed, 0 failed |
 | Golden vectors (Rust plus independent Python references) | 18 commit v2, 26 request identity, 6 merge preview-token, 42 validation protocol and 3 state digest vectors match; no fixture changed since `5216bce` except Phase-5 additions |
-| `check-supply-chain` (on `0582a85`; `Cargo.lock` unchanged since, apart from the dev-only `serde_json` edge for `ledger-merge`) | advisories, bans, licenses and sources ok; SBOMs generated |
+| `check-supply-chain` (on `e7dc273`; also on `0582a85`) | advisories, bans, licenses and sources ok; SBOMs generated |
 | PostgreSQL 17 (`ledger-store --features postgres --tests --ignored`, `ledger-api --tests --ignored`) | 159 passed, 0 failed: `pg_merge` 27, `pg_workflow` 14, `pg_validation` 9, `pg_validation_api` 23, `pg_api` 13, `pg_verify` 4, `pg_least_privilege` 19, `pg_branches` 18, `pg_projection` 7, `pg_cas_race` 1, `pg_immutable_store` 9, `pg_fs_migration` 8, `pg_graphs_migration` 7 |
 | PostgreSQL 15 (same suites) | 159 passed, 0 failed (same counts) |
 | `test-integration.sh` | `INTEGRATION OK`. Merge `agent/it-task` into `main` as `[C2, B1]`; projected by the unchanged projector (marker v3, verify CONSISTENT); repeat contained; `VERIFY OK` |
