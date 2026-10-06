@@ -94,6 +94,11 @@ refuse("ledger-projector", direct("ledger-projector", kinds=(None, "build")), ("
 for crate in members:
     if crate not in ("ledger-projector", "ledger-projection-fuseki") and "ledger-projection-fuseki" in direct(crate):
         fail(f"{crate}: only ledger-projector may depend on ledger-projection-fuseki")
+# Qualification tools (benchmark and stress harnesses) are leaves: nothing depends on them.
+for tool in ("ledger-bench", "ledger-stress"):
+    for crate in members:
+        if crate != tool and tool in direct(crate):
+            fail(f"{crate}: depends on the qualification tool {tool}")
 fluree = sorted({name(n) for n in nodes if "fluree" in name(n).lower()})
 if fluree:
     fail(f"Fluree packages in the dependency graph: {fluree}")

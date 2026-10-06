@@ -94,6 +94,14 @@ fn is_loopback(url: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "[::1]")
 }
 
+/// The host of a `postgres://user:password@host:port/db?…` URL is loopback.
+fn dsn_is_loopback(dsn: &str) -> bool {
+    let rest = dsn.split("://").nth(1).unwrap_or("");
+    let authority = rest.split(['/', '?']).next().unwrap_or("");
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    is_loopback(&format!("postgres://{host_port}"))
+}
+
 struct Args {
     profile: String,
     replica: String,
@@ -214,8 +222,24 @@ fn performance(samples: &[Sample], phases_ms: BTreeMap<String, u128>) -> Perform
         .into_iter()
         .map(|((op, kind, b), mut v)| stats("api", op, &format!("{kind} · {b}"), &mut v))
         .collect();
+    let ingest_steps = samples
+        .iter()
+        .filter(|s| matches!(s.op, "accept" | "branch_create" | "merge_apply"))
+        .count();
+    let mut throughput = BTreeMap::new();
+    if let Some(ms) = phases_ms
+        .get("ingest and per-step checks")
+        .filter(|ms| **ms > 0)
+    {
+        throughput.insert(
+            "ingest_steps_per_s (commits + branches + applied merges, with per-step checks)"
+                .to_owned(),
+            ingest_steps as f64 / (*ms as f64 / 1000.0),
+        );
+    }
     Performance {
         phases_ms,
+        throughput,
         operations,
         by_depth,
         series: runner::series(samples),
@@ -229,28 +253,33 @@ fn write_result(out: &Path, r: &BenchResult) -> Result<(), String> {
     std::fs::write(out.join("report.md"), markdown(r)).map_err(|e| e.to_string())
 }
 
-fn validate(
-    profile: &str,
-    manifests: &Path,
-) -> Result<
-    Vec<(
-        Box<dyn Dataset>,
-        Workload,
-        dataset::Manifest,
-        Result<(), String>,
-        u128,
-    )>,
-    String,
-> {
+/// A dataset prepared for a run, with its manifest check.
+struct Prepared {
+    dataset: Box<dyn Dataset>,
+    workload: Workload,
+    manifest: dataset::Manifest,
+    valid: Result<(), String>,
+    generate_ms: u128,
+}
+
+fn validate(profile: &str, manifests: &Path) -> Result<Vec<Prepared>, String> {
     let datasets = dataset::profile(profile).ok_or("unknown profile")?;
     let mut out = Vec::new();
-    for d in datasets {
+    for dataset in datasets {
         let started = Instant::now();
-        let w = d.prepare();
-        let ms = started.elapsed().as_millis();
-        let m = d.manifest(&w);
-        let ok = verify_manifest(manifests, &m);
-        out.push((d, w, m, ok, ms));
+        let workload = dataset
+            .prepare()
+            .map_err(|e| format!("{}: {e}", dataset.id()))?;
+        let generate_ms = started.elapsed().as_millis();
+        let manifest = dataset.manifest(&workload);
+        let valid = verify_manifest(manifests, &manifest);
+        out.push(Prepared {
+            dataset,
+            workload,
+            manifest,
+            valid,
+            generate_ms,
+        });
     }
     Ok(out)
 }
@@ -260,6 +289,13 @@ async fn run(a: Args) -> ExitCode {
         eprintln!(
             "refusing non-loopback replica {} without --allow-non-loopback (the harness writes data)",
             a.replica
+        );
+        return ExitCode::from(2);
+    }
+    // The owner connection provisions graphs: the same guard applies to its host.
+    if !a.allow_non_loopback && !dsn_is_loopback(&a.owner_database_url) {
+        eprintln!(
+            "refusing a non-loopback owner database without --allow-non-loopback (the harness provisions graphs)"
         );
         return ExitCode::from(2);
     }
@@ -302,7 +338,14 @@ async fn run(a: Args) -> ExitCode {
     };
     let mut exit = 0u8;
     let mut postgres = "unknown".to_owned();
-    for (d, w, m, valid, generate_ms) in prepared {
+    for Prepared {
+        dataset: d,
+        workload: w,
+        manifest: m,
+        valid,
+        generate_ms,
+    } in prepared
+    {
         let mut dr = DatasetResult {
             id: d.id().into(),
             dataset: DatasetInfo {
@@ -365,6 +408,7 @@ async fn run(a: Args) -> ExitCode {
             db_bytes_before: data.db_bytes_before,
             db_bytes_after: data.db_bytes_after,
             immutable_objects_bytes_after: data.immutable_objects_bytes_after,
+            immutable_objects_logical_bytes_after: data.immutable_objects_logical_bytes_after,
             annotations: BTreeMap::new(),
         };
         eprintln!(
@@ -388,6 +432,10 @@ async fn run(a: Args) -> ExitCode {
 }
 
 fn annotate(path: &Path, pairs: impl Iterator<Item = String>) -> Result<(), String> {
+    // The result and its report are rewritten in place, so only `…/result.json` is accepted.
+    if path.file_name().and_then(|n| n.to_str()) != Some("result.json") {
+        return Err(format!("{}: annotate takes a result.json", path.display()));
+    }
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let mut r: BenchResult = serde_json::from_str(&text).map_err(|e| e.to_string())?;
     for kv in pairs {
@@ -434,7 +482,14 @@ async fn main() -> ExitCode {
                 }
             };
             let mut exit = 0;
-            for (d, _, m, ok, ms) in prepared {
+            for Prepared {
+                dataset: d,
+                manifest: m,
+                valid: ok,
+                generate_ms: ms,
+                ..
+            } in prepared
+            {
                 if cmd == "manifest" {
                     println!(
                         "{}",
@@ -523,6 +578,29 @@ mod tests {
         ] {
             assert!(!is_loopback(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn only_loopback_owner_databases_are_accepted_by_default() {
+        for ok in [
+            "postgres://ledger:secret@127.0.0.1:55432/ledger?sslmode=disable",
+            "postgres://u:p@localhost/db",
+        ] {
+            assert!(dsn_is_loopback(ok), "{ok}");
+        }
+        for bad in [
+            "postgres://u:p@db.example.org:5432/ledger",
+            "postgres://u:p@10.1.2.3/db",
+            "postgres://u:127.0.0.1@evil.example/db",
+        ] {
+            assert!(!dsn_is_loopback(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn annotate_only_rewrites_a_result_json() {
+        let err = annotate(Path::new("/tmp/elsewhere/other.json"), std::iter::empty()).unwrap_err();
+        assert!(err.contains("annotate takes a result.json"), "{err}");
     }
 
     #[test]

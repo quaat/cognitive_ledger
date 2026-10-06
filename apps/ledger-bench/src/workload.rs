@@ -42,7 +42,11 @@ pub struct CommitStep {
 #[derive(Clone, Debug, Serialize)]
 pub struct PreviewExpect {
     pub strategy: &'static str,
+    /// An explicit merge base sent with the request (it must be a best common ancestor).
+    pub explicit_base: Option<Label>,
     pub classification: &'static str,
+    /// For `ambiguous_merge_base`: every best common ancestor.
+    pub base_candidates: Vec<Label>,
     pub merge_base: Option<Label>,
     pub ahead: usize,
     pub behind: usize,
@@ -73,6 +77,8 @@ pub struct MergeStep {
 #[derive(Clone, Debug, Serialize)]
 pub struct ApplyStep {
     pub strategy: &'static str,
+    /// The explicit base of the applied preview, if any.
+    pub explicit_base: Option<Label>,
     pub label: Label,
     pub provenance: Provenance,
 }
@@ -96,6 +102,9 @@ pub struct Expected {
     pub parents: Vec<Label>,
     /// Parent-0 chain length from genesis (genesis = 0): what reconstruction folds.
     pub depth: u32,
+    /// Patch operations (adds + deletes) along the parent-0 chain up to and including this
+    /// commit: the logical work a reconstruction folds.
+    pub fold_ops: u64,
     pub quads: usize,
     /// [`oracle_digest`] of the state.
     pub digest: String,
@@ -156,11 +165,18 @@ pub fn workload_checksum(w: &Workload) -> String {
     for (label, e) in &w.expected {
         h.update(
             format!(
-                "{label} {:?} {} {} {} {}\n",
-                e.parents, e.depth, e.quads, e.digest, e.kind
+                "{label}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                e.parents.join(","),
+                e.depth,
+                e.fold_ops,
+                e.quads,
+                e.digest,
+                e.kind
             )
             .as_bytes(),
         );
+        h.update(serde_json::to_vec(&e.provenance).expect("serializable provenance"));
+        h.update(b"\n");
     }
     for (b, l) in &w.final_heads {
         h.update(format!("head {b} {l}\n").as_bytes());

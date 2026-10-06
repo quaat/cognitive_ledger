@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub dataset: String,
     /// `generated` (owned by this project) or `extracted` (third-party source).
@@ -36,8 +37,9 @@ pub struct Manifest {
 
 pub trait Dataset {
     fn id(&self) -> &'static str;
-    /// Deterministic and offline.
-    fn prepare(&self) -> Workload;
+    /// Deterministic and offline. An extracted dataset fails here when its verified cache
+    /// is missing or does not match its manifest.
+    fn prepare(&self) -> Result<Workload, String>;
     fn manifest(&self, workload: &Workload) -> Manifest;
 }
 
@@ -51,8 +53,8 @@ impl Dataset for Synthetic {
         self.id
     }
 
-    fn prepare(&self) -> Workload {
-        synthetic::generate(&self.params)
+    fn prepare(&self) -> Result<Workload, String> {
+        Ok(synthetic::generate(&self.params))
     }
 
     fn manifest(&self, w: &Workload) -> Manifest {
@@ -128,9 +130,34 @@ mod tests {
     #[test]
     fn the_committed_ci_manifest_matches_the_generator() {
         for d in profile("ci").unwrap() {
-            let w = d.prepare();
+            let w = d.prepare().unwrap();
             verify_manifest(&manifests(), &d.manifest(&w)).unwrap();
         }
+    }
+
+    #[test]
+    fn a_changed_expectation_changes_the_checksum() {
+        // The checksum covers expectations, not only the steps: provenance included.
+        let d = Synthetic {
+            id: "synthetic-ledger-ci",
+            params: Params::ci(),
+        };
+        let w = d.prepare().unwrap();
+        let mut changed = w.clone();
+        let e = changed.expected.values_mut().next().unwrap();
+        e.provenance.message.push('!');
+        assert_ne!(workload_checksum(&w), workload_checksum(&changed));
+        let mut changed = w.clone();
+        changed.expected.values_mut().next().unwrap().fold_ops += 1;
+        assert_ne!(workload_checksum(&w), workload_checksum(&changed));
+    }
+
+    #[test]
+    fn unknown_manifest_fields_are_refused() {
+        let text = std::fs::read_to_string(manifests().join("synthetic-ledger-ci.json")).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        v["extra"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<Manifest>(v).is_err());
     }
 
     #[test]
@@ -142,7 +169,7 @@ mod tests {
                 ..Params::ci()
             },
         };
-        let w = d.prepare();
+        let w = d.prepare().unwrap();
         let err = verify_manifest(&manifests(), &d.manifest(&w)).unwrap_err();
         assert!(
             err.contains("seed") && err.contains("output_checksum"),

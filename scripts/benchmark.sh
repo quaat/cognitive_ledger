@@ -16,7 +16,9 @@ PROFILE=${1:-ci}
 OUT="target/benchmark/$(date -u +%Y%m%dT%H%M%SZ)-${PROFILE}"
 mkdir -p "${OUT}"
 COMPOSE=(docker compose -p ledger-qual-benchmark -f compose.yaml)
+SAMPLERS=()
 teardown() {
+  for pid in "${SAMPLERS[@]}"; do kill "$pid" 2>/dev/null || true; done
   "${COMPOSE[@]}" logs --no-color ledger >"${OUT}/server.log" 2>&1 || true
   "${COMPOSE[@]}" down --remove-orphans --volumes >/dev/null 2>&1 || true
 }
@@ -26,8 +28,9 @@ T0=$(date +%s)
 
 cargo build --locked --release -p ledger-bench
 phase harness-build
-# Fail fast on an invalid dataset (no stack needed).
-./target/release/ledger-bench validate --profile "${PROFILE}"
+# Fail fast on an invalid dataset (no stack needed). Every profile's manifests are checked,
+# not only the one being run, so a drifting `local` manifest also fails the PR job.
+for p in ci local; do ./target/release/ledger-bench validate --profile "$p"; done
 phase dataset-validate
 
 "${COMPOSE[@]}" config --quiet
@@ -37,6 +40,11 @@ phase stack-build-and-start
 
 REV=$(git rev-parse HEAD)
 DIRTY=$(git status --porcelain --untracked-files=no | wc -l | tr -d ' ')
+UNTRACKED=$(git status --porcelain --untracked-files=normal | grep -c '^??' || true)
+INPUTS=$(cat Dockerfile compose.yaml Cargo.lock | sha256sum | cut -d' ' -f1)
+# compose.yaml runs the server with the development unvalidated-acceptance switch.
+ACCEPTANCE=$(grep -q 'LEDGER_UNVALIDATED_ACCEPTANCE: allow-unvalidated-acceptance-development-only' compose.yaml \
+  && echo unvalidated-development || echo validation-required)
 IMAGE=$(docker inspect --format '{{.Image}}' "$("${COMPOSE[@]}" ps -q ledger)")
 # Container memory: cgroup v2 `memory.peak` when the kernel has it (>= 5.19, e.g. hosted
 # runners); otherwise a 0.5 s sampler of `memory.current` records the observed maximum.
@@ -56,7 +64,6 @@ sample_memory() {
     sleep 0.5
   done
 }
-SAMPLERS=()
 for svc in ledger postgres; do
   if dir=$(cgroup_dir "$svc"); then
     sample_memory "$dir" "${OUT}/${svc}-memory-sampled-max" &
@@ -67,8 +74,12 @@ export LEDGER_BENCH_HS256_SECRET=development-only-hs256-secret-not-for-productio
 export LEDGER_BENCH_OWNER_DATABASE_URL='postgres://ledger:ledger-development-only@127.0.0.1:55432/ledger?sslmode=disable'
 set +e
 ./target/release/ledger-bench run --profile "${PROFILE}" --replica http://127.0.0.1:8080 --out "${OUT}" \
-  --meta "build_rev=${REV}" --meta "tracked_changes=${DIRTY}" --meta "rustc=$(rustc --version)" \
-  --meta "server_image=${IMAGE}" --meta "compose_project=ledger-qual-benchmark" 2>&1 | tee "${OUT}/run.log"
+  --meta "build_rev=${REV}" --meta "tracked_changes=${DIRTY}" --meta "untracked_files=${UNTRACKED}" \
+  --meta "rustc=$(rustc --version)" --meta "server_image=${IMAGE}" \
+  --meta "server_toolchain=$(grep -m1 '^FROM' Dockerfile)" --meta "inputs_sha256(Dockerfile,compose.yaml,Cargo.lock)=${INPUTS}" \
+  --meta "docker=$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo unknown)" \
+  --meta "compose=$(docker compose version --short 2>/dev/null || echo unknown)" \
+  --meta "acceptance_mode=${ACCEPTANCE}" --meta "compose_project=ledger-qual-benchmark" 2>&1 | tee "${OUT}/run.log"
 STATUS=${PIPESTATUS[0]}
 set -e
 for pid in "${SAMPLERS[@]}"; do kill "$pid" 2>/dev/null || true; done
@@ -90,13 +101,22 @@ peak() {
 if [ -f "${OUT}/result.json" ]; then
   ./target/release/ledger-bench annotate "${OUT}/result.json" \
     "server_peak_memory=$(peak ledger)" "postgres_peak_memory=$(peak postgres)" \
-    "phases=$(tr '\n' ';' <"${OUT}/phases.txt")"
+    "phases=$(tr '\n' ';' <"${OUT}/phases.txt")" || { echo "FAIL: annotate" >&2; STATUS=1; }
+else
+  echo "FAIL: no result.json was written" >&2
+  STATUS=1
 fi
 
-# The production verifier over everything the run wrote.
-"${COMPOSE[@]}" run --rm migrate verify >"${OUT}/verify.log" 2>&1 || true
+# The production verifier over everything the run wrote: exit status and VERIFY OK.
+set +e
+"${COMPOSE[@]}" run --rm migrate verify >"${OUT}/verify.log" 2>&1
+VERIFY=$?
+set -e
 tail -1 "${OUT}/verify.log"
-grep -q "VERIFY OK" "${OUT}/verify.log" || { echo "FAIL: ledger-admin verify did not report VERIFY OK" >&2; STATUS=1; }
+if [ "${VERIFY}" != 0 ] || ! grep -q "VERIFY OK" "${OUT}/verify.log"; then
+  echo "FAIL: ledger-admin verify (exit ${VERIFY}) did not report VERIFY OK" >&2
+  STATUS=1
+fi
 phase verify
 echo "report: ${OUT}/report.md"
 exit "${STATUS}"

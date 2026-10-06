@@ -1,27 +1,39 @@
 //! `synthetic-ledger-*`: a deterministic, seeded generator of a Cognitive Ledger history
-//! (linear, forked, diamond and merge-heavy shapes; additions, deletions and replacements;
-//! designed structural conflicts, delete-vs-modify and convergent changes) **and** the
-//! independent oracle of that history.
+//! **and** the independent oracle of that history. The history covers:
+//! - linear, forked, diamond, merge-heavy and criss-cross shapes;
+//! - additions, deletions and replacements;
+//! - designed structural conflicts of five shapes;
+//! - convergent changes, a merge base reachable only through a second parent, and both
+//!   `NO_CHANGE` directions.
 //!
 //! The oracle never calls the ledger's crates. It knows every state because it generated
 //! every change, and merge outcomes by construction:
 //! - **States.** `state(child) = state(parent) − deletes + adds`, as set algebra over
 //!   generated statements.
-//! - **Ancestry, merge base, ahead/behind.** A brute-force reference over the symbolic DAG:
-//!   ancestor sets, and the maximal elements of their intersection. This is the definition
-//!   in ADR-0024, not `ledger-dag`'s traversal.
-//! - **Merges** (ADR-0023/0024 `structural-slot/v1`). Each scenario is *designed* so that
-//!   target and source touch disjoint `(graph, subject, predicate)` slots, apart from the
-//!   slots the scenario deliberately puts in conflict and deliberately convergent ones.
+//! - **Ancestry, merge base and ahead/behind.** A brute-force reference over the symbolic
+//!   DAG: ancestor sets, and the maximal elements of their intersection. This is the ADR-0024
+//!   definition, not `ledger-dag`'s traversal. Several maximal elements mean an ambiguous
+//!   base.
+//! - **Merges** (ADR-0023/0024 `structural-slot/v1`). Every scenario is *designed*: target
+//!   and source touch disjoint `(graph, subject, predicate)` slots, except the slots it puts
+//!   in conflict on purpose and those it makes convergent on purpose.
 //!   - Outside the designed conflicts, the merged state is the three-way set formula
 //!     `(T − (B − S)) ∪ (S − B)`.
-//!   - Inside them, it is what the strategy specifies (`T|k`, `S|k` or `T|k ∪ S|k`).
+//!   - Inside them, the strategy's definition applies: `T|k`, `S|k` or `T|k ∪ S|k`.
 //!
-//!   The design premise is checked whenever a merge is generated: a slot changed
-//!   differently on both sides that was not designed as a conflict is a generator bug and
-//!   panics. It is never silently folded into the expectation.
-//! - **NO_CHANGE.** The merged state equals T and the source has no net change from B
-//!   (ADR-0024).
+//!   The premise is checked whenever a merge is generated: any slot changed differently on
+//!   both sides that was not designed is a generator bug and panics. It is never folded
+//!   into the expectation.
+//! - **`NO_CHANGE`.** The merged state equals T **and** the source has no net change from B.
+//!
+//! The five conflict shapes, cycled over the designed slots, are chosen so that a ledger
+//! implementing anything other than ADR-0024's slot rules is caught:
+//! 1. replace / replace;
+//! 2. delete (target) / modify (source);
+//! 3. modify (target) / delete (source);
+//! 4. keep-and-add (target) / delete (source). `union` must *keep* the statement the
+//!    source deleted, so a delete-honouring merge fails;
+//! 5. add / add of different values to a slot both sides keep (multi-valued).
 //!
 //! Determinism: one SplitMix64 stream from the seed; only ordered collections; no clocks.
 
@@ -37,11 +49,14 @@ use std::{
 };
 
 /// Bumped whenever generation changes; recorded with the dataset checksum in its manifest.
-pub const GENERATOR_VERSION: &str = "synthetic-ledger-gen/2";
+pub const GENERATOR_VERSION: &str = "synthetic-ledger-gen/3";
 
 /// Size and shape parameters of a synthetic profile.
 #[derive(Clone, Debug, Serialize)]
 pub struct Params {
+    /// Recorded as a hex string at the manifest's top level (a JSON number would exceed
+    /// 2^53).
+    #[serde(skip)]
     pub seed: u64,
     /// Entities present at genesis (each with `predicates` statements).
     pub entities: u32,
@@ -61,9 +76,8 @@ pub struct Params {
     pub fast: u32,
     /// Commits on each of `feature/c` and `feature/d` (merged with designed conflicts).
     pub contested: u32,
-    /// Designed conflicting slots, of which the first `delete_modify` are delete-vs-modify.
+    /// Designed conflicting slots, cycling through the five shapes (module docs).
     pub conflicts: u32,
-    pub delete_modify: u32,
     /// Slots both sides change identically (not conflicts).
     pub convergent: u32,
     /// Retain the full expected state of every n-th commit of each branch (diffs, samples).
@@ -74,7 +88,7 @@ pub struct Params {
 
 impl Params {
     /// The PR-CI profile (Plan 0010 targets: ~1,000 entities, ~6,000 initial statements,
-    /// ~200 commits, 7 branches, 10 applied merges, 6 designed conflicts).
+    /// ~200 commits, 4–8 work branches, ≥ 10 applied merges, ≥ 5 designed conflicts).
     pub fn ci() -> Self {
         Self {
             seed: 0x5eed_0001_c1ed_6e00,
@@ -89,15 +103,14 @@ impl Params {
             churn: 35,
             fast: 6,
             contested: 10,
-            conflicts: 6,
-            delete_modify: 2,
+            conflicts: 10,
             convergent: 2,
             sample_every: 10,
             verify_all_history: true,
         }
     }
 
-    /// A deeper local profile for baselines (≈1,400 commits; parent-0 depth up to ≈650).
+    /// A deeper local profile for baselines (≈1,500 commits; parent-0 depth up to ≈600).
     pub fn local() -> Self {
         Self {
             seed: 0x5eed_0001_10ca_1000,
@@ -112,8 +125,7 @@ impl Params {
             churn: 300,
             fast: 20,
             contested: 40,
-            conflicts: 12,
-            delete_modify: 4,
+            conflicts: 20,
             convergent: 4,
             sample_every: 50,
             verify_all_history: false,
@@ -151,9 +163,10 @@ impl Rng {
 type Stmt = u64;
 
 const MAX_ENTITY: u64 = 1 << 22;
-/// Statements per bulk-load commit (well below the API's 10,000 operations per request).
-const BULK_ADDS: usize = 5_000;
 const MAX_VALUE: u64 = 1 << 33;
+/// Statements per bulk-load commit (well below the API's 10,000 operations per request;
+/// limits are never raised for benchmarks).
+const BULK_ADDS: usize = 5_000;
 
 fn stmt(graph: u64, subject: u64, predicate: u64, literal: bool, object: u64) -> Stmt {
     assert!(graph < 4 && subject < MAX_ENTITY && predicate < 64 && object < MAX_VALUE);
@@ -257,6 +270,7 @@ struct Gen {
     counters: BTreeMap<String, u32>,
     parents: BTreeMap<Label, Vec<Label>>,
     depth: BTreeMap<Label, u32>,
+    fold_ops: BTreeMap<Label, u64>,
     retained: BTreeMap<Label, Arc<BTreeSet<Stmt>>>,
     plan_retain: BTreeSet<Label>,
     ancestors: BTreeMap<Label, Arc<BTreeSet<Label>>>,
@@ -274,9 +288,23 @@ fn kind_of(branch: &str) -> &'static str {
     }
 }
 
+/// Named subject pools (each branch only touches its own; scenario slots have their own).
+const POOLS: [&str; 10] = [
+    "main",
+    "feature/a",
+    "feature/b",
+    "feature/c",
+    "feature/d",
+    "contested",
+    "feature/e",
+    "churn",
+    "resolve",
+    "netzero",
+];
+
 impl Gen {
     fn new(p: Params) -> Self {
-        Self {
+        let g = Self {
             rng: Rng(p.seed),
             p,
             next_value: 0,
@@ -286,13 +314,33 @@ impl Gen {
             counters: BTreeMap::new(),
             parents: BTreeMap::new(),
             depth: BTreeMap::new(),
+            fold_ops: BTreeMap::new(),
             retained: BTreeMap::new(),
             plan_retain: BTreeSet::new(),
             ancestors: BTreeMap::new(),
             steps: Vec::new(),
             expected: BTreeMap::new(),
             merges: 0,
+        };
+        // The pools must be non-empty, within the genesis entities and pairwise disjoint,
+        // or the "branches touch disjoint slots" premise would not hold by construction.
+        let ranges: Vec<Range<u64>> = POOLS.iter().map(|n| g.pool(n)).collect();
+        for (i, a) in ranges.iter().enumerate() {
+            assert!(
+                a.start < a.end && a.end <= u64::from(g.p.entities),
+                "pool {}",
+                POOLS[i]
+            );
+            for (j, b) in ranges.iter().enumerate().skip(i + 1) {
+                assert!(
+                    a.end <= b.start || b.end <= a.start,
+                    "pools {} and {} overlap",
+                    POOLS[i],
+                    POOLS[j]
+                );
+            }
         }
+        g
     }
 
     fn fresh(&mut self) -> u64 {
@@ -313,6 +361,8 @@ impl Gen {
             "contested" => at(50)..at(50) + contested,
             "feature/e" => at(52)..at(56),
             "churn" => at(56)..at(70),
+            "resolve" => at(70)..at(70) + 2,
+            "netzero" => at(72)..at(72) + 2,
             other => panic!("no pool for {other}"),
         }
     }
@@ -327,25 +377,30 @@ impl Gen {
         }
     }
 
-    /// Record the expectation of a new commit (and retain its full state if planned).
+    /// Record the expectation of a new commit whose patch has `ops` operations (and retain
+    /// its full state if planned).
     fn record(
         &mut self,
         label: &Label,
         parents: Vec<Label>,
         state: &BTreeSet<Stmt>,
+        ops: u64,
         kind: &'static str,
         provenance: Provenance,
     ) {
         let depth = parents.first().map_or(0, |p| self.depth[p] + 1);
+        let fold_ops = parents.first().map_or(0, |p| self.fold_ops[p]) + ops;
         let rendered = render_state(state);
         let digest = oracle_digest(rendered.iter().map(String::as_str));
         self.depth.insert(label.clone(), depth);
+        self.fold_ops.insert(label.clone(), fold_ops);
         self.parents.insert(label.clone(), parents.clone());
         self.expected.insert(
             label.clone(),
             Expected {
                 parents,
                 depth,
+                fold_ops,
                 quads: rendered.len(),
                 digest,
                 state: None,
@@ -366,6 +421,12 @@ impl Gen {
         self.retain_rendered(label, state, rendered);
     }
 
+    fn retain_head(&mut self, branch: &str) -> Label {
+        let (label, state) = self.heads[branch].clone();
+        self.retain(&label, &state);
+        label
+    }
+
     fn retain_rendered(
         &mut self,
         label: &Label,
@@ -376,6 +437,8 @@ impl Gen {
         self.expected.get_mut(label).expect("recorded").state = Some(Arc::new(rendered));
     }
 
+    /// The initial load, split into bulk commits of at most `BULK_ADDS` statements labelled
+    /// `main@0.1`, `main@0.2`, …; the last one is `main@0`, the loaded state.
     fn genesis(&mut self) -> Label {
         let mut state = BTreeSet::new();
         for s in 0..u64::from(self.p.entities) {
@@ -389,10 +452,6 @@ impl Gen {
             state.insert(stmt(1, s, u64::from(self.p.predicates), true, v));
         }
         self.next_entity = u64::from(self.p.entities);
-        // The initial load is split into bulk commits of at most `BULK_ADDS` statements
-        // (the API caps a request at 10,000 operations; limits are never raised for
-        // benchmarks). They are labelled `main@0.1`, `main@0.2`, …; the last one is `main@0`,
-        // the loaded state.
         let all: Vec<Stmt> = state.iter().copied().collect();
         let chunks: Vec<&[Stmt]> = all.chunks(BULK_ADDS).collect();
         let mut loaded = BTreeSet::new();
@@ -415,11 +474,13 @@ impl Gen {
                 provenance: provenance.clone(),
             }));
             self.plan_retain.insert(label.clone());
+            let ops = adds.len() as u64;
             self.record(
                 &label,
                 parent.iter().cloned().collect(),
                 &loaded,
-                "main",
+                ops,
+                "bulk",
                 provenance,
             );
             parent = Some(label);
@@ -455,7 +516,15 @@ impl Gen {
             deletes: render_state(&deletes).into_iter().collect(),
             provenance: provenance.clone(),
         }));
-        self.record(&label, vec![parent], &next, kind_of(branch), provenance);
+        let ops = (adds.len() + deletes.len()) as u64;
+        self.record(
+            &label,
+            vec![parent],
+            &next,
+            ops,
+            kind_of(branch),
+            provenance,
+        );
         self.heads.insert(branch.to_owned(), (label.clone(), next));
         label
     }
@@ -476,9 +545,9 @@ impl Gen {
         out
     }
 
-    /// A mixed change (add, delete, replace) confined to the branch's pool.
-    fn mixed_commit(&mut self, branch: &str) -> Label {
-        let pool = self.pool(branch);
+    /// A mixed change (add, delete, replace) confined to `pool`, committed on `branch`.
+    fn mixed_commit_in(&mut self, branch: &str, pool_name: &str) -> Label {
+        let pool = self.pool(pool_name);
         let state = self.heads[branch].1.clone();
         let (mut adds, mut deletes) = (BTreeSet::new(), BTreeSet::new());
         let ops = 1 + self.rng.below(5);
@@ -521,6 +590,10 @@ impl Gen {
         self.commit(branch, adds, deletes)
     }
 
+    fn mixed_commit(&mut self, branch: &str) -> Label {
+        self.mixed_commit_in(branch, branch)
+    }
+
     /// Add-only: a new entity with 2–5 statements (one links to an existing entity).
     fn growth_commit(&mut self) -> Label {
         let s = self.next_entity;
@@ -557,7 +630,14 @@ impl Gen {
         self.commit("churn", adds, deletes)
     }
 
-    fn branch(&mut self, name: &str, from: &Label) {
+    /// Create `name` at `from`, which must be the head of `source` or reachable from it (the
+    /// Phase-4 branch-point rule; asserted here so a scenario cannot ask for a refusal).
+    fn branch(&mut self, name: &str, source: &str, from: &Label) {
+        let head = self.heads[source].0.clone();
+        assert!(
+            self.ancestors_of(&head).contains(from),
+            "branch point {from} is not reachable from {source}"
+        );
         let state = self
             .retained
             .get(from)
@@ -566,10 +646,10 @@ impl Gen {
             .clone();
         self.steps.push(Step::Branch {
             name: name.to_owned(),
-            source: "main".into(),
+            source: source.to_owned(),
             from: from.clone(),
         });
-        self.counters.insert(name.to_owned(), 0);
+        self.counters.entry(name.to_owned()).or_insert(0);
         self.heads.insert(name.to_owned(), (from.clone(), state));
     }
 
@@ -586,12 +666,26 @@ impl Gen {
         set
     }
 
+    /// The single statement of a genesis slot `(s, p)` in the default graph in `state`.
+    fn value_at(state: &BTreeSet<Stmt>, s: u64, p: u64) -> Stmt {
+        let found: Vec<&Stmt> = state
+            .range(stmt(0, s, p, false, 0)..stmt(0, s, p + 1, false, 0))
+            .collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "slot ({s}, {p}) must hold exactly its initial value"
+        );
+        *found[0]
+    }
+
     /// The oracle's expectation of one preview; also returns the merged state.
     fn expect(
         &mut self,
         target: &str,
         source: &str,
         strategy: Strategy,
+        explicit_base: Option<&Label>,
         designed: &BTreeSet<u64>,
     ) -> (PreviewExpect, Option<BTreeSet<Stmt>>) {
         let (t, tstate) = self.heads[target].clone();
@@ -600,9 +694,11 @@ impl Gen {
         let as_ = self.ancestors_of(&s);
         let ahead = as_.difference(&at).count();
         let behind = at.difference(&as_).count();
-        let plain = |classification| PreviewExpect {
+        let plain = |classification, candidates: Vec<Label>| PreviewExpect {
             strategy: strategy.as_str(),
+            explicit_base: explicit_base.cloned(),
             classification,
+            base_candidates: candidates,
             merge_base: None,
             ahead,
             behind,
@@ -613,10 +709,10 @@ impl Gen {
             merged: None,
         };
         if t == s {
-            return (plain("already_equal"), None);
+            return (plain("already_equal", Vec::new()), None);
         }
         if at.contains(&s) {
-            return (plain("already_contained"), None);
+            return (plain("already_contained", Vec::new()), None);
         }
         let ff = as_.contains(&t);
         let base = if ff {
@@ -632,12 +728,20 @@ impl Gen {
                     best.push(c.clone());
                 }
             }
-            assert_eq!(
-                best.len(),
-                1,
-                "scenario must have a unique merge base: {best:?}"
-            );
-            best.remove(0)
+            assert!(!best.is_empty(), "scenario histories are related");
+            match explicit_base {
+                Some(b) => {
+                    assert!(
+                        best.contains(b),
+                        "explicit base {b} must be a best common ancestor"
+                    );
+                    b.clone()
+                }
+                None if best.len() > 1 => {
+                    return (plain("ambiguous_merge_base", best), None);
+                }
+                None => best.remove(0),
+            }
         };
         let bstate = self
             .retained
@@ -706,7 +810,9 @@ impl Gen {
         };
         let expect = PreviewExpect {
             strategy: strategy.as_str(),
+            explicit_base: explicit_base.cloned(),
             classification,
+            base_candidates: Vec::new(),
             merge_base: Some(base),
             ahead,
             behind,
@@ -722,36 +828,34 @@ impl Gen {
         (expect, merged)
     }
 
-    /// One merge request: previews with each strategy in `previews`, then optionally apply
-    /// `apply` (which must yield a candidate). Returns the integration commit label.
+    /// One merge request: previews (strategy, explicit base) in order, then optionally apply
+    /// `apply`, which must yield a candidate. Returns the integration commit label.
     fn merge(
         &mut self,
         source: &str,
         target: &str,
-        previews: &[Strategy],
-        apply: Option<Strategy>,
+        previews: &[(Strategy, Option<&Label>)],
+        apply: Option<(Strategy, Option<&Label>)>,
         designed: &BTreeSet<u64>,
     ) -> Option<Label> {
         self.merges += 1;
         let id = format!("merge#{}", self.merges);
-        let (t, tstate) = self.heads[target].clone();
-        let (s, sstate) = self.heads[source].clone();
-        self.retain(&t, &tstate);
-        self.retain(&s, &sstate);
+        let t = self.retain_head(target);
+        let s = self.retain_head(source);
+        let tstate = self.heads[target].1.clone();
         let mut expects = Vec::new();
-        for strategy in previews {
-            expects.push(self.expect(target, source, *strategy, designed).0);
+        for (strategy, base) in previews {
+            expects.push(self.expect(target, source, *strategy, *base, designed).0);
         }
         let mut applied = None;
         let mut integrated = None;
-        if let Some(strategy) = apply {
-            let (e, merged) = self.expect(target, source, strategy, designed);
+        if let Some((strategy, base)) = apply {
+            let (e, merged) = self.expect(target, source, strategy, base, designed);
             assert!(
                 matches!(e.classification, "fast_forward" | "divergent"),
                 "{id}: applying a {} merge",
                 e.classification
             );
-            let label = id.clone();
             let provenance = Provenance {
                 activity: "merge".into(),
                 message: id.clone(),
@@ -760,15 +864,16 @@ impl Gen {
             };
             applied = Some(ApplyStep {
                 strategy: strategy.as_str(),
-                label: label.clone(),
+                explicit_base: base.cloned(),
+                label: id.clone(),
                 provenance: provenance.clone(),
             });
             integrated = Some((
-                label,
+                id.clone(),
                 merged.expect("candidate has a merged state"),
                 provenance,
             ));
-            if !previews.contains(&strategy) {
+            if !previews.contains(&(strategy, base)) {
                 expects.push(e);
             }
         }
@@ -780,8 +885,9 @@ impl Gen {
             apply: applied,
         }));
         let (label, merged, provenance) = integrated?;
+        let ops = merged.symmetric_difference(&tstate).count() as u64;
         self.plan_retain.insert(label.clone());
-        self.record(&label, vec![t, s], &merged, "merge", provenance);
+        self.record(&label, vec![t, s], &merged, ops, "merge", provenance);
         self.heads
             .insert(target.to_owned(), (label.clone(), merged));
         Some(label)
@@ -790,10 +896,13 @@ impl Gen {
 
 /// Generate the workload of a synthetic profile (pure and deterministic).
 pub fn generate(p: &Params) -> Workload {
+    use Strategy::*;
     let mut g = Gen::new(p.clone());
     let genesis = g.genesis();
     g.plan_retain.insert("main@5".into());
     g.plan_retain.insert("main@10".into());
+    let none = BTreeSet::new();
+    let abort = [(Abort, None)];
 
     // Linear main, then a diamond (a, b) forked at a historical commit, plus a growing-state
     // and a constant-state history forked even earlier.
@@ -802,10 +911,10 @@ pub fn generate(p: &Params) -> Workload {
     }
     let fork = "main@10".to_owned();
     let early = "main@5".to_owned();
-    g.branch("feature/a", &fork);
-    g.branch("feature/b", &fork);
-    g.branch("growth", &early);
-    g.branch("churn", &early);
+    g.branch("feature/a", "main", &fork);
+    g.branch("feature/b", "main", &fork);
+    g.branch("growth", "main", &early);
+    g.branch("churn", "main", &early);
     for i in 0..p.feature.max(p.growth).max(p.churn) {
         if i < p.feature {
             g.mixed_commit("feature/a");
@@ -821,40 +930,30 @@ pub fn generate(p: &Params) -> Workload {
     for _ in 0..p.main_mid {
         g.mixed_commit("main");
     }
-    let none = BTreeSet::new();
-    use Strategy::*;
     // Diamond: both sides of the fork integrate into the moved main (divergent).
-    let m1 = g.merge("feature/a", "main", &[Abort], Some(Abort), &none);
-    g.merge("feature/b", "main", &[Abort], Some(Abort), &none);
+    let m1 = g.merge("feature/a", "main", &abort, Some((Abort, None)), &none);
+    g.merge("feature/b", "main", &abort, Some((Abort, None)), &none);
     // Repeated merge: contained; syncing back is a fast-forward class; then no change.
-    g.merge("feature/a", "main", &[Abort], None, &none);
-    g.merge("main", "feature/a", &[Abort], Some(Abort), &none);
-    g.merge("feature/a", "main", &[Abort], None, &none);
+    g.merge("feature/a", "main", &abort, None, &none);
+    g.merge("main", "feature/a", &abort, Some((Abort, None)), &none);
+    g.merge("feature/a", "main", &abort, None, &none);
     // A branch at the head is already equal; with work it merges as a fast-forward class.
-    let head = g.heads["main"].0.clone();
-    g.retain(&head, &g.heads["main"].1.clone());
-    g.branch("feature/e", &head);
-    g.merge("feature/e", "main", &[Abort], None, &none);
+    let head = g.retain_head("main");
+    g.branch("feature/e", "main", &head);
+    g.merge("feature/e", "main", &abort, None, &none);
     for _ in 0..p.fast {
         g.mixed_commit("feature/e");
     }
-    g.merge("feature/e", "main", &[Abort], Some(Abort), &none);
+    g.merge("feature/e", "main", &abort, Some((Abort, None)), &none);
 
     // Designed conflicts: c and d fork together; c integrates first (fast-forward class),
-    // then d conflicts with it on `conflicts` slots (the first `delete_modify` are
-    // delete-vs-modify) and agrees with it on `convergent` slots.
-    let head = g.heads["main"].0.clone();
-    g.retain(&head, &g.heads["main"].1.clone());
-    g.branch("feature/c", &head);
-    g.branch("feature/d", &head);
+    // then d conflicts with it on `conflicts` slots (five shapes, module docs) and agrees
+    // with it on `convergent` slots.
+    let head = g.retain_head("main");
+    g.branch("feature/c", "main", &head);
+    g.branch("feature/d", "main", &head);
     let contested = g.pool("contested");
     let base_state = g.heads["main"].1.clone();
-    let value_at = |s: u64| -> Stmt {
-        *base_state
-            .range(stmt(0, s, 0, false, 0)..stmt(0, s, 1, false, 0))
-            .next()
-            .expect("contested slot has its initial value")
-    };
     let (mut c_adds, mut c_dels, mut d_adds, mut d_dels) = (
         BTreeSet::new(),
         BTreeSet::new(),
@@ -863,24 +962,49 @@ pub fn generate(p: &Params) -> Workload {
     );
     let mut designed = BTreeSet::new();
     for (i, s) in contested.clone().enumerate() {
-        let old = value_at(s);
+        let old = Gen::value_at(&base_state, s, 0);
         let i = i as u32;
-        if i < p.conflicts {
-            designed.insert(slot(old));
+        let (x, y) = (g.fresh(), g.fresh());
+        let (vx, vy) = (stmt(0, s, 0, true, x), stmt(0, s, 0, true, y));
+        if i >= p.conflicts {
+            // Convergent: both replace the value with the same new one.
             c_dels.insert(old);
-            if i >= p.delete_modify {
-                let x = g.fresh();
-                c_adds.insert(stmt(0, s, 0, true, x));
+            c_adds.insert(vx);
+            d_dels.insert(old);
+            d_adds.insert(vx);
+            continue;
+        }
+        designed.insert(slot(old));
+        match i % 5 {
+            0 => {
+                // replace / replace
+                c_dels.insert(old);
+                c_adds.insert(vx);
+                d_dels.insert(old);
+                d_adds.insert(vy);
             }
-            let y = g.fresh();
-            d_dels.insert(old);
-            d_adds.insert(stmt(0, s, 0, true, y));
-        } else {
-            let z = g.fresh();
-            c_dels.insert(old);
-            c_adds.insert(stmt(0, s, 0, true, z));
-            d_dels.insert(old);
-            d_adds.insert(stmt(0, s, 0, true, z));
+            1 => {
+                // delete (target) / modify (source)
+                c_dels.insert(old);
+                d_dels.insert(old);
+                d_adds.insert(vy);
+            }
+            2 => {
+                // modify (target) / delete (source)
+                c_dels.insert(old);
+                c_adds.insert(vx);
+                d_dels.insert(old);
+            }
+            3 => {
+                // keep-and-add (target) / delete (source): union keeps `old`
+                c_adds.insert(vx);
+                d_dels.insert(old);
+            }
+            _ => {
+                // add / add of different values to a slot both keep (multi-valued)
+                c_adds.insert(vx);
+                d_adds.insert(vy);
+            }
         }
     }
     g.commit("feature/c", c_adds, c_dels);
@@ -890,22 +1014,99 @@ pub fn generate(p: &Params) -> Workload {
         g.mixed_commit("feature/d");
     }
     let before_conflict = g.heads["main"].0.clone();
-    g.merge("feature/c", "main", &[Abort], Some(Abort), &none);
-    let resolved = g.merge(
-        "feature/d",
-        "main",
-        &[Abort, TakeTarget, TakeSource, Union],
-        Some(Union),
-        &designed,
+    g.merge("feature/c", "main", &abort, Some((Abort, None)), &none);
+    let all = [
+        (Abort, None),
+        (TakeTarget, None),
+        (TakeSource, None),
+        (Union, None),
+    ];
+    let resolved = g.merge("feature/d", "main", &all, Some((Union, None)), &designed);
+    g.merge("feature/d", "main", &abort, None, &none);
+    g.merge("main", "feature/c", &abort, Some((Abort, None)), &none);
+    g.merge("main", "feature/d", &abort, Some((Abort, None)), &none);
+
+    // A merge base reachable only through a second parent: c (synced with main through an
+    // integration commit whose parent 1 is main) and main both move on, then c → main.
+    for _ in 0..3 {
+        g.mixed_commit("feature/c");
+    }
+    for _ in 0..2 {
+        g.mixed_commit("main");
+    }
+    g.merge("feature/c", "main", &abort, Some((Abort, None)), &none);
+
+    // NO_CHANGE in both directions:
+    // (1) the merged state equals the target but the source changed something
+    //     (take-target over every differing slot) → an empty integration commit
+    //     (`divergent`), never `no_change`;
+    // (2) a source whose changes net to nothing while the target moved → `no_change`.
+    let resolve = g.pool("resolve");
+    let (mut t_adds, mut t_dels, mut s_adds, mut s_dels, mut resolve_slots) = (
+        BTreeSet::new(),
+        BTreeSet::new(),
+        BTreeSet::new(),
+        BTreeSet::new(),
+        BTreeSet::new(),
     );
-    g.merge("feature/d", "main", &[Abort], None, &none);
-    g.merge("main", "feature/c", &[Abort], Some(Abort), &none);
-    g.merge("main", "feature/d", &[Abort], Some(Abort), &none);
+    let main_state = g.heads["main"].1.clone();
+    for s in resolve {
+        let old = Gen::value_at(&main_state, s, 0);
+        let (x, y) = (g.fresh(), g.fresh());
+        resolve_slots.insert(slot(old));
+        t_dels.insert(old);
+        t_adds.insert(stmt(0, s, 0, true, x));
+        s_dels.insert(old);
+        s_adds.insert(stmt(0, s, 0, true, y));
+    }
+    g.commit("feature/b", s_adds, s_dels);
+    g.commit("main", t_adds, t_dels);
+    g.merge(
+        "feature/b",
+        "main",
+        &[(Abort, None), (TakeTarget, None)],
+        Some((TakeTarget, None)),
+        &resolve_slots,
+    );
+    let netzero = g.pool("netzero").start;
+    let x = g.fresh();
+    let temp = stmt(0, netzero, 1, true, x);
+    g.commit("feature/e", BTreeSet::from([temp]), BTreeSet::new());
+    g.commit("feature/e", BTreeSet::new(), BTreeSet::from([temp]));
+    g.mixed_commit("main");
+    g.merge("feature/e", "main", &abort, None, &none);
+
+    // Criss-cross: a (synced long ago) and the earlier `growth`/`churn` work are not
+    // involved; c and d each move on, then integrate each other's *old* heads (the second
+    // through a historical branch point), leaving two best common ancestors. The ambiguous
+    // preview lists both; an explicit base resolves it.
+    g.mixed_commit("feature/c");
+    g.mixed_commit("feature/d");
+    let c_old = g.retain_head("feature/c");
+    let d_old = g.retain_head("feature/d");
+    g.branch("crisscross", "feature/c", &c_old);
+    g.merge("feature/d", "feature/c", &abort, Some((Abort, None)), &none);
+    g.merge(
+        "crisscross",
+        "feature/d",
+        &abort,
+        Some((Abort, None)),
+        &none,
+    );
+    let candidates = [(Abort, None), (Abort, Some(&c_old)), (Abort, Some(&d_old))];
+    g.merge(
+        "feature/d",
+        "feature/c",
+        &candidates,
+        Some((Abort, Some(&d_old))),
+        &none,
+    );
+
     // The growing- and constant-state histories integrate last (divergent, early base).
-    let growth_head = g.heads["growth"].0.clone();
-    let churn_head = g.heads["churn"].0.clone();
-    g.merge("growth", "main", &[Abort], Some(Abort), &none);
-    g.merge("churn", "main", &[Abort], Some(Abort), &none);
+    let growth_head = g.retain_head("growth");
+    let churn_head = g.retain_head("churn");
+    g.merge("growth", "main", &abort, Some((Abort, None)), &none);
+    g.merge("churn", "main", &abort, Some((Abort, None)), &none);
     for _ in 0..p.main_post {
         g.mixed_commit("main");
     }
@@ -915,9 +1116,8 @@ pub fn generate(p: &Params) -> Workload {
         .iter()
         .map(|(b, (l, _))| (b.clone(), l.clone()))
         .collect();
-    for (b, l) in &final_heads {
-        let state = g.heads[b].1.clone();
-        g.retain(l, &state);
+    for b in final_heads.keys().cloned().collect::<Vec<_>>() {
+        g.retain_head(&b);
     }
     let main_head = final_heads["main"].clone();
     let diff_pairs = vec![
@@ -926,6 +1126,7 @@ pub fn generate(p: &Params) -> Workload {
         (before_conflict, resolved.expect("applied")),
         (early.clone(), growth_head),
         (early, churn_head),
+        (c_old, d_old),
     ];
     Workload {
         steps: g.steps,
@@ -940,6 +1141,16 @@ pub fn generate(p: &Params) -> Workload {
 mod tests {
     use super::*;
     use crate::workload::workload_checksum;
+
+    fn merges(w: &Workload) -> Vec<&MergeStep> {
+        w.steps
+            .iter()
+            .filter_map(|s| match s {
+                Step::Merge(m) => Some(m),
+                _ => None,
+            })
+            .collect()
+    }
 
     #[test]
     fn rendering_is_canonical_n_quads() {
@@ -982,25 +1193,19 @@ mod tests {
             "{}",
             a.commit_count()
         );
+        // main plus the work branches (4–8 suggested) and the criss-cross helper.
         let branches = a.final_heads.len();
-        assert!((4..=8).contains(&branches), "{branches}");
-        let merges: Vec<&MergeStep> = a
-            .steps
-            .iter()
-            .filter_map(|s| match s {
-                Step::Merge(m) => Some(m),
-                _ => None,
-            })
-            .collect();
-        assert!(merges.iter().filter(|m| m.apply.is_some()).count() >= 10);
-        let conflicts = merges
+        assert!((5..=10).contains(&branches), "{branches}");
+        let ms = merges(&a);
+        assert!(ms.iter().filter(|m| m.apply.is_some()).count() >= 10);
+        let conflicts = ms
             .iter()
             .flat_map(|m| &m.previews)
             .map(|p| p.conflict_count)
             .max()
             .unwrap();
         assert!(conflicts >= 5);
-        let classes: BTreeSet<&str> = merges
+        let classes: BTreeSet<&str> = ms
             .iter()
             .flat_map(|m| &m.previews)
             .map(|p| p.classification)
@@ -1012,10 +1217,11 @@ mod tests {
             "fast_forward",
             "divergent",
             "conflicted",
+            "ambiguous_merge_base",
         ] {
             assert!(classes.contains(c), "missing {c}: {classes:?}");
         }
-        // Additions, deletions and replacements all occur; provenance is unique per change.
+        // Every commit fits one API request (≤ 10,000 operations; limits are never raised).
         let commits: Vec<&CommitStep> = a
             .steps
             .iter()
@@ -1024,12 +1230,12 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // Every commit fits one API request (≤ 10,000 operations; limits are never raised).
         assert!(
             commits
                 .iter()
                 .all(|c| c.adds.len() + c.deletes.len() <= 10_000)
         );
+        // Additions, deletions and replacements all occur; provenance is unique per change.
         assert!(
             commits
                 .iter()
@@ -1051,7 +1257,6 @@ mod tests {
             .flat_map(|e| &e.provenance.evidence_refs)
             .collect();
         assert_eq!(refs.len(), a.expected.len());
-        // Every diff pair and every final head is retained in full.
         for (x, y) in &a.diff_pairs {
             assert!(a.expected[x].state.is_some() && a.expected[y].state.is_some());
         }
@@ -1059,8 +1264,8 @@ mod tests {
 
     #[test]
     fn the_oracle_states_are_consistent_with_the_steps() {
-        // Replaying the generated steps with plain set algebra reproduces every recorded
-        // digest (the oracle's own bookkeeping is self-consistent).
+        // Replaying the generated commit steps with plain set algebra reproduces every
+        // recorded digest; integration commits are checked by the next test.
         let w = generate(&Params::ci());
         let mut states: BTreeMap<Label, BTreeSet<String>> = BTreeMap::new();
         for step in &w.steps {
@@ -1097,31 +1302,140 @@ mod tests {
         }
     }
 
+    /// A second, slot-by-slot reading of ADR-0024 (`structural-slot/v1`), written
+    /// independently of `expect`'s set formula, over the retained states: every applied
+    /// merge's expected state must agree with it.
+    #[test]
+    fn applied_merge_expectations_agree_with_a_slot_by_slot_reading() {
+        let w = generate(&Params::ci());
+        let parse = |s: &State| -> BTreeMap<(String, String, String), BTreeSet<String>> {
+            let mut out: BTreeMap<_, BTreeSet<String>> = BTreeMap::new();
+            for line in s.iter() {
+                let parts: Vec<&str> = line.split(' ').collect();
+                let graph = if parts.len() == 5 {
+                    parts[3].to_owned()
+                } else {
+                    String::new()
+                };
+                out.entry((graph, parts[0].to_owned(), parts[1].to_owned()))
+                    .or_default()
+                    .insert(line.clone());
+            }
+            out
+        };
+        for m in merges(&w) {
+            let Some(apply) = &m.apply else { continue };
+            let p = m
+                .previews
+                .iter()
+                .find(|p| p.strategy == apply.strategy && p.explicit_base == apply.explicit_base)
+                .expect("the applied preview");
+            let base = p.merge_base.as_ref().expect("a candidate has a base");
+            let [t, s] = &w.expected[&apply.label].parents[..] else {
+                panic!("two parents")
+            };
+            let (bs, ts, ss) = (
+                parse(w.expected[base].state.as_ref().unwrap()),
+                parse(w.expected[t].state.as_ref().unwrap()),
+                parse(w.expected[s].state.as_ref().unwrap()),
+            );
+            let keys: BTreeSet<_> = bs
+                .keys()
+                .chain(ts.keys())
+                .chain(ss.keys())
+                .cloned()
+                .collect();
+            let mut merged = BTreeSet::new();
+            let empty = BTreeSet::new();
+            for k in keys {
+                let (b, tk, sk) = (
+                    bs.get(&k).unwrap_or(&empty),
+                    ts.get(&k).unwrap_or(&empty),
+                    ss.get(&k).unwrap_or(&empty),
+                );
+                let result: BTreeSet<String> = if tk == b || tk == sk {
+                    sk.clone()
+                } else if sk == b {
+                    tk.clone()
+                } else {
+                    match apply.strategy {
+                        "take-target" => tk.clone(),
+                        "take-source" => sk.clone(),
+                        "union" => tk.union(sk).cloned().collect(),
+                        other => panic!("{}: {other} cannot resolve a conflict", m.id),
+                    }
+                };
+                merged.extend(result);
+            }
+            assert_eq!(
+                &merged,
+                w.expected[&apply.label].state.as_ref().unwrap().as_ref(),
+                "{}",
+                m.id
+            );
+        }
+    }
+
     #[test]
     fn designed_conflicts_resolve_per_strategy() {
         let w = generate(&Params::ci());
-        let m = w
-            .steps
-            .iter()
-            .find_map(|s| match s {
-                Step::Merge(m) if m.previews.len() == 4 => Some(m),
-                _ => None,
-            })
+        let m = merges(&w)
+            .into_iter()
+            .find(|m| m.previews.len() == 4)
             .expect("the conflict scenario");
         let by: BTreeMap<&str, &PreviewExpect> =
             m.previews.iter().map(|p| (p.strategy, p)).collect();
         assert_eq!(by["abort"].classification, "conflicted");
         assert!(by["abort"].merged.is_none());
-        assert_eq!(by["abort"].conflict_count, 6);
+        assert_eq!(by["abort"].conflict_count, 10);
         let t = by["take-target"].merged.as_ref().unwrap();
         let s = by["take-source"].merged.as_ref().unwrap();
         let u = by["union"].merged.as_ref().unwrap();
+        // Union keeps statements one side deleted (shape 4), so it is a strict superset of
+        // both resolutions and of their intersection.
         assert!(t.is_subset(u) && s.is_subset(u) && t != s);
         assert_eq!(u.len(), t.union(s).count());
     }
 
     #[test]
-    #[ignore = "≈90 s in a debug build; `ledger-bench validate --profile local` (release, in scripts/benchmark.sh) checks the same generation and its manifest"]
+    fn both_no_change_directions_and_the_ambiguous_base_are_generated() {
+        let w = generate(&Params::ci());
+        let ms = merges(&w);
+        // The take-target resolution keeps the target state but is not `no_change`.
+        let resolution = ms
+            .iter()
+            .find(|m| {
+                m.apply
+                    .as_ref()
+                    .is_some_and(|a| a.strategy == "take-target")
+            })
+            .expect("take-target resolution");
+        let label = &resolution.apply.as_ref().unwrap().label;
+        let target = &w.expected[label].parents[0];
+        assert_eq!(w.expected[label].digest, w.expected[target].digest);
+        assert!(
+            resolution
+                .previews
+                .iter()
+                .any(|p| p.strategy == "take-target" && p.classification == "divergent")
+        );
+        assert!(
+            ms.iter()
+                .flat_map(|m| &m.previews)
+                .filter(|p| p.classification == "no_change")
+                .count()
+                >= 2
+        );
+        let ambiguous = ms
+            .iter()
+            .flat_map(|m| &m.previews)
+            .find(|p| p.classification == "ambiguous_merge_base")
+            .expect("criss-cross");
+        assert_eq!(ambiguous.base_candidates.len(), 2);
+    }
+
+    #[test]
+    #[ignore = "≈90 s in a debug build; CI runs `ledger-bench validate --profile local` (release) in scripts/benchmark.sh, which regenerates this profile and checks its manifest"]
     fn the_local_profile_generates() {
         let w = generate(&Params::local());
         assert!(w.commit_count() > 1_000);

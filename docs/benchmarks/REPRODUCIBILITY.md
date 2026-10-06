@@ -5,7 +5,10 @@
 | field | source |
 |---|---|
 | `run.meta.build_rev` | `git rev-parse HEAD` |
-| `run.meta.tracked_changes` | number of modified tracked files (0 = clean tree) |
+| `run.meta.tracked_changes`, `run.meta.untracked_files` | modified tracked files and untracked files; both must be 0 for an official result, because untracked sources can reach the image build |
+| `run.meta.inputs_sha256(Dockerfile,compose.yaml,Cargo.lock)` | the digest of the image and stack inputs, comparable across machines (the local `server_image` id is not) |
+| `run.meta.server_toolchain`, `run.meta.docker`, `run.meta.compose` | the Dockerfile base line, and the Docker and Compose versions |
+| `run.meta.acceptance_mode` | `unvalidated-development` while `compose.yaml` sets the development unvalidated-acceptance switch; accept timings are only comparable within one mode |
 | `run.meta.rustc` | `rustc --version` |
 | `run.meta.server_image` | id of the image the compose stack ran |
 | `run.profile`, `run.harness_version`, start, finish, wall time | the harness |
@@ -13,8 +16,9 @@
 | per dataset | id; generator and version; seed; parameters; manifest path; committed and computed checksums; licence |
 | `resources.annotations.phases` | per-phase durations of the script |
 
-A result without these fields, from a dirty tree (`tracked_changes > 0`), or with
-`checksum_ok = false` is not an official benchmark result.
+A result without these fields, from a dirty tree (`tracked_changes > 0` or
+`untracked_files > 0`), or with `checksum_ok = false` is not an official benchmark
+result.
 
 ## Datasets
 - **Generated datasets** are regenerated on every run from the manifest's seed and

@@ -25,7 +25,9 @@ must keep.
 
 Findings that shape the design:
 1. **The measured path must be the public API on the production-shaped stack.** It is the
-   same topology the Plan 0005 baseline used, so the old and new numbers stay comparable.
+   same topology the Plan 0005 baseline used. The workloads differ, though, so the numbers
+   are not directly comparable. Plan 0005 used a 1–10,000-quad linear history with a 1-quad
+   control; the synthetic profiles use a 6–13k-quad genesis and branched histories.
 2. **No public diff, commit or parents endpoint exists.** Adding one only for benchmarks is
    out of scope (Phase 6 "history lookup APIs" may add one later on its own merits). Diff
    correctness is therefore checked by running the production `ledger_rdf::diff` on
@@ -56,6 +58,9 @@ docs/benchmarks/                   this documentation
 ```
 
 - **No production crate depends on `ledger-bench`, and no production code changed for it.**
+  `scripts/check-architecture.py` enforces that no workspace member depends on
+  `ledger-bench` or `ledger-stress`. The Dockerfile builds only `ledger-server` and
+  `ledger-projector`.
   The harness depends on the ledger crates only for:
   - provisioning (`PgGraphs`, the operator path);
   - persisted-state reads (`get_commit`);
@@ -96,7 +101,7 @@ unvalidated-acceptance switch, as `scripts/bench.sh` does.
 ```rust
 trait Dataset {
     fn id(&self) -> &'static str;
-    fn prepare(&self) -> Workload;                   // deterministic, offline
+    fn prepare(&self) -> Result<Workload, String>;   // deterministic, offline; fails on a missing or unverified cache
     fn manifest(&self, w: &Workload) -> Manifest;    // must equal the committed manifest
 }
 ```

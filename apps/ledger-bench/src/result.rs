@@ -7,6 +7,9 @@ use std::collections::BTreeMap;
 
 pub const RESULT_SCHEMA: &str = "sculpin-ledger-bench-result/v1";
 
+/// Below this many samples the report shows no p95/p99 (they would equal the maximum).
+pub const MIN_TAIL_SAMPLES: usize = 20;
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct BenchResult {
     pub schema: String,
@@ -98,11 +101,14 @@ pub struct Failure {
 pub struct Performance {
     /// Ingest and verification phases, wall time.
     pub phases_ms: BTreeMap<String, u128>,
+    /// Throughput of the serial ingest phase, for example `commits_per_s` (commits, branch
+    /// creations and merges, with their per-step state checks).
+    pub throughput: BTreeMap<String, f64>,
     /// Per (category, operation): percentiles over all samples.
     pub operations: Vec<OpStats>,
     /// Per (operation, history kind, depth bucket) for the depth-sensitive operations.
     pub by_depth: Vec<OpStats>,
-    /// Raw `(op, kind, depth, quads, ms)` observations of the depth-sensitive operations.
+    /// Raw observations of the depth-sensitive operations.
     pub series: Vec<SeriesPoint>,
 }
 
@@ -119,8 +125,6 @@ pub struct OpStats {
     pub p99_ms: f64,
     pub max_ms: f64,
     pub mean_ms: f64,
-    /// Operations per second over the summed latency (single client, serial).
-    pub serial_ops_per_s: f64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -129,6 +133,10 @@ pub struct SeriesPoint {
     pub kind: String,
     pub depth: u32,
     pub quads: usize,
+    /// Patch operations along the parent-0 chain (the logical work of a reconstruction).
+    pub fold_ops: u64,
+    /// Response body bytes.
+    pub bytes: Option<usize>,
     pub ms: f64,
 }
 
@@ -138,8 +146,12 @@ pub struct Resources {
     pub harness_peak_rss_kib: Option<u64>,
     pub db_bytes_before: Option<i64>,
     pub db_bytes_after: Option<i64>,
-    /// Bytes of `immutable_objects` (commits and patches) after the run.
+    /// On-disk size of `immutable_objects` (commits and patches, TOAST-compressed) after
+    /// the run: `pg_total_relation_size`.
     pub immutable_objects_bytes_after: Option<i64>,
+    /// Logical bytes of every object in `immutable_objects` (what hashing and decoding
+    /// read), whole database.
+    pub immutable_objects_logical_bytes_after: Option<i64>,
     /// Annotations added by the invoking script after the run (for example the server
     /// container's peak memory); `unavailable` when it could not be read reliably.
     pub annotations: BTreeMap<String, String>,
@@ -169,11 +181,6 @@ pub fn stats(category: &str, op: &str, group: &str, micros: &mut [u64]) -> OpSta
             0.0
         } else {
             total as f64 / micros.len() as f64 / 1000.0
-        },
-        serial_ops_per_s: if total == 0 {
-            0.0
-        } else {
-            micros.len() as f64 / (total as f64 / 1e6)
         },
     }
 }
@@ -268,24 +275,34 @@ pub fn markdown(r: &BenchResult) -> String {
         for (phase, ms) in &p.phases_ms {
             let _ = writeln!(out, "| {phase} | {ms} |");
         }
+        for (name, v) in &p.throughput {
+            let _ = writeln!(out, "| throughput: {name} | {v:.2} |");
+        }
         let table = |out: &mut String, title: &str, rows: &[OpStats]| {
             let _ = writeln!(
                 out,
-                "\n{title}\n\n| category | operation | group | n | p50 ms | p95 ms | p99 ms | max ms | serial ops/s |\n|---|---|---|---:|---:|---:|---:|---:|---:|"
+                "\n{title} (p95/p99 shown only for n ≥ {MIN_TAIL_SAMPLES})\n\n| category | operation | group | n | p50 ms | p95 ms | p99 ms | max ms | mean ms |\n|---|---|---|---:|---:|---:|---:|---:|---:|"
             );
             for s in rows {
+                let tail = |v: f64| {
+                    if s.count >= MIN_TAIL_SAMPLES {
+                        format!("{v:.1}")
+                    } else {
+                        "—".to_owned()
+                    }
+                };
                 let _ = writeln!(
                     out,
-                    "| {} | {} | {} | {} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} |",
+                    "| {} | {} | {} | {} | {:.1} | {} | {} | {:.1} | {:.1} |",
                     s.category,
                     s.op,
                     s.group,
                     s.count,
                     s.p50_ms,
-                    s.p95_ms,
-                    s.p99_ms,
+                    tail(s.p95_ms),
+                    tail(s.p99_ms),
                     s.max_ms,
-                    s.serial_ops_per_s
+                    s.mean_ms
                 );
             }
         };
@@ -299,7 +316,7 @@ pub fn markdown(r: &BenchResult) -> String {
         };
         let _ = writeln!(
             out,
-            "\n### Resources\n\n| resource | value |\n|---|---|\n| harness peak RSS | {} |\n| database before | {} |\n| database after | {} |\n| `immutable_objects` after | {} |",
+            "\n### Resources\n\n| resource | value |\n|---|---|\n| harness peak RSS (includes oracle generation) | {} |\n| database before | {} |\n| database after | {} |\n| `immutable_objects` on disk after | {} |\n| `immutable_objects` logical bytes after | {} |",
             res.harness_peak_rss_kib
                 .map_or("unavailable".to_owned(), |k| format!(
                     "{:.1} MiB",
@@ -308,6 +325,7 @@ pub fn markdown(r: &BenchResult) -> String {
             show(res.db_bytes_before),
             show(res.db_bytes_after),
             show(res.immutable_objects_bytes_after),
+            show(res.immutable_objects_logical_bytes_after),
         );
         for (k, v) in &res.annotations {
             let _ = writeln!(out, "| {k} | {v} |");
@@ -336,11 +354,29 @@ mod tests {
 
     #[test]
     fn the_report_round_trips_through_json() {
+        let mut ops: Vec<u64> = (1..=30).map(|i| i * 1000).collect();
         let r = BenchResult {
             schema: RESULT_SCHEMA.into(),
-            status: "pass".into(),
+            status: "fail".into(),
             datasets: vec![DatasetResult {
                 id: "synthetic-ledger-ci".into(),
+                correctness: Correctness {
+                    assertions: 3,
+                    failed: 1,
+                    checks: BTreeMap::from([("merge base".to_owned(), 3)]),
+                    failures: vec![Failure {
+                        check: "merge base".into(),
+                        subject: "merge#1".into(),
+                        detail: "ledger x, oracle y".into(),
+                    }],
+                },
+                performance: Performance {
+                    operations: vec![
+                        stats("api", "prepare", "all", &mut ops),
+                        stats("api", "rare", "all", &mut [5000]),
+                    ],
+                    ..Default::default()
+                },
                 ..Default::default()
             }],
             ..Default::default()
@@ -348,6 +384,11 @@ mod tests {
         let json = serde_json::to_string(&r).unwrap();
         let back: BenchResult = serde_json::from_str(&json).unwrap();
         assert_eq!(markdown(&back), markdown(&r));
-        assert!(markdown(&r).contains("synthetic-ledger-ci"));
+        let md = markdown(&r);
+        assert!(md.contains("synthetic-ledger-ci") && md.contains("**fail**"));
+        assert!(md.contains("`merge base` merge#1: ledger x, oracle y"));
+        // p95/p99 only for n ≥ 20.
+        assert!(md.contains("| api | prepare | all | 30 | 15.0 | 29.0 | 30.0 | 30.0 | 15.5 |"));
+        assert!(md.contains("| api | rare | all | 1 | 5.0 | — | — | 5.0 | 5.0 |"));
     }
 }

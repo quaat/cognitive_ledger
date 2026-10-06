@@ -15,8 +15,9 @@ time, because the integration, stress and benchmark harnesses share those ports.
 
 The script:
 1. builds `ledger-bench` (release);
-2. **validates every dataset of the profile against its committed manifest**, failing fast
-   with exit 3 on any difference;
+2. **validates the datasets of every profile (`ci` and `local`) against their committed
+   manifests**, failing fast with exit 3 on any difference, so a drifting `local` manifest
+   also fails the PR job;
 3. builds and starts the stack;
 4. runs the profile;
 5. records container peak memory;

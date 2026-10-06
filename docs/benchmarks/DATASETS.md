@@ -22,19 +22,30 @@ generated on every run; nothing is committed except the manifest.
 **Shape of `ci`** (the parameters are in the manifest):
 - ~1,000 entities with 6 statements each, plus 100 statements in the named graph
   `<urn:bench:g:1>`: 6,100 initial quads.
-- 187 commits, among them 10 integration commits, over 8 branches:
+- The initial load is two bulk commits (≤ 5,000 statements each, below the API's
+  10,000-operation limit).
+- 205 commits, among them 16 integration commits, over 9 branches:
   - `main`;
   - `feature/a` and `feature/b`, forked at the historical `main@10`, forming a diamond;
   - `growth` (add-only) and `churn` (replace-only), forked at `main@5`;
   - `feature/e`, forked at the head;
-  - `feature/c` and `feature/d`, carrying the designed conflicts.
-- 17 merge previews, 10 applied.
-- Merge classifications covered: `already_equal`, `already_contained`, `no_change`,
-  `fast_forward` (an integration commit, ADR-0023), `divergent` and `conflicted`.
-- 6 designed structural conflicts, 2 of them delete-vs-modify, plus 2 convergent slots.
-  These are previewed under `abort`, `take-target`, `take-source` and `union`, and applied
-  with `union`.
-- Repeated merge, sync-back and no-change sequences.
+  - `feature/c` and `feature/d`, carrying the designed conflicts;
+  - `crisscross`, a historical branch point used only to build the criss-cross.
+
+  See the manifest for exact counts.
+- Merge classifications covered: `already_equal`, `already_contained`, `no_change` (both a
+  fast-forward-class sync and a source whose changes net to nothing), `fast_forward`
+  (an integration commit, ADR-0023), `divergent`, `conflicted` and `ambiguous_merge_base`.
+  The ambiguous base is resolved by an explicit `base`.
+- 10 designed structural conflicts cycling through five shapes, plus 2 convergent slots.
+  The shapes are replace/replace; delete/modify in both directions; keep-and-add vs delete,
+  where `union` must keep the deleted statement; and add/add on a multi-valued slot. They
+  are previewed under `abort`, `take-target`, `take-source` and `union`, and applied with
+  `union`.
+- A take-target resolution that keeps the target state, recorded as an empty integration
+  commit (not `no_change`).
+- A merge base reachable only through a second parent.
+- Repeated merge, sync-back and criss-cross sequences.
 - Every commit carries generated provenance: activity, message = label, a unique evidence
   reference and the source system.
 
@@ -62,6 +73,14 @@ The rules below are common to all three:
   `scripts/benchmark.sh clean-cache` removes them (to be added with M3).
 - **No third-party data is committed** until its redistribution basis has been reviewed (per
   dataset below). Project-generated data and manifests are committed.
+- **Archive handling.**
+  - Archive entries are streamed by name.
+  - No path from an archive is ever used to write a file, so there is no path traversal
+    (zip-slip) and symlinks are ignored.
+  - Decompressed bytes are capped per dataset, at twice the manifest's expected
+    uncompressed size, so a decompression bomb fails instead of filling the disk.
+  - A restored CI cache is re-hashed against the manifest checksums before use. The cache
+    key alone is never trusted.
 - **Blank nodes** are forbidden in persistent ledger RDF. Extraction replaces each with a
   deterministic skolem IRI (`urn:bench:skolem:<dataset>:<sha256 of the source file and node
   label>`). It records the count; a count above zero is reported, never silent.
