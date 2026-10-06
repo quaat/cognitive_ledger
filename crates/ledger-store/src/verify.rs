@@ -380,7 +380,8 @@ pub async fn run(pool: &PgPool) -> Result<Report, LedgerError> {
 /// ancestor of the source head; divergent: the base is the unique best common ancestor, or an
 /// explicitly chosen one of several); the three-way merge of the recorded base/target/source
 /// states under the recorded strategy has the recorded digest; the integration commit
-/// reconstructs to exactly that state; the token recomputes. A row that cannot be checked
+/// reconstructs to exactly that state; the token recomputes; `source_parties` equals the
+/// proposers of the source-only commits. A row that cannot be checked
 /// (missing objects, limits) counts as a violation — verify never aborts on it.
 async fn verify_merge_rows(pool: &PgPool) -> Result<CheckResult, LedgerError> {
     use ledger_dag::{MergeBase, Relation, TraversalLimits};
@@ -397,7 +398,8 @@ async fn verify_merge_rows(pool: &PgPool) -> Result<CheckResult, LedgerError> {
             let row = sqlx::query(
                 "SELECT graph_id, target_branch, candidate_commit, target_head, source_branch, \
                  source_head, merge_base, base_explicit, classification, strategy, \
-                 merged_state_digest, preview_token FROM merge_proposals WHERE proposal_id = $1",
+                 merged_state_digest, preview_token, source_parties FROM merge_proposals \
+                 WHERE proposal_id = $1",
             )
             .bind(id)
             .fetch_one(&mut *conn)
@@ -419,15 +421,31 @@ async fn verify_merge_rows(pool: &PgPool) -> Result<CheckResult, LedgerError> {
                 .ok_or_else(|| LedgerError::Storage("unknown merge strategy".into()))?;
             let digest: ledger_core::ContentId = get("merged_state_digest")?.parse()?;
             let token = get("preview_token")?;
-            let analysis = {
+            let parties: Vec<String> = row.try_get("source_parties").map_err(db_error)?;
+            let (analysis, target_ancestry, source_ancestry) = {
                 let provider = crate::postgres_branches::GraphParents {
                     conn: tokio::sync::Mutex::new(&mut *conn),
                     graph: graph.clone(),
                 };
-                ledger_dag::analyze(&provider, &target, &source, TraversalLimits::DEFAULT)
-                    .await
-                    .map_err(|e| LedgerError::Storage(format!("ancestry: {e}")))?
+                ledger_dag::analyze_with_ancestries(
+                    &provider,
+                    &target,
+                    &source,
+                    TraversalLimits::DEFAULT,
+                )
+                .await
+                .map_err(|e| LedgerError::Storage(format!("ancestry: {e}")))?
             };
+            // The four-eyes evidence: the proposers of the source-only commits (proposals
+            // are write-once and precede acceptance, so the set cannot have grown since).
+            let source_only: Vec<String> = source_ancestry
+                .difference(&target_ancestry)
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            let parties_ok =
+                crate::postgres_merge::source_parties_on(&mut conn, &graph, &source_only).await?
+                    == parties;
             let lineage_ok = match (&analysis.relation, fast_forward) {
                 (Relation::FastForward, true) => base == target,
                 (Relation::Divergent(MergeBase::Unique(b)), false) => *b == base,
@@ -477,6 +495,7 @@ async fn verify_merge_rows(pool: &PgPool) -> Result<CheckResult, LedgerError> {
             }
             .token();
             Ok(lineage_ok
+                && parties_ok
                 && ledger_rdf::state_digest(&merged) == digest
                 && i.state == merged
                 && recomputed == token)

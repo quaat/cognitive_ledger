@@ -1326,6 +1326,34 @@ async fn each_merge_check_detects_its_own_tampering() {
         .execute(&pool)
         .await
         .unwrap();
+    let recompute_violations = |pool: sqlx::PgPool| async move {
+        verify::run(&pool)
+            .await
+            .unwrap()
+            .checks
+            .iter()
+            .find(|c| c.name == "every merge proposal recomputes from the DAG and immutable states")
+            .unwrap()
+            .violations
+    };
+    // Four-eyes evidence: the source-only commit's proposer is recorded; erasing it (so
+    // that author could review their own change onto the target) is detected.
+    let parties: Vec<String> = sqlx::query_scalar("SELECT source_parties FROM merge_proposals")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!parties.is_empty());
+    sqlx::query("UPDATE merge_proposals SET source_parties = '{}'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(recompute_violations(pool.clone()).await, 1);
+    sqlx::query("UPDATE merge_proposals SET source_parties = $1")
+        .bind(&parties)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(recompute_violations(pool.clone()).await, 0);
     sqlx::query(&format!(
         "UPDATE merge_proposals SET merged_state_digest = 'sha256:{}'",
         "0".repeat(64)

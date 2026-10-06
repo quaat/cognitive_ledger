@@ -348,6 +348,16 @@ follows:
   strategy does not confirm a propose with another (`MERGE_STALE`); normalizing that would
   change the v1 bytes.
 
+Codex review of the final candidate (`60c918f`) found no P0 or P1 and two P2s, both fixed:
+- **Propose replays before any refusal.** If the recomputed token differs from the
+  client's token, propose looks up the stored result first and only then reports a
+  classification error or `MERGE_STALE`. Previously a lost-response retry, racing the
+  original propose and its apply, could get `MERGE_NOTHING_TO_DO` for a merge that had
+  completed. A class with no token (conflicted, no-change, contained, ambiguous, unrelated)
+  is still reported as that class, not as stale.
+- **`verify` recomputes `source_parties`** from the proposals of the source-only commits.
+  Erased four-eyes evidence is a violation.
+
 ## Alternatives considered
 - **Object-level conflict key** `(graph, subject, predicate, object)`: this silently unions
   competing values of a slot. Rejected as the default; it could become a later algorithm id.

@@ -511,6 +511,18 @@ impl WorkflowRepository {
                 limits,
             )
             .await?;
+        if preview.preview_token.as_deref() != Some(request.preview_token.as_str()) {
+            // Before any refusal: a lost response retried while the original commits (and
+            // is perhaps applied, so the recomputation is now contained or moved) replays
+            // the original result rather than reporting a class or staleness error.
+            let mut conn = self.pool.acquire().await.map_err(db_error)?;
+            if let Some(stored) =
+                Self::stored_result(&mut conn, scope, Operation::MergePropose).await?
+            {
+                return Self::replay_merge_proposed(&mut conn, stored, scope).await;
+            }
+        }
+        // Classes without a token are reported as such (more actionable than "stale").
         match &preview.class {
             MergeClass::FastForward | MergeClass::Divergent => {}
             MergeClass::Conflicted => {
@@ -532,14 +544,6 @@ impl WorkflowRepository {
             }
         }
         if preview.preview_token.as_deref() != Some(request.preview_token.as_str()) {
-            // A lost response retried while the original commits and a branch then moves:
-            // the original result replays rather than reporting it stale.
-            let mut conn = self.pool.acquire().await.map_err(db_error)?;
-            if let Some(stored) =
-                Self::stored_result(&mut conn, scope, Operation::MergePropose).await?
-            {
-                return Self::replay_merge_proposed(&mut conn, stored, scope).await;
-            }
             return Err(LedgerError::MergeStale(
                 "the merge no longer matches the previewed token; preview again".into(),
             ));
@@ -585,18 +589,7 @@ impl WorkflowRepository {
             .iter()
             .map(ToString::to_string)
             .collect();
-        let source_parties: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT party FROM ( \
-                 SELECT principal_id AS party FROM proposals WHERE graph_id = $1 AND candidate_commit = ANY($2) \
-                 UNION SELECT on_behalf_of FROM proposals \
-                  WHERE graph_id = $1 AND candidate_commit = ANY($2) AND on_behalf_of IS NOT NULL) p \
-             ORDER BY party",
-        )
-        .bind(scope.graph.as_str())
-        .bind(&source_only)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(db_error)?;
+        let source_parties = source_parties_on(&mut tx, &scope.graph, &source_only).await?;
 
         // The integration commit (ADR-0023 envelope): parents [target, source], the exact
         // patch from the target state to the merged state (computed by the preview).
@@ -1017,4 +1010,25 @@ impl WorkflowRepository {
             replayed: false,
         })
     }
+}
+
+/// The proposers (and principals acted for) of the given commits, sorted and distinct: the
+/// `source_parties` of a merge row. `verify` recomputes it with the same query.
+pub(crate) async fn source_parties_on(
+    conn: &mut sqlx::PgConnection,
+    graph: &GraphId,
+    commits: &[String],
+) -> Result<Vec<String>, LedgerError> {
+    sqlx::query_scalar(
+        "SELECT DISTINCT party FROM ( \
+             SELECT principal_id AS party FROM proposals WHERE graph_id = $1 AND candidate_commit = ANY($2) \
+             UNION SELECT on_behalf_of FROM proposals \
+              WHERE graph_id = $1 AND candidate_commit = ANY($2) AND on_behalf_of IS NOT NULL) p \
+         ORDER BY party",
+    )
+    .bind(graph.as_str())
+    .bind(commits)
+    .fetch_all(conn)
+    .await
+    .map_err(db_error)
 }

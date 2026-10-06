@@ -98,6 +98,15 @@ carried into Phase 8 / production qualification.
   reuse under locks, independent verify recomputation, weighted admission (3 slots),
   pre-permit replay. Remaining P2s are in tech-debt (inline compute memory and per-tenant
   fairness, conflict-report byte budget, per-strategy token).
+- Codex on the final candidate `60c918f` (read-only, 2026-10-06): **no P0/P1**. Two P2s,
+  both fixed:
+  - propose classified the recomputation before its stored-result replay check, so a
+    lost-response retry racing its own apply could get `MERGE_NOTHING_TO_DO`;
+  - `verify` did not recompute `source_parties`.
+
+  The verify fix has a tamper test (erase, then restore). The replay reordering has no
+  forced-race test: failpoints only inject errors, so no deterministic pause exists
+  between the first replay check and the recomputation. It is verified by inspection.
 
 ## Evidence
 Code under test: `ad75e17` (implementation and review fixes). Every gate below ran on 2026-10-06
