@@ -13,6 +13,7 @@ members = [
   "apps/ledger-server",
   "apps/ledger-projector",
   "apps/ledger-stress",
+  "apps/ledger-bench",
 ]
 resolver = "2"
 # cargo-fuzz targets (nightly, sanitizers) live in their own workspace: scripts/fuzz.sh.
