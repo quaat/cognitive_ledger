@@ -1,9 +1,16 @@
 # Plan 0009: Phase 5 — diff and merge
 
-Status: **in progress** (started 2026-10-06). Branch `claude/p5-diff-and-merge` from `main` at
-`5216bcea0faf530faace98e92bc33adf6222194b` (the PR #9 merge; Phase 4 complete, see
-[Plan 0008](../completed/0008-phase4-branches-cognitive-workflows.md)). No gate is reported as
-passed until it is executable and has run.
+Status: **complete / merge-ready** (started and closed 2026-10-06). Branch
+`claude/p5-diff-and-merge` from `main` at `5216bcea0faf530faace98e92bc33adf6222194b` (the
+PR #9 merge; Phase 4 complete, see [Plan 0008](0008-phase4-branches-cognitive-workflows.md)).
+PR #11. No gate is reported as passed until it is executable and has run.
+
+| | |
+|---|---|
+| Phase-5 implementation | complete; final code `e7dc273` |
+| Phase-5 merge-ready | yes, pending the owner's review and merge. Every local gate has run on `e7dc273`, with hosted CI green on PR head `3085396`. The reviews and exact-head Codex found no P0/P1, and PR #11 has 0 unresolved review threads. Hosted CI for this closure commit (docs only) is recorded on the PR |
+| production-qualified | **no**: live Entra issuer test, PITR/WAL archiving, writer fencing during restore, live Sculpin semantic service, production Fuseki (dedicated update identity, HTTPS, private CA), production-storage performance evidence, audited raw-import activation, production credentials/configuration, GitHub `main` protection ([tech-debt](../tech-debt.md)) |
+| still pending (not run, never counted) | live Fluree differential (BUSL-1.1 approval pending); live Sculpin semantic service (the fake protocol-conformant validator is used) |
 
 ## Goal
 Deterministic comparison and merging of divergent branches while preserving immutable DAG
@@ -172,7 +179,7 @@ not run.
 | Independent reviews of `0582a85` (5, Opus, read-only) | no P0/P1; P2s fixed or deferred (Discoveries) |
 | Codex exact-head `026decc` | no P0/P1; 2 P2s fixed in `e7dc273` |
 | Codex focused re-review of `026decc..e7dc273` | no findings; `P0/P1 FOUND: no` |
-| Hosted CI | recorded after push |
+| Hosted CI on PR #11 head `3085396` (code `e7dc273` plus evidence docs) | pass. ci-fast 37495100056 (fast); ci-integration 37495099769 (docker: the forced merge races, the conflict-budget API test, the merge tamper tests, the merge e2e projected by the Phase-3 projector, `INTEGRATION OK`); ci-security 37495099873 (dependency-review, supply-chain, container incl. `RUNTIME LINKAGE OK`); ci-fuzz 37495099813 (address, none). The logs show the `ledger-dag` and `ledger-merge` property suites, the 6 merge preview-token and 26 request reference vectors, and the architecture check |
 
 Not run: live Fluree differential (BUSL-1.1 approval pending; not counted) and the live
 Sculpin semantic service (merge validation uses the Phase-2 contract with the
@@ -213,3 +220,20 @@ on this workstation; nothing is reported that did not run.
 - Not run: live Fluree differential (BUSL-1.1 approval pending; not counted), live Sculpin
   semantic service (validation uses the Phase-2 contract with a fake validator), hosted CI
   (recorded after push).
+
+## Closure (2026-10-06)
+- **Final code:** `e7dc273`. PR #11 head at hosted CI: `3085396`; this closure commit is
+  docs only.
+- **Review rounds:**
+  1. pre-implementation reviews (architecture, invariant, storage/concurrency);
+  2. seven implementation reviews (P1s fixed in `ad75e17`);
+  3. Codex on `60c918f` (2 P2s, fixed in `beece09`);
+  4. five final-candidate reviews of `0582a85` (no P0/P1; P2s fixed in `026decc`);
+  5. exact-head Codex on `026decc` (no P0/P1; 2 P2s fixed in `e7dc273`);
+  6. focused Codex re-review of `026decc..e7dc273` (no findings).
+- **Dependabot PR #10** (`taiki-e/install-action` 2.87.21 → 2.87.22): rebased by Dependabot
+  onto `5216bce` on request (`629b4d38`); all four workflows pass. It is left for the owner
+  to merge, and was not cherry-picked into Phase 5. If it lands first, merge `main` into this
+  branch and re-run hosted CI.
+- **Phase 6** starts only from `main` after the owner merges PR #11 (Plan 0010, measurement
+  first).

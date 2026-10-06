@@ -45,7 +45,7 @@ See [Plan 0008](../exec-plans/completed/0008-phase4-branches-cognitive-workflows
 - [ADR-0022: Named branches: identity, lifecycle, policy and authorization](ADR-0022-named-branches-lifecycle-and-policy.md)
 
 ## Phase 5 diff and merge (P5)
-See [Plan 0009](../exec-plans/active/0009-phase5-diff-and-merge.md).
+See [Plan 0009](../exec-plans/completed/0009-phase5-diff-and-merge.md).
 
 - [ADR-0023: Merge lineage: integration commits, not ref jumps](ADR-0023-merge-lineage-and-integration-commits.md)
 - [ADR-0024: Diff, merge base, structural conflicts, merge preview and stale-safe apply](ADR-0024-diff-merge-base-conflicts-preview-and-apply.md)
