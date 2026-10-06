@@ -172,6 +172,15 @@ The CI budget is measured, not assumed; any size adjustment is recorded with its
     documented;
   - **architecture:** no workspace member may depend on `ledger-bench` or `ledger-stress`,
     and `Dataset::prepare` is fallible.
+- **Pre-existing intermittent hang in hosted `ci-integration`** (head `29e87d1`, a docs-only
+  change from `6b1902d`, which had passed).
+  - The first attempt of run 37524260391 stalled for 36 minutes in the Phase-1 test
+    `pg_graphs_migration::upgrade_refuses_graphs_without_a_derivable_owner`. Its last log
+    line was "has been running for over 60 seconds". I cancelled it.
+  - The rerun passed in 8 minutes.
+  - This PR does not touch that test or any production code. A plausible cause, consistent
+    with the existing tech-debt item about advisory locks left by failed sqlx migrations, is
+    unconfirmed; recorded in tech-debt.
 - **Not fixed (recorded):**
   - The performance P1s "depth signal below noise in `ci`" and "growth vs churn do not
     separate depth from state size" are properties of a correctness-first CI profile. The
@@ -246,6 +255,7 @@ Linux 5.10, Docker; Compose PostgreSQL 17.2). Production code is identical to `c
 | PostgreSQL 15/17 suites | not run: no database-facing production code changed |
 | `test-integration.sh` | runs in hosted `ci-integration`; no production path changed |
 | Hosted CI, PR #12 head `6b1902d` | all green: ci-fast 37522776889, ci-security 37522776971 (dependency-review, supply-chain, container), ci-integration 37522777076 (docker), ci-fuzz 37522777014 (address, none), **ci-benchmark 37522777454** |
+| Hosted CI, head `29e87d1` (plan text only) | ci-fast 37524260466, ci-security 37524260555, ci-fuzz 37524260427 and ci-benchmark 37524260503 green. ci-integration 37524260391 green on its second attempt (8 min); the first attempt hung in a pre-existing test (Discoveries) and was cancelled |
 | **Official `ci` result** (hosted, clean checkout of the PR merge ref `b12b0f1`; `tracked_changes=0`, `untracked_files=0`) | `BENCHMARK PASS`: 1,115 assertions, 0 failed; `VERIFY OK`. Both manifests validated, with checksums identical to the workstation's (cross-machine determinism). Job 5 min 4 s: harness build 90 s, validation 5 s, stack build and start 174 s, **run 11 s**, verify 2 s. Server peak 42 MiB and PostgreSQL 124 MiB (cgroup `memory.peak`). Host: 4 × AMD EPYC 9V45, 16 GiB, kernel 6.17. The result is the `benchmark-ci` artifact of run 37522777454 |
 
 Explicitly not done in Phase 6A:
