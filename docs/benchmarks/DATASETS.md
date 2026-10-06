@@ -24,7 +24,7 @@ generated on every run; nothing is committed except the manifest.
   `<urn:bench:g:1>`: 6,100 initial quads.
 - The initial load is two bulk commits (≤ 5,000 statements each, below the API's
   10,000-operation limit).
-- 205 commits, among them 16 integration commits, over 9 branches:
+- 205 commits, among them 15 integration commits, over 9 branches:
   - `main`;
   - `feature/a` and `feature/b`, forked at the historical `main@10`, forming a diamond;
   - `growth` (add-only) and `churn` (replace-only), forked at `main@5`;
