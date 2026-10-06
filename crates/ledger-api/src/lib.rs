@@ -581,6 +581,20 @@ impl ApiError {
                 "BRANCH_STATE_CONFLICT",
                 message.clone(),
             ),
+            E::MergeStale(message) => (StatusCode::CONFLICT, "MERGE_STALE", message.clone()),
+            E::MergeConflict(count) => (
+                StatusCode::CONFLICT,
+                "MERGE_CONFLICT",
+                format!("{count} structurally conflicting key(s); choose a resolving strategy"),
+            ),
+            E::MergeNothingToDo(message) => {
+                (StatusCode::CONFLICT, "MERGE_NOTHING_TO_DO", message.clone())
+            }
+            E::InvalidMergeBase(message) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "INVALID_MERGE_BASE",
+                message.clone(),
+            ),
             E::IdempotencyConflict => (
                 StatusCode::CONFLICT,
                 "IDEMPOTENCY_CONFLICT",

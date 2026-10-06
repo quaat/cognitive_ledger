@@ -2110,7 +2110,7 @@ async fn lost_referential_and_uniqueness_constraints_are_refused_at_startup_and_
     .await;
     let m = assert_refused_by_schema(&fx, &running, "genesis-shape CHECK dropped").await;
     assert!(m.contains("ref_events_genesis_shape"), "{m}");
-    owner_exec(&fx, "ALTER TABLE ref_events ADD CONSTRAINT ref_events_genesis_shape CHECK ((operation = 'genesis' AND old_head IS NULL AND old_version IS NULL AND new_version = 1) OR (operation = 'advance' AND old_head IS NOT NULL AND old_version IS NOT NULL AND new_version = old_version + 1))").await;
+    owner_exec(&fx, "ALTER TABLE ref_events ADD CONSTRAINT ref_events_genesis_shape CHECK ((operation = 'genesis' AND old_head IS NULL AND old_version IS NULL AND new_version = 1) OR (operation IN ('advance', 'merge') AND old_head IS NOT NULL AND old_version IS NOT NULL AND new_version = old_version + 1))").await;
     assert_healthy(&fx, "all constraints restored").await;
     running.ready().await.expect("readiness after restore");
     fx.teardown().await;
@@ -2442,7 +2442,7 @@ async fn validation_persistence_runs_under_the_runtime_identity_and_its_controls
     .await;
     let m = assert_refused_by_schema(&fx, &running, "idempotency_operation CHECK dropped").await;
     assert!(m.contains("idempotency_operation"), "{m}");
-    owner_exec(&fx, "ALTER TABLE idempotency ADD CONSTRAINT idempotency_operation CHECK (operation IN ('prepare', 'accept', 'reject', 'validate', 'branch_create', 'branch_delete', 'branch_restore'))").await;
+    owner_exec(&fx, "ALTER TABLE idempotency ADD CONSTRAINT idempotency_operation CHECK (operation IN ('prepare', 'accept', 'reject', 'validate', 'branch_create', 'branch_delete', 'branch_restore', 'merge_propose', 'merge_apply'))").await;
     assert_healthy(&fx, "operation CHECK restored").await;
     // A runtime that gained UPDATE on a validation column, or lost a required INSERT column,
     // is refused as an identity drift.

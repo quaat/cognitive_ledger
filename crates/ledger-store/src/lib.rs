@@ -579,11 +579,20 @@ pub use postgres_workflow::{
 #[cfg(feature = "postgres")]
 mod postgres_branches;
 #[cfg(feature = "postgres")]
+mod postgres_merge;
+#[cfg(feature = "postgres")]
 pub use ledger_dag::TraversalLimits;
+#[cfg(feature = "postgres")]
+pub use ledger_merge::{Conflict as MergeConflictReport, Strategy as MergeStrategy};
 #[cfg(feature = "postgres")]
 pub use postgres_branches::{
     BranchEvent, BranchInfo, BranchLifecycleRequest, BranchOutcome, BranchPolicy,
     CreateBranchRequest, RefMovement,
+};
+#[cfg(feature = "postgres")]
+pub use postgres_merge::{
+    ApplyMergeRequest, DeltaSummary, MERGE_ACTIVITY, MergeApplied, MergeClass, MergePreview,
+    MergeProposed, MergeSpec, ProposeMergeRequest,
 };
 #[cfg(feature = "postgres")]
 mod postgres_projection;

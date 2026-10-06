@@ -152,6 +152,36 @@ const CHECKS: &[(&str, &str)] = &[
            OR p.head <> e.head OR p.ref_version <> e.ref_version)",
     ),
     (
+        "every merge event installs the integration commit of a matching merge proposal",
+        "SELECT e.event_id::text FROM ref_events e WHERE e.operation = 'merge' AND NOT EXISTS ( \
+             SELECT 1 FROM merge_proposals m JOIN commit_index c ON c.id = m.candidate_commit \
+              WHERE m.candidate_commit = e.new_head AND m.graph_id = e.graph_id \
+                AND m.target_branch = e.branch AND m.target_head = e.old_head AND c.parent_count = 2 \
+                AND EXISTS (SELECT 1 FROM commit_parents p WHERE p.commit_id = m.candidate_commit \
+                              AND p.position = 1 AND p.parent_id = m.source_head))",
+    ),
+    (
+        "every advance installs a candidate with at most one parent and no merge proposal",
+        "SELECT e.event_id::text FROM ref_events e JOIN commit_index c ON c.id = e.new_head \
+         WHERE e.operation = 'advance' AND (c.parent_count > 1 \
+            OR EXISTS (SELECT 1 FROM merge_proposals m WHERE m.candidate_commit = e.new_head))",
+    ),
+    (
+        "every proposal's candidate has its expected head as parent 0",
+        "SELECT pr.proposal_id::text FROM proposals pr JOIN commit_index c ON c.id = pr.candidate_commit \
+         WHERE (pr.expected_head IS NULL AND c.parent_count <> 0) \
+            OR (pr.expected_head IS NOT NULL AND NOT EXISTS ( \
+                 SELECT 1 FROM commit_parents p WHERE p.commit_id = pr.candidate_commit \
+                   AND p.position = 0 AND p.parent_id = pr.expected_head))",
+    ),
+    (
+        "every merge-apply result names a merge event",
+        "SELECT i.idempotency_id::text FROM idempotency i WHERE i.operation = 'merge_apply' AND NOT EXISTS ( \
+             SELECT 1 FROM decisions d JOIN ref_events e ON e.event_id = d.ref_event_id \
+              WHERE d.decision_id = i.result_decision_id AND e.operation = 'merge' \
+                AND e.new_head = i.result_commit)",
+    ),
+    (
         "every accepted decision has exactly one outbox row",
         "SELECT d.decision_id::text FROM decisions d WHERE d.decision = 'accepted' \
            AND (SELECT count(*) FROM projection_outbox o WHERE o.ref_event_id = d.ref_event_id) <> 1",
@@ -290,6 +320,7 @@ const COUNTED: &[&str] = &[
     "decision_validations",
     "branches",
     "branch_events",
+    "merge_proposals",
 ];
 
 /// The SQL behind a named check (tests run it inside a rolled-back tampering transaction).
@@ -326,6 +357,7 @@ pub async fn run(pool: &PgPool) -> Result<Report, LedgerError> {
         });
     }
     report.checks.extend(verify_validation_bytes(pool).await?);
+    report.checks.push(verify_merge_rows(pool).await?);
     for table in COUNTED {
         let n: i64 = sqlx::query(&format!("SELECT count(*) AS n FROM {table}"))
             .fetch_one(pool)
@@ -336,6 +368,59 @@ pub async fn run(pool: &PgPool) -> Result<Report, LedgerError> {
         report.counts.push((table, n));
     }
     Ok(report)
+}
+
+/// Every merge row agrees with immutable history (ADR-0024): the candidate reconstructs to
+/// the recorded merged-state digest, and the recorded preview token recomputes from the row.
+async fn verify_merge_rows(pool: &PgPool) -> Result<CheckResult, LedgerError> {
+    use ledger_merge::{Classification, PreviewIdentity, Strategy};
+    let mut conn = pool.acquire().await.map_err(db_error)?;
+    let rows = sqlx::query(
+        "SELECT proposal_id, graph_id, target_branch, candidate_commit, target_head, source_branch, \
+         source_head, merge_base, classification, strategy, merged_state_digest, preview_token \
+         FROM merge_proposals ORDER BY proposal_id",
+    )
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(db_error)?;
+    let mut bad = Vec::new();
+    for row in &rows {
+        let get = |c: &str| row.try_get::<String, _>(c).map_err(db_error);
+        let id: i64 = row.try_get("proposal_id").map_err(db_error)?;
+        let candidate: ledger_core::CommitId = get("candidate_commit")?.parse()?;
+        let digest: ledger_core::ContentId = get("merged_state_digest")?.parse()?;
+        let state = crate::postgres_workflow::WorkflowRepository::state_at_on(
+            &mut conn,
+            &candidate,
+            &crate::ReconstructionLimits::DEVELOPMENT,
+        )
+        .await?;
+        let token = PreviewIdentity {
+            graph: ledger_core::GraphId::new(get("graph_id")?)?,
+            source_branch: get("source_branch")?,
+            source_head: get("source_head")?.parse()?,
+            target_branch: get("target_branch")?,
+            target_head: get("target_head")?.parse()?,
+            merge_base: get("merge_base")?.parse()?,
+            classification: if get("classification")? == "fast_forward" {
+                Classification::FastForward
+            } else {
+                Classification::Divergent
+            },
+            strategy: Strategy::parse(&get("strategy")?)
+                .ok_or_else(|| LedgerError::Storage("unknown merge strategy".into()))?,
+            merged_state_digest: digest.clone(),
+        }
+        .token();
+        if ledger_rdf::state_digest(&state.state) != digest || token != get("preview_token")? {
+            bad.push(id.to_string());
+        }
+    }
+    Ok(CheckResult {
+        name: "every merge proposal reconstructs to its digest and recomputes its token",
+        violations: i64::try_from(bad.len()).unwrap_or(i64::MAX),
+        sample: bad.into_iter().take(3).collect(),
+    })
 }
 
 /// Rust-side checks the SQL cannot express: every validation record and context decodes from
