@@ -7,7 +7,8 @@ The ledger is a narrow version-control service for RDF knowledge. The authoritat
 ```text
 ledger-server -> ledger-api -> ledger-store -> ledger-core
                      |            |              ^  ^
-                     |            +-> ledger-dag-+  |   (bounded reachability/history, Phase 4)
+                     |            +-> ledger-dag-+  |   (reachability/history/merge base, Phases 4-5)
+                     |            +-> ledger-merge -> ledger-rdf, ledger-core  (three-way merge, Phase 5)
                      |            +-> ledger-rdf-+  |
                      +------------+-> ledger-validation-protocol
 ledger-projector -> ledger-projection-fuseki -> ledger-projection -> ledger-core, ledger-rdf
@@ -16,7 +17,7 @@ ledger-server (ledger-admin) -> ledger-projection   (cognitive graph IRI at enab
 ledger-testkit -------------------------------> all test-facing crates
 ```
 `scripts/check-architecture.py` enforces these edges on cargo's resolved graph: core crates
-(`ledger-core`, `ledger-rdf`, `ledger-dag`, `ledger-validation-protocol`, `ledger-projection`) reach no
+(`ledger-core`, `ledger-rdf`, `ledger-dag`, `ledger-merge`, `ledger-validation-protocol`, `ledger-projection`) reach no
 HTTP, database or container client even transitively; only `ledger-projector` depends on
 the target adapter, and target HTTP stays inside it.
 
@@ -26,4 +27,4 @@ the target adapter, and target HTTP stays inside it.
 Accepted changes are durable before refs move. Projection is downstream and cannot roll history back. The Sculpin semantic validation/reasoning layer (currently pySHACL and Python reasoning workers; Jena is a possible implementation detail, not an architectural dependency) validates and reasons; Fuseki queries projections. The virtual A-box stays transient. Fluree is an optional external differential-test oracle only.
 
 ## Evolution
-Reserved boundaries (`ledger-merge`) become crates only when a milestone needs them; `ledger-validation-protocol` became one in Phase 2, `ledger-projection` in Phase 3 and `ledger-dag` in Phase 4 (history/reachability only; merge-base belongs to Phase 5). Architectural or invariant changes require an ADR. See [storage boundaries](docs/design/storage-boundaries.md).
+Crates are created only when a milestone needs them: `ledger-validation-protocol` became one in Phase 2, `ledger-projection` in Phase 3, `ledger-dag` in Phase 4 (history/reachability; merge base, ahead/behind and merge classification added in Phase 5), and `ledger-merge` in Phase 5 (ADR-0023/0024: deterministic three-way structural merge over states, strategies and the preview-token identity; synchronous, it never reads storage — `ledger-store` reconstructs states and runs ancestry; `ledger-rdf` owns the state diff and structural keys). Architectural or invariant changes require an ADR. See [storage boundaries](docs/design/storage-boundaries.md).

@@ -68,6 +68,24 @@ pub struct ApiLimits {
     pub max_validation_state_bytes: usize,
     /// Maximum bytes of the encoded context hints of a validate request.
     pub max_validation_metadata_bytes: usize,
+    /// Byte budget of a merge preview's detailed conflict report (the `conflicts` array as
+    /// JSON, ADR-0024). Diagnostic only: the classification, merged state, conflict count
+    /// and preview token never depend on it. Within
+    /// `ledger_merge::{MIN,MAX}_CONFLICT_REPORT_BYTES`.
+    pub max_merge_conflict_report_bytes: usize,
+}
+
+impl ApiLimits {
+    /// Refuse values that would make a limit ambiguous rather than clamping them: a merge
+    /// conflict report budget outside `MIN..=MAX_CONFLICT_REPORT_BYTES` (zero included).
+    pub fn validate(&self) -> Result<(), String> {
+        self.merge_report_limits().map(|_| ())
+    }
+
+    fn merge_report_limits(&self) -> Result<ledger_store::MergeReportLimits, String> {
+        ledger_store::MergeReportLimits::with_max_bytes(self.max_merge_conflict_report_bytes)
+            .map_err(|e| format!("max_merge_conflict_report_bytes: {e}"))
+    }
 }
 
 impl Default for ApiLimits {
@@ -88,6 +106,7 @@ impl Default for ApiLimits {
             validator_response_bytes: 1024 * 1024,
             max_validation_state_bytes: 8 * 1024 * 1024,
             max_validation_metadata_bytes: 16 * 1024,
+            max_merge_conflict_report_bytes: ledger_store::MergeReportLimits::DEFAULT.max_bytes(),
         }
     }
 }
@@ -140,6 +159,11 @@ impl AppState {
                 "UNVALIDATED ACCEPTANCE ENABLED: proposals are accepted without semantic \
                  validation; this is a development/CI setting, never a production one"
             );
+        }
+        // Invalid limits are a configuration error, refused at startup (the server checks
+        // them first and exits with a readable message).
+        if let Err(e) = limits.validate() {
+            panic!("invalid ApiLimits: {e}");
         }
         // One source of truth for reconstruction bounds: the workflow's base
         // reconstruction and public state reads use the same limits.
@@ -230,6 +254,9 @@ pub const ROUTES: &[(&str, &str)] = &[
     ("GET", "/v1/graphs/{graph}/branches/log"),
     ("POST", "/v1/graphs/{graph}/branches/delete"),
     ("POST", "/v1/graphs/{graph}/branches/restore"),
+    ("POST", "/v1/graphs/{graph}/merges/preview"),
+    ("POST", "/v1/graphs/{graph}/merges/propose"),
+    ("POST", "/v1/graphs/{graph}/merges/apply"),
 ];
 
 pub const OPENAPI_JSON: &str = include_str!("../../../docs/api/openapi.json");
@@ -271,6 +298,9 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/graphs/{graph}/branches/log", get(branch_log))
         .route("/v1/graphs/{graph}/branches/delete", post(delete_branch))
         .route("/v1/graphs/{graph}/branches/restore", post(restore_branch))
+        .route("/v1/graphs/{graph}/merges/preview", post(merge_preview))
+        .route("/v1/graphs/{graph}/merges/propose", post(merge_propose))
+        .route("/v1/graphs/{graph}/merges/apply", post(merge_apply))
         .fallback(unknown_route)
         .method_not_allowed_fallback(unknown_route)
         .layer(DefaultBodyLimit::max(body_limit))
@@ -579,6 +609,20 @@ impl ApiError {
             E::BranchStateConflict(message) => (
                 StatusCode::CONFLICT,
                 "BRANCH_STATE_CONFLICT",
+                message.clone(),
+            ),
+            E::MergeStale(message) => (StatusCode::CONFLICT, "MERGE_STALE", message.clone()),
+            E::MergeConflict(count) => (
+                StatusCode::CONFLICT,
+                "MERGE_CONFLICT",
+                format!("{count} structurally conflicting key(s); choose a resolving strategy"),
+            ),
+            E::MergeNothingToDo(message) => {
+                (StatusCode::CONFLICT, "MERGE_NOTHING_TO_DO", message.clone())
+            }
+            E::InvalidMergeBase(message) => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "INVALID_MERGE_BASE",
                 message.clone(),
             ),
             E::IdempotencyConflict => (
@@ -1957,6 +2001,516 @@ pub struct BranchLogResponse {
     pub commits: Vec<CommitId>,
 }
 
+// ---------------------------------------------------------------------------------------
+// Merges (ADR-0023 / ADR-0024): preview (read), propose (persist), apply (accept)
+
+/// Ancestry walks of a merge are bounded like a historical branch point.
+const MERGE_MAX_VISITED: usize = 100_000;
+/// At most this many best common ancestors are listed in a preview (the count is exact).
+pub const MAX_LISTED_MERGE_BASE_CANDIDATES: usize = 64;
+const MERGE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+/// Expensive-operation slots one merge preview or propose takes (three to four state
+/// reconstructions instead of one).
+const MERGE_PERMITS: u32 = 3;
+
+/// [`MERGE_PERMITS`], never more than the configured total (a deployment with fewer slots
+/// still runs merges, one at a time).
+fn merge_permits(state: &AppState) -> u32 {
+    let total = u32::try_from(state.0.limits.max_concurrent_expensive).unwrap_or(u32::MAX);
+    MERGE_PERMITS.min(total).max(1)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MergePreviewBody {
+    pub source: String,
+    pub target: String,
+    #[serde(default)]
+    pub strategy: Option<String>,
+    #[serde(default)]
+    pub base: Option<CommitId>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MergeProposeBody {
+    pub source: String,
+    pub target: String,
+    #[serde(default)]
+    pub strategy: Option<String>,
+    #[serde(default)]
+    pub base: Option<CommitId>,
+    pub preview_token: String,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MergeApplyBody {
+    pub proposal_id: i64,
+    pub preview_token: String,
+    #[serde(default)]
+    pub validation_id: Option<ValidationId>,
+    #[serde(default)]
+    pub semantic_environment_id: Option<SemanticEnvironmentId>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+fn merge_strategy(
+    value: Option<&str>,
+    correlation: &str,
+) -> Result<ledger_store::MergeStrategy, ApiError> {
+    match value {
+        None => Ok(ledger_store::MergeStrategy::Abort),
+        Some(v) => ledger_store::MergeStrategy::parse(v).ok_or_else(|| {
+            ApiError::invalid(
+                "`strategy` must be abort, take-target, take-source or union",
+                correlation,
+            )
+        }),
+    }
+}
+
+fn merge_spec(
+    source: &str,
+    target: &str,
+    strategy: Option<&str>,
+    base: Option<&CommitId>,
+    correlation: &str,
+) -> Result<ledger_store::MergeSpec, ApiError> {
+    check_branch(source, correlation)?;
+    check_branch(target, correlation)?;
+    if source == target {
+        return Err(ApiError::invalid(
+            "`source` and `target` must be different branches",
+            correlation,
+        ));
+    }
+    Ok(ledger_store::MergeSpec {
+        source: source.to_owned(),
+        target: target.to_owned(),
+        strategy: merge_strategy(strategy, correlation)?,
+        base: base.cloned(),
+    })
+}
+
+/// Validate a propose body and compute its canonical identity (merge request v1).
+pub fn canonical_merge_propose(
+    graph: &GraphId,
+    body: &MergeProposeBody,
+    correlation: &str,
+) -> Result<CanonicalRequest, ApiError> {
+    let spec = merge_spec(
+        &body.source,
+        &body.target,
+        body.strategy.as_deref(),
+        body.base.as_ref(),
+        correlation,
+    )?;
+    check_text("preview_token", &body.preview_token, 71, true, correlation)?;
+    let message = body.message.clone().filter(|m| !m.is_empty());
+    if let Some(m) = &message {
+        check_text(
+            "message",
+            m,
+            ledger_core::MAX_MESSAGE_BYTES,
+            true,
+            correlation,
+        )?;
+    }
+    let distinct: std::collections::BTreeSet<&str> =
+        body.evidence_refs.iter().map(String::as_str).collect();
+    if distinct.len() > ledger_core::MAX_EVIDENCE_REFS {
+        return Err(ApiError::invalid(
+            format!(
+                "at most {} distinct evidence references",
+                ledger_core::MAX_EVIDENCE_REFS
+            ),
+            correlation,
+        ));
+    }
+    for e in &body.evidence_refs {
+        check_text(
+            "evidence_refs",
+            e,
+            ledger_core::MAX_IDENTIFIER_BYTES,
+            true,
+            correlation,
+        )?;
+    }
+    Ok(CanonicalRequest::MergePropose {
+        graph: graph.clone(),
+        source: spec.source,
+        target: spec.target,
+        strategy: spec.strategy.as_str().to_owned(),
+        base: spec.base,
+        preview_token: body.preview_token.clone(),
+        message,
+        evidence_refs: body.evidence_refs.clone(),
+    })
+}
+
+/// Validate an apply body and compute its canonical identity (merge request v1).
+pub fn canonical_merge_apply(
+    graph: &GraphId,
+    body: &MergeApplyBody,
+    correlation: &str,
+) -> Result<CanonicalRequest, ApiError> {
+    if body.proposal_id < 1 {
+        return Err(ApiError::invalid(
+            "`proposal_id` must be positive",
+            correlation,
+        ));
+    }
+    check_text("preview_token", &body.preview_token, 71, true, correlation)?;
+    if body.validation_id.is_some() != body.semantic_environment_id.is_some() {
+        return Err(ApiError::invalid(
+            "`validation_id` and `semantic_environment_id` are given together or not at all",
+            correlation,
+        ));
+    }
+    let reason = body.reason.clone().filter(|r| !r.is_empty());
+    check_reason(reason.as_deref(), correlation)?;
+    Ok(CanonicalRequest::MergeApply {
+        graph: graph.clone(),
+        proposal_id: body.proposal_id,
+        preview_token: body.preview_token.clone(),
+        validation_id: body.validation_id.clone(),
+        semantic_environment_id: body.semantic_environment_id.clone(),
+        reason,
+    })
+}
+
+#[derive(Serialize)]
+pub struct DeltaSummaryResponse {
+    pub adds: usize,
+    pub deletes: usize,
+    pub affected_keys: usize,
+}
+
+impl From<ledger_store::DeltaSummary> for DeltaSummaryResponse {
+    fn from(d: ledger_store::DeltaSummary) -> Self {
+        Self {
+            adds: d.adds,
+            deletes: d.deletes,
+            affected_keys: d.affected_keys,
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct ConflictSideResponse {
+    pub quads: Vec<String>,
+    pub truncated: bool,
+}
+
+#[derive(Serialize)]
+pub struct ConflictResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph: Option<String>,
+    pub subject: String,
+    pub predicate: String,
+    pub base: ConflictSideResponse,
+    pub target: ConflictSideResponse,
+    pub source: ConflictSideResponse,
+}
+
+fn side(s: &ledger_merge_side::Side) -> ConflictSideResponse {
+    ConflictSideResponse {
+        quads: s.quads.iter().map(ToString::to_string).collect(),
+        truncated: s.truncated,
+    }
+}
+
+mod ledger_merge_side {
+    pub use ledger_store::MergeSide as Side;
+}
+
+#[derive(Serialize)]
+pub struct MergePreviewResponse {
+    pub classification: &'static str,
+    pub source_head: CommitId,
+    pub target_head: CommitId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge_base: Option<CommitId>,
+    /// The first [`MAX_LISTED_MERGE_BASE_CANDIDATES`] best common ancestors of an
+    /// ambiguous history, ascending.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub merge_base_candidates: Vec<CommitId>,
+    /// Exact number of best common ancestors (ambiguous histories only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge_base_candidate_count: Option<usize>,
+    pub ahead: usize,
+    pub behind: usize,
+    pub target_delta: DeltaSummaryResponse,
+    pub source_delta: DeltaSummaryResponse,
+    pub strategy: &'static str,
+    /// Exact total of conflicting keys.
+    pub conflict_count: usize,
+    /// A deterministic prefix of the conflicts, bounded by count and by
+    /// `max_merge_conflict_report_bytes`.
+    pub conflicts: Vec<ConflictResponse>,
+    /// `conflicts` is incomplete: a limit (entries, quads per side, bytes) left a conflict
+    /// or a quad out. `false` means every conflicting key is listed in full.
+    pub conflicts_truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merged_state_digest: Option<ContentId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview_token: Option<String>,
+    pub correlation_id: String,
+}
+
+async fn merge_preview(
+    State(state): State<AppState>,
+    ctx: RequestContext,
+    Path(graph): Path<String>,
+    ValidJson(body): ValidJson<MergePreviewBody>,
+) -> Result<Json<MergePreviewResponse>, ApiError> {
+    ctx.require(Capability::Read)?;
+    let correlation = ctx.correlation_id.clone();
+    let graph = authorized_graph(&state, &ctx, &graph).await?;
+    let spec = merge_spec(
+        &body.source,
+        &body.target,
+        body.strategy.as_deref(),
+        body.base.as_ref(),
+        &correlation,
+    )?;
+    // A merge preview reconstructs three states (and a propose four): it takes
+    // `MERGE_PERMITS` expensive slots, so merges cannot crowd out single-state reads.
+    let _permit = state
+        .0
+        .expensive
+        .try_acquire_many(merge_permits(&state))
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "RESOURCE_LIMIT",
+                "too many concurrent expensive operations; retry later",
+                &correlation,
+            )
+        })?;
+    let limits = ledger_store::TraversalLimits {
+        max_visited: MERGE_MAX_VISITED,
+        deadline: Some(std::time::Instant::now() + MERGE_DEADLINE),
+    };
+    let report = state
+        .0
+        .limits
+        .merge_report_limits()
+        .expect("validated in AppState::new");
+    let p = state
+        .0
+        .store
+        .workflows()
+        .merge_preview_reported(
+            &ctx.identity.principal.tenant_id,
+            &graph,
+            &spec,
+            limits,
+            report,
+        )
+        .await
+        .map_err(|e| ApiError::from_ledger(e, &correlation))?;
+    // A deliberately built criss-cross can have many best common ancestors: list a bounded
+    // prefix (the order is ascending, so any listed one can be named as `base`) and the count.
+    let (candidates, candidate_count) = match &p.class {
+        ledger_store::MergeClass::AmbiguousMergeBase(c) => (
+            c.iter()
+                .take(MAX_LISTED_MERGE_BASE_CANDIDATES)
+                .cloned()
+                .collect(),
+            Some(c.len()),
+        ),
+        _ => (Vec::new(), None),
+    };
+    Ok(Json(MergePreviewResponse {
+        classification: p.class.as_str(),
+        source_head: p.source_head,
+        target_head: p.target_head,
+        merge_base: p.merge_base,
+        merge_base_candidates: candidates,
+        merge_base_candidate_count: candidate_count,
+        ahead: p.ahead,
+        behind: p.behind,
+        target_delta: p.target_delta.into(),
+        source_delta: p.source_delta.into(),
+        strategy: p.strategy.as_str(),
+        conflict_count: p.conflict_count,
+        conflicts: p
+            .conflicts
+            .iter()
+            .map(|c| ConflictResponse {
+                graph: c.key.graph.clone(),
+                subject: c.key.subject.clone(),
+                predicate: c.key.predicate.clone(),
+                base: side(&c.base),
+                target: side(&c.target),
+                source: side(&c.source),
+            })
+            .collect(),
+        conflicts_truncated: p.conflicts_truncated,
+        merged_state_digest: p.merged_state_digest,
+        preview_token: p.preview_token,
+        correlation_id: correlation,
+    }))
+}
+
+#[derive(Serialize)]
+pub struct MergeProposeResponse {
+    pub proposal_id: i64,
+    pub candidate: CommitId,
+    pub target_head: CommitId,
+    pub source_head: CommitId,
+    pub merge_base: CommitId,
+    pub classification: String,
+    pub strategy: String,
+    pub conflict_count: i32,
+    pub merged_state_digest: ContentId,
+    pub preview_token: String,
+    pub replayed: bool,
+    pub correlation_id: String,
+}
+
+async fn merge_propose(
+    State(state): State<AppState>,
+    ctx: RequestContext,
+    Path(graph): Path<String>,
+    headers: HeaderMap,
+    ValidJson(body): ValidJson<MergeProposeBody>,
+) -> Result<(StatusCode, Json<MergeProposeResponse>), ApiError> {
+    ctx.require(Capability::Propose)?;
+    let correlation = ctx.correlation_id.clone();
+    let key = idempotency_key(&headers, &correlation)?;
+    let graph = authorized_graph(&state, &ctx, &graph).await?;
+    let canonical = canonical_merge_propose(&graph, &body, &correlation)?;
+    let spec = merge_spec(
+        &body.source,
+        &body.target,
+        body.strategy.as_deref(),
+        body.base.as_ref(),
+        &correlation,
+    )?;
+    let request = ledger_store::ProposeMergeRequest {
+        scope: scope(&ctx, &graph, key, canonical.digest()),
+        spec,
+        preview_token: body.preview_token,
+        message: body.message.unwrap_or_default(),
+        evidence_refs: body.evidence_refs,
+    };
+    // A completed propose replays before any admission permit is taken.
+    if let Some(p) = state
+        .0
+        .store
+        .workflows()
+        .stored_merge_proposal(&request.scope)
+        .await
+        .map_err(|e| ApiError::from_ledger(e, &correlation))?
+    {
+        return Ok((StatusCode::OK, Json(propose_response(p, correlation))));
+    }
+    let _permit = state
+        .0
+        .expensive
+        .try_acquire_many(merge_permits(&state))
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "RESOURCE_LIMIT",
+                "too many concurrent expensive operations; retry later",
+                &correlation,
+            )
+        })?;
+    let limits = ledger_store::TraversalLimits {
+        max_visited: MERGE_MAX_VISITED,
+        deadline: Some(std::time::Instant::now() + MERGE_DEADLINE),
+    };
+    let p = state
+        .0
+        .store
+        .workflows()
+        .merge_propose(&request, limits)
+        .await
+        .map_err(|e| ApiError::from_ledger(e, &correlation))?;
+    let status = if p.replayed {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    Ok((status, Json(propose_response(p, correlation))))
+}
+
+fn propose_response(p: ledger_store::MergeProposed, correlation: String) -> MergeProposeResponse {
+    MergeProposeResponse {
+        proposal_id: p.proposal_id,
+        candidate: p.candidate,
+        target_head: p.target_head,
+        source_head: p.source_head,
+        merge_base: p.merge_base,
+        classification: p.classification,
+        strategy: p.strategy,
+        conflict_count: p.conflict_count,
+        merged_state_digest: p.merged_state_digest,
+        preview_token: p.preview_token,
+        replayed: p.replayed,
+        correlation_id: correlation,
+    }
+}
+
+async fn merge_apply(
+    State(state): State<AppState>,
+    ctx: RequestContext,
+    Path(graph): Path<String>,
+    headers: HeaderMap,
+    ValidJson(body): ValidJson<MergeApplyBody>,
+) -> Result<Json<AcceptResponse>, ApiError> {
+    ctx.require(Capability::Review)?;
+    let correlation = ctx.correlation_id.clone();
+    let key = idempotency_key(&headers, &correlation)?;
+    let graph = authorized_graph(&state, &ctx, &graph).await?;
+    let canonical = canonical_merge_apply(&graph, &body, &correlation)?;
+    // As for accept: a named validation binds the merge to that record (ADR-0019);
+    // otherwise the deployment policy travels with the request and the store enforces it
+    // after the replay lookup.
+    let validation = match (&body.validation_id, &body.semantic_environment_id) {
+        (Some(validation_id), Some(semantic_environment_id)) => ValidationPolicy::Validated {
+            validation_id: validation_id.clone(),
+            semantic_environment_id: semantic_environment_id.clone(),
+        },
+        _ => match state.0.acceptance {
+            AcceptancePolicy::RequireValidation => ValidationPolicy::Required,
+            AcceptancePolicy::AllowUnvalidatedDevelopmentOnly => ValidationPolicy::NoValidation,
+        },
+    };
+    let request = ledger_store::ApplyMergeRequest {
+        scope: scope(&ctx, &graph, key, canonical.digest()),
+        proposal_id: body.proposal_id,
+        preview_token: body.preview_token,
+        reason: body.reason.filter(|r| !r.is_empty()),
+        validation,
+    };
+    let applied = state
+        .0
+        .store
+        .workflows()
+        .merge_apply(&request)
+        .await
+        .map_err(|e| ApiError::from_ledger(e, &correlation))?;
+    Ok(Json(AcceptResponse {
+        decision_id: applied.decision_id,
+        ref_event_id: applied.ref_event_id,
+        outbox_id: applied.outbox_id,
+        ref_version: applied.ref_version,
+        head: applied.head,
+        replayed: applied.replayed,
+        correlation_id: correlation,
+    }))
+}
+
 fn query_name(query: &BTreeMap<String, String>, correlation: &str) -> Result<String, ApiError> {
     let name = query.get("name").cloned().ok_or_else(|| {
         ApiError::invalid(
@@ -2268,6 +2822,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn merge_conflict_report_budget_is_validated_never_clamped() {
+        assert!(ApiLimits::default().validate().is_ok());
+        assert_eq!(
+            ApiLimits::default().max_merge_conflict_report_bytes,
+            ledger_store::MergeReportLimits::DEFAULT.max_bytes()
+        );
+        for bad in [0, 1, 1023, 64 * 1024 * 1024 + 1, usize::MAX] {
+            let limits = ApiLimits {
+                max_merge_conflict_report_bytes: bad,
+                ..ApiLimits::default()
+            };
+            assert!(limits.validate().is_err(), "{bad} accepted");
+        }
+        for good in [1024, 64 * 1024 * 1024] {
+            let limits = ApiLimits {
+                max_merge_conflict_report_bytes: good,
+                ..ApiLimits::default()
+            };
+            assert!(limits.validate().is_ok(), "{good} refused");
+        }
+    }
+
+    #[test]
     fn openapi_document_matches_the_served_routes_and_error_codes() {
         let doc: serde_json::Value = serde_json::from_str(OPENAPI_JSON).expect("valid JSON");
         let paths = doc["paths"].as_object().expect("paths object");
@@ -2319,6 +2896,10 @@ mod tests {
             "BRANCH_POINT_UNREACHABLE",
             "BRANCH_POLICY_VIOLATION",
             "BRANCH_STATE_CONFLICT",
+            "MERGE_STALE",
+            "MERGE_CONFLICT",
+            "MERGE_NOTHING_TO_DO",
+            "INVALID_MERGE_BASE",
         ] {
             assert!(codes.contains(code), "OpenAPI error enum lacks {code}");
         }

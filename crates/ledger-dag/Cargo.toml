@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish = false
-description = "Bounded history/reachability primitives over the ledger commit DAG (ancestry checks, first-parent history, ancestor enumeration) behind a ParentProvider boundary. Infrastructure-free: no HTTP, SQL or container clients. Not merge-base or three-way merge."
+description = "Bounded history/reachability primitives over the ledger commit DAG (ancestry checks, first-parent history, ancestor enumeration) behind a ParentProvider boundary. Infrastructure-free: no HTTP, SQL or container clients. Merge base, ahead/behind and merge classification since Phase 5; not three-way merge."
 
 [dependencies]
 async-trait.workspace = true

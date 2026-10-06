@@ -649,6 +649,8 @@ pub(crate) struct CitedValidation {
     pub(crate) environment_id: SemanticEnvironmentId,
     pub(crate) conforms: bool,
     pub(crate) validator_service_id: String,
+    /// The candidate state digest the validator validated (`sculpin-rdf-state/v1`).
+    pub(crate) candidate_state_digest: ledger_core::ContentId,
 }
 
 /// Predicates 1–3 of ADR-0019 on the caller's connection: the record exists for the caller's
@@ -681,6 +683,7 @@ pub(crate) async fn cited_validation(
         environment_id: context.environment_id()?,
         conforms: record.outcome.is_conforming(),
         validator_service_id: record.validator.service_id.clone(),
+        candidate_state_digest: record.candidate_state_digest.clone(),
     })
 }
 

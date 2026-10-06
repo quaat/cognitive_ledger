@@ -336,7 +336,7 @@ fn db_session_limits() -> Result<DbSessionLimits, String> {
 
 fn limits() -> Result<ApiLimits, String> {
     let d = ApiLimits::default();
-    Ok(ApiLimits {
+    let limits = ApiLimits {
         body_bytes: env_usize("LEDGER_LIMIT_BODY_BYTES", d.body_bytes)?,
         max_operations: env_usize("LEDGER_LIMIT_PATCH_OPERATIONS", d.max_operations)?,
         max_term_bytes: env_usize("LEDGER_LIMIT_TERM_BYTES", d.max_term_bytes)?,
@@ -384,7 +384,16 @@ fn limits() -> Result<ApiLimits, String> {
             "LEDGER_LIMIT_VALIDATION_METADATA_BYTES",
             d.max_validation_metadata_bytes,
         )?,
-    })
+        max_merge_conflict_report_bytes: env_usize(
+            "LEDGER_LIMIT_MERGE_CONFLICT_REPORT_BYTES",
+            d.max_merge_conflict_report_bytes,
+        )?,
+    };
+    // LEDGER_LIMIT_MERGE_CONFLICT_REPORT_BYTES must lie within the report budget range.
+    limits
+        .validate()
+        .map_err(|e| format!("invalid limits: {e}"))?;
+    Ok(limits)
 }
 
 /// Validator trust and reachability, decided from configuration alone (ADR-0019).
@@ -517,6 +526,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+    if ledger_store::TEST_HOOKS_COMPILED {
+        return Err(
+            "this build contains ledger-store's test-only pause points (`test-hooks`); \
+                    refusing to serve"
+                .into(),
+        );
+    }
     let address = env_optional("LEDGER_ADDR")?.unwrap_or_else(|| "127.0.0.1:8080".into());
     let data = env_optional("LEDGER_DATA_DIR")?.unwrap_or_else(|| "./data".into());
     let database_url = env_optional("LEDGER_DATABASE_URL")?;

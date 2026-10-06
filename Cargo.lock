@@ -996,6 +996,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ledger-merge"
+version = "0.1.0"
+dependencies = [
+ "ledger-core",
+ "ledger-rdf",
+ "serde_json",
+]
+
+[[package]]
 name = "ledger-projection"
 version = "0.1.0"
 dependencies = [
@@ -1077,7 +1086,9 @@ dependencies = [
  "hex",
  "ledger-core",
  "ledger-dag",
+ "ledger-merge",
  "ledger-rdf",
+ "ledger-store",
  "ledger-validation-protocol",
  "serde",
  "sha2 0.11.0",

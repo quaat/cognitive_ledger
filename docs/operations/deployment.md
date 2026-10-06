@@ -261,6 +261,36 @@ Readers' contract: [reading the projection](../design/sculpin-projection.md).
   starts at its recorded branch point. Qualification: `scripts/stress-branches.sh` (100
   branches, two replicas).
 
+## Diff and merge (Phase 5, ADR-0023/0024)
+- **Upgrade 0012 → 0013**: as for every schema step: stop replicas and projectors, back up,
+  `ledger-admin migrate --runtime-role … --projector-role …` (no new role). 0013 is additive
+  (`merge_proposals`, the `merge` ref-event kind, merge idempotency operations, guard
+  triggers); it replaces two `ref_events` CHECKs, which rescans `ref_events` under an
+  `ACCESS EXCLUSIVE` lock for the migration transaction. A 0012 build refuses 0013 and vice
+  versa; exercised end to end by `scripts/upgrade-p5.sh`.
+- **Three calls**:
+  - `POST …/merges/preview` (`read`) is side-effect free and returns the classification,
+    conflicts, merged-state digest and a preview token;
+  - `POST …/merges/propose` (`propose`) persists the integration candidate as a proposal on
+    the target only while the token still matches;
+  - `POST …/merges/apply` (`review`) installs it under the **target's** policy and
+    validation binding. Any movement since then is `MERGE_STALE`: preview again. Nothing is
+    ever recomputed at apply time.
+- **What a merge writes**: one integration commit `[target head, source head]` whose patch
+  turns the target state into the merged state; one `merge` ref event, decision, outbox row
+  and idempotency result. Fast-forward-class merges also produce an integration commit (the
+  target ref never jumps to the source commit; ADR-0023). Already-equal, already-contained
+  and no-change merges create nothing.
+- **Conflicts**: overlapping `(graph, subject, predicate)` slots. `abort` (default) persists
+  nothing; `take-target`, `take-source` and `union` resolve deterministically. A
+  criss-cross history needs an explicit `base` chosen from the reported best common
+  ancestors.
+- **Validation**: validate the merge candidate like any proposal
+  (`POST …/proposals/{candidate}/validations`) and cite it at apply. A changed semantic
+  environment (for example a Virtual A-Box source version) makes the old validation stale.
+- **Projection**: a merge onto `main` is projected like any accepted head; merges onto
+  other branches are not projected (protocol v1).
+
 ## Development-only switches (never in production)
 `LEDGER_AUTH_MODE=dev-hs256`, `LEDGER_ALLOW_INSECURE_NON_LOOPBACK=allow-insecure-non-loopback-development-only`,
 `LEDGER_UNVALIDATED_ACCEPTANCE=allow-unvalidated-acceptance-development-only`, the compose
@@ -274,6 +304,6 @@ The server refuses the unvalidated-acceptance switch together with production au
 `./scripts/check-fast.sh`, `./scripts/check-supply-chain.sh`, the real PostgreSQL suites
 (including `pg_least_privilege`), `./scripts/test-integration.sh`, `./scripts/fuzz.sh`
 (bounded, also in CI); per release the qualification runs `scripts/stress.sh`,
-`scripts/fault.sh`, `scripts/backup-restore.sh`, `scripts/upgrade.sh` (and the phase upgrades `scripts/upgrade-p2.sh`, `upgrade-p3.sh`, `upgrade-p4.sh`), `scripts/stress-branches.sh` and `scripts/bench.sh`
+`scripts/fault.sh`, `scripts/backup-restore.sh`, `scripts/upgrade.sh` (and the phase upgrades `scripts/upgrade-p2.sh`, `upgrade-p3.sh`, `upgrade-p4.sh`, `upgrade-p5.sh`), `scripts/stress-branches.sh` and `scripts/bench.sh`
 (baselines in `docs/quality/performance-baselines.md`), each recorded in the active plan.
 The live identity-provider smoke test (`scripts/live-issuer-smoke.sh`, configuration in the active plan) is a release prerequisite as long as it is pending.

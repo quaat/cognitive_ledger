@@ -2,7 +2,7 @@
  "openapi": "3.1.0",
  "info": {
   "title": "Sculpin Cognitive Ledger",
-  "version": "1.2.0-p4",
+  "version": "1.3.0-p5",
   "description": "Authenticated, graph-scoped API over the atomic cognitive-change workflow (ADR-0013). Mutations require a bearer token, an Idempotency-Key header and the `propose` (prepare) or `review` (accept/reject) capability; reads require `read`. Ref names may contain `/` and are therefore body/query fields. A graph that does not exist or belongs to another tenant is reported as NOT_FOUND alike. Every response carries X-Correlation-Id; every error is the Error envelope. No query language is exposed. Unknown paths and methods also answer with the Error envelope. Phase 2 (ADR-0014/0018/0019): `validate` capability requests a semantic validation of a prepared candidate (the ledger calls its configured validation service and records an immutable SemanticExecutionContext + ValidationRecord; no ref moves); accept names validation_id and semantic_environment_id and succeeds only for a conforming validation of that candidate run in that environment; reject may cite a validation."
  },
  "servers": [
@@ -123,7 +123,11 @@
        "BRANCH_DELETED",
        "BRANCH_POINT_UNREACHABLE",
        "BRANCH_POLICY_VIOLATION",
-       "BRANCH_STATE_CONFLICT"
+       "BRANCH_STATE_CONFLICT",
+       "MERGE_STALE",
+       "MERGE_CONFLICT",
+       "MERGE_NOTHING_TO_DO",
+       "INVALID_MERGE_BASE"
       ]
      },
      "message": {
@@ -871,6 +875,380 @@
       "items": {
        "$ref": "#/components/schemas/ContentId"
       }
+     }
+    }
+   },
+   "MergePreviewRequest": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+     "source",
+     "target"
+    ],
+    "properties": {
+     "source": {
+      "$ref": "#/components/schemas/RefName"
+     },
+     "target": {
+      "$ref": "#/components/schemas/RefName"
+     },
+     "strategy": {
+      "type": "string",
+      "enum": [
+       "abort",
+       "take-target",
+       "take-source",
+       "union"
+      ],
+      "default": "abort",
+      "description": "Resolution of structurally conflicting (graph, subject, predicate) slots; `abort` (default) persists nothing when any slot conflicts. `union` is RDF set union, never a semantic judgement (ADR-0024)."
+     },
+     "base": {
+      "anyOf": [
+       {
+        "$ref": "#/components/schemas/ContentId"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "description": "Explicit merge base; must be one of the best common ancestors (required to resolve an ambiguous criss-cross history)."
+     }
+    }
+   },
+   "MergeProposeRequest": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+     "source",
+     "target",
+     "preview_token"
+    ],
+    "properties": {
+     "source": {
+      "$ref": "#/components/schemas/RefName"
+     },
+     "target": {
+      "$ref": "#/components/schemas/RefName"
+     },
+     "strategy": {
+      "type": "string",
+      "enum": [
+       "abort",
+       "take-target",
+       "take-source",
+       "union"
+      ],
+      "default": "abort",
+      "description": "Resolution of structurally conflicting (graph, subject, predicate) slots; `abort` (default) persists nothing when any slot conflicts. `union` is RDF set union, never a semantic judgement (ADR-0024)."
+     },
+     "base": {
+      "anyOf": [
+       {
+        "$ref": "#/components/schemas/ContentId"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "description": "As in the preview."
+     },
+     "preview_token": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "The token of the preview the client saw; the propose recomputes it and refuses with MERGE_STALE on any difference."
+     },
+     "message": {
+      "type": [
+       "string",
+       "null"
+      ],
+      "maxLength": 4096,
+      "description": "Message of the integration commit (empty or null = none)."
+     },
+     "evidence_refs": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      },
+      "maxItems": 64,
+      "description": "Evidence of the integration commit (a set: sorted, de-duplicated)."
+     }
+    }
+   },
+   "MergeApplyRequest": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+     "proposal_id",
+     "preview_token"
+    ],
+    "properties": {
+     "proposal_id": {
+      "type": "integer",
+      "minimum": 1
+     },
+     "preview_token": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+     },
+     "validation_id": {
+      "anyOf": [
+       {
+        "$ref": "#/components/schemas/ContentId"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "description": "A conforming validation of the merge candidate (with semantic_environment_id; ADR-0019)."
+     },
+     "semantic_environment_id": {
+      "anyOf": [
+       {
+        "$ref": "#/components/schemas/ContentId"
+       },
+       {
+        "type": "null"
+       }
+      ],
+      "description": "The current semantic environment of the target."
+     },
+     "reason": {
+      "type": [
+       "string",
+       "null"
+      ],
+      "maxLength": 4096
+     }
+    }
+   },
+   "MergeConflictSide": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+     "quads",
+     "truncated"
+    ],
+    "properties": {
+     "quads": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      },
+      "maxItems": 64
+     },
+     "truncated": {
+      "type": "boolean",
+      "description": "More quads exist on this side than are listed (the 64-quad cap or the report byte budget)."
+     }
+    }
+   },
+   "MergeConflict": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+     "subject",
+     "predicate",
+     "base",
+     "target",
+     "source"
+    ],
+    "properties": {
+     "graph": {
+      "type": "string",
+      "description": "Named graph term; absent for the default graph."
+     },
+     "subject": {
+      "type": "string"
+     },
+     "predicate": {
+      "type": "string"
+     },
+     "base": {
+      "$ref": "#/components/schemas/MergeConflictSide"
+     },
+     "target": {
+      "$ref": "#/components/schemas/MergeConflictSide"
+     },
+     "source": {
+      "$ref": "#/components/schemas/MergeConflictSide"
+     }
+    }
+   },
+   "MergeDeltaSummary": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+     "adds",
+     "deletes",
+     "affected_keys"
+    ],
+    "properties": {
+     "adds": {
+      "type": "integer"
+     },
+     "deletes": {
+      "type": "integer"
+     },
+     "affected_keys": {
+      "type": "integer"
+     }
+    }
+   },
+   "MergePreviewResponse": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+     "classification",
+     "source_head",
+     "target_head",
+     "ahead",
+     "behind",
+     "target_delta",
+     "source_delta",
+     "strategy",
+     "conflict_count",
+     "conflicts",
+     "conflicts_truncated",
+     "correlation_id"
+    ],
+    "properties": {
+     "classification": {
+      "type": "string",
+      "enum": [
+       "already_equal",
+       "already_contained",
+       "no_change",
+       "fast_forward",
+       "divergent",
+       "ambiguous_merge_base",
+       "unrelated_histories",
+       "conflicted"
+      ]
+     },
+     "source_head": {
+      "$ref": "#/components/schemas/ContentId"
+     },
+     "target_head": {
+      "$ref": "#/components/schemas/ContentId"
+     },
+     "merge_base": {
+      "$ref": "#/components/schemas/ContentId"
+     },
+     "merge_base_candidates": {
+      "type": "array",
+      "items": {
+       "$ref": "#/components/schemas/ContentId"
+      },
+      "description": "The first 64 best common ancestors of an ambiguous history, ascending (any of them may be named as `base`).",
+      "maxItems": 64
+     },
+     "merge_base_candidate_count": {
+      "type": "integer",
+      "description": "Exact number of best common ancestors (ambiguous histories only)."
+     },
+     "ahead": {
+      "type": "integer",
+      "description": "Commits the source has that the target lacks."
+     },
+     "behind": {
+      "type": "integer"
+     },
+     "target_delta": {
+      "$ref": "#/components/schemas/MergeDeltaSummary"
+     },
+     "source_delta": {
+      "$ref": "#/components/schemas/MergeDeltaSummary"
+     },
+     "strategy": {
+      "type": "string"
+     },
+     "conflict_count": {
+      "type": "integer",
+      "description": "Exact total of structurally conflicting keys; never affected by the report limits."
+     },
+     "conflicts": {
+      "type": "array",
+      "items": {
+       "$ref": "#/components/schemas/MergeConflict"
+      },
+      "maxItems": 1000,
+      "description": "A deterministic prefix of the conflicting keys in ascending key order: at most 1000 entries, 64 quads per side, and at most the deployment's conflict report byte budget as JSON (LEDGER_LIMIT_MERGE_CONFLICT_REPORT_BYTES, default 2 MiB). Whole quads only. Diagnostic: the merged state, conflict_count and preview_token never depend on these limits (ADR-0024)."
+     },
+     "conflicts_truncated": {
+      "type": "boolean",
+      "description": "`conflicts` is incomplete: a limit (1000 entries, 64 quads per side, or the byte budget) left a conflict or a quad out. `false` means every conflicting key is listed in full."
+     },
+     "merged_state_digest": {
+      "$ref": "#/components/schemas/ContentId"
+     },
+     "preview_token": {
+      "type": "string",
+      "description": "Present exactly when a candidate would result (fast_forward / divergent)."
+     },
+     "correlation_id": {
+      "type": "string"
+     }
+    }
+   },
+   "MergeProposeResponse": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+     "proposal_id",
+     "candidate",
+     "target_head",
+     "source_head",
+     "merge_base",
+     "classification",
+     "strategy",
+     "conflict_count",
+     "merged_state_digest",
+     "preview_token",
+     "replayed",
+     "correlation_id"
+    ],
+    "properties": {
+     "proposal_id": {
+      "type": "integer"
+     },
+     "candidate": {
+      "$ref": "#/components/schemas/ContentId"
+     },
+     "target_head": {
+      "$ref": "#/components/schemas/ContentId"
+     },
+     "source_head": {
+      "$ref": "#/components/schemas/ContentId"
+     },
+     "merge_base": {
+      "$ref": "#/components/schemas/ContentId"
+     },
+     "classification": {
+      "type": "string",
+      "enum": [
+       "fast_forward",
+       "divergent"
+      ]
+     },
+     "strategy": {
+      "type": "string"
+     },
+     "conflict_count": {
+      "type": "integer"
+     },
+     "merged_state_digest": {
+      "$ref": "#/components/schemas/ContentId"
+     },
+     "preview_token": {
+      "type": "string"
+     },
+     "replayed": {
+      "type": "boolean"
+     },
+     "correlation_id": {
+      "type": "string"
      }
     }
    }
@@ -1780,6 +2158,202 @@
        "application/json": {
         "schema": {
          "$ref": "#/components/schemas/BranchLifecycleResponse"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     },
+     "409": {
+      "$ref": "#/components/responses/Error"
+     },
+     "500": {
+      "$ref": "#/components/responses/Error"
+     },
+     "503": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/v1/graphs/{graph}/merges/preview": {
+   "post": {
+    "summary": "Side-effect-free merge preview of `source` into `target` (read capability): classification, merge base, conflicts, merged-state digest and preview token (ADR-0024). Writes nothing.",
+    "parameters": [
+     {
+      "$ref": "#/components/parameters/Graph"
+     },
+     {
+      "$ref": "#/components/parameters/CorrelationId"
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/MergePreviewRequest"
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "preview",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/MergePreviewResponse"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     },
+     "409": {
+      "$ref": "#/components/responses/Error"
+     },
+     "413": {
+      "$ref": "#/components/responses/Error"
+     },
+     "422": {
+      "$ref": "#/components/responses/Error"
+     },
+     "500": {
+      "$ref": "#/components/responses/Error"
+     },
+     "503": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/v1/graphs/{graph}/merges/propose": {
+   "post": {
+    "summary": "Persist the integration candidate [target, source] of a still-current preview as a proposal on the target (propose capability; ADR-0023/0024). Refuses MERGE_STALE, MERGE_CONFLICT, MERGE_NOTHING_TO_DO, INVALID_MERGE_BASE.",
+    "parameters": [
+     {
+      "$ref": "#/components/parameters/Graph"
+     },
+     {
+      "$ref": "#/components/parameters/IdempotencyKey"
+     },
+     {
+      "$ref": "#/components/parameters/CorrelationId"
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/MergeProposeRequest"
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "proposed",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/MergeProposeResponse"
+        }
+       }
+      }
+     },
+     "200": {
+      "description": "replayed",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/MergeProposeResponse"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/Error"
+     },
+     "401": {
+      "$ref": "#/components/responses/Error"
+     },
+     "403": {
+      "$ref": "#/components/responses/Error"
+     },
+     "404": {
+      "$ref": "#/components/responses/Error"
+     },
+     "409": {
+      "$ref": "#/components/responses/Error"
+     },
+     "413": {
+      "$ref": "#/components/responses/Error"
+     },
+     "422": {
+      "$ref": "#/components/responses/Error"
+     },
+     "500": {
+      "$ref": "#/components/responses/Error"
+     },
+     "503": {
+      "$ref": "#/components/responses/Error"
+     }
+    }
+   }
+  },
+  "/v1/graphs/{graph}/merges/apply": {
+   "post": {
+    "summary": "Apply a merge proposal onto its target (review capability; the target's policy and the ADR-0019 validation binding apply). Any movement since the proposal is MERGE_STALE; nothing is recomputed.",
+    "parameters": [
+     {
+      "$ref": "#/components/parameters/Graph"
+     },
+     {
+      "$ref": "#/components/parameters/IdempotencyKey"
+     },
+     {
+      "$ref": "#/components/parameters/CorrelationId"
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/MergeApplyRequest"
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "applied (or replayed)",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/AcceptResponse"
         }
        }
       }

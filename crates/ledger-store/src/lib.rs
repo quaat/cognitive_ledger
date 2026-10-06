@@ -579,11 +579,35 @@ pub use postgres_workflow::{
 #[cfg(feature = "postgres")]
 mod postgres_branches;
 #[cfg(feature = "postgres")]
+mod postgres_merge;
+#[cfg(all(feature = "postgres", feature = "test-hooks"))]
+pub mod test_hooks;
+// The pause points are test infrastructure: an optimized build without debug assertions (any
+// release build) refuses to compile with them, whatever enabled the feature.
+#[cfg(all(feature = "test-hooks", not(debug_assertions)))]
+compile_error!(
+    "ledger-store's `test-hooks` feature (forced-interleaving pause points) is test-only and \
+     cannot be part of a release build"
+);
+/// Whether this build contains the test-only pause points (`test-hooks`); servers refuse to
+/// start when it does.
+pub const TEST_HOOKS_COMPILED: bool = cfg!(feature = "test-hooks");
+#[cfg(feature = "postgres")]
 pub use ledger_dag::TraversalLimits;
+#[cfg(feature = "postgres")]
+pub use ledger_merge::{
+    Conflict as MergeConflictReport, InvalidReportLimit, ReportLimits as MergeReportLimits,
+    Side as MergeSide, Strategy as MergeStrategy,
+};
 #[cfg(feature = "postgres")]
 pub use postgres_branches::{
     BranchEvent, BranchInfo, BranchLifecycleRequest, BranchOutcome, BranchPolicy,
     CreateBranchRequest, RefMovement,
+};
+#[cfg(feature = "postgres")]
+pub use postgres_merge::{
+    ApplyMergeRequest, DeltaSummary, MERGE_ACTIVITY, MergeApplied, MergeClass, MergePreview,
+    MergeProposed, MergeSpec, ProposeMergeRequest,
 };
 #[cfg(feature = "postgres")]
 mod postgres_projection;

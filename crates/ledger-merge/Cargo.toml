@@ -1,0 +1,18 @@
+[package]
+name = "ledger-merge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Deterministic merge classification, three-way structural RDF merge (abort / take-target / take-source / union) and the merge preview-token v1 identity (ADR-0023/0024). Infrastructure-free: no HTTP, SQL or container clients; no reasoning or SHACL."
+
+[dependencies]
+ledger-core = { path = "../ledger-core" }
+ledger-rdf = { path = "../ledger-rdf" }
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -1145,3 +1145,342 @@ async fn each_branch_check_detects_its_own_tampering() {
         .await
         .unwrap();
 }
+
+// =========================================================================================
+// Phase 5 (ADR-0023/0024): every merge check detects its own tampering
+// =========================================================================================
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn each_merge_check_detects_its_own_tampering() {
+    use ledger_store::{
+        ApplyMergeRequest, BranchPolicy, CreateBranchRequest, MergeSpec, MergeStrategy,
+        ProposeMergeRequest, TraversalLimits,
+    };
+    let (admin, pool, db) = fresh_database("verify_mg").await;
+    let g = GraphId::new(unique("g").replace('_', "-")).unwrap();
+    PgGraphs::new(pool.clone())
+        .create(&NewGraph {
+            graph_id: g.clone(),
+            tenant_id: TenantId::new("tenant-v").unwrap(),
+            knowledge_base_id: None,
+            purpose: None,
+            status: GraphStatus::Active,
+        })
+        .await
+        .unwrap();
+    let store = PostgresLedgerStore::from_pool_migrated(pool.clone(), V1Binding::Reject);
+    let wf = store.workflows();
+    let land = |branch: &'static str, head: Option<ledger_core::CommitId>, i: &'static str| {
+        let (wf, g) = (wf.clone(), g.clone());
+        async move {
+            let p = wf
+                .prepare(&PrepareRequest {
+                    scope: scope(&g, &format!("p{i}")),
+                    branch: branch.into(),
+                    expected_head: head.clone(),
+                    requested: patch(&format!("<urn:s{i}> <urn:p> \"{i}\" .")),
+                    activity: "a".into(),
+                    event_time: None,
+                    evidence_refs: vec![],
+                    source_system: None,
+                    message: "m".into(),
+                })
+                .await
+                .unwrap();
+            wf.accept(&AcceptRequest {
+                scope: scope(&g, &format!("a{i}")),
+                branch: branch.into(),
+                expected_head: head,
+                candidate: p.candidate.clone(),
+                reason: None,
+                validation: ValidationPolicy::NoValidation,
+            })
+            .await
+            .unwrap();
+            p.candidate
+        }
+    };
+    let c1 = land("main", None, "m1").await;
+    wf.create_branch(
+        &CreateBranchRequest {
+            scope: scope(&g, "cb"),
+            name: "b".into(),
+            source: "main".into(),
+            from_commit: None,
+            policy: BranchPolicy::default(),
+        },
+        TraversalLimits::DEFAULT,
+    )
+    .await
+    .unwrap();
+    land("b", Some(c1.clone()), "b1").await;
+    let m2 = land("main", Some(c1.clone()), "m2").await;
+    let spec = MergeSpec {
+        source: "b".into(),
+        target: "main".into(),
+        strategy: MergeStrategy::Abort,
+        base: None,
+    };
+    let preview = wf
+        .merge_preview(
+            &TenantId::new("tenant-v").unwrap(),
+            &g,
+            &spec,
+            TraversalLimits::DEFAULT,
+        )
+        .await
+        .unwrap();
+    let token = preview.preview_token.unwrap();
+    let pr = wf
+        .merge_propose(
+            &ProposeMergeRequest {
+                scope: scope(&g, "mp"),
+                spec,
+                preview_token: token.clone(),
+                message: String::new(),
+                evidence_refs: vec![],
+            },
+            TraversalLimits::DEFAULT,
+        )
+        .await
+        .unwrap();
+    wf.merge_apply(&ApplyMergeRequest {
+        scope: scope(&g, "ma"),
+        proposal_id: pr.proposal_id,
+        preview_token: token,
+        reason: None,
+        validation: ValidationPolicy::NoValidation,
+    })
+    .await
+    .unwrap();
+    let clean = verify::run(&pool).await.unwrap();
+    assert!(clean.is_clean(), "{:?}", failing(&clean));
+
+    let bypass = |sql: String, expect: &'static str| {
+        let pool = pool.clone();
+        async move {
+            let mut tx = pool.begin().await.unwrap();
+            for guard in [
+                "ALTER TABLE refs DISABLE TRIGGER ALL",
+                "ALTER TABLE ref_events DISABLE TRIGGER ALL",
+                "ALTER TABLE decisions DISABLE TRIGGER ALL",
+                "ALTER TABLE proposals DISABLE TRIGGER ALL",
+                "ALTER TABLE idempotency DISABLE TRIGGER ALL",
+                "ALTER TABLE merge_proposals DISABLE TRIGGER ALL",
+                "ALTER TABLE branches DISABLE TRIGGER ALL",
+            ] {
+                sqlx::query(guard).execute(&mut *tx).await.unwrap();
+            }
+            let count = |name: &'static str| {
+                format!("SELECT count(*) AS n FROM ({}) v", verify_query(name))
+            };
+            let n: i64 = sqlx::query(&count(expect))
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap()
+                .try_get("n")
+                .unwrap();
+            assert_eq!(n, 0, "{expect}: violated before tampering");
+            sqlx::query(&sql).execute(&mut *tx).await.unwrap();
+            let n: i64 = sqlx::query(&count(expect))
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap()
+                .try_get("n")
+                .unwrap();
+            assert!(n > 0, "{expect}: tampering {sql:?} not detected");
+            tx.rollback().await.unwrap();
+        }
+    };
+    bypass(
+        "UPDATE ref_events SET operation = 'advance' WHERE operation = 'merge'".into(),
+        "every advance installs a candidate with at most one parent and no merge proposal",
+    )
+    .await;
+    bypass(
+        format!("UPDATE ref_events SET operation = 'merge' WHERE new_head = '{m2}'"),
+        "every merge event installs the integration commit of a matching merge proposal",
+    )
+    .await;
+    bypass(
+        format!("UPDATE merge_proposals SET target_head = '{c1}'"),
+        "every merge proposal's target head is its proposal's expected head",
+    )
+    .await;
+    bypass(
+        format!(
+            "UPDATE proposals SET expected_head = '{c1}' WHERE candidate_commit = '{}'",
+            pr.candidate
+        ),
+        "every proposal's candidate has its expected head as parent 0",
+    )
+    .await;
+    bypass(
+        "UPDATE idempotency SET result_decision_id = (SELECT min(decision_id) FROM decisions) WHERE operation = 'merge_apply'".into(),
+        "every merge-apply result names a merge event",
+    )
+    .await;
+    bypass(
+        format!("UPDATE idempotency SET result_commit = '{c1}' WHERE operation = 'merge_propose'"),
+        "every merge-propose result names its merge proposal and candidate",
+    )
+    .await;
+    // c1 was a head of `b` (its branch point) but is not the candidate's parent 1.
+    bypass(
+        format!("UPDATE merge_proposals SET source_head = '{c1}'"),
+        "every merge proposal's candidate has exactly the parents [target head, source head]",
+    )
+    .await;
+    // m2 only ever lived on `main`.
+    bypass(
+        format!("UPDATE merge_proposals SET source_head = '{m2}'"),
+        "every merge proposal's source head was a head of its source branch",
+    )
+    .await;
+    // The same principal proposed, authored the source and applied: allowed on `main`'s
+    // policy, a violation had the target required a distinct reviewer.
+    bypass(
+        "UPDATE branches SET require_distinct_reviewer = true WHERE branch = 'main'".into(),
+        "an applied merge onto a four-eyes branch was applied by a party distinct from its proposer and source authors",
+    )
+    .await;
+    // The Rust-side recomputation (not an SQL check): tamper, commit, observe, on this
+    // throw-away database.
+    sqlx::query("ALTER TABLE merge_proposals DISABLE TRIGGER merge_proposals_write_once")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let recompute_violations = |pool: sqlx::PgPool| async move {
+        verify::run(&pool)
+            .await
+            .unwrap()
+            .checks
+            .iter()
+            .find(|c| c.name == "every merge proposal recomputes from the DAG and immutable states")
+            .unwrap()
+            .violations
+    };
+    // Four-eyes evidence: the source-only commit's proposer is recorded; erasing it (so
+    // that author could review their own change onto the target) is detected.
+    let parties: Vec<String> = sqlx::query_scalar("SELECT source_parties FROM merge_proposals")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!parties.is_empty());
+    sqlx::query("UPDATE merge_proposals SET source_parties = '{}'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(recompute_violations(pool.clone()).await, 1);
+    sqlx::query("UPDATE merge_proposals SET source_parties = $1")
+        .bind(&parties)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(recompute_violations(pool.clone()).await, 0);
+    // The recorded conflict count recomputes: a union merge with one conflicting slot.
+    let land_quad = |branch: &'static str, head: ledger_core::CommitId, i: &'static str, quad| {
+        let (wf, g) = (wf.clone(), g.clone());
+        async move {
+            let p = wf
+                .prepare(&PrepareRequest {
+                    scope: scope(&g, &format!("p{i}")),
+                    branch: branch.into(),
+                    expected_head: Some(head.clone()),
+                    requested: patch(quad),
+                    activity: "a".into(),
+                    event_time: None,
+                    evidence_refs: vec![],
+                    source_system: None,
+                    message: "m".into(),
+                })
+                .await
+                .unwrap();
+            wf.accept(&AcceptRequest {
+                scope: scope(&g, &format!("a{i}")),
+                branch: branch.into(),
+                expected_head: Some(head),
+                candidate: p.candidate.clone(),
+                reason: None,
+                validation: ValidationPolicy::NoValidation,
+            })
+            .await
+            .unwrap();
+            p.candidate
+        }
+    };
+    let merged_head = pr.candidate.clone();
+    wf.create_branch(
+        &CreateBranchRequest {
+            scope: scope(&g, "cu"),
+            name: "u".into(),
+            source: "main".into(),
+            from_commit: None,
+            policy: BranchPolicy::default(),
+        },
+        TraversalLimits::DEFAULT,
+    )
+    .await
+    .unwrap();
+    land_quad("main", merged_head.clone(), "x1", "<urn:x> <urn:p> \"t\" .").await;
+    land_quad("u", merged_head, "x2", "<urn:x> <urn:p> \"s\" .").await;
+    let union = MergeSpec {
+        source: "u".into(),
+        target: "main".into(),
+        strategy: MergeStrategy::Union,
+        base: None,
+    };
+    let preview = wf
+        .merge_preview(
+            &TenantId::new("tenant-v").unwrap(),
+            &g,
+            &union,
+            TraversalLimits::DEFAULT,
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview.conflict_count, 1);
+    wf.merge_propose(
+        &ProposeMergeRequest {
+            scope: scope(&g, "mu"),
+            spec: union,
+            preview_token: preview.preview_token.unwrap(),
+            message: String::new(),
+            evidence_refs: vec![],
+        },
+        TraversalLimits::DEFAULT,
+    )
+    .await
+    .unwrap();
+    assert_eq!(recompute_violations(pool.clone()).await, 0);
+    sqlx::query("UPDATE merge_proposals SET conflict_count = 0 WHERE strategy = 'union'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(recompute_violations(pool.clone()).await, 1);
+    sqlx::query("UPDATE merge_proposals SET conflict_count = 1 WHERE strategy = 'union'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(recompute_violations(pool.clone()).await, 0);
+    sqlx::query(&format!(
+        "UPDATE merge_proposals SET merged_state_digest = 'sha256:{}' WHERE strategy = 'abort'",
+        "0".repeat(64)
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let report = verify::run(&pool).await.unwrap();
+    let recompute = report
+        .checks
+        .iter()
+        .find(|c| c.name == "every merge proposal recomputes from the DAG and immutable states")
+        .unwrap();
+    assert_eq!(recompute.violations, 1);
+    pool.close().await;
+    sqlx::query(&format!("DROP DATABASE {db} WITH (FORCE)"))
+        .execute(&admin)
+        .await
+        .unwrap();
+}

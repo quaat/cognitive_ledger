@@ -148,6 +148,19 @@ pub enum LedgerError {
     /// deleting a deleted branch under a new key).
     #[error("BRANCH_STATE_CONFLICT: {0}")]
     BranchStateConflict(String),
+    /// A merge preview or proposal no longer matches the branches (a head, a branch status
+    /// or the preview token changed since it was computed); preview again (ADR-0024).
+    #[error("MERGE_STALE: {0}")]
+    MergeStale(String),
+    /// A merge under `abort` has structurally conflicting keys (ADR-0024).
+    #[error("MERGE_CONFLICT: {0} conflicting structural key(s)")]
+    MergeConflict(usize),
+    /// Nothing to integrate: already equal, already contained, or no state change.
+    #[error("MERGE_NOTHING_TO_DO: {0}")]
+    MergeNothingToDo(String),
+    /// The histories share no unique merge base and none (or an invalid one) was chosen.
+    #[error("INVALID_MERGE_BASE: {0}")]
+    InvalidMergeBase(String),
     #[error("graph {0} already exists")]
     GraphAlreadyExists(String),
     #[error("graph {0} does not exist")]

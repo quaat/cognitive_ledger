@@ -11,6 +11,7 @@ async-trait.workspace = true
 fs2 = "0.4.3"
 ledger-core = { path = "../ledger-core" }
 ledger-dag = { path = "../ledger-dag" }
+ledger-merge = { path = "../ledger-merge" }
 ledger-rdf = { path = "../ledger-rdf" }
 ledger-validation-protocol = { path = "../ledger-validation-protocol" }
 serde.workspace = true
@@ -22,8 +23,13 @@ tokio = { workspace = true }
 
 [features]
 postgres = ["dep:sqlx"]
+# Deterministic pause points for forced-interleaving tests (`src/test_hooks.rs`). Never
+# enabled by a binary; only this crate's test targets turn it on (dev-dependency below).
+test-hooks = []
 
 [dev-dependencies]
+# Self dev-dependency: the test targets (and only they) build the library with `test-hooks`.
+ledger-store = { path = ".", features = ["test-hooks"] }
 tempfile.workspace = true
 
 [lints]

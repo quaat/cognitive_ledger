@@ -152,9 +152,12 @@ pub enum FailPoint {
 #[derive(Clone, Debug)]
 pub struct WorkflowRepository {
     pub(crate) pool: PgPool,
-    immutable: PostgresImmutableStore,
+    pub(crate) immutable: PostgresImmutableStore,
     failpoint: Option<FailPoint>,
-    limits: crate::ReconstructionLimits,
+    /// A forced-interleaving pause (feature `test-hooks` only; see `crate::test_hooks`).
+    #[cfg(feature = "test-hooks")]
+    pause: Option<crate::test_hooks::PauseHook>,
+    pub(crate) limits: crate::ReconstructionLimits,
     /// The validation service this deployment trusts (ADR-0019). Independent of whether a
     /// validator endpoint is configured; without it, validated acceptance fails closed.
     trust: Option<ValidationTrustPolicy>,
@@ -437,6 +440,8 @@ pub(crate) enum Operation {
     BranchCreate,
     BranchDelete,
     BranchRestore,
+    MergePropose,
+    MergeApply,
 }
 
 impl Operation {
@@ -449,19 +454,21 @@ impl Operation {
             Self::BranchCreate => "branch_create",
             Self::BranchDelete => "branch_delete",
             Self::BranchRestore => "branch_restore",
+            Self::MergePropose => "merge_propose",
+            Self::MergeApply => "merge_apply",
         }
     }
 }
 
 /// A proposal row as accept/reject need it: the ref it was prepared for.
-struct ProposalBinding {
-    proposal_id: i64,
+pub(crate) struct ProposalBinding {
+    pub(crate) proposal_id: i64,
     graph_id: String,
     branch: String,
     expected_head: Option<String>,
 }
 
-fn now() -> Result<LedgerTimestamp, LedgerError> {
+pub(crate) fn now() -> Result<LedgerTimestamp, LedgerError> {
     LedgerTimestamp::try_from_offset_date_time(OffsetDateTime::now_utc())
 }
 
@@ -539,6 +546,8 @@ impl WorkflowRepository {
             pool,
             immutable,
             failpoint: None,
+            #[cfg(feature = "test-hooks")]
+            pause: None,
             limits: crate::ReconstructionLimits::DEVELOPMENT,
             trust: None,
         }
@@ -579,7 +588,21 @@ impl WorkflowRepository {
         self
     }
 
-    fn fail_at(&self, point: FailPoint) -> Result<(), LedgerError> {
+    /// Pause at `hook`'s point (feature `test-hooks` only; never in a release build).
+    #[cfg(feature = "test-hooks")]
+    pub fn with_pause_hook(mut self, hook: crate::test_hooks::PauseHook) -> Self {
+        self.pause = Some(hook);
+        self
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) async fn pause_at(&self, point: crate::test_hooks::HookPoint) {
+        if let Some(hook) = &self.pause {
+            hook.at(point).await;
+        }
+    }
+
+    pub(crate) fn fail_at(&self, point: FailPoint) -> Result<(), LedgerError> {
         if self.failpoint == Some(point) {
             return Err(LedgerError::Storage(format!(
                 "injected failure at {point:?}"
@@ -829,7 +852,7 @@ impl WorkflowRepository {
 
     /// The candidate must be an indexed commit of the caller's graph with a proposal bound
     /// to exactly this ref and expected head, and carry no terminal decision yet.
-    async fn bound_undecided_proposal(
+    pub(crate) async fn bound_undecided_proposal(
         conn: &mut PgConnection,
         scope: &RequestScope,
         branch: &str,
@@ -891,7 +914,7 @@ impl WorkflowRepository {
     }
 
     /// Read the current head and version of a ref, optionally locking the row.
-    async fn read_ref(
+    pub(crate) async fn read_ref(
         conn: &mut PgConnection,
         graph: &GraphId,
         branch: &str,
@@ -1194,6 +1217,100 @@ impl WorkflowRepository {
         })
     }
 
+    /// `require_distinct_reviewer` (ADR-0022): the proposer's and the acceptor's accountable
+    /// parties ({principal, delegator}) must not share a member.
+    pub(crate) async fn require_distinct_parties(
+        conn: &mut PgConnection,
+        proposal_id: i64,
+        scope: &RequestScope,
+    ) -> Result<(), LedgerError> {
+        let proposer =
+            sqlx::query("SELECT principal_id, on_behalf_of FROM proposals WHERE proposal_id = $1")
+                .bind(proposal_id)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(db_error)?;
+        // Distinct accountable parties (ADR-0022): the proposer's {principal, delegator}
+        // and the acceptor's {principal, delegator} must not share a member. Principal
+        // type does not distinguish parties (the same subject under another type, or an
+        // agent acting for the proposer, is the same party).
+        let actor = scope.principal.actor();
+        let proposer_parties = [
+            Some(
+                proposer
+                    .try_get::<String, _>("principal_id")
+                    .map_err(db_error)?,
+            ),
+            proposer
+                .try_get::<Option<String>, _>("on_behalf_of")
+                .map_err(db_error)?,
+        ];
+        let acceptor_parties = [
+            Some(actor.principal_id.as_str().to_owned()),
+            actor.on_behalf_of.as_ref().map(|p| p.as_str().to_owned()),
+        ];
+        let same = proposer_parties
+            .iter()
+            .flatten()
+            .any(|p| acceptor_parties.iter().flatten().any(|a| a == p));
+        if same {
+            return Err(LedgerError::BranchPolicyViolation(
+                "this branch requires a reviewer distinct from the proposer".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// ADR-0019 validation binding shared by acceptance and merge apply: the cited validation
+    /// must exist for this graph and tenant, name this candidate, agree with its context,
+    /// conform, and have run in exactly the semantic environment the reviewer names. Checked
+    /// (on the hashed bytes) before any write. `Required` must be refused by the caller.
+    pub(crate) async fn cite_validation(
+        &self,
+        conn: &mut PgConnection,
+        scope: &RequestScope,
+        candidate: &CommitId,
+        validation: &ValidationPolicy,
+    ) -> Result<Option<crate::postgres_validation::CitedValidation>, LedgerError> {
+        Ok(match validation {
+            ValidationPolicy::Validated {
+                validation_id,
+                semantic_environment_id,
+            } => {
+                let cited = crate::postgres_validation::cited_validation(
+                    &mut *conn,
+                    scope,
+                    candidate,
+                    validation_id,
+                )
+                .await?;
+                // Trust first: the verdict of an untrusted service is neither acted on nor
+                // disclosed (it would otherwise surface as VALIDATION_REJECTED).
+                if !self
+                    .trust
+                    .as_ref()
+                    .is_some_and(|trust| trust.trusts(&cited.validator_service_id))
+                {
+                    return Err(LedgerError::ValidationStale(format!(
+                        "validation {validation_id} was not produced by a validation service this \
+                         deployment trusts"
+                    )));
+                }
+                if !cited.conforms {
+                    return Err(LedgerError::ValidationRejected);
+                }
+                if &cited.environment_id != semantic_environment_id {
+                    return Err(LedgerError::ValidationStale(format!(
+                        "validation {validation_id} was recorded under another semantic environment"
+                    )));
+                }
+                Some(cited)
+            }
+            ValidationPolicy::NoValidation => None,
+            ValidationPolicy::Required => unreachable!("refused above"),
+        })
+    }
+
     /// Accept a prepared candidate onto a ref: ONE transaction with idempotency, tenant and
     /// graph lifecycle, proposal binding, ref lock + lineage against the verified index,
     /// ref advance with version bump, ref event, accepted decision, projection outbox row
@@ -1252,83 +1369,12 @@ impl WorkflowRepository {
         )
         .await?;
         if branch.as_ref().is_some_and(|b| b.require_distinct_reviewer) {
-            let proposer = sqlx::query(
-                "SELECT principal_id, on_behalf_of FROM proposals WHERE proposal_id = $1",
-            )
-            .bind(proposal.proposal_id)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(db_error)?;
-            // Distinct accountable parties (ADR-0022): the proposer's {principal, delegator}
-            // and the acceptor's {principal, delegator} must not share a member. Principal
-            // type does not distinguish parties (the same subject under another type, or an
-            // agent acting for the proposer, is the same party).
-            let actor = scope.principal.actor();
-            let proposer_parties = [
-                Some(
-                    proposer
-                        .try_get::<String, _>("principal_id")
-                        .map_err(db_error)?,
-                ),
-                proposer
-                    .try_get::<Option<String>, _>("on_behalf_of")
-                    .map_err(db_error)?,
-            ];
-            let acceptor_parties = [
-                Some(actor.principal_id.as_str().to_owned()),
-                actor.on_behalf_of.as_ref().map(|p| p.as_str().to_owned()),
-            ];
-            let same = proposer_parties
-                .iter()
-                .flatten()
-                .any(|p| acceptor_parties.iter().flatten().any(|a| a == p));
-            if same {
-                return Err(LedgerError::BranchPolicyViolation(
-                    "this branch requires a reviewer distinct from the proposer".into(),
-                ));
-            }
+            Self::require_distinct_parties(&mut tx, proposal.proposal_id, scope).await?;
         }
 
-        // ADR-0019: the cited validation must exist for this graph and tenant, name this
-        // candidate, agree with its context, conform, and have run in exactly the semantic
-        // environment the reviewer names. Checked (on the hashed bytes) before any write.
-        let cited = match &request.validation {
-            ValidationPolicy::Validated {
-                validation_id,
-                semantic_environment_id,
-            } => {
-                let cited = crate::postgres_validation::cited_validation(
-                    &mut tx,
-                    scope,
-                    &request.candidate,
-                    validation_id,
-                )
-                .await?;
-                // Trust first: the verdict of an untrusted service is neither acted on nor
-                // disclosed (it would otherwise surface as VALIDATION_REJECTED).
-                if !self
-                    .trust
-                    .as_ref()
-                    .is_some_and(|trust| trust.trusts(&cited.validator_service_id))
-                {
-                    return Err(LedgerError::ValidationStale(format!(
-                        "validation {validation_id} was not produced by a validation service this \
-                         deployment trusts"
-                    )));
-                }
-                if !cited.conforms {
-                    return Err(LedgerError::ValidationRejected);
-                }
-                if &cited.environment_id != semantic_environment_id {
-                    return Err(LedgerError::ValidationStale(format!(
-                        "validation {validation_id} was recorded under another semantic environment"
-                    )));
-                }
-                Some(cited)
-            }
-            ValidationPolicy::NoValidation => None,
-            ValidationPolicy::Required => unreachable!("refused above"),
-        };
+        let cited = self
+            .cite_validation(&mut tx, scope, &request.candidate, &request.validation)
+            .await?;
         let validation_ids: Vec<String> =
             cited.iter().map(|c| c.validation_id.to_string()).collect();
 
@@ -1348,9 +1394,11 @@ impl WorkflowRepository {
         .map_err(db_error)?
         .map(|row| row.try_get("parent_id").map_err(db_error))
         .transpose()?;
+        // Merge candidates are installed only by merge apply (ADR-0023/0024; database
+        // triggers of migration 0013 enforce the same).
         if parent_count > 1 {
             return Err(LedgerError::LineageMismatch(
-                "merge commits are not accepted before Phase 5".into(),
+                "a merge candidate is accepted only through merge apply".into(),
             ));
         }
         let operation = match (&current, &request.expected_head) {
@@ -1681,7 +1729,7 @@ impl WorkflowRepository {
 
     /// The enforced decision ↔ validation relation (ADR-0019): PostgreSQL's composite
     /// foreign keys prove both sides name the same graph and candidate.
-    async fn link_decision_validation(
+    pub(crate) async fn link_decision_validation(
         conn: &mut PgConnection,
         decision_id: i64,
         scope: &RequestScope,

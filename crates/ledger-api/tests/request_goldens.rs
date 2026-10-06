@@ -7,9 +7,10 @@
 //! is a protocol change and needs an ADR plus golden review.
 
 use ledger_api::{
-    AcceptBody, ApiLimits, BranchLifecycleBody, CreateBranchBody, PrepareBody, RejectBody,
-    ValidateBody, canonical_accept, canonical_branch_create, canonical_branch_lifecycle,
-    canonical_prepare, canonical_reject, canonical_validate, request_identity::CanonicalRequest,
+    AcceptBody, ApiLimits, BranchLifecycleBody, CreateBranchBody, MergeApplyBody, MergeProposeBody,
+    PrepareBody, RejectBody, ValidateBody, canonical_accept, canonical_branch_create,
+    canonical_branch_lifecycle, canonical_merge_apply, canonical_merge_propose, canonical_prepare,
+    canonical_reject, canonical_validate, request_identity::CanonicalRequest,
 };
 use ledger_core::{CommitId, GraphId};
 use serde_json::{Value, json};
@@ -42,6 +43,26 @@ fn through_the_api(input: &Value) -> CanonicalRequest {
                 canonical_branch_lifecycle(&graph, kind == "delete", &body, "golden").unwrap()
             }
             other => panic!("unknown branch operation {other}"),
+        };
+    }
+    // Merge bodies are sent as-is (ADR-0024).
+    if let Some(kind) = operation.strip_prefix("merge_") {
+        let mut body = input.clone();
+        let obj = body.as_object_mut().unwrap();
+        obj.remove("operation");
+        obj.remove("graph_id");
+        return match kind {
+            "propose" => {
+                let body: MergeProposeBody =
+                    serde_json::from_value(body).expect("valid merge propose body");
+                canonical_merge_propose(&graph, &body, "golden").unwrap()
+            }
+            "apply" => {
+                let body: MergeApplyBody =
+                    serde_json::from_value(body).expect("valid merge apply body");
+                canonical_merge_apply(&graph, &body, "golden").unwrap()
+            }
+            other => panic!("unknown merge operation {other}"),
         };
     }
     let mut body = input.clone();
@@ -112,8 +133,8 @@ fn every_request_identity_vector_matches_bytes_and_digest_through_the_handlers()
         );
     }
     assert!(
-        count == 21,
-        "expected exactly 21 request vectors (6 v1 + 6 v2 + 9 branch v1), found {count}"
+        count == 26,
+        "expected exactly 26 request vectors (6 v1 + 6 v2 + 9 branch v1 + 5 merge v1), found {count}"
     );
 }
 

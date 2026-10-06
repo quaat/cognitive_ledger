@@ -1873,7 +1873,34 @@ impl Harness {
 
     /// prepare → validate → accept on `branch` from `head`; returns the new head.
     async fn step_on(&self, g: &GraphId, t: &str, branch: &str, head: &str, quad: &str) -> String {
-        let (status, p) = self.prepare_on(g, t, branch, head, quad).await;
+        self.step_adding(g, t, branch, head, &[quad]).await
+    }
+
+    /// [`Self::step_on`] adding several quads in one commit.
+    async fn step_adding(
+        &self,
+        g: &GraphId,
+        t: &str,
+        branch: &str,
+        head: &str,
+        quads: &[&str],
+    ) -> String {
+        let operations: Vec<Value> = quads
+            .iter()
+            .map(|q| json!({"op": "add", "quad": q}))
+            .collect();
+        let (status, p) = self
+            .call(
+                "POST",
+                &format!("/v1/graphs/{g}/proposals"),
+                t,
+                Some(&unique("p")),
+                Some(json!({
+                    "ref": branch, "expected_head": head, "operations": operations,
+                    "activity": "cognitive-correction", "message": "m",
+                })),
+            )
+            .await;
         assert_eq!(status, StatusCode::CREATED, "{p}");
         let c = p["candidate"].as_str().unwrap().to_owned();
         let (status, v) = self.validate(g, t, &c, &unique("v"), json!({})).await;
@@ -2067,8 +2094,13 @@ async fn a_validated_multi_step_cognitive_workflow_runs_on_a_branch_while_main_s
         .count("SELECT count(*) FROM projection_outbox WHERE graph_id = $1 AND branch = 'agent/task-17'", &g)
         .await;
     assert_eq!(outbox_branch, 3);
-    let unconfigured = ledger_store::ProjectionRepository::new(h.owner.pool().clone())
-        .unconfigured_pending()
+    // Both global readings in one snapshot: other tests write outbox rows concurrently.
+    let mut snapshot = h.owner.pool().begin().await.unwrap();
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *snapshot)
+        .await
+        .unwrap();
+    let unconfigured = ledger_store::ProjectionRepository::unconfigured_pending_on(&mut snapshot)
         .await
         .unwrap();
     let main_pending = sqlx::query_scalar::<_, i64>(
@@ -2076,9 +2108,10 @@ async fn a_validated_multi_step_cognitive_workflow_runs_on_a_branch_while_main_s
          AND NOT EXISTS (SELECT 1 FROM projection_state s WHERE s.graph_id = o.graph_id AND s.branch = o.branch \
                          AND s.status <> 'disabled')",
     )
-    .fetch_one(h.owner.pool())
+    .fetch_one(&mut *snapshot)
     .await
     .unwrap();
+    snapshot.rollback().await.unwrap();
     assert_eq!(
         unconfigured, main_pending,
         "non-main branch traffic is not a projection backlog"
@@ -2373,4 +2406,423 @@ async fn deleted_branches_are_readable_but_frozen_and_lifecycle_retries_replay()
         .map(|e| e["operation"].as_str().unwrap())
         .collect();
     assert_eq!(ops, vec!["created", "deleted", "restored"]);
+}
+
+/// Phase 5 over HTTP (ADR-0023/0024): read-only preview, propose, and apply onto `main`
+/// bound to a validation of the merged candidate. The merged state's acceptability depends
+/// on the external (Virtual A-Box) source version: validated under D-A it conforms, under
+/// D-B it does not; an apply naming another environment than its validation's is stale.
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn a_validated_merge_onto_main_binds_the_merged_state_in_its_semantic_environment() {
+    let h = harness().await;
+    let g = h.graph("tenant-mg").await;
+    let admin = token("tenant-mg", "operator", &ADMIN);
+    let agent = token("tenant-mg", "agent-7", &ROLES);
+    let reviewer = token("tenant-mg", "reviewer-1", &ROLES);
+    let reader = token("tenant-mg", "reader", &["ledger.read"]);
+    let c100 = h.main_history(&g, &admin, 1).await.remove(0);
+    let (status, created) = h
+        .create_branch(
+            &g,
+            &agent,
+            "mg-b",
+            json!({"name": "agent/m", "source": "main"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    // Divergence: the branch adds A-Box-dependent material, main adds something else.
+    let s1 = h
+        .step_on(
+            &g,
+            &agent,
+            "agent/m",
+            &c100,
+            "<urn:material:abox-dependent> <urn:p> \"m\" .",
+        )
+        .await;
+    let m1 = h
+        .step_on(
+            &g,
+            &admin,
+            "main",
+            &c100,
+            "<urn:main:other> <urn:p> \"o\" .",
+        )
+        .await;
+    let body = json!({"source": "agent/m", "target": "main"});
+    // Preview is a read: the reader may preview, nothing is written.
+    let (status, p) = h
+        .call(
+            "POST",
+            &format!("/v1/graphs/{g}/merges/preview"),
+            &reader,
+            None,
+            Some(body.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{p}");
+    assert_eq!(p["classification"], "divergent");
+    assert_eq!(p["merge_base"], c100);
+    assert_eq!(
+        (p["ahead"].as_i64(), p["behind"].as_i64()),
+        (Some(1), Some(1))
+    );
+    let token_v = p["preview_token"].as_str().unwrap().to_owned();
+    // Propose needs the propose capability.
+    let mut propose = body.clone();
+    propose["preview_token"] = json!(token_v);
+    let (status, _) = h
+        .call(
+            "POST",
+            &format!("/v1/graphs/{g}/merges/propose"),
+            &reader,
+            Some("mg-p0"),
+            Some(propose.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, pr) = h
+        .call(
+            "POST",
+            &format!("/v1/graphs/{g}/merges/propose"),
+            &agent,
+            Some("mg-p1"),
+            Some(propose.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{pr}");
+    let candidate = pr["candidate"].as_str().unwrap().to_owned();
+    assert_eq!(pr["merged_state_digest"], p["merged_state_digest"]);
+    assert_eq!(
+        h.head(&g).await,
+        Some((m1.clone(), 2)),
+        "propose moves nothing"
+    );
+    // Validate the merged candidate under two external versions.
+    let pin = |v: &str| json!({"sources_revision": format!("catalog-{v}")});
+    let (sa, va) = h
+        .validate(&g, &agent, &candidate, "mg-va", pin("D-A"))
+        .await;
+    let (sb, vb) = h
+        .validate(&g, &agent, &candidate, "mg-vb", pin("D-B"))
+        .await;
+    assert_eq!(
+        (sa, sb),
+        (StatusCode::CREATED, StatusCode::CREATED),
+        "{va} {vb}"
+    );
+    assert_eq!(
+        (va["conforms"].as_bool(), vb["conforms"].as_bool()),
+        (Some(true), Some(false))
+    );
+    let apply = |validation: &Value, environment: &Value| {
+        json!({
+            "proposal_id": pr["proposal_id"], "preview_token": token_v,
+            "validation_id": validation["validation_id"],
+            "semantic_environment_id": environment["semantic_environment_id"],
+            "reason": "merge reviewed",
+        })
+    };
+    let path = format!("/v1/graphs/{g}/merges/apply");
+    // Non-conforming under D-B: rejected.
+    let (status, e) = h
+        .call(
+            "POST",
+            &path,
+            &reviewer,
+            Some("mg-a1"),
+            Some(apply(&vb, &vb)),
+        )
+        .await;
+    assert_eq!(
+        (status, e["code"].as_str()),
+        (StatusCode::CONFLICT, Some("VALIDATION_REJECTED")),
+        "{e}"
+    );
+    // The D-A validation cited in the D-B environment: stale (the A-Box version changed).
+    let (status, e) = h
+        .call(
+            "POST",
+            &path,
+            &reviewer,
+            Some("mg-a2"),
+            Some(apply(&va, &vb)),
+        )
+        .await;
+    assert_eq!(e["code"].as_str(), Some("VALIDATION_STALE"), "{status} {e}");
+    // The deployment floor (RequireValidation): no validation cited → refused.
+    let (status, e) = h
+        .call(
+            "POST",
+            &path,
+            &reviewer,
+            Some("mg-a-none"),
+            Some(json!({"proposal_id": pr["proposal_id"], "preview_token": token_v})),
+        )
+        .await;
+    assert_eq!(
+        (status, e["code"].as_str()),
+        (StatusCode::CONFLICT, Some("VALIDATION_REQUIRED")),
+        "{e}"
+    );
+    // A validation of another candidate (the source tip) never validates the merge.
+    let (_, vs) = h.validate(&g, &agent, &s1, "mg-vs", pin("D-A")).await;
+    let (status, e) = h
+        .call(
+            "POST",
+            &path,
+            &reviewer,
+            Some("mg-a-src"),
+            Some(apply(&vs, &vs)),
+        )
+        .await;
+    assert_eq!(
+        (status, e["code"].as_str()),
+        (StatusCode::CONFLICT, Some("LINEAGE_MISMATCH")),
+        "{e}"
+    );
+    // Apply needs review; another tenant sees no graph.
+    let proposer_only = token("tenant-mg", "p-only", &["ledger.read", "ledger.propose"]);
+    let (status, _) = h
+        .call(
+            "POST",
+            &path,
+            &proposer_only,
+            Some("mg-a-po"),
+            Some(apply(&va, &va)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let other = token("tenant-other", "x", &ROLES);
+    let (status, _) = h
+        .call(
+            "POST",
+            &path,
+            &other,
+            Some("mg-a-ot"),
+            Some(apply(&va, &va)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // Conforming in its own environment: applied onto main.
+    let (status, a) = h
+        .call(
+            "POST",
+            &path,
+            &reviewer,
+            Some("mg-a3"),
+            Some(apply(&va, &va)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{a}");
+    assert_eq!(a["head"], candidate);
+    assert_eq!(h.head(&g).await, Some((candidate.clone(), 3)));
+    let (_, again) = h
+        .call(
+            "POST",
+            &path,
+            &reviewer,
+            Some("mg-a3"),
+            Some(apply(&va, &va)),
+        )
+        .await;
+    assert_eq!(again["replayed"], true);
+    // The merged state holds both sides.
+    let (status, st) = h
+        .call(
+            "GET",
+            &format!("/v1/graphs/{g}/commits/{candidate}/state"),
+            &agent,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let quads: Vec<&str> = st["quads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|q| q.as_str().unwrap())
+        .collect();
+    assert!(quads.contains(&"<urn:material:abox-dependent> <urn:p> \"m\" ."));
+    assert!(quads.contains(&"<urn:main:other> <urn:p> \"o\" ."));
+    // Repeating the merge: contained. Another tenant sees nothing.
+    let (_, p2) = h
+        .call(
+            "POST",
+            &format!("/v1/graphs/{g}/merges/preview"),
+            &reader,
+            None,
+            Some(body.clone()),
+        )
+        .await;
+    assert_eq!(p2["classification"], "already_contained");
+    let foreign = token("tenant-other", "x", &ROLES);
+    let (status, _) = h
+        .call(
+            "POST",
+            &format!("/v1/graphs/{g}/merges/preview"),
+            &foreign,
+            None,
+            Some(body),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// ADR-0024 conflict report byte budget: large legal terms in conflicting slots. Under a tiny
+/// budget the preview lists a deterministic prefix within the budget and says so; the
+/// classification, exact conflict count, merged-state digest and preview token are those of a
+/// server with the default budget, and a token previewed under the tiny budget proposes.
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn the_conflict_report_has_a_byte_budget_that_never_changes_the_merge() {
+    const TINY: usize = 4 * 1024;
+    let big_terms = ApiLimits {
+        max_term_bytes: 64 * 1024,
+        ..ApiLimits::default()
+    };
+    let h = harness_with(
+        ApiLimits {
+            max_merge_conflict_report_bytes: TINY,
+            ..big_terms
+        },
+        true,
+    )
+    .await;
+    let roomy = Harness {
+        owner: h.owner.clone(),
+        app: app_for(
+            &h.runtime_url,
+            big_terms,
+            &h.validator,
+            Some(SERVICE_ID),
+            Some(SERVICE_ID),
+        )
+        .await,
+        validator: h.validator.clone(),
+        runtime_url: h.runtime_url.clone(),
+        limits: big_terms,
+    };
+    let g = h.graph("tenant-cr").await;
+    let admin = token("tenant-cr", "operator", &ADMIN);
+    let agent = token("tenant-cr", "agent-3", &ROLES);
+    let reader = token("tenant-cr", "reader", &["ledger.read"]);
+    let c1 = h.main_history(&g, &admin, 1).await.remove(0);
+    let (status, created) = h
+        .create_branch(
+            &g,
+            &agent,
+            "cr-b",
+            json!({"name": "agent/cr", "source": "main"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    // Six slots both sides fill differently, each with a ~16 KiB literal full of characters
+    // that N-Quads and then JSON escape again.
+    const SLOTS: usize = 6;
+    let heavy = |side: &str, i: usize| {
+        let mut lit = format!("{side}{i}-");
+        while lit.len() < 16 * 1024 {
+            lit.push_str("q\\\"b\\nc\\\\é");
+        }
+        format!("<urn:cr:slot:{i}> <urn:cr:p> \"{lit}\" .")
+    };
+    let target_quads: Vec<String> = (0..SLOTS).map(|i| heavy("t", i)).collect();
+    let source_quads: Vec<String> = (0..SLOTS).map(|i| heavy("s", i)).collect();
+    fn refs(v: &[String]) -> Vec<&str> {
+        v.iter().map(String::as_str).collect()
+    }
+    h.step_adding(&g, &admin, "main", &c1, &refs(&target_quads))
+        .await;
+    h.step_adding(&g, &agent, "agent/cr", &c1, &refs(&source_quads))
+        .await;
+
+    async fn preview(server: &Harness, g: &GraphId, reader: &str, strategy: &str) -> Value {
+        let body = json!({"source": "agent/cr", "target": "main", "strategy": strategy});
+        let (status, p) = server
+            .call(
+                "POST",
+                &format!("/v1/graphs/{g}/merges/preview"),
+                reader,
+                None,
+                Some(body),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{p}");
+        p
+    }
+    for strategy in ["abort", "union", "take-source"] {
+        let tiny = preview(&h, &g, &reader, strategy).await;
+        let full = preview(&roomy, &g, &reader, strategy).await;
+        // The merge is the same; only the report differs.
+        for field in [
+            "classification",
+            "conflict_count",
+            "merged_state_digest",
+            "preview_token",
+            "merge_base",
+            "target_delta",
+            "source_delta",
+        ] {
+            assert_eq!(tiny[field], full[field], "{strategy}: {field}");
+        }
+        assert_eq!(tiny["conflict_count"], SLOTS);
+        // The default budget holds the whole report; the tiny one does not.
+        assert_eq!(full["conflicts_truncated"], false);
+        assert_eq!(full["conflicts"].as_array().unwrap().len(), SLOTS);
+        assert_eq!(tiny["conflicts_truncated"], true);
+        let details = serde_json::to_string(&tiny["conflicts"]).unwrap();
+        assert!(
+            details.len() <= TINY + 2,
+            "{strategy}: {} bytes of detail over a {TINY}-byte budget",
+            details.len()
+        );
+        // Whole quads only, each a quad of its side in the full report; a deterministic
+        // prefix of the full report.
+        let listed = tiny["conflicts"].as_array().unwrap();
+        assert!(!listed.is_empty(), "the slot key fits the tiny budget");
+        for (i, c) in listed.iter().enumerate() {
+            let f = &full["conflicts"][i];
+            assert_eq!(
+                (&c["subject"], &c["predicate"]),
+                (&f["subject"], &f["predicate"])
+            );
+            for side in ["base", "target", "source"] {
+                let (cq, fq) = (
+                    c[side]["quads"].as_array().unwrap(),
+                    f[side]["quads"].as_array().unwrap(),
+                );
+                assert!(fq.starts_with(cq), "{strategy}: {side} is a prefix");
+                assert_eq!(c[side]["truncated"], cq.len() < fq.len());
+            }
+        }
+        // The same inputs report exactly the same prefix.
+        assert_eq!(
+            preview(&h, &g, &reader, strategy).await["conflicts"],
+            tiny["conflicts"]
+        );
+        if strategy == "abort" {
+            assert_eq!(tiny["classification"], "conflicted");
+            assert!(tiny.get("preview_token").is_none());
+        }
+    }
+    // A token previewed under the tiny budget is the merge's token: it proposes.
+    let tiny = preview(&h, &g, &reader, "union").await;
+    let (status, pr) = h
+        .call(
+            "POST",
+            &format!("/v1/graphs/{g}/merges/propose"),
+            &agent,
+            Some("cr-propose"),
+            Some(json!({
+                "source": "agent/cr", "target": "main", "strategy": "union",
+                "preview_token": tiny["preview_token"],
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{pr}");
+    assert_eq!(pr["merged_state_digest"], tiny["merged_state_digest"]);
+    assert_eq!(pr["conflict_count"], SLOTS);
 }

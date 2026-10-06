@@ -1612,6 +1612,27 @@ Gate:
 
 the end-to-end validation flow specified by the architecture must pass.
 
+> **Roadmap reconciliation (2026-10-06, recorded in Plan 0009).** The wording above asks
+> for "the Sculpin semantic-validator adapter" and a complete semantic flow with Jena
+> SHACL, reasoning and Virtual A-Box. What Phase 2 actually delivered and qualified (Plan
+> 0006, ADR-0014/0018/0019) is the **ledger side** of that flow:
+> `SemanticExecutionContext`, `ValidationRecord`, validator authentication, the hardened
+> validator client, freshness and the acceptance binding, end to end against a protocol-
+> conformant fake validator. That matches the validator-agnostic boundary of §§8–11 and the
+> architecture: the ledger never embeds SHACL or reasoning.
+>
+> Status therefore reads:
+> - **Phase-2 ledger infrastructure: complete.**
+> - **Live Sculpin semantic service** (pySHACL/reasoning/Virtual A-Box behind the
+>   protocol): an **external product-integration prerequisite, not done**. It is carried
+>   into Phase 8 (Sculpin product integration) and remains a production-qualification
+>   blocker (`docs/exec-plans/tech-debt.md`, Plan 0006 "PENDING_EXTERNAL").
+>
+> Read literally, the Phase-2 gate above ("the end-to-end validation flow … must pass")
+> includes the live service. Under that reading it has **not** passed. Phase 2 is complete
+> only in the reconciled sense stated here, and nothing in Phases 3–5 depends on the live
+> service.
+
 ---
 
 ## Phase 3 — Fuseki cognitive projection

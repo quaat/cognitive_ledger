@@ -8,6 +8,8 @@
 - Migration 0009 aborts on a corrupt `immutable_objects` row with a raw `23514` naming no ids (the README convention is guards that name rows); the runbook says to run `verify` first. Add a pre-check guard that lists offending ids, and document the `ACCESS EXCLUSIVE` hashing window. Also: a graph moved from `importing` to `active` after raw ref moves has no `ref_events` for them and fails the verifier's version-equals-events check permanently — activation needs an audited path (Phase 4 admin flow).
 - Fault injection (Plan 0005 slice 4): the lost-response-after-COMMIT case is deterministic only in the `FailPoint` unit test; at the HTTP level random SIGKILLs hit the sub-millisecond COMMIT-to-response window by chance (0–3 observations per run). A `fault-injection` cargo feature that aborts the process right after the workflow transaction commits — compiled only into a separate qualification image, never into the runtime image — would make it deterministic.
 
+- Repository governance (observed 2026-10-06): the GitHub `main` branch has no branch protection or ruleset. Before a production release, enable a ruleset requiring a pull request, the required CI checks (ci-fast, ci-integration, ci-security, ci-fuzz), a review, and no direct pushes to `main`. Not changed automatically (repository policy is the owner's).
+
 ## Phase 2 (Plan 0006) external prerequisites and residuals
 
 - **Sculpin validation endpoint — EXTERNAL PREREQUISITE.** The ledger-side contract, client and
@@ -113,6 +115,63 @@
 - Live Fluree branch differential: deferred with the rest of the Fluree comparison (BUSL-1.1 sign-off pending); not run, not counted.
 - Merge-base, merge, conflicts, checkpoints and GC of deleted branches are Phase 5+ (product plan).
 - Activating a raw-imported graph (`bootstrap`/`importing` → `active`) adopts its refs as branches, but the imported heads still have no ref events (Phase-1 import semantics), so `ledger-admin verify` reports the ref-version and lifecycle-position checks for that graph. The audited import/activation command (P1.5 blocker above) must write the import's ref events before activation.
+
+## Phase 5 (Plan 0009) residuals and accepted risk
+
+- Merge ancestry walks compute full ancestor sets of both heads in memory, bounded by the
+  visit limit (100 000) and a 10 s deadline. Very long-lived branches eventually hit the
+  limit (`RESOURCE_LIMIT`, never a wrong answer). Generation numbers and checkpoints are
+  Phase 6.
+- Each preview reconstructs three full states (base, target, source), bounded by the
+  reconstruction limits and the expensive-operation slot. Incremental diff (`change_index`)
+  is deferred until measurements require it (product plan §15).
+- The structural slot key `(graph, subject, predicate)` conservatively flags multi-valued
+  predicates (for example, two different `rdf:type` additions) as conflicts. A per-quad
+  strategy would be a new algorithm id (ADR-0024).
+- Criss-cross histories need an explicit `base`. Virtual merge-base synthesis needs a
+  later ADR.
+- Every `propose` persists an immutable candidate, proposal and merge row, with no GC in
+  v1. Re-proposing after staleness adds rows; superseded merge proposals are retired by
+  `reject`.
+- Fast-forward-class merges create an integration commit rather than moving the target to
+  the source commit (ADR-0023). Ref equality between target and source after a merge is not
+  provided; option B (a database-verified descendant jump) would need its own ADR and
+  migration.
+- The Virtual A-Box-dependent merge validation is qualified against the protocol-conformant
+  fake validator. The live Sculpin service remains an external prerequisite (Phase 8).
+- Merge computation runs inline on an async worker and holds the base, target, source and
+  merged states plus the summary diffs at once (roughly 6–8 times one state's budget at
+  the limits). It is bounded by the 3-slot admission weight and the reconstruction limits.
+  Computing keys only for the changed quads, starting from T, and running under
+  `spawn_blocking` are measured-later optimizations. The admission semaphore is global,
+  not per tenant.
+- Resolved (Plan 0009 closure): the conflict report now also has a byte budget
+  (`LEDGER_LIMIT_MERGE_CONFLICT_REPORT_BYTES`, default 2 MiB) and a report-level
+  `conflicts_truncated` flag (ADR-0024 "Conflict report byte budget"). The budget bounds the
+  report only; the merge itself still holds the full states (item above).
+- `verify` recomputes merges under `ReconstructionLimits::DEVELOPMENT` and
+  `TraversalLimits::DEFAULT`, not the deployment's configured limits. A deployment that
+  raises them sees valid large merges reported as violations. This fails closed (a false
+  alarm, never a missed fault); pass the configured limits to `ledger-admin verify` when
+  limits are raised (review, 2026-10-06).
+- A merge walks each side's whole ancestry (`analyze_with_ancestries`, 100 000-visit cap),
+  so very long histories cannot merge even when the base is recent (`RESOURCE_LIMIT`, fails
+  closed). Generation numbers and checkpoints are Phase-6 measurement items.
+- Merge preview builds the integration patch and the source-only set even for API
+  previews, which discard them. This is a small allocation saving for Phase 6.
+- `scripts/upgrade-p5.sh` merges one fast-forward-class branch on upgraded data (now with
+  exact row-count assertions). Divergent and explicit-base merges on upgraded data rely on
+  the DDL identity of clean and upgraded 0013 and on the PostgreSQL suites.
+- Forced-interleaving pauses exist only under the non-default `ledger-store` feature
+  `test-hooks` (two points today, both in propose: after the first replay lookup, and just
+  before `COMMIT`; enforced absent from every app build by `check-architecture.py`). Further races that are now forced by holding database locks could move to
+  such pauses if those tests become slow or brittle.
+- The preview token binds the chosen strategy even when no slot conflicts, so previewing
+  with `abort` and proposing with `union` is `MERGE_STALE`. This is intended and documented;
+  normalizing it would be a token v2.
+- Live Fluree merge differential: deferred (BUSL-1.1 approval pending). It has not been run
+  and is not counted; the ledger-dag and ledger-merge property suites against independent
+  reference models replace it internally.
 
 ## Later-phase work and accepted residual risk (does not block Phase 2 or the P1.5 gate)
 

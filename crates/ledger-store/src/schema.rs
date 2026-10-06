@@ -92,7 +92,7 @@ pub async fn grant_runtime_role(conn: &mut PgConnection, role: &str) -> Result<(
 pub const CONTENT_SCHEMA_VERSION: i64 = 5;
 /// The exact schema level this build requires at runtime (startup and readiness refuse
 /// anything else, ADR-0016).
-pub const REQUIRED_SCHEMA_VERSION: i64 = 12;
+pub const REQUIRED_SCHEMA_VERSION: i64 = 13;
 
 /// What `verify` found.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -454,6 +454,43 @@ const GUARD_TRIGGERS: &[ExpectedTrigger] = &[
         false,
         &[],
     ),
+    // 0013: diff and merge (ADR-0023/0024)
+    before(
+        "merge_proposals_write_once",
+        "merge_proposals",
+        "ledger_rows_are_write_once",
+        false,
+        true,
+        true,
+        &[],
+    ),
+    before(
+        "merge_proposals_lineage",
+        "merge_proposals",
+        "merge_proposals_match_lineage",
+        true,
+        false,
+        false,
+        &[],
+    ),
+    before(
+        "ref_events_kind",
+        "ref_events",
+        "ref_events_kind_matches_candidate",
+        true,
+        false,
+        false,
+        &[],
+    ),
+    before(
+        "decisions_merge_kind",
+        "decisions",
+        "decisions_merge_kind",
+        true,
+        false,
+        false,
+        &[],
+    ),
     // 0012: named branches (ADR-0022)
     before(
         "branch_events_write_once",
@@ -583,6 +620,9 @@ const GUARD_FUNCTIONS: &[&str] = &[
     "refs_branch_is_active",
     "proposals_branch_is_active",
     "graphs_adopt_refs_on_activation",
+    "merge_proposals_match_lineage",
+    "ref_events_kind_matches_candidate",
+    "decisions_merge_kind",
 ];
 
 /// Parse every `CREATE OR REPLACE FUNCTION … AS $$ … $$` in the embedded migrations (up to
@@ -887,6 +927,28 @@ const fn uq(table: &'static str, columns: &'static [&'static str]) -> ExpectedCo
 /// control (a column that is additionally `NOT NULL` is harmless and accepted).
 pub const EXPECTED_NOT_NULL: &[(&str, &[&str])] = &[
     (
+        "merge_proposals",
+        &[
+            "proposal_id",
+            "graph_id",
+            "target_branch",
+            "candidate_commit",
+            "target_head",
+            "source_branch",
+            "source_head",
+            "merge_base",
+            "base_explicit",
+            "classification",
+            "strategy",
+            "merge_algorithm",
+            "conflict_count",
+            "merged_state_digest",
+            "preview_token",
+            "source_parties",
+            "created_at",
+        ],
+    ),
+    (
         "branches",
         &[
             "graph_id",
@@ -1103,6 +1165,50 @@ pub const EXPECTED_NOT_NULL: &[(&str, &[&str])] = &[
 ];
 
 const EXPECTED_CONSTRAINTS: &[ExpectedConstraint] = &[
+    // 0013: diff and merge (ADR-0024)
+    pk("merge_proposals", &["proposal_id"]),
+    fk(
+        "merge_proposals",
+        &[
+            "proposal_id",
+            "graph_id",
+            "target_branch",
+            "candidate_commit",
+        ],
+        "proposals",
+        &["proposal_id", "graph_id", "branch", "candidate_commit"],
+    ),
+    uq("merge_proposals", &["candidate_commit"]),
+    fk(
+        "merge_proposals",
+        &["graph_id", "target_head"],
+        "commit_index",
+        &["graph_id", "id"],
+    ),
+    fk(
+        "merge_proposals",
+        &["graph_id", "source_head"],
+        "commit_index",
+        &["graph_id", "id"],
+    ),
+    fk(
+        "merge_proposals",
+        &["graph_id", "merge_base"],
+        "commit_index",
+        &["graph_id", "id"],
+    ),
+    fk(
+        "merge_proposals",
+        &["graph_id", "source_branch"],
+        "branches",
+        &["graph_id", "branch"],
+    ),
+    fk(
+        "merge_proposals",
+        &["graph_id", "target_branch"],
+        "branches",
+        &["graph_id", "branch"],
+    ),
     // 0012: named branches (ADR-0022)
     pk("branches", &["graph_id", "branch"]),
     fk(
@@ -1504,6 +1610,57 @@ const EXPECTED_UNIQUE_INDEXES: &[(&str, &str, &[&str], &str)] = &[
 /// compared by deparse at start-up and by expression fingerprint on readiness, so a same-named
 /// vacuous replacement cannot pass; the Rust layer enforces the same domain rules independently.
 const EXPECTED_CHECKS: &[(&str, &str, &str)] = &[
+    // 0013: diff and merge (ADR-0024)
+    (
+        "idempotency",
+        "idempotency_merge_shape",
+        "CHECK((((operation='merge_propose')=(result_kind='merge_proposed'))AND((operation='merge_apply')=(result_kind='merge_applied'))AND((result_kind<>'merge_proposed')OR((result_proposal_idISNOTNULL)AND(result_commitISNOTNULL)))AND((result_kind<>'merge_applied')OR((result_decision_idISNOTNULL)AND(result_ref_versionISNOTNULL)AND(result_commitISNOTNULL)))))",
+    ),
+    (
+        "merge_proposals",
+        "merge_proposals_abort_clean",
+        "CHECK(((strategy<>'abort')OR(conflict_count=0)))",
+    ),
+    (
+        "merge_proposals",
+        "merge_proposals_algorithm",
+        "CHECK((merge_algorithm='structural-slot/v1'))",
+    ),
+    (
+        "merge_proposals",
+        "merge_proposals_classification",
+        "CHECK((classification=ANY(ARRAY['fast_forward','divergent'])))",
+    ),
+    (
+        "merge_proposals",
+        "merge_proposals_conflicts",
+        "CHECK((conflict_count>=0))",
+    ),
+    (
+        "merge_proposals",
+        "merge_proposals_digest_format",
+        "CHECK((merged_state_digest~'^sha256:[0-9a-f]{64}$'))",
+    ),
+    (
+        "merge_proposals",
+        "merge_proposals_distinct_branches",
+        "CHECK((source_branch<>target_branch))",
+    ),
+    (
+        "merge_proposals",
+        "merge_proposals_fast_forward_shape",
+        "CHECK(((classification<>'fast_forward')OR((conflict_count=0)AND(merge_base=target_head)AND(strategy='abort'))))",
+    ),
+    (
+        "merge_proposals",
+        "merge_proposals_strategy",
+        "CHECK((strategy=ANY(ARRAY['abort','take-target','take-source','union'])))",
+    ),
+    (
+        "merge_proposals",
+        "merge_proposals_token_format",
+        "CHECK((preview_token~'^sha256:[0-9a-f]{64}$'))",
+    ),
     // 0012: named branches (ADR-0022)
     (
         "branch_events",
@@ -1673,7 +1830,7 @@ const EXPECTED_CHECKS: &[(&str, &str, &str)] = &[
     (
         "idempotency",
         "idempotency_operation",
-        "CHECK((operation=ANY(ARRAY['prepare','accept','reject','validate','branch_create','branch_delete','branch_restore'])))",
+        "CHECK((operation=ANY(ARRAY['prepare','accept','reject','validate','branch_create','branch_delete','branch_restore','merge_propose','merge_apply'])))",
     ),
     (
         "idempotency",
@@ -1688,7 +1845,7 @@ const EXPECTED_CHECKS: &[(&str, &str, &str)] = &[
     (
         "idempotency",
         "idempotency_result_kind",
-        "CHECK((result_kind=ANY(ARRAY['prepared','accepted','rejected','validated','branch_created','branch_deleted','branch_restored'])))",
+        "CHECK((result_kind=ANY(ARRAY['prepared','accepted','rejected','validated','branch_created','branch_deleted','branch_restored','merge_proposed','merge_applied'])))",
     ),
     (
         "immutable_objects",
@@ -1733,12 +1890,12 @@ const EXPECTED_CHECKS: &[(&str, &str, &str)] = &[
     (
         "ref_events",
         "ref_events_genesis_shape",
-        "CHECK((((operation='genesis')AND(old_headISNULL)AND(old_versionISNULL)AND(new_version=1))OR((operation='advance')AND(old_headISNOTNULL)AND(old_versionISNOTNULL)AND(new_version=(old_version+1)))))",
+        "CHECK((((operation='genesis')AND(old_headISNULL)AND(old_versionISNULL)AND(new_version=1))OR((operation=ANY(ARRAY['advance','merge']))AND(old_headISNOTNULL)AND(old_versionISNOTNULL)AND(new_version=(old_version+1)))))",
     ),
     (
         "ref_events",
         "ref_events_operation",
-        "CHECK((operation=ANY(ARRAY['genesis','advance'])))",
+        "CHECK((operation=ANY(ARRAY['genesis','advance','merge'])))",
     ),
     (
         "ref_events",
@@ -2634,6 +2791,28 @@ const RUNTIME_TABLE_MODEL: &[TablePrivileges] = &[
         update_columns: &["status", "lifecycle_version", "updated_at"],
     },
     TablePrivileges {
+        table: "merge_proposals",
+        insert_columns: &[
+            "proposal_id",
+            "graph_id",
+            "target_branch",
+            "candidate_commit",
+            "target_head",
+            "source_branch",
+            "source_head",
+            "merge_base",
+            "base_explicit",
+            "classification",
+            "strategy",
+            "merge_algorithm",
+            "conflict_count",
+            "merged_state_digest",
+            "preview_token",
+            "source_parties",
+        ],
+        update_columns: &[],
+    },
+    TablePrivileges {
         table: "branch_events",
         insert_columns: &[
             "graph_id",
@@ -3308,7 +3487,7 @@ mod tests {
             .2;
         assert_eq!(normalize_constraint_def(pg17), expected);
         assert_ne!(normalize_constraint_def("CHECK (true)"), expected);
-        assert_eq!(EXPECTED_CHECKS.len(), 82);
+        assert_eq!(EXPECTED_CHECKS.len(), 92);
     }
 
     #[test]
@@ -3424,6 +3603,11 @@ mod tests {
         assert_eq!(by_name("refs_branch_active"), 19); // ROW BEFORE UPDATE
         assert_eq!(by_name("proposals_branch_active"), 7); // ROW BEFORE INSERT
         assert_eq!(by_name("graphs_adopt_refs"), 17); // ROW AFTER UPDATE
-        assert_eq!(GUARD_TRIGGERS.len(), 28);
+        // Migration 0013.
+        assert_eq!(by_name("merge_proposals_write_once"), 27); // ROW BEFORE UPDATE DELETE
+        assert_eq!(by_name("merge_proposals_lineage"), 7); // ROW BEFORE INSERT
+        assert_eq!(by_name("ref_events_kind"), 7); // ROW BEFORE INSERT
+        assert_eq!(by_name("decisions_merge_kind"), 7); // ROW BEFORE INSERT
+        assert_eq!(GUARD_TRIGGERS.len(), 32);
     }
 }

@@ -38,3 +38,14 @@ See [Plan 0007](../exec-plans/completed/0007-phase3-accepted-state-projection.md
 
 - [ADR-0020: Accepted-state projection protocol: target graph identity, marker and write semantics](ADR-0020-accepted-state-projection-protocol.md)
 - [ADR-0021: Projection state, stream leases and the projector database identity](ADR-0021-projection-state-leases-and-projector-identity.md)
+
+## Phase 4 branches and cognitive workflows (P4)
+See [Plan 0008](../exec-plans/completed/0008-phase4-branches-cognitive-workflows.md).
+
+- [ADR-0022: Named branches: identity, lifecycle, policy and authorization](ADR-0022-named-branches-lifecycle-and-policy.md)
+
+## Phase 5 diff and merge (P5)
+See [Plan 0009](../exec-plans/completed/0009-phase5-diff-and-merge.md).
+
+- [ADR-0023: Merge lineage: integration commits, not ref jumps](ADR-0023-merge-lineage-and-integration-commits.md)
+- [ADR-0024: Diff, merge base, structural conflicts, merge preview and stale-safe apply](ADR-0024-diff-merge-base-conflicts-preview-and-apply.md)

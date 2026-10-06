@@ -102,9 +102,9 @@ pub struct RefMovement {
 /// Commit parents of one graph, read on one connection (immutable rows; a commit not indexed
 /// under the graph is unknown — foreign commits never resolve). Fails closed on a parent list
 /// that disagrees with the indexed `parent_count` (corruption, never "fewer parents").
-struct GraphParents<'c> {
-    conn: Mutex<&'c mut PgConnection>,
-    graph: GraphId,
+pub(crate) struct GraphParents<'c> {
+    pub(crate) conn: Mutex<&'c mut PgConnection>,
+    pub(crate) graph: GraphId,
 }
 
 #[async_trait::async_trait]
@@ -782,7 +782,11 @@ impl WorkflowRepository {
 
     /// The graph must belong to the reading tenant (foreign and missing graphs are
     /// indistinguishable).
-    async fn readable_graph(&self, tenant: &TenantId, graph: &GraphId) -> Result<(), LedgerError> {
+    pub(crate) async fn readable_graph(
+        &self,
+        tenant: &TenantId,
+        graph: &GraphId,
+    ) -> Result<(), LedgerError> {
         let owner: Option<String> =
             sqlx::query_scalar("SELECT tenant_id FROM graphs WHERE graph_id = $1")
                 .bind(graph.as_str())

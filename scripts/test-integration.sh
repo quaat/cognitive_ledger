@@ -83,6 +83,9 @@ cargo test -p ledger-store --features postgres --test pg_projection -- --ignored
 # --- 1k2. Named branches (ADR-0022, Plan 0008): creation from head / reachable history,
 #          tombstone delete, restore, policy, idempotency, DB guards and lifecycle races ---
 cargo test -p ledger-store --features postgres --test pg_branches -- --ignored --nocapture
+# Merge preview / propose / apply, staleness, target policy, database guards and forced
+# merge races (Plan 0009, ADR-0023/0024).
+cargo test -p ledger-store --features postgres --test pg_merge -- --ignored --nocapture
 
 # --- 1l. Projection against the real Fuseki (compose `fuseki`, own TDB2 dataset): genesis,
 #         advance, duplicate/stale/equal-version writes, outage + catch-up, lost response,
@@ -362,6 +365,38 @@ PY
 R=$(api POST "/v1/graphs/${GRAPH}/branches/delete" "${ADMIN_TOKEN}" "it-bdm" '{"name":"main"}')
 [ "$(echo "${R}" | status_of)" = "409" ] || { echo "FAIL: main delete not refused: ${R}" >&2; exit 1; }
 echo "branches: agent/it-task created from C1 (retry replayed), advanced once, deleted (admin only, prepare refused), restored with head/version kept; main untouched and undeletable"
+
+# --- Merge end to end (ADR-0023/0024): the branch (C1 + note) and main (C2) diverged from C1;
+#     preview (read, writes nothing), propose, apply onto main; the ordinary Phase-3 projector
+#     projects the integration commit like any accepted head. -------------------------------
+R=$(api POST "/v1/graphs/${GRAPH}/merges/preview" "${TOKEN}" "" '{"source":"agent/it-task","target":"main"}')
+[ "$(echo "${R}" | status_of)" = "200" ] || { echo "FAIL: merge preview: ${R}" >&2; exit 1; }
+[ "$(echo "${R}" | body_of | json_field classification)" = "divergent" ] || { echo "FAIL: merge classification: ${R}" >&2; exit 1; }
+[ "$(echo "${R}" | body_of | json_field merge_base)" = "${C1}" ] || { echo "FAIL: merge base: ${R}" >&2; exit 1; }
+PTOKEN=$(echo "${R}" | body_of | json_field preview_token)
+R=$(api POST "/v1/graphs/${GRAPH}/merges/propose" "${TOKEN}" "it-mp1" "{\"source\":\"agent/it-task\",\"target\":\"main\",\"preview_token\":\"${PTOKEN}\",\"message\":\"integrate the branch note\"}")
+[ "$(echo "${R}" | status_of)" = "201" ] || { echo "FAIL: merge propose: ${R}" >&2; exit 1; }
+MPROPOSAL=$(echo "${R}" | body_of | json_field proposal_id)
+MCAND=$(echo "${R}" | body_of | json_field candidate)
+R=$(api POST "/v1/graphs/${GRAPH}/proposals/${MCAND}/accept" "${TOKEN}" "it-macc" "{\"ref\":\"main\",\"expected_head\":\"${C2}\",\"reason\":\"ordinary path\"}")
+[ "$(echo "${R}" | status_of)" = "409" ] || { echo "FAIL: ordinary accept of a merge candidate not refused: ${R}" >&2; exit 1; }
+R=$(api POST "/v1/graphs/${GRAPH}/merges/apply" "${TOKEN}" "it-ma1" "{\"proposal_id\":${MPROPOSAL},\"preview_token\":\"${PTOKEN}\",\"reason\":\"integration\"}")
+[ "$(echo "${R}" | status_of)" = "200" ] || { echo "FAIL: merge apply: ${R}" >&2; exit 1; }
+[ "$(echo "${R}" | body_of | json_field head)" = "${MCAND}" ] || { echo "FAIL: merge head: ${R}" >&2; exit 1; }
+for _ in $(seq 1 120); do
+  V=$(sparql "SELECT ?v WHERE { GRAPH <urn:sculpin:ledger-projection:v1:markers> { <${COGNITIVE}> <urn:sculpin:ledger-projection:v1#refVersion> ?v } }" | python3 -c 'import sys,json; b=json.load(sys.stdin)["results"]["bindings"]; print(b[0]["v"]["value"] if b else "")')
+  [ "${V}" = "3" ] && break; sleep 0.5
+done
+[ "${V}" = "3" ] || { echo "FAIL: the merge on main was not projected (marker: '${V}')" >&2; docker compose logs projector >&2; exit 1; }
+PROJECTED=$(sparql "SELECT ?s ?p ?o WHERE { GRAPH <${COGNITIVE}> { ?s ?p ?o } } ORDER BY ?p" | python3 -c 'import sys,json; print(json.dumps(sorted((b["s"]["value"],b["p"]["value"],b["o"]["value"]) for b in json.load(sys.stdin)["results"]["bindings"])))')
+EXPECTED_PROJECTED='[["urn:material:a", "urn:humidity", "40"], ["urn:material:a", "urn:note", "branch"], ["urn:material:a", "urn:temperature", "80"]]'
+[ "${PROJECTED}" = "${EXPECTED_PROJECTED}" ] || { echo "FAIL: projected graph is not exactly the merged state: ${PROJECTED}" >&2; exit 1; }
+MARKER_COMMIT=$(sparql "SELECT ?c WHERE { GRAPH <urn:sculpin:ledger-projection:v1:markers> { <${COGNITIVE}> <urn:sculpin:ledger-projection:v1#commitId> ?c } }" | python3 -c 'import sys,json; print(json.load(sys.stdin)["results"]["bindings"][0]["c"]["value"])')
+[ "${MARKER_COMMIT}" = "${MCAND}" ] || { echo "FAIL: marker commit ${MARKER_COMMIT} != merge ${MCAND}" >&2; exit 1; }
+docker compose run --rm --no-deps projector verify --graph "${GRAPH}" | grep -q "PROJECTION CONSISTENT" || { echo "FAIL: projection inconsistent after the merge" >&2; exit 1; }
+R=$(api POST "/v1/graphs/${GRAPH}/merges/preview" "${TOKEN}" "" '{"source":"agent/it-task","target":"main"}')
+[ "$(echo "${R}" | body_of | json_field classification)" = "already_contained" ] || { echo "FAIL: repeated merge not contained: ${R}" >&2; exit 1; }
+echo "merge: agent/it-task integrated into main as [C2, B1] (preview read-only, ordinary accept refused, apply), projected by the unchanged projector (marker v3, verify CONSISTENT), repeat contained"
 
 # The reusable invariant suite (Plan 0005 §20) over the whole database, as the owner.
 docker compose run --rm migrate verify | tail -3 | grep -q "VERIFY OK" || { echo "FAIL: ledger-admin verify reported violations" >&2; docker compose run --rm migrate verify >&2 || true; exit 1; }

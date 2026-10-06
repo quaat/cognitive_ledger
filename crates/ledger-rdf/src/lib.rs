@@ -1,6 +1,8 @@
 //! Restricted deterministic RDF patch protocol for the walking skeleton.
 
+mod diff;
 mod effective_delta;
+pub use diff::{DiffSummary, StateDiff, StructuralKey, diff};
 pub use effective_delta::{DeltaError, DeltaPolicy, apply_patch, effective_delta};
 
 use ledger_core::{ContentId, PatchId};
@@ -70,6 +72,12 @@ impl FromStr for Quad {
     }
 }
 impl Quad {
+    /// The canonical N-Quads line without its terminating newline (the `Display` form),
+    /// borrowed.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
     /// The quad as an N-Triples statement (`<s> <p> <o> .`) when it is in the default graph,
     /// `None` for a named-graph quad. The terms are the canonical N-Triples forms (valid
     /// SPARQL term syntax), so the statement can be embedded in a SPARQL template verbatim.
