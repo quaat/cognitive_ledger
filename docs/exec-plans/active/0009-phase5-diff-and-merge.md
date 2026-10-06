@@ -151,6 +151,34 @@ carried into Phase 8 / production qualification.
   are no weaker.
 
 ## Evidence
+### Final code candidate `e7dc273` (2026-10-06)
+Every gate below ran on this workstation (Linux 5.10, Docker; scratch `postgres:15-bookworm`
+and `postgres:17-bookworm`) against `e7dc273`. A tracked diff of zero bytes was recorded by
+the harnesses; the only untracked file is a session note. Nothing here is reported that did
+not run.
+
+| gate | result |
+|---|---|
+| `check-fast` (fmt, clippy `-D warnings` all features, unit and property tests, architecture incl. the `test-hooks` guard, doc links) | exit 0; 212 tests passed, 0 failed |
+| Golden vectors (Rust plus independent Python references) | 18 commit v2, 26 request identity, 6 merge preview-token, 42 validation protocol and 3 state digest vectors match; no fixture changed since `5216bce` except Phase-5 additions |
+| `check-supply-chain` (on `0582a85`; `Cargo.lock` unchanged since, apart from the dev-only `serde_json` edge for `ledger-merge`) | advisories, bans, licenses and sources ok; SBOMs generated |
+| PostgreSQL 17 (`ledger-store --features postgres --tests --ignored`, `ledger-api --tests --ignored`) | 159 passed, 0 failed: `pg_merge` 27, `pg_workflow` 14, `pg_validation` 9, `pg_validation_api` 23, `pg_api` 13, `pg_verify` 4, `pg_least_privilege` 19, `pg_branches` 18, `pg_projection` 7, `pg_cas_race` 1, `pg_immutable_store` 9, `pg_fs_migration` 8, `pg_graphs_migration` 7 |
+| PostgreSQL 15 (same suites) | 159 passed, 0 failed (same counts) |
+| `test-integration.sh` | `INTEGRATION OK`. Merge `agent/it-task` into `main` as `[C2, B1]`; projected by the unchanged projector (marker v3, verify CONSISTENT); repeat contained; `VERIFY OK` |
+| `upgrade-p5.sh` (previous `5216bce`, schema 12 → 13) | `UPGRADE-P5 OK`, `target/upgrade-p5/20261006T161424Z`: pre-upgrade rows byte-identical; recorded keys replay; exactly one merge row and one merge event after the workload; skew refused; clean and upgraded 0013 identical |
+| `backup-restore.sh` | `BACKUP RESTORE OK`, `target/backup/20261006T161717Z`: dump and basebackup both restore the merge proposal and the merge event |
+| `stress-branches.sh` (2 replicas) | `BRANCH STRESS GATE OK`, `target/stress-branches/20261006T162003Z`: 53 verify checks, 0 violations, including every new merge check |
+| Release linkage of `test-hooks` | release `ledger-server`, `ledger-projector` and `ledger-admin` (unstripped, 20k–30k symbols) contain no hook symbol, against 33 in the test binary. `cargo tree` normal graphs of every app carry no `test-hooks`. A release build with the feature fails to compile |
+| Independent reviews of `0582a85` (5, Opus, read-only) | no P0/P1; P2s fixed or deferred (Discoveries) |
+| Codex exact-head `026decc` | no P0/P1; 2 P2s fixed in `e7dc273` |
+| Codex focused re-review of `026decc..e7dc273` | no findings; `P0/P1 FOUND: no` |
+| Hosted CI | recorded after push |
+
+Not run: live Fluree differential (BUSL-1.1 approval pending; not counted) and the live
+Sculpin semantic service (merge validation uses the Phase-2 contract with the
+protocol-conformant fake validator).
+
+### Earlier evidence (code `ad75e17`)
 Code under test: `ad75e17` (implementation and review fixes). Every gate below ran on 2026-10-06
 on this workstation; nothing is reported that did not run.
 - `check-fast` (fmt, clippy, unit and property tests, the 6 merge-preview token goldens
