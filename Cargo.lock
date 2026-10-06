@@ -1085,6 +1085,7 @@ dependencies = [
  "hex",
  "ledger-core",
  "ledger-dag",
+ "ledger-merge",
  "ledger-rdf",
  "ledger-validation-protocol",
  "serde",
