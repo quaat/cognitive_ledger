@@ -100,6 +100,13 @@ def populate(out, commits):
         branches = [("main", commits)] + ([("dev", 3)] if gi == 0 else [])
         for ref, n in branches:
             head = None
+            # Phase-4+ releases refuse genesis on a non-main ref (ADR-0022): with
+            # UPGRADE_CREATE_BRANCHES=1 the ref is created from main first and builds on it.
+            if ref != "main" and os.environ.get("UPGRADE_CREATE_BRANCHES") == "1":
+                s, b = call(tok, "POST", f"/v1/graphs/{graph}/branches", f"b-{graph}-{ref}",
+                            {"name": ref, "source": "main"})
+                expect(s == 201, f"old branch create {graph}/{ref}: {s} {b}")
+                head = b["event"]["head"]
             for i in range(n):
                 tag = f"{graph}-{ref}-{i}"
                 body = prepare_body(ref, head, ops_for(gi if ref == "main" else f"{gi}dev", i), tag)
