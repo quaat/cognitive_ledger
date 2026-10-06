@@ -154,6 +154,9 @@ pub struct WorkflowRepository {
     pub(crate) pool: PgPool,
     pub(crate) immutable: PostgresImmutableStore,
     failpoint: Option<FailPoint>,
+    /// A forced-interleaving pause (feature `test-hooks` only; see `crate::test_hooks`).
+    #[cfg(feature = "test-hooks")]
+    pause: Option<crate::test_hooks::PauseHook>,
     pub(crate) limits: crate::ReconstructionLimits,
     /// The validation service this deployment trusts (ADR-0019). Independent of whether a
     /// validator endpoint is configured; without it, validated acceptance fails closed.
@@ -543,6 +546,8 @@ impl WorkflowRepository {
             pool,
             immutable,
             failpoint: None,
+            #[cfg(feature = "test-hooks")]
+            pause: None,
             limits: crate::ReconstructionLimits::DEVELOPMENT,
             trust: None,
         }
@@ -581,6 +586,20 @@ impl WorkflowRepository {
     pub fn with_failpoint(mut self, point: FailPoint) -> Self {
         self.failpoint = Some(point);
         self
+    }
+
+    /// Pause at `hook`'s point (feature `test-hooks` only; never in a release build).
+    #[cfg(feature = "test-hooks")]
+    pub fn with_pause_hook(mut self, hook: crate::test_hooks::PauseHook) -> Self {
+        self.pause = Some(hook);
+        self
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) async fn pause_at(&self, point: crate::test_hooks::HookPoint) {
+        if let Some(hook) = &self.pause {
+            hook.at(point).await;
+        }
     }
 
     pub(crate) fn fail_at(&self, point: FailPoint) -> Result<(), LedgerError> {

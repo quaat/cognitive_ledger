@@ -580,11 +580,14 @@ pub use postgres_workflow::{
 mod postgres_branches;
 #[cfg(feature = "postgres")]
 mod postgres_merge;
+#[cfg(all(feature = "postgres", feature = "test-hooks"))]
+pub mod test_hooks;
 #[cfg(feature = "postgres")]
 pub use ledger_dag::TraversalLimits;
 #[cfg(feature = "postgres")]
 pub use ledger_merge::{
-    Conflict as MergeConflictReport, Side as MergeSide, Strategy as MergeStrategy,
+    Conflict as MergeConflictReport, InvalidReportLimit, ReportLimits as MergeReportLimits,
+    Side as MergeSide, Strategy as MergeStrategy,
 };
 #[cfg(feature = "postgres")]
 pub use postgres_branches::{

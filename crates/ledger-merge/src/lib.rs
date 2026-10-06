@@ -31,6 +31,17 @@ pub const MERGE_ALGORITHM_V1: &str = "structural-slot/v1";
 pub const MAX_REPORTED_CONFLICTS: usize = 1_000;
 /// At most this many quads per side of a reported conflict (each side flags truncation).
 pub const MAX_REPORTED_QUADS_PER_SIDE: usize = 64;
+/// Default byte budget of the detailed conflict report (2 MiB; see [`ReportLimits`]).
+pub const DEFAULT_CONFLICT_REPORT_BYTES: usize = 2 * 1024 * 1024;
+/// Smallest accepted byte budget: one conflict entry of ordinary terms with a few quads per
+/// side fits; below this a report could not show even that.
+pub const MIN_CONFLICT_REPORT_BYTES: usize = 1024;
+/// Largest accepted byte budget (64 MiB, the default state-export cap).
+pub const MAX_CONFLICT_REPORT_BYTES: usize = 64 * 1024 * 1024;
+/// Bytes charged per listed conflict for its JSON framing: field names, braces, separators
+/// and the framing of its three sides. At least the real framing (153 bytes with a `graph`
+/// field and both `truncated` flags `false`), so the charge never undercounts.
+pub const CONFLICT_ENTRY_FRAMING_BYTES: usize = 160;
 
 /// Conflict resolution for structurally conflicting keys.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -78,17 +89,6 @@ pub struct Side {
     pub truncated: bool,
 }
 
-fn side(set: &BTreeSet<Quad>) -> Side {
-    Side {
-        quads: set
-            .iter()
-            .take(MAX_REPORTED_QUADS_PER_SIDE)
-            .cloned()
-            .collect(),
-        truncated: set.len() > MAX_REPORTED_QUADS_PER_SIDE,
-    }
-}
-
 /// A structurally conflicting key: both sides changed the slot, differently.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Conflict {
@@ -103,10 +103,175 @@ pub struct Conflict {
 pub struct ThreeWay {
     /// The merged state; `None` only for `abort` with at least one conflict.
     pub merged: Option<BTreeSet<Quad>>,
-    /// Conflicting keys in ascending key order, at most [`MAX_REPORTED_CONFLICTS`].
+    /// The detailed conflict report: a prefix, in ascending key order, bounded by the
+    /// [`ReportLimits`] the merge ran with.
     pub conflicts: Vec<Conflict>,
-    /// Total number of conflicting keys (reported or not).
+    /// Total number of conflicting keys (reported or not); never affected by the limits.
     pub conflict_count: usize,
+    /// The report-level limits (listed conflicts or bytes) left conflicts or quads out of
+    /// `conflicts`. A side's own `truncated` flag also covers the per-side quad cap.
+    pub conflicts_truncated: bool,
+}
+
+/// Bounds of the detailed conflict report: an operational setting, **never** part of the
+/// merge. The merged state, `conflict_count`, the preview token and the candidate are the
+/// same under any limits; only how much of the conflicts is listed differs.
+///
+/// The byte budget charges what the report costs as JSON (the API response shape): every
+/// listed key term and quad as an escaped JSON string ([`json_string_len`]) plus a separator,
+/// and [`CONFLICT_ENTRY_FRAMING_BYTES`] per listed conflict. The serialized `conflicts`
+/// array is therefore at most the budget plus its two brackets.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReportLimits {
+    max_conflicts: usize,
+    max_quads_per_side: usize,
+    max_bytes: usize,
+}
+
+/// A byte budget outside `MIN_CONFLICT_REPORT_BYTES..=MAX_CONFLICT_REPORT_BYTES`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidReportLimit(pub usize);
+
+impl std::fmt::Display for InvalidReportLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "conflict report budget {} is outside {MIN_CONFLICT_REPORT_BYTES}..={MAX_CONFLICT_REPORT_BYTES} bytes",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for InvalidReportLimit {}
+
+impl ReportLimits {
+    /// 1 000 conflicts, 64 quads per side, [`DEFAULT_CONFLICT_REPORT_BYTES`].
+    pub const DEFAULT: Self = Self {
+        max_conflicts: MAX_REPORTED_CONFLICTS,
+        max_quads_per_side: MAX_REPORTED_QUADS_PER_SIDE,
+        max_bytes: DEFAULT_CONFLICT_REPORT_BYTES,
+    };
+
+    /// The default counts with the smallest byte budget (for callers that need only the
+    /// merge and the count, never the details).
+    pub const SMALLEST: Self = Self {
+        max_conflicts: MAX_REPORTED_CONFLICTS,
+        max_quads_per_side: MAX_REPORTED_QUADS_PER_SIDE,
+        max_bytes: MIN_CONFLICT_REPORT_BYTES,
+    };
+
+    /// The default counts with another byte budget; a budget of zero, below the minimum or
+    /// above the maximum is refused rather than silently clamped.
+    pub fn with_max_bytes(max_bytes: usize) -> Result<Self, InvalidReportLimit> {
+        if !(MIN_CONFLICT_REPORT_BYTES..=MAX_CONFLICT_REPORT_BYTES).contains(&max_bytes) {
+            return Err(InvalidReportLimit(max_bytes));
+        }
+        Ok(Self {
+            max_bytes,
+            ..Self::DEFAULT
+        })
+    }
+
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+}
+
+impl Default for ReportLimits {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// The length of `s` as a JSON string literal: quotes plus the escapes `serde_json` writes
+/// (`\"` and `\\`, the short forms of backspace, form feed, newline, carriage return and
+/// tab, `\u00XX` for every other control character; everything else verbatim).
+pub fn json_string_len(s: &str) -> usize {
+    2 + s
+        .bytes()
+        .map(|b| match b {
+            b'"' | b'\\' | 0x08 | 0x0c | b'\n' | b'\r' | b'\t' => 2,
+            0x00..=0x1f => 6,
+            _ => 1,
+        })
+        .sum::<usize>()
+}
+
+/// Collects the detailed conflict report under [`ReportLimits`]. It only reads the slots the
+/// merge already partitioned and stops cloning once a limit is reached, so the report costs
+/// at most its budget however large the conflicting terms are. Conflicts are offered in
+/// ascending key order and each side's quads in canonical order, so the report is a
+/// deterministic prefix: (conflict, side base/target/source, quad).
+struct Reporter {
+    limits: ReportLimits,
+    remaining: usize,
+    conflicts: Vec<Conflict>,
+    /// A report-level limit was hit; nothing further is listed.
+    exhausted: bool,
+}
+
+impl Reporter {
+    fn new(limits: ReportLimits) -> Self {
+        Self {
+            limits,
+            remaining: limits.max_bytes,
+            conflicts: Vec::new(),
+            exhausted: false,
+        }
+    }
+
+    fn charge(&mut self, cost: usize) -> bool {
+        if cost > self.remaining {
+            self.exhausted = true;
+            return false;
+        }
+        self.remaining -= cost;
+        true
+    }
+
+    fn offer(&mut self, key: &StructuralKey, slot: &Slot) {
+        if self.exhausted {
+            return;
+        }
+        if self.conflicts.len() == self.limits.max_conflicts {
+            self.exhausted = true;
+            return;
+        }
+        let key_cost = CONFLICT_ENTRY_FRAMING_BYTES
+            + key.graph.as_deref().map_or(0, json_string_len)
+            + json_string_len(&key.subject)
+            + json_string_len(&key.predicate);
+        if !self.charge(key_cost) {
+            return;
+        }
+        let base = self.side(&slot.base);
+        let target = self.side(&slot.target);
+        let source = self.side(&slot.source);
+        self.conflicts.push(Conflict {
+            key: key.clone(),
+            base,
+            target,
+            source,
+        });
+    }
+
+    /// One side: whole quads while they fit (never a partial quad), then `truncated` if any
+    /// quad of the side is not listed.
+    fn side(&mut self, set: &BTreeSet<Quad>) -> Side {
+        let mut quads = Vec::new();
+        if !self.exhausted {
+            for q in set.iter().take(self.limits.max_quads_per_side) {
+                if !self.charge(json_string_len(q.as_str()) + 1) {
+                    break;
+                }
+                quads.push(q.clone());
+            }
+        }
+        Side {
+            truncated: quads.len() < set.len(),
+            quads,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -116,12 +281,25 @@ struct Slot {
     source: BTreeSet<Quad>,
 }
 
-/// The three-way structural merge of `source` into `target` from `base` (module docs).
+/// The three-way structural merge of `source` into `target` from `base` (module docs), with
+/// the default conflict report limits.
 pub fn three_way(
     base: &BTreeSet<Quad>,
     target: &BTreeSet<Quad>,
     source: &BTreeSet<Quad>,
     strategy: Strategy,
+) -> ThreeWay {
+    three_way_reported(base, target, source, strategy, ReportLimits::DEFAULT)
+}
+
+/// [`three_way`] with explicit conflict report limits. The limits bound only the detailed
+/// report; the merged state and `conflict_count` are computed independently of them.
+pub fn three_way_reported(
+    base: &BTreeSet<Quad>,
+    target: &BTreeSet<Quad>,
+    source: &BTreeSet<Quad>,
+    strategy: Strategy,
+    report: ReportLimits,
 ) -> ThreeWay {
     let mut slots: BTreeMap<StructuralKey, Slot> = BTreeMap::new();
     for q in base {
@@ -146,7 +324,7 @@ pub fn three_way(
             .insert(q.clone());
     }
     let mut merged = BTreeSet::new();
-    let mut conflicts = Vec::new();
+    let mut reporter = Reporter::new(report);
     let mut conflict_count = 0;
     for (key, slot) in slots {
         let result = if slot.target == slot.base || slot.target == slot.source {
@@ -155,14 +333,7 @@ pub fn three_way(
             slot.target.clone()
         } else {
             conflict_count += 1;
-            if conflicts.len() < MAX_REPORTED_CONFLICTS {
-                conflicts.push(Conflict {
-                    key: key.clone(),
-                    base: side(&slot.base),
-                    target: side(&slot.target),
-                    source: side(&slot.source),
-                });
-            }
+            reporter.offer(&key, &slot);
             match strategy {
                 Strategy::Abort => BTreeSet::new(),
                 Strategy::TakeTarget => slot.target.clone(),
@@ -172,9 +343,11 @@ pub fn three_way(
         };
         merged.extend(result);
     }
+    // `exhausted` is set exactly when a limit left a conflict or a quad unlisted.
     ThreeWay {
         merged: (strategy != Strategy::Abort || conflict_count == 0).then_some(merged),
-        conflicts,
+        conflicts_truncated: reporter.exhausted,
+        conflicts: reporter.conflicts,
         conflict_count,
     }
 }

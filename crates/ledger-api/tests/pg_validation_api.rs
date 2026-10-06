@@ -1873,7 +1873,34 @@ impl Harness {
 
     /// prepare → validate → accept on `branch` from `head`; returns the new head.
     async fn step_on(&self, g: &GraphId, t: &str, branch: &str, head: &str, quad: &str) -> String {
-        let (status, p) = self.prepare_on(g, t, branch, head, quad).await;
+        self.step_adding(g, t, branch, head, &[quad]).await
+    }
+
+    /// [`Self::step_on`] adding several quads in one commit.
+    async fn step_adding(
+        &self,
+        g: &GraphId,
+        t: &str,
+        branch: &str,
+        head: &str,
+        quads: &[&str],
+    ) -> String {
+        let operations: Vec<Value> = quads
+            .iter()
+            .map(|q| json!({"op": "add", "quad": q}))
+            .collect();
+        let (status, p) = self
+            .call(
+                "POST",
+                &format!("/v1/graphs/{g}/proposals"),
+                t,
+                Some(&unique("p")),
+                Some(json!({
+                    "ref": branch, "expected_head": head, "operations": operations,
+                    "activity": "cognitive-correction", "message": "m",
+                })),
+            )
+            .await;
         assert_eq!(status, StatusCode::CREATED, "{p}");
         let c = p["candidate"].as_str().unwrap().to_owned();
         let (status, v) = self.validate(g, t, &c, &unique("v"), json!({})).await;
@@ -2636,4 +2663,160 @@ async fn a_validated_merge_onto_main_binds_the_merged_state_in_its_semantic_envi
         )
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// ADR-0024 conflict report byte budget: large legal terms in conflicting slots. Under a tiny
+/// budget the preview lists a deterministic prefix within the budget and says so; the
+/// classification, exact conflict count, merged-state digest and preview token are those of a
+/// server with the default budget, and a token previewed under the tiny budget proposes.
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn the_conflict_report_has_a_byte_budget_that_never_changes_the_merge() {
+    const TINY: usize = 4 * 1024;
+    let big_terms = ApiLimits {
+        max_term_bytes: 64 * 1024,
+        ..ApiLimits::default()
+    };
+    let h = harness_with(
+        ApiLimits {
+            max_merge_conflict_report_bytes: TINY,
+            ..big_terms
+        },
+        true,
+    )
+    .await;
+    let roomy = Harness {
+        owner: h.owner.clone(),
+        app: app_for(
+            &h.runtime_url,
+            big_terms,
+            &h.validator,
+            Some(SERVICE_ID),
+            Some(SERVICE_ID),
+        )
+        .await,
+        validator: h.validator.clone(),
+        runtime_url: h.runtime_url.clone(),
+        limits: big_terms,
+    };
+    let g = h.graph("tenant-cr").await;
+    let admin = token("tenant-cr", "operator", &ADMIN);
+    let agent = token("tenant-cr", "agent-3", &ROLES);
+    let reader = token("tenant-cr", "reader", &["ledger.read"]);
+    let c1 = h.main_history(&g, &admin, 1).await.remove(0);
+    let (status, created) = h
+        .create_branch(
+            &g,
+            &agent,
+            "cr-b",
+            json!({"name": "agent/cr", "source": "main"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    // Six slots both sides fill differently, each with a ~16 KiB literal full of characters
+    // that N-Quads and then JSON escape again.
+    const SLOTS: usize = 6;
+    let heavy = |side: &str, i: usize| {
+        let mut lit = format!("{side}{i}-");
+        while lit.len() < 16 * 1024 {
+            lit.push_str("q\\\"b\\nc\\\\é");
+        }
+        format!("<urn:cr:slot:{i}> <urn:cr:p> \"{lit}\" .")
+    };
+    let target_quads: Vec<String> = (0..SLOTS).map(|i| heavy("t", i)).collect();
+    let source_quads: Vec<String> = (0..SLOTS).map(|i| heavy("s", i)).collect();
+    fn refs(v: &[String]) -> Vec<&str> {
+        v.iter().map(String::as_str).collect()
+    }
+    h.step_adding(&g, &admin, "main", &c1, &refs(&target_quads))
+        .await;
+    h.step_adding(&g, &agent, "agent/cr", &c1, &refs(&source_quads))
+        .await;
+
+    async fn preview(server: &Harness, g: &GraphId, reader: &str, strategy: &str) -> Value {
+        let body = json!({"source": "agent/cr", "target": "main", "strategy": strategy});
+        let (status, p) = server
+            .call(
+                "POST",
+                &format!("/v1/graphs/{g}/merges/preview"),
+                reader,
+                None,
+                Some(body),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{p}");
+        p
+    }
+    for strategy in ["abort", "union", "take-source"] {
+        let tiny = preview(&h, &g, &reader, strategy).await;
+        let full = preview(&roomy, &g, &reader, strategy).await;
+        // The merge is the same; only the report differs.
+        for field in [
+            "classification",
+            "conflict_count",
+            "merged_state_digest",
+            "preview_token",
+            "merge_base",
+            "target_delta",
+            "source_delta",
+        ] {
+            assert_eq!(tiny[field], full[field], "{strategy}: {field}");
+        }
+        assert_eq!(tiny["conflict_count"], SLOTS);
+        // The default budget holds the whole report; the tiny one does not.
+        assert_eq!(full["conflicts_truncated"], false);
+        assert_eq!(full["conflicts"].as_array().unwrap().len(), SLOTS);
+        assert_eq!(tiny["conflicts_truncated"], true);
+        let details = serde_json::to_string(&tiny["conflicts"]).unwrap();
+        assert!(
+            details.len() <= TINY + 2,
+            "{strategy}: {} bytes of detail over a {TINY}-byte budget",
+            details.len()
+        );
+        // Whole quads only, each a quad of its side in the full report; a deterministic
+        // prefix of the full report.
+        let listed = tiny["conflicts"].as_array().unwrap();
+        assert!(!listed.is_empty(), "the slot key fits the tiny budget");
+        for (i, c) in listed.iter().enumerate() {
+            let f = &full["conflicts"][i];
+            assert_eq!(
+                (&c["subject"], &c["predicate"]),
+                (&f["subject"], &f["predicate"])
+            );
+            for side in ["base", "target", "source"] {
+                let (cq, fq) = (
+                    c[side]["quads"].as_array().unwrap(),
+                    f[side]["quads"].as_array().unwrap(),
+                );
+                assert!(fq.starts_with(cq), "{strategy}: {side} is a prefix");
+                assert_eq!(c[side]["truncated"], cq.len() < fq.len());
+            }
+        }
+        // The same inputs report exactly the same prefix.
+        assert_eq!(
+            preview(&h, &g, &reader, strategy).await["conflicts"],
+            tiny["conflicts"]
+        );
+        if strategy == "abort" {
+            assert_eq!(tiny["classification"], "conflicted");
+            assert!(tiny.get("preview_token").is_none());
+        }
+    }
+    // A token previewed under the tiny budget is the merge's token: it proposes.
+    let tiny = preview(&h, &g, &reader, "union").await;
+    let (status, pr) = h
+        .call(
+            "POST",
+            &format!("/v1/graphs/{g}/merges/propose"),
+            &agent,
+            Some("cr-propose"),
+            Some(json!({
+                "source": "agent/cr", "target": "main", "strategy": "union",
+                "preview_token": tiny["preview_token"],
+            })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{pr}");
+    assert_eq!(pr["merged_state_digest"], tiny["merged_state_digest"]);
+    assert_eq!(pr["conflict_count"], SLOTS);
 }

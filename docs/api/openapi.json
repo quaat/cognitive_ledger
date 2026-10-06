@@ -1039,7 +1039,8 @@
       "maxItems": 64
      },
      "truncated": {
-      "type": "boolean"
+      "type": "boolean",
+      "description": "More quads exist on this side than are listed (the 64-quad cap or the report byte budget)."
      }
     }
    },
@@ -1109,6 +1110,7 @@
      "strategy",
      "conflict_count",
      "conflicts",
+     "conflicts_truncated",
      "correlation_id"
     ],
     "properties": {
@@ -1158,14 +1160,20 @@
       "type": "string"
      },
      "conflict_count": {
-      "type": "integer"
+      "type": "integer",
+      "description": "Exact total of structurally conflicting keys; never affected by the report limits."
      },
      "conflicts": {
       "type": "array",
       "items": {
        "$ref": "#/components/schemas/MergeConflict"
       },
-      "maxItems": 1000
+      "maxItems": 1000,
+      "description": "A deterministic prefix of the conflicting keys in ascending key order: at most 1000 entries, 64 quads per side, and at most the deployment's conflict report byte budget as JSON (LEDGER_LIMIT_MERGE_CONFLICT_REPORT_BYTES, default 2 MiB). Whole quads only. Diagnostic: the merged state, conflict_count and preview_token never depend on these limits (ADR-0024)."
+     },
+     "conflicts_truncated": {
+      "type": "boolean",
+      "description": "The report limits (entry count or byte budget) left conflicts or quads out of `conflicts`. A side's own `truncated` flag also covers the 64-quad cap."
      },
      "merged_state_digest": {
       "$ref": "#/components/schemas/ContentId"

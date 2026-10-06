@@ -145,9 +145,14 @@
   Computing keys only for the changed quads, starting from T, and running under
   `spawn_blocking` are measured-later optimizations. The admission semaphore is global,
   not per tenant.
-- The conflict report is capped at 1 000 keys × 64 quads per side, not by bytes: a report
-  can be large when single quads are huge (each is bounded by the state limits). Add a byte
-  budget with a report-level truncation flag.
+- Resolved (Plan 0009 closure): the conflict report now also has a byte budget
+  (`LEDGER_LIMIT_MERGE_CONFLICT_REPORT_BYTES`, default 2 MiB) and a report-level
+  `conflicts_truncated` flag (ADR-0024 "Conflict report byte budget"). The budget bounds the
+  report only; the merge itself still holds the full states (item above).
+- Forced-interleaving pauses exist only under the non-default `ledger-store` feature
+  `test-hooks` (one point today: propose between its first replay lookup and the
+  recomputation). Further races that are now forced by holding database locks could move to
+  such pauses if those tests become slow or brittle.
 - The preview token binds the chosen strategy even when no slot conflicts, so previewing
   with `abort` and proposing with `union` is `MERGE_STALE`. This is intended and documented;
   normalizing it would be a token v2.

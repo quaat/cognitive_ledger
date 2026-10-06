@@ -11,5 +11,8 @@ description = "Deterministic merge classification, three-way structural RDF merg
 ledger-core = { path = "../ledger-core" }
 ledger-rdf = { path = "../ledger-rdf" }
 
+[dev-dependencies]
+serde_json.workspace = true
+
 [lints]
 workspace = true

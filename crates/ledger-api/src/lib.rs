@@ -68,6 +68,24 @@ pub struct ApiLimits {
     pub max_validation_state_bytes: usize,
     /// Maximum bytes of the encoded context hints of a validate request.
     pub max_validation_metadata_bytes: usize,
+    /// Byte budget of a merge preview's detailed conflict report (the `conflicts` array as
+    /// JSON, ADR-0024). Diagnostic only: the classification, merged state, conflict count
+    /// and preview token never depend on it. Within
+    /// `ledger_merge::{MIN,MAX}_CONFLICT_REPORT_BYTES`.
+    pub max_merge_conflict_report_bytes: usize,
+}
+
+impl ApiLimits {
+    /// Refuse values that would make a limit ambiguous rather than clamping them: a merge
+    /// conflict report budget outside `MIN..=MAX_CONFLICT_REPORT_BYTES` (zero included).
+    pub fn validate(&self) -> Result<(), String> {
+        self.merge_report_limits().map(|_| ())
+    }
+
+    fn merge_report_limits(&self) -> Result<ledger_store::MergeReportLimits, String> {
+        ledger_store::MergeReportLimits::with_max_bytes(self.max_merge_conflict_report_bytes)
+            .map_err(|e| format!("max_merge_conflict_report_bytes: {e}"))
+    }
 }
 
 impl Default for ApiLimits {
@@ -88,6 +106,7 @@ impl Default for ApiLimits {
             validator_response_bytes: 1024 * 1024,
             max_validation_state_bytes: 8 * 1024 * 1024,
             max_validation_metadata_bytes: 16 * 1024,
+            max_merge_conflict_report_bytes: ledger_store::MergeReportLimits::DEFAULT.max_bytes(),
         }
     }
 }
@@ -140,6 +159,11 @@ impl AppState {
                 "UNVALIDATED ACCEPTANCE ENABLED: proposals are accepted without semantic \
                  validation; this is a development/CI setting, never a production one"
             );
+        }
+        // Invalid limits are a configuration error, refused at startup (the server checks
+        // them first and exits with a readable message).
+        if let Err(e) = limits.validate() {
+            panic!("invalid ApiLimits: {e}");
         }
         // One source of truth for reconstruction bounds: the workflow's base
         // reconstruction and public state reads use the same limits.
@@ -2218,8 +2242,13 @@ pub struct MergePreviewResponse {
     pub target_delta: DeltaSummaryResponse,
     pub source_delta: DeltaSummaryResponse,
     pub strategy: &'static str,
+    /// Exact total of conflicting keys.
     pub conflict_count: usize,
+    /// A deterministic prefix of the conflicts, bounded by count and by
+    /// `max_merge_conflict_report_bytes`.
     pub conflicts: Vec<ConflictResponse>,
+    /// The report limits left conflicts or quads out of `conflicts`.
+    pub conflicts_truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub merged_state_digest: Option<ContentId>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2261,11 +2290,22 @@ async fn merge_preview(
         max_visited: MERGE_MAX_VISITED,
         deadline: Some(std::time::Instant::now() + MERGE_DEADLINE),
     };
+    let report = state
+        .0
+        .limits
+        .merge_report_limits()
+        .expect("validated in AppState::new");
     let p = state
         .0
         .store
         .workflows()
-        .merge_preview(&ctx.identity.principal.tenant_id, &graph, &spec, limits)
+        .merge_preview_reported(
+            &ctx.identity.principal.tenant_id,
+            &graph,
+            &spec,
+            limits,
+            report,
+        )
         .await
         .map_err(|e| ApiError::from_ledger(e, &correlation))?;
     let candidates = match &p.class {
@@ -2296,6 +2336,7 @@ async fn merge_preview(
                 source: side(&c.source),
             })
             .collect(),
+        conflicts_truncated: p.conflicts_truncated,
         merged_state_digest: p.merged_state_digest,
         preview_token: p.preview_token,
         correlation_id: correlation,
@@ -2762,6 +2803,29 @@ async fn read_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_conflict_report_budget_is_validated_never_clamped() {
+        assert!(ApiLimits::default().validate().is_ok());
+        assert_eq!(
+            ApiLimits::default().max_merge_conflict_report_bytes,
+            ledger_store::MergeReportLimits::DEFAULT.max_bytes()
+        );
+        for bad in [0, 1, 1023, 64 * 1024 * 1024 + 1, usize::MAX] {
+            let limits = ApiLimits {
+                max_merge_conflict_report_bytes: bad,
+                ..ApiLimits::default()
+            };
+            assert!(limits.validate().is_err(), "{bad} accepted");
+        }
+        for good in [1024, 64 * 1024 * 1024] {
+            let limits = ApiLimits {
+                max_merge_conflict_report_bytes: good,
+                ..ApiLimits::default()
+            };
+            assert!(limits.validate().is_ok(), "{good} refused");
+        }
+    }
 
     #[test]
     fn openapi_document_matches_the_served_routes_and_error_codes() {

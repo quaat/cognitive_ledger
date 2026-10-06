@@ -24,7 +24,8 @@ use crate::postgres_workflow::{
 use ledger_core::{AnyCommit, CommitId, CommitV2, ContentId, GraphId, LedgerError, TenantId};
 use ledger_dag::{MergeBase, Relation, TraversalLimits};
 use ledger_merge::{
-    Classification, Conflict, MERGE_ALGORITHM_V1, PreviewIdentity, Strategy, three_way,
+    Classification, Conflict, MERGE_ALGORITHM_V1, PreviewIdentity, ReportLimits, Strategy,
+    three_way_reported,
 };
 use ledger_rdf::{Quad, diff};
 use sqlx::{PgConnection, Row};
@@ -96,8 +97,12 @@ pub struct MergePreview {
     pub behind: usize,
     pub target_delta: DeltaSummary,
     pub source_delta: DeltaSummary,
+    /// The detailed conflict report, bounded by the [`ReportLimits`] of the preview.
     pub conflicts: Vec<Conflict>,
+    /// Exact, whatever the report limits.
     pub conflict_count: usize,
+    /// The report limits left conflicts or quads out of `conflicts`.
+    pub conflicts_truncated: bool,
     pub strategy: Strategy,
     pub merged_state_digest: Option<ContentId>,
     /// Present exactly when a candidate would result (`FastForward` / `Divergent`).
@@ -249,13 +254,29 @@ impl WorkflowRepository {
         Ok((head.parse()?, row.try_get("status").map_err(db_error)?))
     }
 
-    /// The side-effect-free merge preview (ADR-0024): no transaction writes, no locks.
+    /// The side-effect-free merge preview (ADR-0024): no transaction writes, no locks. The
+    /// conflict report has the default limits.
     pub async fn merge_preview(
         &self,
         tenant: &TenantId,
         graph: &GraphId,
         spec: &MergeSpec,
         limits: TraversalLimits,
+    ) -> Result<MergePreview, LedgerError> {
+        self.merge_preview_reported(tenant, graph, spec, limits, ReportLimits::DEFAULT)
+            .await
+    }
+
+    /// [`Self::merge_preview`] with explicit conflict report limits (an operational bound on
+    /// the detailed report only: the classification, merged state, conflict count and token
+    /// are the same under any limits).
+    pub async fn merge_preview_reported(
+        &self,
+        tenant: &TenantId,
+        graph: &GraphId,
+        spec: &MergeSpec,
+        limits: TraversalLimits,
+        report: ReportLimits,
     ) -> Result<MergePreview, LedgerError> {
         crate::postgres_workflow::validate_branch(&spec.source)?;
         crate::postgres_workflow::validate_branch(&spec.target)?;
@@ -299,6 +320,7 @@ impl WorkflowRepository {
             source_delta: DeltaSummary::default(),
             conflicts: Vec::new(),
             conflict_count: 0,
+            conflicts_truncated: false,
             strategy: spec.strategy,
             merged_state_digest: None,
             preview_token: None,
@@ -368,9 +390,16 @@ impl WorkflowRepository {
             Classification::Divergent => spec.strategy,
         };
         preview.strategy = strategy;
-        let merged = three_way(&base_state.state, &target.state, &source.state, strategy);
+        let merged = three_way_reported(
+            &base_state.state,
+            &target.state,
+            &source.state,
+            strategy,
+            report,
+        );
         preview.conflicts = merged.conflicts;
         preview.conflict_count = merged.conflict_count;
+        preview.conflicts_truncated = merged.conflicts_truncated;
         let Some(merged) = merged.merged else {
             preview.class = MergeClass::Conflicted;
             return Ok(preview);
@@ -503,18 +532,27 @@ impl WorkflowRepository {
                 return Self::replay_merge_proposed(&mut conn, stored, scope).await;
             }
         }
+        #[cfg(feature = "test-hooks")]
+        self.pause_at(crate::test_hooks::HookPoint::ProposeAfterReplayCheck)
+            .await;
+        // Propose never returns the detailed conflict report: the smallest report budget.
         let preview = self
-            .merge_preview(
+            .merge_preview_reported(
                 &scope.principal.tenant_id,
                 &scope.graph,
                 &request.spec,
                 limits,
+                ReportLimits::SMALLEST,
             )
-            .await?;
-        if preview.preview_token.as_deref() != Some(request.preview_token.as_str()) {
-            // Before any refusal: a lost response retried while the original commits (and
-            // is perhaps applied, so the recomputation is now contained or moved) replays
-            // the original result rather than reporting a class or staleness error.
+            .await;
+        let current = matches!(&preview, Ok(p)
+            if p.preview_token.as_deref() == Some(request.preview_token.as_str()));
+        if !current {
+            // Before any refusal (a recomputation error, another class, another token): a
+            // lost response retried while the original commits (and is perhaps applied, so
+            // the recomputation is now contained, moved, or an explicit base no longer
+            // applies) replays the original result. Completed durable replay wins over
+            // mutable recomputed state.
             let mut conn = self.pool.acquire().await.map_err(db_error)?;
             if let Some(stored) =
                 Self::stored_result(&mut conn, scope, Operation::MergePropose).await?
@@ -522,6 +560,7 @@ impl WorkflowRepository {
                 return Self::replay_merge_proposed(&mut conn, stored, scope).await;
             }
         }
+        let preview = preview?;
         // Classes without a token are reported as such (more actionable than "stale").
         match &preview.class {
             MergeClass::FastForward | MergeClass::Divergent => {}

@@ -2214,3 +2214,133 @@ async fn a_propose_paused_while_the_target_moves_is_stale() {
             .unwrap();
     assert_eq!(merges, 0);
 }
+
+/// The stored propose results of `key` in this graph: (request digest, proposal).
+async fn stored_proposes(pool: &sqlx::PgPool, g: &GraphId, key: &str) -> Vec<(String, i64)> {
+    sqlx::query_as(
+        "SELECT request_digest, result_proposal_id FROM idempotency \
+         WHERE graph_id = $1 AND operation = 'merge_propose' AND idempotency_key = $2",
+    )
+    .bind(g.as_str())
+    .bind(key)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+/// Forced ordering (feature `test-hooks`; no sleeps, no held locks): a retry R of a propose
+/// pauses right after its first stored-result lookup found nothing; the original O then
+/// proposes and the merge is applied; R resumes and its recomputation now sees the source
+/// contained (and an explicit base no longer applicable). Completed durable replay must win
+/// over the mutable recomputed state: R returns O's result, never `MERGE_NOTHING_TO_DO`,
+/// `MERGE_STALE` or `INVALID_MERGE_BASE`; and R with the same key but another canonical
+/// request gets `IDEMPOTENCY_CONFLICT` without disturbing O's stored result.
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn a_propose_retry_paused_before_recomputation_replays_the_applied_original() {
+    use ledger_store::test_hooks::{HookPoint, PauseHook};
+    let store = store().await;
+    let pool = store.pool().clone();
+    // (explicit base, retry with the same canonical request)
+    for (explicit_base, same_request) in [(false, true), (true, true), (false, false)] {
+        let g = graph(&store).await;
+        let c1 = change(&store, &g, "main", None, &[A], &[]).await;
+        branch(&store, &g, "agent/rr", BranchPolicy::default()).await;
+        change(&store, &g, "agent/rr", Some(c1.clone()), &[B], &[]).await;
+        let mut sp = spec("agent/rr", "main", MergeStrategy::Abort);
+        if explicit_base {
+            // A fast-forward's only valid base is the target head; after the apply the
+            // source is contained and naming a base is refused by a recomputation.
+            sp.base = Some(c1.clone());
+        }
+        let p = preview(&store, &g, &sp).await;
+        assert_eq!(p.class, MergeClass::FastForward);
+        let token = p.preview_token.unwrap();
+        let key = "rr-propose";
+        let r_scope = if same_request {
+            scope(&g, key)
+        } else {
+            scope_as("curator", &g, key, "another canonical request")
+        };
+
+        let hook = PauseHook::new(HookPoint::ProposeAfterReplayCheck);
+        let paused = store.workflows().clone().with_pause_hook(hook.clone());
+        let retry = {
+            let request = ProposeMergeRequest {
+                scope: r_scope,
+                spec: sp.clone(),
+                preview_token: token.clone(),
+                message: "integrate".into(),
+                evidence_refs: vec![],
+            };
+            tokio::spawn(async move { paused.merge_propose(&request, limits()).await })
+        };
+        // R has looked up the stored result (none) and is paused before recomputing.
+        hook.reached().await;
+        assert!(stored_proposes(&pool, &g, key).await.is_empty());
+
+        // O completes, and its proposal is applied.
+        let original = propose(&store, &g, &sp, &token, key).await.unwrap();
+        assert!(!original.replayed);
+        apply(
+            &store,
+            &g,
+            original.proposal_id,
+            &token,
+            "reviewer",
+            "rr-apply",
+        )
+        .await
+        .unwrap();
+        // The recomputation R is about to run would now refuse.
+        let now = preview(&store, &g, &spec("agent/rr", "main", MergeStrategy::Abort)).await;
+        assert_eq!(now.class, MergeClass::AlreadyContained);
+
+        hook.resume();
+        let outcome = retry.await.unwrap();
+        if same_request {
+            let replay = outcome.unwrap_or_else(|e| {
+                panic!("explicit base {explicit_base}: the retry must replay, got {e:?}")
+            });
+            assert!(replay.replayed);
+            assert_eq!(
+                (
+                    replay.proposal_id,
+                    &replay.candidate,
+                    &replay.preview_token,
+                    &replay.merged_state_digest
+                ),
+                (
+                    original.proposal_id,
+                    &original.candidate,
+                    &original.preview_token,
+                    &original.merged_state_digest
+                )
+            );
+        } else {
+            assert!(
+                matches!(outcome, Err(LedgerError::IdempotencyConflict)),
+                "{outcome:?}"
+            );
+            // O's result still replays for O, unchanged.
+            let again = propose(&store, &g, &sp, &token, key).await.unwrap();
+            assert!(again.replayed && again.proposal_id == original.proposal_id);
+        }
+        // Exactly one durable result for the scope/key: O's.
+        let stored = stored_proposes(&pool, &g, key).await;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].1, original.proposal_id);
+        assert_eq!(
+            stored[0].0,
+            ContentId::for_bytes(key.as_bytes()).to_string()
+        );
+        let merges: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM merge_proposals WHERE graph_id = $1")
+                .bind(g.as_str())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(merges, 1);
+    }
+    verify_clean(&store).await;
+}

@@ -131,6 +131,258 @@ fn conflict_report_is_bounded() {
     let first = &r.conflicts[0];
     assert_eq!(first.target.quads.len(), MAX_REPORTED_QUADS_PER_SIDE);
     assert!(first.target.truncated && !first.source.truncated);
+    assert!(r.conflicts_truncated);
+}
+
+// ---- conflict report byte budget (an operational limit, never part of the merge) ----
+
+/// The report as the API serializes it (`ConflictResponse` shape), for measuring bytes.
+fn report_json(conflicts: &[Conflict]) -> String {
+    let side = |s: &Side| {
+        serde_json::json!({
+            "quads": s.quads.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "truncated": s.truncated,
+        })
+    };
+    let entries: Vec<serde_json::Value> = conflicts
+        .iter()
+        .map(|c| {
+            let mut v = serde_json::json!({
+                "subject": c.key.subject,
+                "predicate": c.key.predicate,
+                "base": side(&c.base),
+                "target": side(&c.target),
+                "source": side(&c.source),
+            });
+            if let Some(g) = &c.key.graph {
+                v["graph"] = serde_json::Value::String(g.clone());
+            }
+            v
+        })
+        .collect();
+    serde_json::to_string(&entries).unwrap()
+}
+
+/// A legal literal of about `len` bytes that is expensive as JSON: quotes, backslashes and
+/// newlines (escaped in N-Quads, escaped again in JSON) and non-ASCII text.
+fn heavy_literal(tag: &str, len: usize) -> String {
+    let unit = "a\\\"b\\nc\\\\é";
+    let mut out = String::from(tag);
+    while out.len() < len {
+        out.push_str(unit);
+    }
+    out
+}
+
+/// `conflicts` divergent slots with large terms: per slot, `per_side` heavy quads per side.
+fn heavy_conflicts(
+    conflicts: usize,
+    per_side: usize,
+    len: usize,
+) -> (BTreeSet<Quad>, BTreeSet<Quad>, BTreeSet<Quad>) {
+    let (mut b, mut t, mut s) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
+    for i in 0..conflicts {
+        let subject = format!("<urn:subject:{i}:{}>", "x".repeat(200));
+        for j in 0..per_side {
+            for (set, side) in [(&mut b, "b"), (&mut t, "t"), (&mut s, "s")] {
+                let lit = heavy_literal(&format!("{side}{j}-"), len);
+                set.insert(q(&format!("{subject} <urn:p> \"{lit}\" <urn:g> .")));
+            }
+        }
+        // Independent non-conflicting changes so the merged state is non-trivial.
+        t.insert(q(&format!("<urn:t{i}> <urn:p> \"t\" .")));
+        s.insert(q(&format!("<urn:s{i}> <urn:p> \"s\" .")));
+    }
+    (b, t, s)
+}
+
+#[test]
+fn json_string_len_is_the_serialized_length() {
+    for v in [
+        "",
+        "plain",
+        "quote \" backslash \\ slash /",
+        "\u{0}\u{1}\u{8}\u{9}\u{a}\u{b}\u{c}\u{d}\u{1f}\u{7f}",
+        "é ✓ 𝄞 \u{2028}",
+        "<urn:s> <urn:p> \"a\\\"b\\n\" .",
+    ] {
+        assert_eq!(
+            json_string_len(v),
+            serde_json::to_string(v).unwrap().len(),
+            "{v:?}"
+        );
+    }
+    let heavy = heavy_literal("h", 4096);
+    assert_eq!(
+        json_string_len(&heavy),
+        serde_json::to_string(&heavy).unwrap().len()
+    );
+}
+
+#[test]
+fn report_limits_refuse_zero_and_out_of_range_budgets() {
+    for bad in [
+        0,
+        1,
+        MIN_CONFLICT_REPORT_BYTES - 1,
+        MAX_CONFLICT_REPORT_BYTES + 1,
+        usize::MAX,
+    ] {
+        assert_eq!(
+            ReportLimits::with_max_bytes(bad),
+            Err(InvalidReportLimit(bad))
+        );
+    }
+    for good in [
+        MIN_CONFLICT_REPORT_BYTES,
+        DEFAULT_CONFLICT_REPORT_BYTES,
+        MAX_CONFLICT_REPORT_BYTES,
+    ] {
+        assert_eq!(
+            ReportLimits::with_max_bytes(good).unwrap().max_bytes(),
+            good
+        );
+    }
+    assert_eq!(
+        ReportLimits::default().max_bytes(),
+        DEFAULT_CONFLICT_REPORT_BYTES
+    );
+}
+
+#[test]
+fn large_terms_are_reported_within_the_byte_budget_and_never_change_the_merge() {
+    // 40 conflicting slots × 3 sides × 4 quads × ~16 KiB literals ≈ 8 MiB of conflict
+    // detail (more as JSON): far beyond every budget below, but within the count caps, so
+    // only the byte budget bounds the report.
+    let (b, t, s) = heavy_conflicts(40, 4, 16 * 1024);
+    let budgets = [
+        MIN_CONFLICT_REPORT_BYTES,
+        64 * 1024,
+        DEFAULT_CONFLICT_REPORT_BYTES,
+    ];
+    for strategy in ALL {
+        let reference = three_way(&b, &t, &s, strategy);
+        let mut previous: Option<Vec<Conflict>> = None;
+        for budget in budgets {
+            let limits = ReportLimits::with_max_bytes(budget).unwrap();
+            let r = three_way_reported(&b, &t, &s, strategy, limits);
+            // The merge is independent of the report.
+            assert_eq!(r.conflict_count, 40, "exact count under {budget}");
+            assert_eq!(r.merged, reference.merged, "merged state under {budget}");
+            // The report is bounded: details within the budget plus the array brackets.
+            let json = report_json(&r.conflicts);
+            assert!(
+                json.len() <= budget + 2,
+                "{} bytes of conflict detail over a {budget}-byte budget",
+                json.len()
+            );
+            assert!(
+                r.conflicts_truncated,
+                "budget {budget} cannot hold everything"
+            );
+            // Complete quads only: every listed quad is a quad of its side.
+            for c in &r.conflicts {
+                for side in [&c.base, &c.target, &c.source] {
+                    assert!(
+                        side.quads
+                            .iter()
+                            .all(|x| b.contains(x) || t.contains(x) || s.contains(x))
+                    );
+                }
+            }
+            // Deterministic: the same inputs report exactly the same prefix.
+            assert_eq!(three_way_reported(&b, &t, &s, strategy, limits), r);
+            // A smaller budget lists a prefix of a larger one: equal entries, then at most one
+            // entry cut short.
+            if let Some(smaller) = &previous {
+                assert!(smaller.len() <= r.conflicts.len());
+                let n = smaller.len();
+                if n > 0 {
+                    assert_eq!(smaller[..n - 1], r.conflicts[..n - 1]);
+                    let (cut, full) = (&smaller[n - 1], &r.conflicts[n - 1]);
+                    assert_eq!(cut.key, full.key);
+                    for (c, f) in [
+                        (&cut.base, &full.base),
+                        (&cut.target, &full.target),
+                        (&cut.source, &full.source),
+                    ] {
+                        assert!(f.quads.starts_with(&c.quads));
+                    }
+                }
+            }
+            previous = Some(r.conflicts);
+        }
+    }
+    // The preview token binds the merged-state digest, which no budget changes.
+    let tokens: BTreeSet<String> = budgets
+        .iter()
+        .map(|budget| {
+            let r = three_way_reported(
+                &b,
+                &t,
+                &s,
+                Strategy::Union,
+                ReportLimits::with_max_bytes(*budget).unwrap(),
+            );
+            PreviewIdentity {
+                graph: GraphId::new("g").unwrap(),
+                source_branch: "agent/s".into(),
+                source_head: CommitId(ContentId::for_bytes(b"s")),
+                target_branch: "main".into(),
+                target_head: CommitId(ContentId::for_bytes(b"t")),
+                merge_base: CommitId(ContentId::for_bytes(b"b")),
+                classification: Classification::Divergent,
+                strategy: Strategy::Union,
+                merged_state_digest: merged_state_digest(&r.merged.unwrap()),
+            }
+            .token()
+        })
+        .collect();
+    assert_eq!(tokens.len(), 1);
+}
+
+#[test]
+fn the_smallest_budget_still_lists_an_ordinary_conflict() {
+    let base = st(&["<urn:a> <urn:p> \"1\" ."]);
+    let target = st(&["<urn:a> <urn:p> \"2\" ."]);
+    let source = st(&["<urn:a> <urn:p> \"3\" ."]);
+    let limits = ReportLimits::with_max_bytes(MIN_CONFLICT_REPORT_BYTES).unwrap();
+    let r = three_way_reported(&base, &target, &source, Strategy::Abort, limits);
+    assert_eq!(r.conflict_count, 1);
+    assert!(!r.conflicts_truncated);
+    let c = &r.conflicts[0];
+    assert_eq!(
+        (
+            c.base.quads.len(),
+            c.target.quads.len(),
+            c.source.quads.len()
+        ),
+        (1, 1, 1)
+    );
+    assert!(!c.base.truncated && !c.target.truncated && !c.source.truncated);
+}
+
+#[test]
+fn a_term_larger_than_the_budget_is_never_partially_listed() {
+    let (b, t, s) = heavy_conflicts(1, 1, 8 * 1024);
+    let limits = ReportLimits::with_max_bytes(MIN_CONFLICT_REPORT_BYTES).unwrap();
+    let r = three_way_reported(&b, &t, &s, Strategy::Abort, limits);
+    assert_eq!(r.conflict_count, 1);
+    assert!(r.conflicts_truncated && r.merged.is_none());
+    // The key fits; no side's quad does, so every side is empty and flagged.
+    let c = &r.conflicts[0];
+    for side in [&c.base, &c.target, &c.source] {
+        assert!(side.quads.is_empty() && side.truncated);
+    }
+}
+
+#[test]
+fn the_count_caps_alone_set_the_report_truncation_flag() {
+    let (b, t, s) = heavy_conflicts(MAX_REPORTED_CONFLICTS, 1, 1);
+    let r = three_way(&b, &t, &s, Strategy::Abort);
+    // Exactly the cap: everything is listed.
+    assert_eq!(r.conflicts.len(), MAX_REPORTED_CONFLICTS);
+    assert!(!r.conflicts_truncated);
 }
 
 // ---- property tests against an independent set-formula oracle (deterministic seeds) ----

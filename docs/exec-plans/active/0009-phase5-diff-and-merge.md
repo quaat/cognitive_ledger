@@ -104,9 +104,25 @@ carried into Phase 8 / production qualification.
     lost-response retry racing its own apply could get `MERGE_NOTHING_TO_DO`;
   - `verify` did not recompute `source_parties`.
 
-  The verify fix has a tamper test (erase, then restore). The replay reordering has no
-  forced-race test: failpoints only inject errors, so no deterministic pause exists
-  between the first replay check and the recomputation. It is verified by inspection.
+  The verify fix has a tamper test (erase, then restore). At `beece09` the replay
+  reordering had no forced-race test, because failpoints only inject errors and no
+  deterministic pause existed.
+- Closure work after `beece09` (2026-10-06), summarized in ADR-0024 "Conflict report byte
+  budget and replay before refusal":
+  - **Conflict-report byte budget.** `LEDGER_LIMIT_MERGE_CONFLICT_REPORT_BYTES` defaults to
+    2 MiB; values outside 1 KiB..=64 MiB are refused. The budget is enforced while the
+    report is collected in `ledger-merge` (`ReportLimits`, `three_way_reported`), before
+    any JSON exists. The response gains `conflicts_truncated`. The merged state, the count,
+    the token and the candidate are unchanged under any budget.
+  - **Deterministic propose-replay race.** The non-default `ledger-store` feature
+    `test-hooks` adds a pause between the first stored-result lookup and the
+    recomputation. Only that crate's test targets enable it, through a self
+    dev-dependency; `cargo tree` shows that no binary's normal graph has it. The forced
+    test found a residual defect in `beece09`: a retry carrying an explicit `base` got
+    `INVALID_MERGE_BASE` after the original had been applied, because recomputation
+    errors were returned before the second replay lookup. Propose now replays before
+    **any** refusal. Two mutations (the `beece09` ordering, and no second lookup) each
+    fail the test.
 
 ## Evidence
 Code under test: `ad75e17` (implementation and review fixes). Every gate below ran on 2026-10-06

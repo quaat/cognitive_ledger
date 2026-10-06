@@ -92,7 +92,8 @@ comparison.
 
 **Conflict report.** Conflicting keys are listed in ascending key order. At most 1 000 keys
 are listed in detail, each with at most 64 quads per side and a `truncated` flag per side;
-the total count is always given.
+the total count is always given. The report also has a byte budget and a report-level
+`conflicts_truncated` flag (see "Conflict report byte budget" below).
 
 **No-change.** The merge is classified `NO_CHANGE` and creates nothing only if **both**
 hold:
@@ -357,6 +358,44 @@ Codex review of the final candidate (`60c918f`) found no P0 or P1 and two P2s, b
   is still reported as that class, not as stale.
 - **`verify` recomputes `source_parties`** from the proposals of the source-only commits.
   Erased four-eyes evidence is a violation.
+
+## Conflict report byte budget and replay before refusal (Plan 0009 closure, 2026-10-06)
+**Byte budget.** The detailed report was bounded by count only, and a legal quad can be
+large: up to 1 000 × 3 × 64 large quads could be listed. Now:
+- The budget is an operational setting, `LEDGER_LIMIT_MERGE_CONFLICT_REPORT_BYTES`
+  (`ApiLimits::max_merge_conflict_report_bytes`). It defaults to **2 MiB**. Values outside
+  1 KiB..=64 MiB, including 0, are refused at startup and never clamped.
+- It is enforced while the report is collected, before any JSON is built.
+  `ledger_merge::three_way_reported` takes `ReportLimits`, and a separate collector reads the
+  slots the merge has already partitioned. Conflicts are offered in ascending key order and
+  sides in base/target/source order. Each quad's cost is its length as an escaped JSON
+  string plus a separator. Each listed conflict also pays a fixed framing charge (160 bytes,
+  at least the real framing) plus its key terms. Collection stops at the first item that
+  does not fit.
+- The result is a deterministic prefix of whole quads; no quad or entry is cut in half. The
+  serialized `conflicts` array is at most the budget plus its two brackets. A side that lost
+  quads has `truncated: true`. `conflicts_truncated: true` means a count or byte limit left
+  something out.
+- The budget is **diagnostic only.** The merged state, `conflict_count`, the
+  classification, the preview token (`sculpin-ledger-merge-preview/v1` bytes unchanged), the
+  candidate and the merge row are the same under any budget. Propose collects with the
+  smallest budget, because it never returns details.
+- The merge computation still holds the full states; that memory is bounded by the
+  reconstruction limits and admission (tech-debt).
+
+**Replay before refusal, including recomputation errors.** Propose now consults the stored
+result before returning **any** refusal, not only a token mismatch or a class error. That
+includes errors raised by the recomputation itself, such as `INVALID_MERGE_BASE` for an
+explicit `base` once the source is contained, or `BRANCH_DELETED`. A lost-response retry of
+a completed propose therefore always replays it, and a same-key retry with another request
+gets `IDEMPOTENCY_CONFLICT`. The forced-race test showed that `beece09` still returned
+`INVALID_MERGE_BASE` for a retry with an explicit base.
+
+**Deterministic pause point.** The ordering is pinned by
+`pg_merge::a_propose_retry_paused_before_recomputation_replays_the_applied_original`. The
+test uses a pause compiled only under the non-default `ledger-store` feature `test-hooks`,
+which only that crate's test targets enable. The server, admin and projector binaries
+never build it: there is no runtime switch, environment variable or endpoint.
 
 ## Alternatives considered
 - **Object-level conflict key** `(graph, subject, predicate, object)`: this silently unions
