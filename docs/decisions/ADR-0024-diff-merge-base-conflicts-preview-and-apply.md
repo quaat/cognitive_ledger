@@ -397,6 +397,36 @@ test uses a pause compiled only under the non-default `ledger-store` feature `te
 which only that crate's test targets enable. The server, admin and projector binaries
 never build it: there is no runtime switch, environment variable or endpoint.
 
+**Final-candidate review amendments (2026-10-06).** Five independent reviews of `0582a85`
+(merge/DAG, storage/concurrency, semantic validation, security/resources,
+verification/migration) found no P0 or P1. These P2s were fixed:
+- **A duplicate propose racing an uncommitted original.** The refusal-path lookup now runs
+  under the request's idempotency lock (`begin_scoped`). A duplicate that recomputes
+  another token while the original is committing therefore waits, and then replays or
+  reports `IDEMPOTENCY_CONFLICT`. Before, it answered `MERGE_STALE`. This is forced by
+  `pg_merge::a_duplicate_propose_racing_the_uncommitted_original_waits_and_replays`, using
+  the `ProposeBeforeCommit` pause; the old lookup fails that test.
+- **`merge_base_candidates` is capped** at 64 listed candidates, in ascending order, with
+  the exact `merge_base_candidate_count`. A deliberately built criss-cross could otherwise
+  list up to the 100 000-commit visit limit.
+- **`verify` false negatives closed.** Verify now:
+  - recomputes `conflict_count`;
+  - refuses rows that a `NO_CHANGE` merge would never have created (the shared
+    `ledger_merge::creates_nothing` rule);
+  - checks that every merge candidate has exactly the parents `[target_head, source_head]`
+    (also for unapplied rows);
+  - checks that the source head was once a head of the source branch;
+  - checks that every `merge_propose` result names its merge row and candidate;
+  - checks that an applied merge onto a four-eyes branch was applied by a party distinct
+    from its proposer and its `source_parties`.
+
+  Every check has a tamper test.
+- **`test-hooks` absence is enforced.** `scripts/check-architecture.py` (run by
+  `check-fast`) fails if any `apps/*` package's normal build graph enables the feature.
+- **New tests for four-eyes laundering paths.** Delegators of source proposers, and the
+  authors and proposer of a nested merge, are `source_parties`; an applier acting for one
+  of them is refused.
+
 ## Alternatives considered
 - **Object-level conflict key** `(graph, subject, predicate, object)`: this silently unions
   competing values of a slot. Rejected as the default; it could become a later algorithm id.

@@ -1141,7 +1141,12 @@
       "items": {
        "$ref": "#/components/schemas/ContentId"
       },
-      "description": "Best common ancestors of an ambiguous history, ascending."
+      "description": "The first 64 best common ancestors of an ambiguous history, ascending (any of them may be named as `base`).",
+      "maxItems": 64
+     },
+     "merge_base_candidate_count": {
+      "type": "integer",
+      "description": "Exact number of best common ancestors (ambiguous histories only)."
      },
      "ahead": {
       "type": "integer",

@@ -123,6 +123,27 @@ carried into Phase 8 / production qualification.
     errors were returned before the second replay lookup. Propose now replays before
     **any** refusal. Two mutations (the `beece09` ordering, and no second lookup) each
     fail the test.
+- Final-candidate reviews of `0582a85` (2026-10-06): merge/DAG, storage/concurrency,
+  semantic validation, security/resources and verification/migration. Each ran read-only on
+  Opus. There was **no P0/P1**. The P2s fixed are listed in ADR-0024 "Final-candidate review
+  amendments":
+  - a duplicate propose racing an uncommitted original;
+  - the `merge_base_candidates` cap;
+  - six `verify` false negatives (count, no-change, parents, source head, propose results,
+    offline four-eyes);
+  - the `test-hooks` absence guard;
+  - four-eyes laundering tests.
+
+  P2s deferred, in tech-debt: merge memory and CPU on the async runtime (Phase-6
+  measurement), verify's fixed limits (fails closed), environment freshness named by the
+  caller (accepted in ADR-0019), and full-history ancestry walks.
+- PostgreSQL 15 first run on `0582a85`: two assertions compared a global backlog count with
+  a second global count taken by another query, while parallel tests wrote outbox rows.
+  The failures were `pg_merge::a_merge_writes_exactly_one_ordinary_outbox_row…` (275 vs
+  274) and `pg_validation_api::a_validated_multi_step_cognitive_workflow…` (341 vs 342).
+  Both passed in isolation. They now take both readings in one REPEATABLE READ snapshot
+  (`ProjectionRepository::unconfigured_pending_on`), which removes the race; the assertions
+  are no weaker.
 
 ## Evidence
 Code under test: `ad75e17` (implementation and review fixes). Every gate below ran on 2026-10-06

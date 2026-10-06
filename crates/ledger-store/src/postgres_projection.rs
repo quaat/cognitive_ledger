@@ -806,6 +806,15 @@ impl ProjectionRepository {
     /// Outbox events of projection-eligible refs (`main` under v1) that no stream projects
     /// (unconfigured backlog).
     pub async fn unconfigured_pending(&self) -> Result<i64, LedgerError> {
+        let mut conn = self.pool.acquire().await.map_err(db_error)?;
+        Self::unconfigured_pending_on(&mut conn).await
+    }
+
+    /// [`Self::unconfigured_pending`] on a caller's connection (for example inside one
+    /// snapshot with other readings).
+    pub async fn unconfigured_pending_on(
+        conn: &mut sqlx::PgConnection,
+    ) -> Result<i64, LedgerError> {
         // Only projection-eligible refs count (ADR-0022): v1 projects `main`, so outbox rows
         // of cognitive work branches are kept (future protocols) but never a backlog alarm.
         sqlx::query_scalar(
@@ -815,7 +824,7 @@ impl ProjectionRepository {
                              AND s.branch = o.branch AND s.status <> 'disabled')",
         )
         .bind(PROJECTED_REF)
-        .fetch_one(&self.pool)
+        .fetch_one(conn)
         .await
         .map_err(db_error)
     }

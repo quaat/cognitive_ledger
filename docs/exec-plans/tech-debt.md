@@ -149,9 +149,22 @@
   (`LEDGER_LIMIT_MERGE_CONFLICT_REPORT_BYTES`, default 2 MiB) and a report-level
   `conflicts_truncated` flag (ADR-0024 "Conflict report byte budget"). The budget bounds the
   report only; the merge itself still holds the full states (item above).
+- `verify` recomputes merges under `ReconstructionLimits::DEVELOPMENT` and
+  `TraversalLimits::DEFAULT`, not the deployment's configured limits. A deployment that
+  raises them sees valid large merges reported as violations. This fails closed (a false
+  alarm, never a missed fault); pass the configured limits to `ledger-admin verify` when
+  limits are raised (review, 2026-10-06).
+- A merge walks each side's whole ancestry (`analyze_with_ancestries`, 100 000-visit cap),
+  so very long histories cannot merge even when the base is recent (`RESOURCE_LIMIT`, fails
+  closed). Generation numbers and checkpoints are Phase-6 measurement items.
+- Merge preview builds the integration patch and the source-only set even for API
+  previews, which discard them. This is a small allocation saving for Phase 6.
+- `scripts/upgrade-p5.sh` merges one fast-forward-class branch on upgraded data (now with
+  exact row-count assertions). Divergent and explicit-base merges on upgraded data rely on
+  the DDL identity of clean and upgraded 0013 and on the PostgreSQL suites.
 - Forced-interleaving pauses exist only under the non-default `ledger-store` feature
-  `test-hooks` (one point today: propose between its first replay lookup and the
-  recomputation). Further races that are now forced by holding database locks could move to
+  `test-hooks` (two points today, both in propose: after the first replay lookup, and just
+  before `COMMIT`; enforced absent from every app build by `check-architecture.py`). Further races that are now forced by holding database locks could move to
   such pauses if those tests become slow or brittle.
 - The preview token binds the chosen strategy even when no slot conflicts, so previewing
   with `abort` and proposing with `union` is `MERGE_STALE`. This is intended and documented;

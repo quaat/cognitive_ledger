@@ -411,9 +411,7 @@ impl WorkflowRepository {
         // present), an empty integration commit is recorded, so the resolution is part of
         // history and a later merge never reapplies what was set aside (ADR-0023; the
         // explicit-workflow exception of ADR-0008).
-        if ledger_merge::is_no_change(&target.state, &merged)
-            && preview.source_delta == DeltaSummary::default()
-        {
+        if ledger_merge::creates_nothing(&base_state.state, &target.state, &source.state, &merged) {
             preview.class = MergeClass::NoChange;
             return Ok(preview);
         }
@@ -552,12 +550,14 @@ impl WorkflowRepository {
             // lost response retried while the original commits (and is perhaps applied, so
             // the recomputation is now contained, moved, or an explicit base no longer
             // applies) replays the original result. Completed durable replay wins over
-            // mutable recomputed state.
-            let mut conn = self.pool.acquire().await.map_err(db_error)?;
+            // mutable recomputed state. The lookup runs under the request's idempotency lock,
+            // so a duplicate that arrives while the original is still committing waits for it
+            // and replays rather than refusing.
+            let mut tx = self.begin_merge(scope, Operation::MergePropose).await?;
             if let Some(stored) =
-                Self::stored_result(&mut conn, scope, Operation::MergePropose).await?
+                Self::stored_result(&mut tx, scope, Operation::MergePropose).await?
             {
-                return Self::replay_merge_proposed(&mut conn, stored, scope).await;
+                return Self::replay_merge_proposed(&mut tx, stored, scope).await;
             }
         }
         let preview = preview?;
@@ -730,6 +730,9 @@ impl WorkflowRepository {
         let row = Self::load_merge_row(&mut tx, &scope.graph, proposal_id)
             .await?
             .ok_or_else(|| LedgerError::Storage("merge row vanished".into()))?;
+        #[cfg(feature = "test-hooks")]
+        self.pause_at(crate::test_hooks::HookPoint::ProposeBeforeCommit)
+            .await;
         tx.commit().await.map_err(db_error)?;
         Ok(Self::proposed_from_row(row, false))
     }

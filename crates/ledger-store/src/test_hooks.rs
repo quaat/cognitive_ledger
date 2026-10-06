@@ -19,6 +19,8 @@ pub enum HookPoint {
     /// `merge_propose`: after the first stored-result lookup found nothing, before the
     /// preview is recomputed.
     ProposeAfterReplayCheck,
+    /// `merge_propose`: everything written, idempotency lock held, just before `COMMIT`.
+    ProposeBeforeCommit,
 }
 
 /// A pause at one [`HookPoint`].

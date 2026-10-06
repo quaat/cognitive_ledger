@@ -1268,6 +1268,7 @@ async fn each_merge_check_detects_its_own_tampering() {
                 "ALTER TABLE proposals DISABLE TRIGGER ALL",
                 "ALTER TABLE idempotency DISABLE TRIGGER ALL",
                 "ALTER TABLE merge_proposals DISABLE TRIGGER ALL",
+                "ALTER TABLE branches DISABLE TRIGGER ALL",
             ] {
                 sqlx::query(guard).execute(&mut *tx).await.unwrap();
             }
@@ -1320,6 +1321,30 @@ async fn each_merge_check_detects_its_own_tampering() {
         "every merge-apply result names a merge event",
     )
     .await;
+    bypass(
+        format!("UPDATE idempotency SET result_commit = '{c1}' WHERE operation = 'merge_propose'"),
+        "every merge-propose result names its merge proposal and candidate",
+    )
+    .await;
+    // c1 was a head of `b` (its branch point) but is not the candidate's parent 1.
+    bypass(
+        format!("UPDATE merge_proposals SET source_head = '{c1}'"),
+        "every merge proposal's candidate has exactly the parents [target head, source head]",
+    )
+    .await;
+    // m2 only ever lived on `main`.
+    bypass(
+        format!("UPDATE merge_proposals SET source_head = '{m2}'"),
+        "every merge proposal's source head was a head of its source branch",
+    )
+    .await;
+    // The same principal proposed, authored the source and applied: allowed on `main`'s
+    // policy, a violation had the target required a distinct reviewer.
+    bypass(
+        "UPDATE branches SET require_distinct_reviewer = true WHERE branch = 'main'".into(),
+        "an applied merge onto a four-eyes branch was applied by a party distinct from its proposer and source authors",
+    )
+    .await;
     // The Rust-side recomputation (not an SQL check): tamper, commit, observe, on this
     // throw-away database.
     sqlx::query("ALTER TABLE merge_proposals DISABLE TRIGGER merge_proposals_write_once")
@@ -1354,8 +1379,93 @@ async fn each_merge_check_detects_its_own_tampering() {
         .await
         .unwrap();
     assert_eq!(recompute_violations(pool.clone()).await, 0);
+    // The recorded conflict count recomputes: a union merge with one conflicting slot.
+    let land_quad = |branch: &'static str, head: ledger_core::CommitId, i: &'static str, quad| {
+        let (wf, g) = (wf.clone(), g.clone());
+        async move {
+            let p = wf
+                .prepare(&PrepareRequest {
+                    scope: scope(&g, &format!("p{i}")),
+                    branch: branch.into(),
+                    expected_head: Some(head.clone()),
+                    requested: patch(quad),
+                    activity: "a".into(),
+                    event_time: None,
+                    evidence_refs: vec![],
+                    source_system: None,
+                    message: "m".into(),
+                })
+                .await
+                .unwrap();
+            wf.accept(&AcceptRequest {
+                scope: scope(&g, &format!("a{i}")),
+                branch: branch.into(),
+                expected_head: Some(head),
+                candidate: p.candidate.clone(),
+                reason: None,
+                validation: ValidationPolicy::NoValidation,
+            })
+            .await
+            .unwrap();
+            p.candidate
+        }
+    };
+    let merged_head = pr.candidate.clone();
+    wf.create_branch(
+        &CreateBranchRequest {
+            scope: scope(&g, "cu"),
+            name: "u".into(),
+            source: "main".into(),
+            from_commit: None,
+            policy: BranchPolicy::default(),
+        },
+        TraversalLimits::DEFAULT,
+    )
+    .await
+    .unwrap();
+    land_quad("main", merged_head.clone(), "x1", "<urn:x> <urn:p> \"t\" .").await;
+    land_quad("u", merged_head, "x2", "<urn:x> <urn:p> \"s\" .").await;
+    let union = MergeSpec {
+        source: "u".into(),
+        target: "main".into(),
+        strategy: MergeStrategy::Union,
+        base: None,
+    };
+    let preview = wf
+        .merge_preview(
+            &TenantId::new("tenant-v").unwrap(),
+            &g,
+            &union,
+            TraversalLimits::DEFAULT,
+        )
+        .await
+        .unwrap();
+    assert_eq!(preview.conflict_count, 1);
+    wf.merge_propose(
+        &ProposeMergeRequest {
+            scope: scope(&g, "mu"),
+            spec: union,
+            preview_token: preview.preview_token.unwrap(),
+            message: String::new(),
+            evidence_refs: vec![],
+        },
+        TraversalLimits::DEFAULT,
+    )
+    .await
+    .unwrap();
+    assert_eq!(recompute_violations(pool.clone()).await, 0);
+    sqlx::query("UPDATE merge_proposals SET conflict_count = 0 WHERE strategy = 'union'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(recompute_violations(pool.clone()).await, 1);
+    sqlx::query("UPDATE merge_proposals SET conflict_count = 1 WHERE strategy = 'union'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(recompute_violations(pool.clone()).await, 0);
     sqlx::query(&format!(
-        "UPDATE merge_proposals SET merged_state_digest = 'sha256:{}'",
+        "UPDATE merge_proposals SET merged_state_digest = 'sha256:{}' WHERE strategy = 'abort'",
         "0".repeat(64)
     ))
     .execute(&pool)

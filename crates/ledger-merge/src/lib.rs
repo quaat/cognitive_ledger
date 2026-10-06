@@ -434,6 +434,19 @@ pub fn merged_state_digest(merged: &BTreeSet<Quad>) -> ledger_core::ContentId {
     state_digest(merged)
 }
 
+/// The ADR-0024 `NO_CHANGE` rule: a merge creates nothing only when the merged state is the
+/// target state **and** the source contributed no net change from the base. If the source
+/// changed something that the merge set aside or already had, an (empty) integration commit
+/// records the resolution instead.
+pub fn creates_nothing(
+    base: &BTreeSet<Quad>,
+    target: &BTreeSet<Quad>,
+    source: &BTreeSet<Quad>,
+    merged: &BTreeSet<Quad>,
+) -> bool {
+    is_no_change(target, merged) && diff(base, source).is_empty()
+}
+
 /// Whether integrating `merged` into a target whose state is `target` changes nothing
 /// (ADR-0023 amendment: such a merge creates no commit, which keeps two-way syncing from
 /// producing endless empty integrations and respects ADR-0008's no-empty-commit rule).

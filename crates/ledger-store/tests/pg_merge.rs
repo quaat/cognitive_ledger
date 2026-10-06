@@ -1580,21 +1580,27 @@ async fn a_merge_writes_exactly_one_ordinary_outbox_row_and_branch_merges_are_no
     .await
     .unwrap();
     assert_eq!(side_rows, 1);
+    // Both global readings in one snapshot: other tests write outbox rows concurrently.
+    let mut snapshot = store.pool().begin().await.unwrap();
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *snapshot)
+        .await
+        .unwrap();
     let unconfigured_main: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM projection_outbox WHERE delivered_at IS NULL AND branch = 'main' \
          AND NOT EXISTS (SELECT 1 FROM projection_state s WHERE s.graph_id = projection_outbox.graph_id \
          AND s.branch = projection_outbox.branch AND s.status <> 'disabled')",
     )
-    .fetch_one(store.pool())
+    .fetch_one(&mut *snapshot)
     .await
     .unwrap();
     assert_eq!(
-        ledger_store::ProjectionRepository::new(store.pool().clone())
-            .unconfigured_pending()
+        ledger_store::ProjectionRepository::unconfigured_pending_on(&mut snapshot)
             .await
             .unwrap(),
         unconfigured_main
     );
+    snapshot.rollback().await.unwrap();
 }
 
 #[tokio::test]
@@ -2342,5 +2348,318 @@ async fn a_propose_retry_paused_before_recomputation_replays_the_applied_origina
                 .unwrap();
         assert_eq!(merges, 1);
     }
+    verify_clean(&store).await;
+}
+
+/// Backends waiting for the advisory lock `key` (as `pg_advisory_xact_lock(bigint)` splits it).
+async fn advisory_waiters(pool: &sqlx::PgPool, key: i64) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted \
+         AND ((classid::bigint << 32) | objid::bigint) = $1",
+    )
+    .bind(key)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// Forced ordering: the original propose O is paused just before its COMMIT (everything
+/// written, idempotency lock held); the target then moves, so a duplicate R of the same
+/// key recomputes another token. R's refusal-path lookup must wait on O's idempotency lock
+/// and then replay O's committed result (or report `IDEMPOTENCY_CONFLICT` for another
+/// request), never answer `MERGE_STALE` while O is about to commit.
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn a_duplicate_propose_racing_the_uncommitted_original_waits_and_replays() {
+    use ledger_store::test_hooks::{HookPoint, PauseHook};
+    let store = store().await;
+    let pool = store.pool().clone();
+    for same_request in [true, false] {
+        let g = graph(&store).await;
+        let c1 = change(&store, &g, "main", None, &[A], &[]).await;
+        branch(&store, &g, "agent/ic", BranchPolicy::default()).await;
+        change(&store, &g, "agent/ic", Some(c1.clone()), &[B], &[]).await;
+        let sp = spec("agent/ic", "main", MergeStrategy::Abort);
+        let token = preview(&store, &g, &sp).await.preview_token.unwrap();
+        let key = "ic-propose";
+        let lock = ledger_store::lock_key(&format!(
+            "idempotency:tenant-a\u{1f}urn:it:curator\u{1f}agent\u{1f}\u{1f}{}\u{1f}merge_propose\u{1f}{key}",
+            g.as_str()
+        ));
+
+        let hook = PauseHook::new(HookPoint::ProposeBeforeCommit);
+        let original = {
+            let paused = store.workflows().clone().with_pause_hook(hook.clone());
+            let request = ProposeMergeRequest {
+                scope: scope(&g, key),
+                spec: sp.clone(),
+                preview_token: token.clone(),
+                message: "integrate".into(),
+                evidence_refs: vec![],
+            };
+            tokio::spawn(async move { paused.merge_propose(&request, limits()).await })
+        };
+        hook.reached().await;
+        // O holds its idempotency lock, uncommitted. The target moves (an ordinary accept
+        // is compatible with O's share lock on the target branch row).
+        change(
+            &store,
+            &g,
+            "main",
+            Some(c1.clone()),
+            &["<urn:ic> <urn:p> \"1\" ."],
+            &[],
+        )
+        .await;
+        let duplicate = {
+            let (store, request) = (
+                store.workflows().clone(),
+                ProposeMergeRequest {
+                    scope: if same_request {
+                        scope(&g, key)
+                    } else {
+                        scope_as("curator", &g, key, "another canonical request")
+                    },
+                    spec: sp.clone(),
+                    preview_token: token.clone(),
+                    message: "integrate".into(),
+                    evidence_refs: vec![],
+                },
+            );
+            tokio::spawn(async move { store.merge_propose(&request, limits()).await })
+        };
+        // R recomputes (stale token) and must now be waiting on O's idempotency lock; it
+        // must not have answered while O is uncommitted.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while advisory_waiters(&pool, lock).await == 0 {
+            assert!(
+                !duplicate.is_finished(),
+                "the duplicate answered while the original was uncommitted: {:?}",
+                duplicate.await
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "duplicate never waited"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        hook.resume();
+        let original = original.await.unwrap().unwrap();
+        assert!(!original.replayed);
+        let outcome = duplicate.await.unwrap();
+        if same_request {
+            let replay = outcome.unwrap();
+            assert!(replay.replayed);
+            assert_eq!(
+                (replay.proposal_id, &replay.candidate),
+                (original.proposal_id, &original.candidate)
+            );
+        } else {
+            assert!(
+                matches!(outcome, Err(LedgerError::IdempotencyConflict)),
+                "{outcome:?}"
+            );
+        }
+        assert_eq!(stored_proposes(&pool, &g, key).await.len(), 1);
+    }
+    verify_clean(&store).await;
+}
+
+/// Prepare + accept one added quad on `branch` as `principal`, optionally acting for
+/// `delegator`; the new head.
+async fn change_as(
+    store: &PostgresLedgerStore,
+    g: &GraphId,
+    branch: &str,
+    head: CommitId,
+    quad: &str,
+    principal: &str,
+    delegator: Option<&str>,
+) -> CommitId {
+    let key = unique("ca");
+    let mut s = scope_as(principal, g, &format!("p-{key}"), &format!("p-{key}"));
+    s.principal.on_behalf_of = delegator.map(|d| PrincipalId::new(format!("urn:it:{d}")).unwrap());
+    let prepared = store
+        .workflows()
+        .prepare(&PrepareRequest {
+            scope: s.clone(),
+            branch: branch.into(),
+            expected_head: Some(head.clone()),
+            requested: Patch::new([Operation {
+                kind: OperationKind::Add,
+                quad: q(quad),
+            }])
+            .unwrap(),
+            activity: "cognitive-correction".into(),
+            event_time: None,
+            evidence_refs: vec![],
+            source_system: None,
+            message: key.clone(),
+        })
+        .await
+        .unwrap();
+    s.idempotency_key = format!("a-{key}");
+    s.request_digest = ContentId::for_bytes(s.idempotency_key.as_bytes());
+    store
+        .workflows()
+        .accept(&AcceptRequest {
+            scope: s,
+            branch: branch.into(),
+            expected_head: Some(head),
+            candidate: prepared.candidate.clone(),
+            reason: None,
+            validation: ValidationPolicy::NoValidation,
+        })
+        .await
+        .unwrap();
+    prepared.candidate
+}
+
+/// Four-eyes cannot be laundered through delegation or a nested merge: the source parties
+/// of a merge include the delegator of a source commit's proposer, and the authors and
+/// proposer of a merge already integrated into the source (its whole source-only ancestry).
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn four_eyes_counts_delegators_and_the_authors_of_nested_merges() {
+    let store = store().await;
+    let g = graph(&store).await;
+    let c1 = change(&store, &g, "main", None, &[A], &[]).await;
+    let strict = BranchPolicy {
+        protected: false,
+        require_validation: false,
+        require_distinct_reviewer: true,
+    };
+    store
+        .workflows()
+        .create_branch(
+            &CreateBranchRequest {
+                scope: scope(&g, "cb-strict"),
+                name: "strict".into(),
+                source: "main".into(),
+                from_commit: None,
+                policy: strict,
+            },
+            limits(),
+        )
+        .await
+        .unwrap();
+    branch(&store, &g, "agent/outer", BranchPolicy::default()).await;
+    branch(&store, &g, "agent/inner", BranchPolicy::default()).await;
+    // "helper" proposes on behalf of "owner" on the outer source.
+    let s1 = change_as(
+        &store,
+        &g,
+        "agent/outer",
+        c1.clone(),
+        "<urn:outer> <urn:p> \"1\" .",
+        "helper",
+        Some("owner"),
+    )
+    .await;
+    // "inner-author" works on another branch, which "merger" merges into the outer source
+    // (self-applied: the outer source has the default, lax policy).
+    change_as(
+        &store,
+        &g,
+        "agent/inner",
+        c1.clone(),
+        "<urn:inner> <urn:p> \"1\" .",
+        "inner-author",
+        None,
+    )
+    .await;
+    let nested = spec("agent/inner", "agent/outer", MergeStrategy::Abort);
+    let token = preview(&store, &g, &nested).await.preview_token.unwrap();
+    let inner = store
+        .workflows()
+        .merge_propose(
+            &ProposeMergeRequest {
+                scope: scope_as("merger", &g, "nested-p", "nested-p"),
+                spec: nested,
+                preview_token: token.clone(),
+                message: String::new(),
+                evidence_refs: vec![],
+            },
+            limits(),
+        )
+        .await
+        .unwrap();
+    apply(&store, &g, inner.proposal_id, &token, "merger", "nested-a")
+        .await
+        .unwrap();
+    assert_eq!(head(&store, &g, "agent/outer").await.0, inner.candidate);
+    assert_ne!(inner.candidate, s1);
+
+    // The outer merge onto the four-eyes target, proposed by "mechanic".
+    let outer = spec("agent/outer", "strict", MergeStrategy::Abort);
+    let token = preview(&store, &g, &outer).await.preview_token.unwrap();
+    let pr = store
+        .workflows()
+        .merge_propose(
+            &ProposeMergeRequest {
+                scope: scope_as("mechanic", &g, "outer-p", "outer-p"),
+                spec: outer,
+                preview_token: token.clone(),
+                message: String::new(),
+                evidence_refs: vec![],
+            },
+            limits(),
+        )
+        .await
+        .unwrap();
+    let parties: Vec<String> =
+        sqlx::query_scalar("SELECT source_parties FROM merge_proposals WHERE proposal_id = $1")
+            .bind(pr.proposal_id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+    for party in ["helper", "owner", "inner-author", "merger"] {
+        assert!(
+            parties.contains(&format!("urn:it:{party}")),
+            "{party} missing from {parties:?}"
+        );
+    }
+    for who in ["owner", "helper", "inner-author", "merger", "mechanic"] {
+        let r = apply(
+            &store,
+            &g,
+            pr.proposal_id,
+            &token,
+            who,
+            &format!("outer-{who}"),
+        )
+        .await;
+        assert!(
+            matches!(r, Err(LedgerError::BranchPolicyViolation(_))),
+            "{who}: {r:?}"
+        );
+    }
+    // Acting for a source author is the same party too.
+    let mut delegated = scope_as("someone", &g, "outer-del", "outer-del");
+    delegated.principal.on_behalf_of = Some(PrincipalId::new("urn:it:inner-author").unwrap());
+    let r = store
+        .workflows()
+        .merge_apply(&ApplyMergeRequest {
+            scope: delegated,
+            proposal_id: pr.proposal_id,
+            preview_token: token.clone(),
+            reason: None,
+            validation: ValidationPolicy::NoValidation,
+        })
+        .await;
+    assert!(
+        matches!(r, Err(LedgerError::BranchPolicyViolation(_))),
+        "{r:?}"
+    );
+    apply(
+        &store,
+        &g,
+        pr.proposal_id,
+        &token,
+        "reviewer",
+        "outer-reviewer",
+    )
+    .await
+    .unwrap();
     verify_clean(&store).await;
 }

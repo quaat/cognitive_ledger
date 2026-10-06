@@ -100,4 +100,27 @@ if fluree:
 for p in [root / "Cargo.toml", *root.glob("crates/*/Cargo.toml"), *root.glob("apps/*/Cargo.toml")]:
     if "fluree" in p.read_text().lower():
         fail(f"Fluree dependency in {p}")
+
+
+def feature_tree(pkg, edges):
+    """`cargo tree` of `pkg` with feature edges; `edges` selects the dependency kinds."""
+    errors = []
+    for extra in (["--offline"], []):
+        try:
+            return subprocess.run(
+                ["cargo", "tree", "-p", pkg, "-e", f"features,{edges}", "--locked", "--prefix", "none", *extra],
+                cwd=root, check=True, capture_output=True, text=True).stdout
+        except (OSError, subprocess.CalledProcessError) as e:
+            errors.append(f"{' '.join(extra) or 'online'}: {e}")
+    fail(f"cargo tree failed for {pkg}: {errors}")
+
+
+# Forced-interleaving pause points (ledger-store feature `test-hooks`) exist only in test
+# builds: no shipped or qualification binary may enable them in its normal build graph.
+HOOKS = 'ledger-store feature "test-hooks"'
+if HOOKS not in feature_tree("ledger-store", "normal,build,dev"):
+    fail("check broken: the ledger-store test graph does not show the test-hooks feature")
+for app in sorted(p.parent.name for p in root.glob("apps/*/Cargo.toml")):
+    if HOOKS in feature_tree(app, "normal,build"):
+        fail(f"{app}: its build enables ledger-store's test-hooks feature (test-only pause points)")
 print("architecture dependency checks passed")

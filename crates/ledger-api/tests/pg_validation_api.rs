@@ -2094,8 +2094,13 @@ async fn a_validated_multi_step_cognitive_workflow_runs_on_a_branch_while_main_s
         .count("SELECT count(*) FROM projection_outbox WHERE graph_id = $1 AND branch = 'agent/task-17'", &g)
         .await;
     assert_eq!(outbox_branch, 3);
-    let unconfigured = ledger_store::ProjectionRepository::new(h.owner.pool().clone())
-        .unconfigured_pending()
+    // Both global readings in one snapshot: other tests write outbox rows concurrently.
+    let mut snapshot = h.owner.pool().begin().await.unwrap();
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *snapshot)
+        .await
+        .unwrap();
+    let unconfigured = ledger_store::ProjectionRepository::unconfigured_pending_on(&mut snapshot)
         .await
         .unwrap();
     let main_pending = sqlx::query_scalar::<_, i64>(
@@ -2103,9 +2108,10 @@ async fn a_validated_multi_step_cognitive_workflow_runs_on_a_branch_while_main_s
          AND NOT EXISTS (SELECT 1 FROM projection_state s WHERE s.graph_id = o.graph_id AND s.branch = o.branch \
                          AND s.status <> 'disabled')",
     )
-    .fetch_one(h.owner.pool())
+    .fetch_one(&mut *snapshot)
     .await
     .unwrap();
+    snapshot.rollback().await.unwrap();
     assert_eq!(
         unconfigured, main_pending,
         "non-main branch traffic is not a projection backlog"

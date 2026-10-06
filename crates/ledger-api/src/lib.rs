@@ -2006,6 +2006,8 @@ pub struct BranchLogResponse {
 
 /// Ancestry walks of a merge are bounded like a historical branch point.
 const MERGE_MAX_VISITED: usize = 100_000;
+/// At most this many best common ancestors are listed in a preview (the count is exact).
+pub const MAX_LISTED_MERGE_BASE_CANDIDATES: usize = 64;
 const MERGE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 /// Expensive-operation slots one merge preview or propose takes (three to four state
 /// reconstructions instead of one).
@@ -2235,8 +2237,13 @@ pub struct MergePreviewResponse {
     pub target_head: CommitId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub merge_base: Option<CommitId>,
+    /// The first [`MAX_LISTED_MERGE_BASE_CANDIDATES`] best common ancestors of an
+    /// ambiguous history, ascending.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub merge_base_candidates: Vec<CommitId>,
+    /// Exact number of best common ancestors (ambiguous histories only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge_base_candidate_count: Option<usize>,
     pub ahead: usize,
     pub behind: usize,
     pub target_delta: DeltaSummaryResponse,
@@ -2308,9 +2315,17 @@ async fn merge_preview(
         )
         .await
         .map_err(|e| ApiError::from_ledger(e, &correlation))?;
-    let candidates = match &p.class {
-        ledger_store::MergeClass::AmbiguousMergeBase(c) => c.clone(),
-        _ => Vec::new(),
+    // A deliberately built criss-cross can have many best common ancestors: list a bounded
+    // prefix (the order is ascending, so any listed one can be named as `base`) and the count.
+    let (candidates, candidate_count) = match &p.class {
+        ledger_store::MergeClass::AmbiguousMergeBase(c) => (
+            c.iter()
+                .take(MAX_LISTED_MERGE_BASE_CANDIDATES)
+                .cloned()
+                .collect(),
+            Some(c.len()),
+        ),
+        _ => (Vec::new(), None),
     };
     Ok(Json(MergePreviewResponse {
         classification: p.class.as_str(),
@@ -2318,6 +2333,7 @@ async fn merge_preview(
         target_head: p.target_head,
         merge_base: p.merge_base,
         merge_base_candidates: candidates,
+        merge_base_candidate_count: candidate_count,
         ahead: p.ahead,
         behind: p.behind,
         target_delta: p.target_delta.into(),

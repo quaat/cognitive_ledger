@@ -187,6 +187,40 @@ const CHECKS: &[(&str, &str)] = &[
                 AND e.new_head = i.result_commit)",
     ),
     (
+        "every merge-propose result names its merge proposal and candidate",
+        "SELECT i.idempotency_id::text FROM idempotency i WHERE i.operation = 'merge_propose' AND NOT EXISTS ( \
+             SELECT 1 FROM merge_proposals m WHERE m.proposal_id = i.result_proposal_id \
+               AND m.graph_id = i.graph_id AND m.candidate_commit = i.result_commit)",
+    ),
+    (
+        "every merge proposal's candidate has exactly the parents [target head, source head]",
+        "SELECT m.proposal_id::text FROM merge_proposals m LEFT JOIN commit_index c ON c.id = m.candidate_commit \
+         WHERE c.id IS NULL OR c.parent_count <> 2 \
+            OR NOT EXISTS (SELECT 1 FROM commit_parents p WHERE p.commit_id = m.candidate_commit \
+                             AND p.position = 0 AND p.parent_id = m.target_head) \
+            OR NOT EXISTS (SELECT 1 FROM commit_parents p WHERE p.commit_id = m.candidate_commit \
+                             AND p.position = 1 AND p.parent_id = m.source_head)",
+    ),
+    (
+        "every merge proposal's source head was a head of its source branch",
+        "SELECT m.proposal_id::text FROM merge_proposals m WHERE NOT EXISTS ( \
+             SELECT 1 FROM ref_events e WHERE e.graph_id = m.graph_id AND e.branch = m.source_branch \
+               AND m.source_head IN (e.new_head, e.old_head)) \
+           AND NOT EXISTS (SELECT 1 FROM refs r WHERE r.graph_id = m.graph_id \
+               AND r.branch = m.source_branch AND r.head = m.source_head)",
+    ),
+    (
+        "an applied merge onto a four-eyes branch was applied by a party distinct from its proposer and source authors",
+        "SELECT d.decision_id::text FROM decisions d \
+           JOIN merge_proposals m ON m.proposal_id = d.proposal_id \
+           JOIN proposals pr ON pr.proposal_id = d.proposal_id \
+           JOIN branches b ON b.graph_id = d.graph_id AND b.branch = d.branch \
+         WHERE d.decision = 'accepted' AND b.require_distinct_reviewer \
+           AND (d.principal_id = ANY(m.source_parties) OR d.on_behalf_of = ANY(m.source_parties) \
+             OR d.principal_id IN (pr.principal_id, pr.on_behalf_of) \
+             OR d.on_behalf_of IN (pr.principal_id, pr.on_behalf_of))",
+    ),
+    (
         "every accepted decision has exactly one outbox row",
         "SELECT d.decision_id::text FROM decisions d WHERE d.decision = 'accepted' \
            AND (SELECT count(*) FROM projection_outbox o WHERE o.ref_event_id = d.ref_event_id) <> 1",
@@ -379,13 +413,17 @@ pub async fn run(pool: &PgPool) -> Result<Report, LedgerError> {
 /// recorded classification and base follow from the DAG (fast-forward: the target head is an
 /// ancestor of the source head; divergent: the base is the unique best common ancestor, or an
 /// explicitly chosen one of several); the three-way merge of the recorded base/target/source
-/// states under the recorded strategy has the recorded digest; the integration commit
+/// states under the recorded strategy has the recorded digest and conflict count and is not
+/// a no-change merge (which never persists a row); the integration commit
 /// reconstructs to exactly that state; the token recomputes; `source_parties` equals the
 /// proposers of the source-only commits. A row that cannot be checked
 /// (missing objects, limits) counts as a violation — verify never aborts on it.
 async fn verify_merge_rows(pool: &PgPool) -> Result<CheckResult, LedgerError> {
     use ledger_dag::{MergeBase, Relation, TraversalLimits};
-    use ledger_merge::{Classification, PreviewIdentity, Strategy, three_way};
+    use ledger_merge::{
+        Classification, PreviewIdentity, ReportLimits, Strategy, creates_nothing,
+        three_way_reported,
+    };
     let ids: Vec<i64> =
         sqlx::query_scalar("SELECT proposal_id FROM merge_proposals ORDER BY proposal_id")
             .fetch_all(pool)
@@ -398,7 +436,7 @@ async fn verify_merge_rows(pool: &PgPool) -> Result<CheckResult, LedgerError> {
             let row = sqlx::query(
                 "SELECT graph_id, target_branch, candidate_commit, target_head, source_branch, \
                  source_head, merge_base, base_explicit, classification, strategy, \
-                 merged_state_digest, preview_token, source_parties FROM merge_proposals \
+                 conflict_count, merged_state_digest, preview_token, source_parties FROM merge_proposals \
                  WHERE proposal_id = $1",
             )
             .bind(id)
@@ -422,6 +460,7 @@ async fn verify_merge_rows(pool: &PgPool) -> Result<CheckResult, LedgerError> {
             let digest: ledger_core::ContentId = get("merged_state_digest")?.parse()?;
             let token = get("preview_token")?;
             let parties: Vec<String> = row.try_get("source_parties").map_err(db_error)?;
+            let conflict_count: i32 = row.try_get("conflict_count").map_err(db_error)?;
             let (analysis, target_ancestry, source_ancestry) = {
                 let provider = crate::postgres_branches::GraphParents {
                     conn: tokio::sync::Mutex::new(&mut *conn),
@@ -475,9 +514,20 @@ async fn verify_merge_rows(pool: &PgPool) -> Result<CheckResult, LedgerError> {
             } else {
                 strategy
             };
-            let Some(merged) = three_way(&b.state, &t.state, &s.state, strategy).merged else {
+            // Only the merge and the count are compared: the smallest report budget.
+            let three = three_way_reported(
+                &b.state,
+                &t.state,
+                &s.state,
+                strategy,
+                ReportLimits::SMALLEST,
+            );
+            let count_ok = usize::try_from(conflict_count).ok() == Some(three.conflict_count);
+            let Some(merged) = three.merged else {
                 return Ok(false);
             };
+            // A merge that creates nothing (ADR-0024 NO_CHANGE) never has a row.
+            let changes_something = !creates_nothing(&b.state, &t.state, &s.state, &merged);
             let recomputed = PreviewIdentity {
                 graph,
                 source_branch: get("source_branch")?,
@@ -496,6 +546,8 @@ async fn verify_merge_rows(pool: &PgPool) -> Result<CheckResult, LedgerError> {
             .token();
             Ok(lineage_ok
                 && parties_ok
+                && count_ok
+                && changes_something
                 && ledger_rdf::state_digest(&merged) == digest
                 && i.state == merged
                 && recomputed == token)

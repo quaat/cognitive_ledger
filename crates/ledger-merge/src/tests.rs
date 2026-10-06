@@ -134,6 +134,34 @@ fn conflict_report_is_bounded() {
     assert!(r.conflicts_truncated);
 }
 
+#[test]
+fn creates_nothing_only_when_the_source_has_no_net_change_and_the_target_is_kept() {
+    let base = st(&["<urn:a> <urn:p> \"1\" ."]);
+    let changed = st(&["<urn:a> <urn:p> \"2\" ."]);
+    let other = st(&["<urn:a> <urn:p> \"3\" ."]);
+    // The source nets to nothing: the merge is the target, nothing is created.
+    let m = three_way(&base, &changed, &base, Strategy::Abort)
+        .merged
+        .unwrap();
+    assert!(creates_nothing(&base, &changed, &base, &m));
+    // A conflict resolved by take-target keeps the target but records the resolution.
+    let m = three_way(&base, &changed, &other, Strategy::TakeTarget)
+        .merged
+        .unwrap();
+    assert_eq!(m, changed);
+    assert!(!creates_nothing(&base, &changed, &other, &m));
+    // A convergent change already present in the target is recorded too.
+    let m = three_way(&base, &changed, &changed, Strategy::Abort)
+        .merged
+        .unwrap();
+    assert!(!creates_nothing(&base, &changed, &changed, &m));
+    // A merge that changes the target always creates a commit.
+    let m = three_way(&base, &base, &changed, Strategy::Abort)
+        .merged
+        .unwrap();
+    assert!(!creates_nothing(&base, &base, &changed, &m));
+}
+
 // ---- conflict report byte budget (an operational limit, never part of the merge) ----
 
 /// The report as the API serializes it (`ConflictResponse` shape), for measuring bytes.

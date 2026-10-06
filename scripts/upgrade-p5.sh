@@ -242,6 +242,9 @@ step "Phase-5 server ready as ledger_runtime; VERIFY OK; every recorded key (pop
 # --- 3. Merge and projection on the upgraded ledger ---------------------------------------------
 python3 scripts/upgrade-p5/workload.py merge "${P_GRAPH}" "${P_TENANT}" "${OUT}/merge.json"
 admin "${NEW_IMAGE}" ledger verify >"${OUT}/verify-after-merge.log" 2>&1 && grep -q "VERIFY OK" "${OUT}/verify-after-merge.log" || { cat "${OUT}/verify-after-merge.log"; fail "verify after the merge"; }
+# The VERIFY OK above covers exactly the workload's one merge (a skipped propose would pass).
+[ "$(psql_q ledger "SELECT count(*) FROM merge_proposals")" = 1 ] || fail "expected exactly one merge row after the workload"
+[ "$(psql_q ledger "SELECT count(*) FROM ref_events WHERE operation = 'merge'")" = 1 ] || fail "expected exactly one merge event after the workload"
 # The new projector consumes the old backlog; branch traffic is not a projection backlog.
 projector "${PROJ}" ledger run
 wait_ready "${MPORT}" 60 || { docker logs "${PROJ}" | tail -30; fail "projector not ready"; }
