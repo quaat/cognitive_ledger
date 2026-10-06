@@ -526,6 +526,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+    if ledger_store::TEST_HOOKS_COMPILED {
+        return Err(
+            "this build contains ledger-store's test-only pause points (`test-hooks`); \
+                    refusing to serve"
+                .into(),
+        );
+    }
     let address = env_optional("LEDGER_ADDR")?.unwrap_or_else(|| "127.0.0.1:8080".into());
     let data = env_optional("LEDGER_DATA_DIR")?.unwrap_or_else(|| "./data".into());
     let database_url = env_optional("LEDGER_DATABASE_URL")?;

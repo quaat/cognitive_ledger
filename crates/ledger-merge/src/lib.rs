@@ -108,8 +108,8 @@ pub struct ThreeWay {
     pub conflicts: Vec<Conflict>,
     /// Total number of conflicting keys (reported or not); never affected by the limits.
     pub conflict_count: usize,
-    /// The report-level limits (listed conflicts or bytes) left conflicts or quads out of
-    /// `conflicts`. A side's own `truncated` flag also covers the per-side quad cap.
+    /// `conflicts` is incomplete: a limit (listed conflicts, quads per side, or bytes) left a
+    /// conflict or a quad out. `false` means every conflicting key is listed in full.
     pub conflicts_truncated: bool,
 }
 
@@ -208,6 +208,8 @@ struct Reporter {
     conflicts: Vec<Conflict>,
     /// A report-level limit was hit; nothing further is listed.
     exhausted: bool,
+    /// Some listed side omits quads (the per-side cap or the budget).
+    incomplete: bool,
 }
 
 impl Reporter {
@@ -217,6 +219,7 @@ impl Reporter {
             remaining: limits.max_bytes,
             conflicts: Vec::new(),
             exhausted: false,
+            incomplete: false,
         }
     }
 
@@ -267,10 +270,9 @@ impl Reporter {
                 quads.push(q.clone());
             }
         }
-        Side {
-            truncated: quads.len() < set.len(),
-            quads,
-        }
+        let truncated = quads.len() < set.len();
+        self.incomplete |= truncated;
+        Side { truncated, quads }
     }
 }
 
@@ -343,10 +345,11 @@ pub fn three_way_reported(
         };
         merged.extend(result);
     }
-    // `exhausted` is set exactly when a limit left a conflict or a quad unlisted.
+    // `exhausted` is set when a report-level limit stopped the listing, `incomplete` when a
+    // listed side omits quads: together, exactly when anything is left out.
     ThreeWay {
         merged: (strategy != Strategy::Abort || conflict_count == 0).then_some(merged),
-        conflicts_truncated: reporter.exhausted,
+        conflicts_truncated: reporter.exhausted || reporter.incomplete,
         conflicts: reporter.conflicts,
         conflict_count,
     }

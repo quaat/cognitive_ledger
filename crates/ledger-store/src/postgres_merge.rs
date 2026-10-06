@@ -101,7 +101,7 @@ pub struct MergePreview {
     pub conflicts: Vec<Conflict>,
     /// Exact, whatever the report limits.
     pub conflict_count: usize,
-    /// The report limits left conflicts or quads out of `conflicts`.
+    /// `conflicts` is incomplete (a count, per-side or byte limit left something out).
     pub conflicts_truncated: bool,
     pub strategy: Strategy,
     pub merged_state_digest: Option<ContentId>,

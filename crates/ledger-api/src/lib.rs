@@ -2254,7 +2254,8 @@ pub struct MergePreviewResponse {
     /// A deterministic prefix of the conflicts, bounded by count and by
     /// `max_merge_conflict_report_bytes`.
     pub conflicts: Vec<ConflictResponse>,
-    /// The report limits left conflicts or quads out of `conflicts`.
+    /// `conflicts` is incomplete: a limit (entries, quads per side, bytes) left a conflict
+    /// or a quad out. `false` means every conflicting key is listed in full.
     pub conflicts_truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub merged_state_digest: Option<ContentId>,

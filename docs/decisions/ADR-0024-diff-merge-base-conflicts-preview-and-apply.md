@@ -374,8 +374,9 @@ large: up to 1 000 × 3 × 64 large quads could be listed. Now:
   does not fit.
 - The result is a deterministic prefix of whole quads; no quad or entry is cut in half. The
   serialized `conflicts` array is at most the budget plus its two brackets. A side that lost
-  quads has `truncated: true`. `conflicts_truncated: true` means a count or byte limit left
-  something out.
+  quads has `truncated: true`. `conflicts_truncated` is `true` exactly when anything is
+  omitted: a conflict entry, or a quad cut by the per-side cap or the byte budget. `false`
+  means the report is complete.
 - The budget is **diagnostic only.** The merged state, `conflict_count`, the
   classification, the preview token (`sculpin-ledger-merge-preview/v1` bytes unchanged), the
   candidate and the merge row are the same under any budget. Propose collects with the
@@ -426,6 +427,18 @@ verification/migration) found no P0 or P1. These P2s were fixed:
 - **New tests for four-eyes laundering paths.** Delegators of source proposers, and the
   authors and proposer of a nested merge, are `source_parties`; an applier acting for one
   of them is refused.
+
+**Exact-head Codex review of `026decc` (2026-10-06).** Codex found no P0 or P1 and two
+P2s, both fixed:
+- **The report flag missed the per-side cap.** `conflicts_truncated` was `false` when only
+  the 64-quad per-side cap had trimmed a side. It now covers every omission.
+- **`test-hooks` could be forced into a release build** with an explicit
+  `--features ledger-store/test-hooks` or `--all-features`. Two guards now stop it:
+  - `ledger-store` refuses to compile the feature in any build without debug assertions
+    (`compile_error!`), which includes every release build;
+  - `ledger-server` refuses to start if `ledger_store::TEST_HOOKS_COMPILED` is set.
+
+  The architecture check still keeps the feature out of every app's build graph.
 
 ## Alternatives considered
 - **Object-level conflict key** `(graph, subject, predicate, object)`: this silently unions

@@ -1178,7 +1178,7 @@
      },
      "conflicts_truncated": {
       "type": "boolean",
-      "description": "The report limits (entry count or byte budget) left conflicts or quads out of `conflicts`. A side's own `truncated` flag also covers the 64-quad cap."
+      "description": "`conflicts` is incomplete: a limit (1000 entries, 64 quads per side, or the byte budget) left a conflict or a quad out. `false` means every conflicting key is listed in full."
      },
      "merged_state_digest": {
       "$ref": "#/components/schemas/ContentId"

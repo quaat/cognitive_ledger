@@ -405,6 +405,23 @@ fn a_term_larger_than_the_budget_is_never_partially_listed() {
 }
 
 #[test]
+fn the_per_side_cap_alone_marks_the_report_incomplete() {
+    let base = st(&["<urn:k> <urn:p> \"b\" ."]);
+    let mut target = BTreeSet::new();
+    for j in 0..=MAX_REPORTED_QUADS_PER_SIDE {
+        target.insert(q(&format!("<urn:k> <urn:p> \"t{j}\" .")));
+    }
+    let source = st(&["<urn:k> <urn:p> \"s\" ."]);
+    let r = three_way(&base, &target, &source, Strategy::Abort);
+    assert_eq!((r.conflict_count, r.conflicts.len()), (1, 1));
+    let c = &r.conflicts[0];
+    assert_eq!(c.target.quads.len(), MAX_REPORTED_QUADS_PER_SIDE);
+    assert!(c.target.truncated && !c.base.truncated && !c.source.truncated);
+    // Short quads, well within every byte budget: still not the complete report.
+    assert!(r.conflicts_truncated);
+}
+
+#[test]
 fn the_count_caps_alone_set_the_report_truncation_flag() {
     let (b, t, s) = heavy_conflicts(MAX_REPORTED_CONFLICTS, 1, 1);
     let r = three_way(&b, &t, &s, Strategy::Abort);

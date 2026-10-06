@@ -582,6 +582,16 @@ mod postgres_branches;
 mod postgres_merge;
 #[cfg(all(feature = "postgres", feature = "test-hooks"))]
 pub mod test_hooks;
+// The pause points are test infrastructure: an optimized build without debug assertions (any
+// release build) refuses to compile with them, whatever enabled the feature.
+#[cfg(all(feature = "test-hooks", not(debug_assertions)))]
+compile_error!(
+    "ledger-store's `test-hooks` feature (forced-interleaving pause points) is test-only and \
+     cannot be part of a release build"
+);
+/// Whether this build contains the test-only pause points (`test-hooks`); servers refuse to
+/// start when it does.
+pub const TEST_HOOKS_COMPILED: bool = cfg!(feature = "test-hooks");
 #[cfg(feature = "postgres")]
 pub use ledger_dag::TraversalLimits;
 #[cfg(feature = "postgres")]

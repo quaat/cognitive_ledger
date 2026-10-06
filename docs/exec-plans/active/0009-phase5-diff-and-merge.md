@@ -137,6 +137,11 @@ carried into Phase 8 / production qualification.
   P2s deferred, in tech-debt: merge memory and CPU on the async runtime (Phase-6
   measurement), verify's fixed limits (fails closed), environment freshness named by the
   caller (accepted in ADR-0019), and full-history ancestry walks.
+- Exact-head Codex review of `026decc` (read-only, 2026-10-06): **no P0/P1**. Two P2s,
+  both fixed (ADR-0024):
+  - `conflicts_truncated` ignored the per-side cap; it now covers every omission;
+  - `test-hooks` could be forced into a release build. The feature now fails to compile
+    without debug assertions, and `ledger-server` refuses to start if it was compiled in.
 - PostgreSQL 15 first run on `0582a85`: two assertions compared a global backlog count with
   a second global count taken by another query, while parallel tests wrote outbox rows.
   The failures were `pg_merge::a_merge_writes_exactly_one_ordinary_outbox_row…` (275 vs
