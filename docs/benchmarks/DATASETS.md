@@ -135,10 +135,19 @@ written before verification.
 - **No publisher checksums exist.** SHA-256 and byte size were pinned on the first reviewed
   download and confirmed by a second, independent `fetch`. Any later mismatch fails.
 - **License.** The BEAR page states no data license (checked 2026-10-06). The data derives
-  from DBpedia (CC BY-SA 3.0 and GFDL; attribution, share-alike). BEAR's code is LGPL-3.0.
-  Redistribution of a derived subset has **not** been reviewed, so nothing third-party is
-  committed: sources and prepared artifacts live only in the local or CI cache. Attribution
-  is in the manifest.
+  from DBpedia (CC BY-SA 3.0 and GFDL; attribution, share-alike). BEAR's code license is not
+  relevant here (no BEAR code is used) and was not reviewed.
+  - Redistribution of a derived subset has **not** been reviewed, so nothing third-party is
+    committed. The prepared artifact lives only in the local cache.
+  - The unmodified public source archives are also kept in a GitHub Actions cache entry.
+    In a public repository, pull requests (including forks) can restore it. This is a form
+    of distribution of public, unmodified files, and **the owner must accept it explicitly**
+    (Plan 0011 Decisions). Until then it is recorded in the manifest's `redistribution`
+    field.
+  - Failure details and reports never quote BEAR statements (`stmt:<hash>` references;
+    ledger error bodies are reduced to their code and a hash).
+  - The report states the source, license, attribution and that the data was modified
+    (normalized and windowed).
 - **Blank nodes:** none. Parse failures: none. Normalization collisions: none.
 
 **Finding: BEAR-B day publishes two internally consistent but different lineages.**
@@ -151,7 +160,7 @@ written before verification.
 - The plan's cross-check "IC differences equal CB" therefore **fails on the published
   data**. That is a property of the source, not of extraction.
 
-`bear-b-ci` follows the lineage where two independent representations agree exactly:
+`bear-b-ci` follows the lineage where two encodings of one lineage (TB and CB) agree exactly:
 - **Oracle:** TB's per-version membership (full versions).
 - **Hard cross-checks at preparation:**
   - TB version 0 equals IC file 1 (the shared start);

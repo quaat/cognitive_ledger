@@ -52,6 +52,8 @@ REV=$(git rev-parse HEAD)
 DIRTY=$(git status --porcelain --untracked-files=no | wc -l | tr -d ' ')
 UNTRACKED=$(git status --porcelain --untracked-files=normal | grep -c '^??' || true)
 INPUTS=$(cat Dockerfile compose.yaml Cargo.lock | sha256sum | cut -d' ' -f1)
+# With tracked changes, which ones: a hash of the diff (the count alone does not identify them).
+DIFF_SHA=$(git diff HEAD | sha256sum | cut -d' ' -f1)
 # compose.yaml runs the server with the development unvalidated-acceptance switch.
 ACCEPTANCE=$(grep -q 'LEDGER_UNVALIDATED_ACCEPTANCE: allow-unvalidated-acceptance-development-only' compose.yaml \
   && echo unvalidated-development || echo validation-required)
@@ -84,7 +86,7 @@ export LEDGER_BENCH_HS256_SECRET=development-only-hs256-secret-not-for-productio
 export LEDGER_BENCH_OWNER_DATABASE_URL='postgres://ledger:ledger-development-only@127.0.0.1:55432/ledger?sslmode=disable'
 set +e
 ./target/release/ledger-bench run --profile "${PROFILE}" --replica http://127.0.0.1:8080 --out "${OUT}" \
-  --meta "build_rev=${REV}" --meta "tracked_changes=${DIRTY}" --meta "untracked_files=${UNTRACKED}" \
+  --meta "build_rev=${REV}" --meta "tracked_changes=${DIRTY}" --meta "untracked_files=${UNTRACKED}" --meta "tracked_diff_sha256=${DIFF_SHA}" \
   --meta "rustc=$(rustc --version)" --meta "server_image=${IMAGE}" \
   --meta "server_toolchain=$(grep -m1 '^FROM' Dockerfile)" --meta "inputs_sha256(Dockerfile,compose.yaml,Cargo.lock)=${INPUTS}" \
   --meta "docker=$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo unknown)" \

@@ -116,12 +116,19 @@ def required_checks(text, origin, errors):
     for j in js:
         if j["matrix"] is None:
             continue
+        result = re.escape(f"needs.{j['id']}.result")
         aggregates = [a for a in js if a["matrix"] is None and j["id"] in a["needs"]
-                      and "always()" in a["if"] and f"needs.{j['id']}.result" in a["text"]]
+                      and a["if"].replace(" ", "") in ("always()", "${{always()}}")
+                      and re.search(rf"{result}\s*}}}}", a["text"])
+                      and re.search(r"(==?\s*['\"]?success|success['\"]?\s*==?)", a["text"])]
         if not aggregates:
             errors.append(f"{origin}: matrix job {j['id']} reports {check_names(j)}; add a non-matrix "
                           f"aggregate job with `needs: {j['id']}`, `if: always()` and a check of "
                           f"`needs.{j['id']}.result`, and require the aggregate")
+    for j in js:
+        # A required job with a job-level condition must still run on pull requests.
+        if j["matrix"] is None and j["if"] and "always()" not in j["if"] and "pull_request" not in j["if"]:
+            errors.append(f"{origin}: required job {j['id']} has `if: {j['if']}`, which may skip it on pull requests")
     return [j["name"] for j in js if j["matrix"] is None]
 
 
@@ -134,6 +141,9 @@ def self_test():
         "matrix without aggregate": (head + matrix, None),
         "aggregate without always()": (head + matrix + good.replace("    if: always()\n", ""), None),
         "aggregate ignoring the result": (head + matrix + good.replace("needs.m.result", "x"), None),
+        "aggregate only echoing the result": (head + matrix + good.replace('" = success', '"'), None),
+        "aggregate skipped outside schedules": (head + matrix + good.replace("if: always()", "if: always() && github.event_name == 'schedule'"), None),
+        "required job skipped on pull requests": (head + good.replace("    needs: m\n", "").replace("if: always()", "if: github.event_name == 'push'"), None),
         "aggregate with block-list needs": (head + matrix + good.replace("    needs: m\n", "    needs:\n      - m\n"), ["fuzz"]),
         "correct aggregate": (head + matrix + good, ["fuzz"]),
     }

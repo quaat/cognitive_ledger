@@ -417,9 +417,13 @@ async fn legacy_shared_ref_topology_upgrades_only_after_content_is_imported() {
     // On a dedicated connection: a failed sqlx run keeps its advisory lock on the connection
     // it ran on, and closing that connection releases it.
     let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
-    let error = ledger_store::schema::migrate_all_on(&mut conn)
-        .await
-        .unwrap_err();
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        ledger_store::schema::migrate_all_on(&mut conn),
+    )
+    .await
+    .expect("a refused migration must fail, not hang")
+    .unwrap_err();
     let _ = conn.close().await;
     assert!(
         error

@@ -9,9 +9,11 @@
 //!
 //! **Measure.** Afterwards, serially on a quiet stack, for every (S, depth) point:
 //! - `api` / `state_read`: `GET …/commits/{c}/state` of the commit at that depth. This
-//!   includes HTTP, server JSON encoding, transfer and client decoding.
+//!   includes HTTP, server JSON encoding, transfer and client JSON decoding.
 //! - `persisted` / `store_reconstruct`: the production fold
-//!   (`WorkflowRepository::reconstruct`) on an owner pool in this process. Same work, no HTTP.
+//!   (`WorkflowRepository::reconstruct`) on an owner pool in this process: the same fold
+//!   without HTTP, but as the owner role (the API runs as the runtime role, whose
+//!   row-security predicates and grants may make PostgreSQL do slightly different work).
 //! - `algorithm` / `fold_cpu`: the fold's CPU work (SHA-256 re-hash, envelope and patch
 //!   decoding, set application) re-executed on objects prefetched in one query. It estimates
 //!   the non-I/O share; it is not the production code path.
@@ -23,9 +25,15 @@
 //! - `api` / `merge_preview_divergent`: a preview of two branches forked at that commit:
 //!   three reconstructions at about that depth plus the ancestry walk.
 //!
-//! **Correctness.** Every point is verified exactly, outside the timed region: the state a
-//! path returned (API reply, store reconstruction, prefetched fold) must have the oracle's
-//! digest (sorted canonical lines, SHA-256) for that commit, not merely its cardinality.
+//! **Correctness.** Every timed result is verified exactly, outside the timed region, against
+//! expectations the harness computes with its own set algebra:
+//! - every API state reply, store reconstruction, prefetched fold and post-restart read must
+//!   have the oracle digest (sorted canonical lines, SHA-256) of that commit's state, not
+//!   merely its cardinality;
+//! - every prepared candidate's state (read back afterwards) is the base state plus its probe;
+//! - every merge preview reply has the expected classification; a divergent preview's
+//!   `merged_state_digest` equals the protocol digest of base + both probes (computed with the
+//!   labelled `ledger_rdf::state_digest` over the harness's set).
 //!
 //! **Measurement window** around each measured batch, in this order:
 //! 1. reset `pg_stat_statements`, read the baseline statement totals;
@@ -222,6 +230,38 @@ struct History {
     ids: Vec<CommitId>,
     /// (quads, canonical bytes, oracle digest, fold ops) per index.
     expected: Vec<(usize, u64, String, u64)>,
+    /// The full expected state at every measured depth (harness set algebra).
+    snapshots: BTreeMap<usize, BTreeSet<String>>,
+}
+
+impl History {
+    fn state_at(&self, depth: usize) -> BTreeSet<String> {
+        self.snapshots[&depth].clone()
+    }
+}
+
+/// The quad a prepare probe adds at `depth` (repetition `i`).
+fn probe_quad(depth: usize, i: usize) -> String {
+    format!("<urn:recon:prep> <urn:recon:p> \"d{depth}-{i}\" .")
+}
+
+/// Whether a state reply holds exactly the expected state (count and oracle digest).
+fn reply_matches(v: &Value, quads: usize, digest: &str) -> bool {
+    let lines: Vec<&str> = v["quads"]
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    lines.len() == quads && oracle_digest(lines) == digest
+}
+
+/// `sculpin-rdf-state/v1` digest of an expected state: the ledger's labelled digest function
+/// over the harness's own set (used only to compare a preview's `merged_state_digest`).
+fn protocol_digest(state: &BTreeSet<String>) -> String {
+    let quads: BTreeSet<Quad> = state
+        .iter()
+        .map(|q| q.parse::<Quad>().expect("harness quads are canonical"))
+        .collect();
+    ledger_rdf::state_digest(&quads).to_string()
 }
 
 struct Client {
@@ -284,13 +324,10 @@ impl Client {
         let response = request.send().await.map_err(|e| format!("{path}: {e}"))?;
         let status = response.status().as_u16();
         let bytes = response.bytes().await.map_err(|e| format!("{path}: {e}"))?;
+        // Client decoding is part of the API timing (module docs), as in the `run` profiles.
+        let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         let elapsed = started.elapsed();
-        Ok((
-            status,
-            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
-            elapsed,
-            bytes.len(),
-        ))
+        Ok((status, value, elapsed, bytes.len()))
     }
 
     async fn expect(
@@ -371,6 +408,7 @@ async fn build(
     let mut current: BTreeSet<String> = BTreeSet::new();
     let mut ids = Vec::new();
     let mut expected = Vec::new();
+    let mut snapshots = BTreeMap::new();
     let mut fold_ops = 0u64;
     let all: Vec<String> = (0..states).map(|e| quad(e, values[e])).collect();
     for chunk in all.chunks(BULK) {
@@ -381,6 +419,9 @@ async fn build(
         fold_ops += chunk.len() as u64;
         ids.push(id);
         expected.push(fingerprint(&current, fold_ops));
+        if cfg.depths.contains(&(ids.len() - 1)) {
+            snapshots.insert(ids.len() - 1, current.clone());
+        }
     }
     while ids.len() <= max_depth {
         let e = ids.len() % states;
@@ -402,12 +443,16 @@ async fn build(
         fold_ops += 2;
         ids.push(id);
         expected.push(fingerprint(&current, fold_ops));
+        if cfg.depths.contains(&(ids.len() - 1)) {
+            snapshots.insert(ids.len() - 1, current.clone());
+        }
     }
     Ok(History {
         graph,
         states,
         ids,
         expected,
+        snapshots,
     })
 }
 
@@ -610,10 +655,11 @@ fn point(
     (pg, cpu): (Option<PgDelta>, Option<CpuDelta>),
 ) -> ReconPoint {
     let s = stats(category, op, cache, micros);
-    let (_, bytes, _, fold_ops) = h.expected[depth];
+    let (quads, bytes, _, fold_ops) = h.expected[depth];
     let tail = s.count >= crate::result::MIN_TAIL_SAMPLES;
     ReconPoint {
-        state_quads: h.states,
+        // The state actually at this depth (a bulk genesis holds fewer quads at depth 0).
+        state_quads: quads,
         depth,
         fold_ops,
         canonical_state_bytes: bytes,
@@ -640,9 +686,9 @@ fn us(d: Duration) -> u64 {
 fn fold_cpu(chain: &[(Vec<u8>, Vec<u8>)]) -> Result<BTreeSet<Quad>, String> {
     let mut state: BTreeSet<Quad> = BTreeSet::new();
     for (commit, patch) in chain {
-        let _ = ContentId::for_bytes(commit);
+        std::hint::black_box(ContentId::for_bytes(commit));
         AnyCommit::from_canonical_bytes(commit).map_err(|e| e.to_string())?;
-        let _ = ContentId::for_bytes(patch);
+        std::hint::black_box(ContentId::for_bytes(patch));
         let p = Patch::from_canonical_bytes(patch).map_err(|e| e.to_string())?;
         for op in p.operations() {
             match op.kind {
@@ -782,25 +828,30 @@ async fn run_inner(cfg: &ReconConfig, result: &mut ReconResult) -> Result<(), St
             }
             let w = open_window(cfg, &owner, rt, RUNTIME_ROLE).await;
             let mut samples = Vec::new();
-            let mut last = Value::Null;
+            let mut replies = Vec::with_capacity(cfg.reps);
             for _ in 0..cfg.reps {
                 let (v, t, n) = client
                     .expect(reqwest::Method::GET, &state_path, false, None, 200)
                     .await?;
                 samples.push(us(t));
                 bytes = n;
-                last = v;
+                replies.push(v);
             }
             let (pg, cpu) = close_window(cfg, &owner, rt, RUNTIME_ROLE, w, cfg.reps).await;
-            let lines: Vec<&str> = last["quads"]
-                .as_array()
-                .map(|a| a.iter().filter_map(Value::as_str).collect())
-                .unwrap_or_default();
+            // Untimed: every timed reply equals the oracle state exactly.
+            let wrong = replies
+                .iter()
+                .filter(|v| !reply_matches(v, quads, &digest))
+                .count();
+            drop(replies);
             check(
                 result,
-                "state at depth equals the expected constant state",
-                lines.len() == quads && oracle_digest(lines.iter().copied()) == digest,
-                format!("S={} depth={depth}: {} quads", h.states, lines.len()),
+                "API state equals the oracle state (digest)",
+                wrong == 0,
+                format!(
+                    "S={} depth={depth}: {wrong} of {} differ",
+                    h.states, cfg.reps
+                ),
             );
             result.points.push(point(
                 h,
@@ -901,7 +952,7 @@ async fn run_inner(cfg: &ReconConfig, result: &mut ReconResult) -> Result<(), St
                 .await?;
             let prepare = |i: usize| {
                 json!({"ref": branch, "expected_head": id.to_string(),
-                    "operations": [{"op": "add", "quad": format!("<urn:recon:prep> <urn:recon:p> \"d{depth}-{i}\" .")}],
+                    "operations": [{"op": "add", "quad": probe_quad(depth, i)}],
                     "activity": "benchmark-recon", "message": "prepare probe", "evidence_refs": []})
             };
             let path = format!("/v1/graphs/{}/proposals", h.graph);
@@ -912,8 +963,9 @@ async fn run_inner(cfg: &ReconConfig, result: &mut ReconResult) -> Result<(), St
             }
             let w = open_window(cfg, &owner, rt, RUNTIME_ROLE).await;
             let mut samples = Vec::new();
+            let mut candidates = Vec::with_capacity(cfg.reps);
             for i in 0..cfg.reps {
-                let (_, t, _) = client
+                let (v, t, _) = client
                     .expect(
                         reqwest::Method::POST,
                         &path,
@@ -923,8 +975,40 @@ async fn run_inner(cfg: &ReconConfig, result: &mut ReconResult) -> Result<(), St
                     )
                     .await?;
                 samples.push(us(t));
+                candidates.push(v["candidate"].as_str().unwrap_or_default().to_owned());
             }
             let (pg, cpu) = close_window(cfg, &owner, rt, RUNTIME_ROLE, w, cfg.reps).await;
+            // Untimed: every prepared candidate holds the base state plus its probe quad.
+            let mut wrong = 0;
+            for (i, candidate) in candidates.iter().enumerate() {
+                let mut want = h.state_at(depth);
+                want.insert(probe_quad(depth, cfg.warmup + i));
+                let (v, _, _) = client
+                    .expect(
+                        reqwest::Method::GET,
+                        &format!("/v1/graphs/{}/commits/{candidate}/state", h.graph),
+                        false,
+                        None,
+                        200,
+                    )
+                    .await?;
+                if !reply_matches(
+                    &v,
+                    want.len(),
+                    &oracle_digest(want.iter().map(String::as_str)),
+                ) {
+                    wrong += 1;
+                }
+            }
+            check(
+                result,
+                "prepared candidate equals base state plus probe (digest)",
+                wrong == 0,
+                format!(
+                    "S={} depth={depth}: {wrong} of {} differ",
+                    h.states, cfg.reps
+                ),
+            );
             result.points.push(point(
                 h,
                 depth,
@@ -987,8 +1071,9 @@ async fn run_inner(cfg: &ReconConfig, result: &mut ReconResult) -> Result<(), St
                 );
                 let w = open_window(cfg, &owner, rt, RUNTIME_ROLE).await;
                 let mut samples = Vec::new();
+                let mut replies = Vec::with_capacity(cfg.preview_reps);
                 for _ in 0..cfg.preview_reps {
-                    let (_, t, _) = client
+                    let (v, t, _) = client
                         .expect(
                             reqwest::Method::POST,
                             &preview_path,
@@ -998,9 +1083,37 @@ async fn run_inner(cfg: &ReconConfig, result: &mut ReconResult) -> Result<(), St
                         )
                         .await?;
                     samples.push(us(t));
+                    replies.push(v);
                 }
                 let (pg, cpu) =
                     close_window(cfg, &owner, rt, RUNTIME_ROLE, w, cfg.preview_reps).await;
+                // Untimed: every timed reply is classified correctly; a divergent preview's
+                // merged state is the base state plus both probes (its protocol digest is
+                // computed by the labelled `ledger_rdf::state_digest` over the harness's set).
+                let merged = (op == "merge_preview_divergent").then(|| {
+                    let mut want = h.state_at(depth);
+                    want.extend(probe("x"));
+                    want.extend(probe("y"));
+                    protocol_digest(&want)
+                });
+                let wrong = replies
+                    .iter()
+                    .filter(|v| {
+                        v["classification"] != expected_class
+                            || merged.as_ref().is_some_and(|m| {
+                                v["merged_state_digest"].as_str() != Some(m.as_str())
+                            })
+                    })
+                    .count();
+                check(
+                    result,
+                    "merge preview replies (classification, merged state digest)",
+                    wrong == 0,
+                    format!(
+                        "S={} depth={depth} {op}: {wrong} of {} differ",
+                        h.states, cfg.preview_reps
+                    ),
+                );
                 result.points.push(point(
                     h,
                     depth,
@@ -1044,13 +1157,7 @@ async fn run_inner(cfg: &ReconConfig, result: &mut ReconResult) -> Result<(), St
                         // Untimed exact check of the measured result.
                         let ok = match &got {
                             Ok(state) => state.len() == quads && state_digest(state) == digest,
-                            Err(v) => {
-                                let lines: Vec<&str> = v["quads"]
-                                    .as_array()
-                                    .map(|a| a.iter().filter_map(Value::as_str).collect())
-                                    .unwrap_or_default();
-                                lines.len() == quads && oracle_digest(lines) == digest
-                            }
+                            Err(v) => reply_matches(v, quads, &digest),
                         };
                         if !ok {
                             wrong += 1;

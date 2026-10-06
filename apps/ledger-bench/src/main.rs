@@ -24,7 +24,8 @@
 //!
 //! Every command except `fetch` is offline. Exit status: 0 pass; 1 correctness failure or
 //! aborted run; 2 usage; 3 invalid or unprepared dataset (manifest mismatch, missing or
-//! unverified cache).
+//! unverified cache, failed preparation); 4 `fetch` could not obtain the pinned source
+//! (network, HTTP, or a download that does not match its pin).
 
 use ledger_bench::{
     bear,
@@ -475,7 +476,11 @@ fn annotate(path: &Path, pairs: impl Iterator<Item = String>) -> Result<(), Stri
     write_result(path.parent().unwrap_or(Path::new(".")), &r)
 }
 
+/// A comma-separated list of counts; an empty value is an empty list.
 fn list(v: &str) -> Result<Vec<usize>, String> {
+    if v.trim().is_empty() {
+        return Ok(Vec::new());
+    }
     v.split(',')
         .map(|x| {
             x.trim()
@@ -532,6 +537,11 @@ async fn recon_command(mut argv: impl Iterator<Item = String>) -> ExitCode {
                 "--meta" => {
                     let kv = value()?;
                     let (k, v) = kv.split_once('=').ok_or("--meta takes key=value")?;
+                    if k == "official" {
+                        return Err(
+                            "official is decided by scripts/benchmark-recon.sh (LEDGER_BENCH_OFFICIAL), not by --meta".into(),
+                        );
+                    }
                     meta.insert(k.to_owned(), v.to_owned());
                 }
                 _ => return Err(USAGE.into()),
@@ -560,6 +570,12 @@ async fn recon_command(mut argv: impl Iterator<Item = String>) -> ExitCode {
     let started = Instant::now();
     let mut r = recon::run(&cfg).await;
     r.meta = meta;
+    // Set by benchmark-recon.sh from the checkout state and the absence of custom arguments.
+    r.meta.insert(
+        "official".into(),
+        std::env::var("LEDGER_BENCH_OFFICIAL")
+            .unwrap_or_else(|_| "no (not run by scripts/benchmark-recon.sh)".into()),
+    );
     r.meta.insert(
         "wall_s".into(),
         format!("{:.0}", started.elapsed().as_secs_f64()),
@@ -696,10 +712,19 @@ async fn main() -> ExitCode {
             };
             let mut all = false;
             while let Some(flag) = argv.next() {
-                match (flag.as_str(), argv.next()) {
-                    ("--manifests", Some(v)) => ctx.manifests = v.into(),
-                    ("--cache", Some(v)) => ctx.cache = v.into(),
-                    ("--all", None) => all = true,
+                match flag.as_str() {
+                    "--all" if cmd == "clean" => all = true,
+                    "--manifests" | "--cache" => {
+                        let Some(v) = argv.next() else {
+                            eprintln!("{USAGE}");
+                            return ExitCode::from(2);
+                        };
+                        if flag == "--cache" {
+                            ctx.cache = v.into();
+                        } else {
+                            ctx.manifests = v.into();
+                        }
+                    }
                     _ => {
                         eprintln!("{USAGE}");
                         return ExitCode::from(2);
@@ -732,7 +757,7 @@ async fn main() -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!("{cmd} {id}: {e}");
-                    ExitCode::from(3)
+                    ExitCode::from(if cmd == "fetch" { 4 } else { 3 })
                 }
             }
         }
@@ -785,6 +810,13 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_list_value_is_an_empty_list() {
+        assert_eq!(list(""), Ok(vec![]));
+        assert_eq!(list("1, 10,100"), Ok(vec![1, 10, 100]));
+        assert!(list("1,,2").is_err());
+    }
 
     #[test]
     fn only_loopback_replicas_are_accepted_by_default() {

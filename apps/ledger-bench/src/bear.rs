@@ -18,7 +18,7 @@
 //! IC version 1 plus the cumulative CB changes equals TB at every step: one *changeset
 //! lineage*. The IC files after version 1 are a separately materialized lineage. It drops
 //! stale values the changesets never delete, and disagrees with both. This dataset follows
-//! the changeset lineage, where two independent representations agree exactly:
+//! the changeset lineage, where two encodings of one lineage agree exactly:
 //! - the **oracle** is TB's per-version membership, the full versions. TB and CB are two
 //!   encodings of one lineage (BEAR likely derived TB from the changesets): their agreement
 //!   proves the extraction reads both consistently, not that the lineage is "true";
@@ -167,7 +167,8 @@ pub async fn fetch(ctx: &Context, id: &str) -> Result<Vec<String>, String> {
         .connect_timeout(Duration::from_secs(30))
         // A stalled transfer fails instead of holding a CI runner until the job timeout.
         .read_timeout(Duration::from_secs(120))
-        .timeout(Duration::from_secs(1800))
+        // Per attempt; three attempts stay well inside the CI job timeout (30 min).
+        .timeout(Duration::from_secs(300))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             let same_host = attempt
                 .previous()
@@ -184,8 +185,7 @@ pub async fn fetch(ctx: &Context, id: &str) -> Result<Vec<String>, String> {
     let mut log = Vec::new();
     for f in &source.files {
         let path = dir.join(cached_name(&f.role, &f.url)?);
-        if let Ok(bytes) = std::fs::read(&path)
-            && bytes.len() as u64 == f.bytes
+        if let Ok(bytes) = read_pinned(&path, f.bytes)
             && sha256_hex(&bytes) == f.sha256
         {
             log.push(format!("{}: cached and verified", f.role));
@@ -199,14 +199,46 @@ pub async fn fetch(ctx: &Context, id: &str) -> Result<Vec<String>, String> {
                 f.url, f.bytes, f.sha256
             ));
         }
-        let part = part_path(&path);
-        let mut file = std::fs::File::create(&part).map_err(|e| e.to_string())?;
-        file.write_all(&body).map_err(|e| e.to_string())?;
-        file.sync_all().map_err(|e| e.to_string())?;
-        std::fs::rename(&part, &path).map_err(|e| e.to_string())?;
+        write_atomically(&path, &body)?;
         log.push(format!("{}: downloaded {size} bytes, verified", f.role));
     }
     Ok(log)
+}
+
+/// Read a cached file only if it is a regular file (not a symlink) of exactly `bytes` bytes
+/// (a poisoned cache cannot make the reader allocate more than the pin).
+fn read_pinned(path: &Path, bytes: u64) -> Result<Vec<u8>, String> {
+    let meta = std::fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if !meta.file_type().is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    if meta.len() != bytes {
+        return Err(format!(
+            "{} is {} bytes; the manifest pins {bytes}",
+            path.display(),
+            meta.len()
+        ));
+    }
+    std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Write `bytes` to `path` via a fresh `.part` file (never through a planted link) and an
+/// atomic rename.
+fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let part = part_path(path);
+    match std::fs::remove_file(&part) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("{}: {e}", part.display())),
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&part)
+        .map_err(|e| format!("{}: {e}", part.display()))?;
+    file.write_all(bytes).map_err(|e| e.to_string())?;
+    file.sync_all().map_err(|e| e.to_string())?;
+    std::fs::rename(&part, path).map_err(|e| e.to_string())
 }
 
 /// Download attempts per file; transient failures back off for 5 s, then 20 s.
@@ -273,14 +305,15 @@ pub fn verified_sources(
     let mut out = BTreeMap::new();
     for f in &source.files {
         let path = dir.join(cached_name(&f.role, &f.url)?);
-        let bytes = std::fs::read(&path).map_err(|_| {
-            format!(
+        if !path.exists() {
+            return Err(format!(
                 "source {} is not cached at {}: run `ledger-bench fetch {}` first",
                 f.role,
                 path.display(),
                 manifest.dataset
-            )
-        })?;
+            ));
+        }
+        let bytes = read_pinned(&path, f.bytes)?;
         let (size, digest) = (bytes.len() as u64, sha256_hex(&bytes));
         if size != f.bytes || digest != f.sha256 {
             return Err(format!(
@@ -297,6 +330,8 @@ pub fn verified_sources(
 #[derive(Default)]
 struct Normalizer {
     blank_nodes: u64,
+    /// Every unparsable line, and hashed references to the first three.
+    invalid_count: u64,
     invalid: Vec<String>,
     /// Source lines whose canonical form differs from the source spelling (bounds what the
     /// shared canonicalizer could mask).
@@ -319,13 +354,13 @@ impl Normalizer {
                 self.blank_nodes += 1;
                 None
             }
-            Err(e) => {
+            Err(_) => {
+                // Third-party statements are named by hash, never printed (CI logs); the
+                // parser's message may quote the term, so it is not printed either.
+                self.invalid_count += 1;
                 if self.invalid.len() < 3 {
-                    // Third-party statements are named by hash, never printed (CI logs).
-                    self.invalid
-                        .push(format!("{e}: {}", statement_ref(line, true)));
+                    self.invalid.push(statement_ref(line, true));
                 }
-                self.invalid.push(String::new());
                 None
             }
         }
@@ -360,11 +395,10 @@ impl Normalizer {
                 self.duplicates
             ));
         }
-        if !self.invalid.is_empty() {
-            let samples: Vec<&String> = self.invalid.iter().filter(|s| !s.is_empty()).collect();
+        if self.invalid_count > 0 {
             return Err(format!(
-                "{} source statements do not parse as RDF: {samples:?}",
-                self.invalid.len()
+                "{} source statements do not parse as RDF (first: {:?})",
+                self.invalid_count, self.invalid
             ));
         }
         Ok(())
@@ -408,6 +442,7 @@ pub fn prepare(ctx: &Context, id: &str) -> Result<(String, u64, Extraction), Str
         n.len() == 12 && n.ends_with(".nt.gz") && n[..6].bytes().all(|b| b.is_ascii_digit())
     };
     let (ic_files, ic_report) = tar_regular_files(&ic_tar, ic_name, ENTRY_CAP, TAR_TOTAL_CAP)?;
+    drop(ic_tar);
     let versions = ic_files.len();
     if versions < WINDOW {
         return Err(format!(
@@ -451,6 +486,7 @@ pub fn prepare(ctx: &Context, id: &str) -> Result<(String, u64, Extraction), Str
         matches!((a.parse::<usize>(), b.parse::<usize>()), (Ok(a), Ok(b)) if b == a + 1 && a >= 1)
     };
     let (cb_files, _) = tar_regular_files(&cb_tar, cb_name, ENTRY_CAP, TAR_TOTAL_CAP)?;
+    drop(cb_tar);
     if cb_files.len() != 2 * (versions - 1) {
         return Err(format!(
             "expected {} CB entries, found {}",
@@ -493,16 +529,16 @@ pub fn prepare(ctx: &Context, id: &str) -> Result<(String, u64, Extraction), Str
         let list = graph
             .strip_prefix(TB_GRAPH)
             .and_then(|g| g.strip_suffix('>'))
-            .ok_or_else(|| format!("unexpected TB graph {graph}"))?;
+            .ok_or_else(|| format!("unexpected TB graph {graph:?}"))?;
         let mut vs = BTreeSet::new();
         let mut last = None;
         for v in list.split('_') {
             let v: usize = v
                 .parse()
-                .map_err(|_| format!("bad TB version list {graph}"))?;
+                .map_err(|_| format!("bad TB version list {graph:?}"))?;
             if v >= versions || last.is_some_and(|l| v <= l) {
                 return Err(format!(
-                    "TB version list not strictly increasing within 0..{versions}: {graph}"
+                    "TB version list not strictly increasing within 0..{versions}: {graph:?}"
                 ));
             }
             last = Some(v);
@@ -552,7 +588,8 @@ pub fn prepare(ctx: &Context, id: &str) -> Result<(String, u64, Extraction), Str
     };
 
     // Anchor: TB version 0 == IC version 1.
-    if state(0) != ic(1, &mut norm)? {
+    let ic1 = ic(1, &mut norm)?;
+    if state(0) != ic1 {
         return Err(
             "TB version 0 differs from IC version 1: the lineages do not share a start".into(),
         );
@@ -636,7 +673,14 @@ pub fn prepare(ctx: &Context, id: &str) -> Result<(String, u64, Extraction), Str
     // documented relation between the two lineages no longer holds.
     let mut divergence_all = 0u64;
     for k in 0..versions {
-        let (tb, icv) = (state(k), ic(k + 1, &mut norm)?);
+        // IC file 1 was parsed for the anchor; parsing it again would double-count its
+        // canonicalization rewrites.
+        let icv = if k == 0 {
+            ic1.clone()
+        } else {
+            ic(k + 1, &mut norm)?
+        };
+        let tb = state(k);
         if !icv.is_subset(&tb) {
             return Err(format!(
                 "IC file {:06} holds {} statements outside TB v{k}: the documented lineage relation does not hold",
@@ -707,9 +751,7 @@ pub fn prepare(ctx: &Context, id: &str) -> Result<(String, u64, Extraction), Str
     }
     let path = artifact_path(ctx, id);
     std::fs::create_dir_all(path.parent().expect("has parent")).map_err(|e| e.to_string())?;
-    let part = part_path(&path);
-    std::fs::write(&part, &bytes).map_err(|e| e.to_string())?;
-    std::fs::rename(&part, &path).map_err(|e| e.to_string())?;
+    write_atomically(&path, &bytes)?;
     Ok((sha256_hex(&bytes), bytes.len() as u64, extraction))
 }
 
@@ -815,12 +857,22 @@ fn parse_artifact(bytes: &[u8]) -> Result<(ArtifactHeader, Prepared), String> {
 fn load(ctx: &Context, id: &str) -> Result<(Manifest, ArtifactHeader, Prepared, Vec<u8>), String> {
     let manifest = source_manifest(ctx, id)?;
     let path = artifact_path(ctx, id);
-    let bytes = std::fs::read(&path).map_err(|_| {
-        format!(
+    if !path.exists() {
+        return Err(format!(
             "{id} is not prepared ({} missing): run `ledger-bench fetch {id}` and `ledger-bench prepare {id}` first",
             path.display()
-        )
-    })?;
+        ));
+    }
+    let size = std::fs::symlink_metadata(&path)
+        .map_err(|e| e.to_string())?
+        .len();
+    if size > ARTIFACT_CAP {
+        return Err(format!(
+            "prepared artifact {} exceeds {ARTIFACT_CAP} bytes: run `ledger-bench prepare {id}` again",
+            path.display()
+        ));
+    }
+    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
     let digest = sha256_hex(&bytes);
     let pinned =
         manifest.output.artifact_sha256.is_some() || manifest.output.artifact_bytes.is_some();
@@ -1245,6 +1297,31 @@ mod tests {
         .unwrap();
         let err = load(&ctx, "bear-b-ci").unwrap_err();
         assert!(err.contains("is for dataset \"bear-b-other\""), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cached_files_are_read_only_as_regular_files_of_the_pinned_size() {
+        let dir = std::env::temp_dir().join(format!("ledger-bench-pinned-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("source");
+        write_atomically(&file, b"four").unwrap();
+        assert_eq!(read_pinned(&file, 4).unwrap(), b"four");
+        assert!(read_pinned(&file, 3).unwrap_err().contains("pins 3"));
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(
+            read_pinned(&link, 4)
+                .unwrap_err()
+                .contains("not a regular file")
+        );
+        // A planted `.part` link is replaced, never written through.
+        let target = dir.join("victim");
+        std::fs::write(&target, b"keep").unwrap();
+        std::os::unix::fs::symlink(&target, part_path(&file)).unwrap();
+        write_atomically(&file, b"new!").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+        assert_eq!(std::fs::read(&file).unwrap(), b"new!");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

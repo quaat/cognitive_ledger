@@ -95,7 +95,8 @@ development HS256 secret in `LEDGER_BENCH_HS256_SECRET`. The script supplies all
 | 0 | every dataset valid; every correctness assertion held; `VERIFY OK` |
 | 1 | a correctness assertion failed, a step was refused, the run aborted, or verify failed |
 | 2 | usage or configuration error |
-| 3 | invalid dataset: the computed manifest differs from the committed one |
+| 3 | invalid or unprepared dataset: the computed manifest differs from the committed one, the prepared cache is missing or does not match its pin, or `prepare` failed a source cross-check |
+| 4 | `fetch` could not obtain the pinned source (network or HTTP failure after retries, or a download that does not match its pinned size and SHA-256) |
 
 ## Changing a dataset
 Changing the generator, its parameters or the seed changes the manifest. Do it deliberately:

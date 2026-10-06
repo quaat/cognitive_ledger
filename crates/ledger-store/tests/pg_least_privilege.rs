@@ -475,7 +475,13 @@ async fn runtime_identity_serves_the_workflow_but_cannot_touch_schema_or_history
     // On a dedicated connection: a failed sqlx run keeps its advisory lock on the connection
     // it ran on, so it must not be a pooled one that later work reuses.
     let mut conn = PgConnection::connect(&f.runtime_db_url).await.unwrap();
-    let err = schema::migrate_all_on(&mut conn).await.unwrap_err();
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        schema::migrate_all_on(&mut conn),
+    )
+    .await
+    .expect("a refused migration must fail, not hang")
+    .unwrap_err();
     let _ = conn.close().await;
     assert!(
         matches!(&err, LedgerError::Storage(m) if m.contains("permission denied") || m.contains("must be owner")),

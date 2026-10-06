@@ -65,8 +65,13 @@ docs/benchmarks/                   this documentation
   - provisioning (`PgGraphs`, the operator path);
   - persisted-state reads (`get_commit`);
   - the labelled `algorithm` category (`ledger_rdf::diff`);
-  - one labelled oracle-side protocol function (`ledger_rdf::state_digest`, frozen and
-    golden-pinned).
+  - two labelled oracle-side uses of frozen ledger code: the protocol function
+    `ledger_rdf::state_digest` (golden-pinned), and the BEAR-B extraction's normalization of
+    source triples through `ledger_rdf::Quad` (canonical N-Quads; the rewrite count is
+    pinned in the manifest). A canonicalization that changed a statement's meaning without
+    causing a collision would not be caught by the BEAR oracle. This is accepted and labelled.
+  - `recon` uses the same `ledger_rdf::state_digest` to compare merge-preview digests, and
+    `ledger_rdf::Quad` to parse its own synthetic quads.
 - The existing `benchmark/` directory is kept and evolves: it was a placeholder README.
   It now holds dataset manifests. No competing `benchmarks/` tree is created; code lives
   under `apps/`, like every other application.

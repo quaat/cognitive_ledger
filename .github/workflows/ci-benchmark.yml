@@ -24,10 +24,17 @@ jobs:
       # miss the script's `fetch` step downloads and verifies them (SHA-256 and size) before
       # the stack starts. The benchmark run itself stays offline. A restored cache is
       # re-verified by `fetch` and `prepare`, never trusted by its key.
+      # Keyed by the pinned `source` section only, so output-only manifest changes reuse the
+      # cache. An older entry may be restored as a fallback: `fetch` re-verifies every file
+      # and downloads only those that do not match their pin.
+      - name: Source cache key
+        id: sources
+        run: echo "key=benchmark-sources-$(jq -cS .source benchmark/datasets/bear-b-ci.json | sha256sum | cut -c1-32)" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target/benchmark-cache/bear-b-ci/source
-          key: benchmark-sources-${{ hashFiles('benchmark/datasets/bear-b-ci.json') }}
+          key: ${{ steps.sources.outputs.key }}
+          restore-keys: benchmark-sources-
       - run: ./scripts/benchmark.sh ci
       - if: ${{ !cancelled() }}
         run: cat target/benchmark/*-ci/report.md >>"$GITHUB_STEP_SUMMARY" || true

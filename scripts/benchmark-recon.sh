@@ -41,7 +41,13 @@ DIRTY=$(git status --porcelain --untracked-files=no | wc -l | tr -d ' ')
 UNTRACKED=$(git status --porcelain --untracked-files=normal | grep -c '^??' || true)
 # Official architecture evidence only from a clean checkout of a recorded revision (for
 # example a detached `git worktree`); anything else is labelled non-official in the result.
-if [ "${DIRTY}" = 0 ] && [ "${UNTRACKED}" = 0 ]; then OFFICIAL=yes; else OFFICIAL="no (tracked_changes=${DIRTY}, untracked_files=${UNTRACKED})"; fi
+# The official sweep is the default one: custom arguments make a run non-official too.
+if [ "$#" -gt 0 ]; then OFFICIAL="no (custom arguments)"
+elif [ "${DIRTY}" = 0 ] && [ "${UNTRACKED}" = 0 ]; then OFFICIAL=yes
+else OFFICIAL="no (tracked_changes=${DIRTY}, untracked_files=${UNTRACKED})"; fi
+export LEDGER_BENCH_OFFICIAL="${OFFICIAL}"
+# With tracked changes, which ones: a hash of the diff (the count alone does not identify them).
+DIFF_SHA=$(git diff HEAD | sha256sum | cut -d' ' -f1)
 INPUTS=$(cat Dockerfile compose.yaml benchmark/compose.instrumented.yaml Cargo.lock | sha256sum | cut -d' ' -f1)
 # The server's reconstruction depth limit (compose override, else the server default).
 DEPTH_LIMIT=$("${COMPOSE[@]}" config | sed -n 's/.*LEDGER_LIMIT_RECONSTRUCTION_DEPTH: *"\{0,1\}\([0-9]*\).*/\1/p' | head -1)
@@ -53,7 +59,7 @@ set +e
   --restart-cmd "docker restart ${PG_CONTAINER} >/dev/null" --depth-limit "${DEPTH_LIMIT}" \
   ${SERVER_CG:+--server-cgroup "${SERVER_CG}"} ${PG_CG:+--postgres-cgroup "${PG_CG}"} \
   --meta "build_rev=${REV}" --meta "tracked_changes=${DIRTY}" --meta "untracked_files=${UNTRACKED}" \
-  --meta "official=${OFFICIAL}" \
+  --meta "tracked_diff_sha256=${DIFF_SHA}" \
   --meta "inputs_sha256(Dockerfile,compose.yaml,benchmark/compose.instrumented.yaml,Cargo.lock)=${INPUTS}" \
   --meta "rustc=$(rustc --version)" --meta "server_toolchain=$(grep -m1 '^FROM' Dockerfile)" \
   --meta "docker=$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo unknown)" \

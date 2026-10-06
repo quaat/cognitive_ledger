@@ -3,13 +3,13 @@
   "dataset": "bear-b-ci",
   "kind": "extracted",
   "source": {
-    "publisher": "BEAR benchmark, Vienna University of Economics and Business (WU), QADLOD project (Fernández, Umbrich, Polleres, Knuth)",
+    "publisher": "BEAR benchmark, Vienna University of Economics and Business (WU), QADLOD project (Fern\u00e1ndez, Umbrich, Polleres, Knuth)",
     "title": "BEAR-B (DBpedia Live, 100 most volatile resources, Aug-Oct 2015), day granularity",
     "source_version": "archives dated 2017-04-05 (HTTP Last-Modified); 89 day versions",
     "landing_url": "https://aic.ai.wu.ac.at/qadlod/bear.html",
-    "license": "Data derived from DBpedia (CC BY-SA 3.0 and GNU FDL); the BEAR page states no separate data license (verified 2026-10-06); BEAR code is LGPL-3.0",
-    "attribution": "BEAR: Fernández, Umbrich, Polleres, Knuth, 'Evaluating query and storage strategies for RDF archives', Semantic Web Journal (2019); data from DBpedia Live (DBpedia Association) and Wikipedia contributors",
-    "redistribution": "not reviewed for redistribution: raw archives and extracted triples are cached locally or as CI cache entries and never committed",
+    "license": "Data derived from DBpedia (CC BY-SA 3.0 and GNU FDL); the BEAR page states no separate data license (verified 2026-10-06)",
+    "attribution": "BEAR: Fern\u00e1ndez, Umbrich, Polleres, Knuth, 'Evaluating query and storage strategies for RDF archives', Semantic Web Journal (2019); data from DBpedia Live (DBpedia Association) and Wikipedia contributors",
+    "redistribution": "not reviewed for redistribution: raw archives and extracted triples are never committed; the unmodified public source archives are kept in the local cache and in GitHub Actions cache entries, which pull requests (including forks) of a public repository can restore (owner acceptance pending)",
     "retrieved": "2026-10-06",
     "files": [
       {
@@ -45,7 +45,7 @@
     },
     "range": "day versions v22..=v33 (0-based TB numbering; IC files 000023..000034) of v0..=v88",
     "counts": {
-      "canonicalization_rewrites": 17710,
+      "canonicalization_rewrites": 17451,
       "cb_noop_churn_statements": 733,
       "cb_steps_cross_checked": 88,
       "ic_lineage_divergence_all_versions": 679246,
@@ -71,7 +71,7 @@
   "output": {
     "commits": 19,
     "workload_checksum": "sha256:3c5db35a5609982aeb554cee298e3ee3aa3d8206efc7e6b9c49a700100cf095a",
-    "artifact_sha256": "fe8c84d2c6fc3f9f9a33ecc07dcf0578eca9bcae36acf785a013597c5f55d51f",
+    "artifact_sha256": "db8bd158cd4dd61cf5e3a31ba75efb7f03303dad081f10144f4ff3ef4fd7f906",
     "artifact_bytes": 8532667
   }
 }

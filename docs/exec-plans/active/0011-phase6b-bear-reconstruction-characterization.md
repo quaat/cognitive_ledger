@@ -159,9 +159,8 @@ Every item of the Phase-6B gate in the task holds, the recommendation is written
   - IC and CB/TB diverge as described in Decisions 1.
   - 13 TB triples are written across 733 annotation lines with disjoint version lists.
     They are merged, and overlapping lists fail.
-  - Normalization rewrote 17,710 source lines to canonical N-Quads, counted per parse over
-    TB, CB and all 89 IC files (IC file 1 is parsed twice, for the anchor and for the
-    subset check), with 0 collisions. The count bounds
+  - Normalization rewrote 17,451 source lines to canonical N-Quads. The count covers TB,
+    CB and all 89 IC files, each parsed once, with 0 collisions. The count bounds
     what the shared canonicalizer could mask.
 - **A failed sqlx migration keeps its advisory lock on the connection it ran on.** sqlx
   0.8 does not unlock on error. A pooled connection carries the lock into later use;
