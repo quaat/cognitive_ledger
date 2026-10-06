@@ -1,0 +1,19 @@
+[package]
+name = "ledger-dag"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "Bounded history/reachability primitives over the ledger commit DAG (ancestry checks, first-parent history, ancestor enumeration) behind a ParentProvider boundary. Infrastructure-free: no HTTP, SQL or container clients. Not merge-base or three-way merge."
+
+[dependencies]
+async-trait.workspace = true
+ledger-core = { path = "../ledger-core" }
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true

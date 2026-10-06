@@ -151,7 +151,7 @@ pub enum FailPoint {
 
 #[derive(Clone, Debug)]
 pub struct WorkflowRepository {
-    pool: PgPool,
+    pub(crate) pool: PgPool,
     immutable: PostgresImmutableStore,
     failpoint: Option<FailPoint>,
     limits: crate::ReconstructionLimits,
@@ -425,6 +425,7 @@ pub(crate) struct StoredResult {
     pub(crate) result_decision_id: Option<i64>,
     pub(crate) result_proposal_id: Option<i64>,
     pub(crate) result_validation_id: Option<String>,
+    pub(crate) result_branch_event_id: Option<i64>,
 }
 
 #[derive(Clone, Copy)]
@@ -433,15 +434,21 @@ pub(crate) enum Operation {
     Accept,
     Reject,
     Validate,
+    BranchCreate,
+    BranchDelete,
+    BranchRestore,
 }
 
 impl Operation {
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Prepare => "prepare",
             Self::Accept => "accept",
             Self::Reject => "reject",
             Self::Validate => "validate",
+            Self::BranchCreate => "branch_create",
+            Self::BranchDelete => "branch_delete",
+            Self::BranchRestore => "branch_restore",
         }
     }
 }
@@ -458,7 +465,7 @@ fn now() -> Result<LedgerTimestamp, LedgerError> {
     LedgerTimestamp::try_from_offset_date_time(OffsetDateTime::now_utc())
 }
 
-fn validate_branch(branch: &str) -> Result<(), LedgerError> {
+pub(crate) fn validate_branch(branch: &str) -> Result<(), LedgerError> {
     if branch.is_empty() || branch.len() > MAX_BRANCH_BYTES {
         return Err(LedgerError::InvalidIdentifier {
             field: "branch",
@@ -501,7 +508,7 @@ pub(crate) fn validate_scope_fn(scope: &RequestScope) -> Result<(), LedgerError>
     Ok(())
 }
 
-fn validate_reason(reason: Option<&str>) -> Result<(), LedgerError> {
+pub(crate) fn validate_reason(reason: Option<&str>) -> Result<(), LedgerError> {
     if let Some(reason) = reason
         && reason.len() > MAX_REASON_BYTES
     {
@@ -637,7 +644,8 @@ impl WorkflowRepository {
     ) -> Result<Option<StoredResult>, LedgerError> {
         let row = sqlx::query(
             "SELECT request_digest, result_kind, result_commit, result_ref_version, \
-             result_decision_id, result_proposal_id, result_validation_id FROM idempotency \
+             result_decision_id, result_proposal_id, result_validation_id, result_branch_event_id \
+             FROM idempotency \
              WHERE tenant_id = $1 AND principal_id = $2 AND principal_type = $3 \
              AND on_behalf_of IS NOT DISTINCT FROM $4 AND graph_id = $5 AND operation = $6 \
              AND idempotency_key = $7",
@@ -667,6 +675,7 @@ impl WorkflowRepository {
                 result_decision_id: row.try_get("result_decision_id").map_err(db_error)?,
                 result_proposal_id: row.try_get("result_proposal_id").map_err(db_error)?,
                 result_validation_id: row.try_get("result_validation_id").map_err(db_error)?,
+                result_branch_event_id: row.try_get("result_branch_event_id").map_err(db_error)?,
             })
         })
         .transpose()
@@ -994,6 +1003,18 @@ impl WorkflowRepository {
         }
         self.fail_at(FailPoint::AfterIdempotencyCheck)?;
         Self::graph_must_be_active(&mut tx, scope).await?;
+        // The branch must exist and be active (ADR-0022); held `FOR SHARE` until commit so a
+        // concurrent delete serializes with this prepare. Only `main` may be proposed onto
+        // before it exists (its genesis).
+        match Self::lock_branch(&mut tx, &scope.graph, &request.branch, false).await? {
+            None if request.branch != "main" => {
+                return Err(LedgerError::BranchNotFound(request.branch.clone()));
+            }
+            Some(branch) if branch.status != "active" => {
+                return Err(LedgerError::BranchDeleted(request.branch.clone()));
+            }
+            _ => {}
+        }
         // Prepare never moves the ref, so it reads without locking; a stale head is
         // caught here and, if the ref moves later, again at accept.
         let current = Self::read_ref(&mut tx, &scope.graph, &request.branch, false).await?;
@@ -1194,8 +1215,27 @@ impl WorkflowRepository {
         self.fail_at(FailPoint::AfterIdempotencyCheck)?;
         Self::graph_must_be_active(&mut tx, scope).await?;
 
-        // Lock the ref row (if it exists) so competing advances serialize on it.
+        // Lock the ref row (if it exists) so competing advances serialize on it, then the
+        // branch row `FOR SHARE` (ADR-0022 lock order: ref, then branch; delete/restore
+        // lock only the branch), so acceptance and a lifecycle change serialize.
         let current = Self::read_ref(&mut tx, &scope.graph, &request.branch, true).await?;
+        let branch = Self::lock_branch(&mut tx, &scope.graph, &request.branch, false).await?;
+        match &branch {
+            None if request.branch != "main" || current.is_some() => {
+                return Err(LedgerError::BranchNotFound(request.branch.clone()));
+            }
+            Some(branch) if branch.status != "active" => {
+                return Err(LedgerError::BranchDeleted(request.branch.clone()));
+            }
+            _ => {}
+        }
+        // Branch policy only tightens the deployment floor: a branch that requires
+        // validation refuses unvalidated acceptance even where the deployment allows it.
+        if branch.as_ref().is_some_and(|b| b.require_validation)
+            && request.validation == ValidationPolicy::NoValidation
+        {
+            return Err(LedgerError::ValidationRequired);
+        }
         let current_head = current.as_ref().map(|(head, _, _)| head.clone());
         if current_head != request.expected_head {
             return Err(LedgerError::HeadChanged {
@@ -1211,6 +1251,43 @@ impl WorkflowRepository {
             &request.candidate,
         )
         .await?;
+        if branch.as_ref().is_some_and(|b| b.require_distinct_reviewer) {
+            let proposer = sqlx::query(
+                "SELECT principal_id, on_behalf_of FROM proposals WHERE proposal_id = $1",
+            )
+            .bind(proposal.proposal_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_error)?;
+            // Distinct accountable parties (ADR-0022): the proposer's {principal, delegator}
+            // and the acceptor's {principal, delegator} must not share a member. Principal
+            // type does not distinguish parties (the same subject under another type, or an
+            // agent acting for the proposer, is the same party).
+            let actor = scope.principal.actor();
+            let proposer_parties = [
+                Some(
+                    proposer
+                        .try_get::<String, _>("principal_id")
+                        .map_err(db_error)?,
+                ),
+                proposer
+                    .try_get::<Option<String>, _>("on_behalf_of")
+                    .map_err(db_error)?,
+            ];
+            let acceptor_parties = [
+                Some(actor.principal_id.as_str().to_owned()),
+                actor.on_behalf_of.as_ref().map(|p| p.as_str().to_owned()),
+            ];
+            let same = proposer_parties
+                .iter()
+                .flatten()
+                .any(|p| acceptor_parties.iter().flatten().any(|a| a == p));
+            if same {
+                return Err(LedgerError::BranchPolicyViolation(
+                    "this branch requires a reviewer distinct from the proposer".into(),
+                ));
+            }
+        }
 
         // ADR-0019: the cited validation must exist for this graph and tenant, name this
         // candidate, agree with its context, conform, and have run in exactly the semantic
@@ -1371,6 +1448,11 @@ impl WorkflowRepository {
         .await
         .map_err(db_error)?;
         let ref_event_id: i64 = event_row.try_get("event_id").map_err(db_error)?;
+        if operation == "genesis" {
+            // Only `main` is born by genesis (checked above); its branch comes with it.
+            Self::record_genesis_branch(&mut tx, scope, &request.branch, &request.candidate)
+                .await?;
+        }
         self.fail_at(FailPoint::AfterRefEvent)?;
 
         let decision_row = sqlx::query(

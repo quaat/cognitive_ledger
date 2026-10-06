@@ -1837,3 +1837,540 @@ async fn pins_are_not_hints_and_an_ignored_revision_hint_is_a_validator_error() 
         .await;
     assert_eq!(records, 0);
 }
+
+// ---- Phase 4: branches over HTTP (ADR-0022; Plan 0008) -----------------------------------
+
+const ADMIN: [&str; 5] = [
+    "ledger.read",
+    "ledger.propose",
+    "ledger.validate",
+    "ledger.review",
+    "ledger.admin",
+];
+
+impl Harness {
+    async fn prepare_on(
+        &self,
+        g: &GraphId,
+        t: &str,
+        branch: &str,
+        head: &str,
+        quad: &str,
+    ) -> Reply {
+        self.call(
+            "POST",
+            &format!("/v1/graphs/{g}/proposals"),
+            t,
+            Some(&unique("p")),
+            Some(json!({
+                "ref": branch, "expected_head": head,
+                "operations": [{"op": "add", "quad": quad}],
+                "activity": "cognitive-correction", "message": "m",
+            })),
+        )
+        .await
+    }
+
+    /// prepare → validate → accept on `branch` from `head`; returns the new head.
+    async fn step_on(&self, g: &GraphId, t: &str, branch: &str, head: &str, quad: &str) -> String {
+        let (status, p) = self.prepare_on(g, t, branch, head, quad).await;
+        assert_eq!(status, StatusCode::CREATED, "{p}");
+        let c = p["candidate"].as_str().unwrap().to_owned();
+        let (status, v) = self.validate(g, t, &c, &unique("v"), json!({})).await;
+        assert_eq!(status, StatusCode::CREATED, "{v}");
+        let body = json!({
+            "ref": branch, "expected_head": head, "reason": "reviewed",
+            "validation_id": v["validation_id"], "semantic_environment_id": v["semantic_environment_id"],
+        });
+        let (status, a) = self
+            .call(
+                "POST",
+                &format!("/v1/graphs/{g}/proposals/{c}/accept"),
+                t,
+                Some(&unique("a")),
+                Some(body),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{a}");
+        c
+    }
+
+    /// Validated genesis + (n-1) advances on main; returns the heads in order.
+    async fn main_history(&self, g: &GraphId, t: &str, n: usize) -> Vec<String> {
+        let first = self
+            .prepare(g, t, None, &format!("<urn:m:{g}:1> <urn:p> \"1\" ."))
+            .await;
+        let (_, v) = self.validate(g, t, &first, &unique("v"), json!({})).await;
+        let (status, a) = self
+            .accept(
+                g,
+                t,
+                &first,
+                None,
+                &unique("a"),
+                Some((&v["validation_id"], &v["semantic_environment_id"])),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{a}");
+        let mut heads = vec![first];
+        for i in 2..=n {
+            let head = heads.last().unwrap().clone();
+            heads.push(
+                self.step_on(
+                    g,
+                    t,
+                    "main",
+                    &head,
+                    &format!("<urn:m:{g}:{i}> <urn:p> \"{i}\" ."),
+                )
+                .await,
+            );
+        }
+        heads
+    }
+
+    async fn create_branch(&self, g: &GraphId, t: &str, key: &str, body: Value) -> Reply {
+        self.call(
+            "POST",
+            &format!("/v1/graphs/{g}/branches"),
+            t,
+            Some(key),
+            Some(body),
+        )
+        .await
+    }
+
+    async fn lifecycle(&self, g: &GraphId, t: &str, op: &str, key: &str, name: &str) -> Reply {
+        self.call(
+            "POST",
+            &format!("/v1/graphs/{g}/branches/{op}"),
+            t,
+            Some(key),
+            Some(json!({"name": name, "reason": format!("{op} by test")})),
+        )
+        .await
+    }
+
+    async fn branch_status(&self, g: &GraphId, t: &str, name: &str) -> Reply {
+        self.call(
+            "GET",
+            &format!("/v1/graphs/{g}/branches/status?name={name}"),
+            t,
+            None,
+            None,
+        )
+        .await
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn a_validated_multi_step_cognitive_workflow_runs_on_a_branch_while_main_stays_put() {
+    let h = harness().await;
+    let g = h.graph("tenant-br").await;
+    let admin = token("tenant-br", "operator", &ADMIN);
+    let agent = token("tenant-br", "agent-17", &ROLES);
+    let c100 = h.main_history(&g, &admin, 1).await.remove(0);
+    // The agent creates its workspace from main's head: O(1), nothing copied.
+    let (status, created) = h
+        .create_branch(
+            &g,
+            &agent,
+            "t17",
+            json!({"name": "agent/task-17", "source": "main"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["event"]["head"], c100);
+    assert_eq!(created["event"]["version"], 1);
+    assert_eq!(created["event"]["operation"], "created");
+    // Three proposal → validation → acceptance cycles on the branch.
+    let mut head = c100.clone();
+    let mut heads = Vec::new();
+    for step in 101..=103 {
+        head = h
+            .step_on(
+                &g,
+                &agent,
+                "agent/task-17",
+                &head,
+                &format!("<urn:task17:c{step}> <urn:p> \"{step}\" ."),
+            )
+            .await;
+        heads.push(head.clone());
+    }
+    assert_eq!(
+        h.head(&g).await,
+        Some((c100.clone(), 1)),
+        "main never moved"
+    );
+    let (status, b) = h.branch_status(&g, &agent, "agent/task-17").await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    assert_eq!(
+        (b["head"].as_str().unwrap(), b["version"].as_i64().unwrap()),
+        (heads[2].as_str(), 4)
+    );
+    assert_eq!(
+        (
+            b["origin"].as_str(),
+            b["source"].as_str(),
+            b["source_commit"].as_str()
+        ),
+        (Some("created"), Some("main"), Some(c100.as_str()))
+    );
+    // Deterministic historical reconstruction at C101, C102, C103.
+    for (i, c) in heads.iter().enumerate() {
+        let path = format!("/v1/graphs/{g}/commits/{c}/state");
+        let (s1, a) = h.call("GET", &path, &agent, None, None).await;
+        let (s2, b) = h.call("GET", &path, &agent, None, None).await;
+        assert_eq!((s1, s2), (StatusCode::OK, StatusCode::OK));
+        assert_eq!(a, b);
+        assert_eq!(a["quads"].as_array().unwrap().len(), i + 2);
+    }
+    // History: lifecycle and movements are distinct surfaces.
+    let (status, history) = h
+        .call(
+            "GET",
+            &format!("/v1/graphs/{g}/branches/history?name=agent/task-17"),
+            &agent,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    assert_eq!(history["lifecycle"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        history["lifecycle"][0]["principal_id"],
+        created["event"]["principal_id"]
+    );
+    let versions: Vec<i64> = history["movements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["new_version"].as_i64().unwrap())
+        .collect();
+    assert_eq!(versions, vec![4, 3, 2, 1]);
+    let (status, log) = h
+        .call(
+            "GET",
+            &format!("/v1/graphs/{g}/branches/log?name=agent%2Ftask-17&limit=10"),
+            &agent,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{log}");
+    assert_eq!(log["commits"], json!([heads[2], heads[1], heads[0], c100]));
+    // Branch acceptance writes the ordinary atomic records, and no projection alarm: its
+    // outbox rows exist but projection observability counts only `main`.
+    let outbox_branch = h
+        .count("SELECT count(*) FROM projection_outbox WHERE graph_id = $1 AND branch = 'agent/task-17'", &g)
+        .await;
+    assert_eq!(outbox_branch, 3);
+    let unconfigured = ledger_store::ProjectionRepository::new(h.owner.pool().clone())
+        .unconfigured_pending()
+        .await
+        .unwrap();
+    let main_pending = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM projection_outbox o WHERE o.branch = 'main' AND o.delivered_at IS NULL \
+         AND NOT EXISTS (SELECT 1 FROM projection_state s WHERE s.graph_id = o.graph_id AND s.branch = o.branch \
+                         AND s.status <> 'disabled')",
+    )
+    .fetch_one(h.owner.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        unconfigured, main_pending,
+        "non-main branch traffic is not a projection backlog"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn branch_authority_follows_capabilities_and_foreign_tenants_see_nothing() {
+    let h = harness().await;
+    let g = h.graph("tenant-bz").await;
+    let admin = token("tenant-bz", "operator", &ADMIN);
+    let agent = token("tenant-bz", "agent", &ROLES);
+    let reader = token("tenant-bz", "reader", &["ledger.read"]);
+    let reviewer = token("tenant-bz", "reviewer", &["ledger.read", "ledger.review"]);
+    let foreign = token("tenant-other", "intruder", &ADMIN);
+    h.main_history(&g, &admin, 1).await;
+    let plain = json!({"name": "agent/x", "source": "main"});
+    assert_code(
+        &h.create_branch(&g, &reader, "r1", plain.clone()).await,
+        StatusCode::FORBIDDEN,
+        "FORBIDDEN",
+    );
+    let (status, _) = h.create_branch(&g, &agent, "a1", plain.clone()).await;
+    assert_eq!(status, StatusCode::CREATED);
+    // Protected branches are administrative.
+    let protected = json!({"name": "release/1", "source": "main", "policy": {"protected": true}});
+    assert_code(
+        &h.create_branch(&g, &agent, "a2", protected.clone()).await,
+        StatusCode::FORBIDDEN,
+        "FORBIDDEN",
+    );
+    let (status, _) = h.create_branch(&g, &admin, "ad1", protected).await;
+    assert_eq!(status, StatusCode::CREATED);
+    // Delete / restore are administrative.
+    for t in [&agent, &reviewer, &reader] {
+        assert_code(
+            &h.lifecycle(&g, t, "delete", &unique("d"), "agent/x").await,
+            StatusCode::FORBIDDEN,
+            "FORBIDDEN",
+        );
+    }
+    let (status, _) = h.lifecycle(&g, &admin, "delete", "del-x", "agent/x").await;
+    assert_eq!(status, StatusCode::OK);
+    // main is never deleted, not even by an administrator.
+    assert_code(
+        &h.lifecycle(&g, &admin, "delete", "del-main", "main").await,
+        StatusCode::CONFLICT,
+        "BRANCH_POLICY_VIOLATION",
+    );
+    // Readers see status; foreign tenants see nothing, not even existence.
+    let (status, list) = h
+        .call(
+            "GET",
+            &format!("/v1/graphs/{g}/branches"),
+            &reader,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let names: Vec<&str> = list["branches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["agent/x", "main", "release/1"]);
+    for path in [
+        format!("/v1/graphs/{g}/branches"),
+        format!("/v1/graphs/{g}/branches/status?name=main"),
+        format!("/v1/graphs/{g}/branches/history?name=main"),
+    ] {
+        assert_code(
+            &h.call("GET", &path, &foreign, None, None).await,
+            StatusCode::NOT_FOUND,
+            "NOT_FOUND",
+        );
+    }
+    assert_code(
+        &h.create_branch(
+            &g,
+            &foreign,
+            "fx",
+            json!({"name": "stolen", "source": "main"}),
+        )
+        .await,
+        StatusCode::NOT_FOUND,
+        "NOT_FOUND",
+    );
+    // A slash in a name is never path structure: no such route exists.
+    let (status, _) = h
+        .call(
+            "GET",
+            &format!("/v1/graphs/{g}/branches/agent/x"),
+            &reader,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    // Percent-encoded and raw query names address the same branch.
+    let (s1, a) = h.branch_status(&g, &reader, "agent/x").await;
+    let (s2, b) = h.branch_status(&g, &reader, "agent%2Fx").await;
+    assert_eq!((s1, s2), (StatusCode::OK, StatusCode::OK));
+    assert_eq!(a, b);
+    assert_eq!(a["status"], "deleted");
+    assert_code(
+        &h.branch_status(&g, &reader, "agent/none").await,
+        StatusCode::NOT_FOUND,
+        "BRANCH_NOT_FOUND",
+    );
+    // Unknown fields are refused (no hidden override flags).
+    assert_code(
+        &h.create_branch(
+            &g,
+            &admin,
+            "ov",
+            json!({"name": "y", "source": "main", "force": true}),
+        )
+        .await,
+        StatusCode::BAD_REQUEST,
+        "INVALID_REQUEST",
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn historical_branch_points_must_be_reachable_and_failures_disclose_nothing() {
+    let h = harness().await;
+    let g = h.graph("tenant-bh").await;
+    let admin = token("tenant-bh", "operator", &ADMIN);
+    let c = h.main_history(&g, &admin, 5).await;
+    let (status, a) = h
+        .create_branch(
+            &g,
+            &admin,
+            "ba",
+            json!({"name": "branch-A", "source": "main"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{a}");
+    assert_eq!(a["event"]["head"], c[4]);
+    let (status, b) = h
+        .create_branch(
+            &g,
+            &admin,
+            "bb",
+            json!({"name": "branch-B", "source": "main", "from_commit": c[1]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{b}");
+    assert_eq!(b["event"]["head"], c[1]);
+    // Unreachable (a commit only on branch-A beyond C5, from branch-B), foreign-graph and
+    // unknown commits: the same status, code and message.
+    let beyond = h
+        .step_on(
+            &g,
+            &admin,
+            "branch-A",
+            &c[4],
+            "<urn:beyond> <urn:p> \"x\" .",
+        )
+        .await;
+    let other = h.graph("tenant-other-bh").await;
+    let other_admin = token("tenant-other-bh", "operator", &ADMIN);
+    let foreign_commit = h.main_history(&other, &other_admin, 1).await.remove(0);
+    let unknown = format!("sha256:{}", "e".repeat(64));
+    let mut replies = Vec::new();
+    for (i, point) in [beyond, foreign_commit, unknown].iter().enumerate() {
+        let reply = h
+            .create_branch(
+                &g,
+                &admin,
+                &format!("bad{i}"),
+                json!({"name": format!("bad-{i}"), "source": "branch-B", "from_commit": point}),
+            )
+            .await;
+        assert_code(
+            &reply,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "BRANCH_POINT_UNREACHABLE",
+        );
+        replies.push(reply.1["message"].clone());
+    }
+    assert!(replies.windows(2).all(|w| w[0] == w[1]), "{replies:?}");
+    assert_code(
+        &h.branch_status(&g, &admin, "bad-0").await,
+        StatusCode::NOT_FOUND,
+        "BRANCH_NOT_FOUND",
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn deleted_branches_are_readable_but_frozen_and_lifecycle_retries_replay() {
+    let h = harness().await;
+    let g = h.graph("tenant-bd").await;
+    let admin = token("tenant-bd", "operator", &ADMIN);
+    let c = h.main_history(&g, &admin, 1).await;
+    let body = json!({"name": "work/1", "source": "main"});
+    let (status, first) = h.create_branch(&g, &admin, "cw", body.clone()).await;
+    assert_eq!(status, StatusCode::CREATED);
+    // Create retry: the original result; another request under the key: conflict.
+    let (status, again) = h.create_branch(&g, &admin, "cw", body).await;
+    assert_eq!(
+        (status, again["replayed"].clone()),
+        (StatusCode::OK, json!(true))
+    );
+    assert_eq!(again["event"], first["event"]);
+    assert_code(
+        &h.create_branch(
+            &g,
+            &admin,
+            "cw",
+            json!({"name": "work/2", "source": "main"}),
+        )
+        .await,
+        StatusCode::CONFLICT,
+        "IDEMPOTENCY_CONFLICT",
+    );
+    let h1 = h
+        .step_on(&g, &admin, "work/1", &c[0], "<urn:w:1> <urn:p> \"1\" .")
+        .await;
+    let (status, deleted) = h.lifecycle(&g, &admin, "delete", "dw", "work/1").await;
+    assert_eq!(status, StatusCode::OK, "{deleted}");
+    let (status, replay) = h.lifecycle(&g, &admin, "delete", "dw", "work/1").await;
+    assert_eq!(
+        (status, replay["replayed"].clone()),
+        (StatusCode::OK, json!(true))
+    );
+    assert_eq!(replay["event"], deleted["event"]);
+    assert_code(
+        &h.lifecycle(&g, &admin, "delete", "dw2", "work/1").await,
+        StatusCode::CONFLICT,
+        "BRANCH_STATE_CONFLICT",
+    );
+    // History and state still readable; prepare and accept refused.
+    let (status, _) = h
+        .call(
+            "GET",
+            &format!("/v1/graphs/{g}/commits/{h1}/state"),
+            &admin,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_code(
+        &h.prepare_on(&g, &admin, "work/1", &h1, "<urn:w:2> <urn:p> \"2\" .")
+            .await,
+        StatusCode::CONFLICT,
+        "BRANCH_DELETED",
+    );
+    // Restore: same head and version; the workflow resumes.
+    let (status, restored) = h.lifecycle(&g, &admin, "restore", "rw", "work/1").await;
+    assert_eq!(status, StatusCode::OK, "{restored}");
+    assert_eq!(
+        (
+            restored["event"]["head"].as_str(),
+            restored["event"]["version"].as_i64()
+        ),
+        (Some(h1.as_str()), Some(2))
+    );
+    let (_, replay) = h.lifecycle(&g, &admin, "restore", "rw", "work/1").await;
+    assert_eq!(replay["replayed"], true);
+    let h2 = h
+        .step_on(&g, &admin, "work/1", &h1, "<urn:w:2> <urn:p> \"2\" .")
+        .await;
+    let (_, b) = h.branch_status(&g, &admin, "work/1").await;
+    assert_eq!(
+        (
+            b["head"].as_str(),
+            b["version"].as_i64(),
+            b["status"].as_str()
+        ),
+        (Some(h2.as_str()), Some(3), Some("active"))
+    );
+    let (_, history) = h
+        .call(
+            "GET",
+            &format!("/v1/graphs/{g}/branches/history?name=work/1"),
+            &admin,
+            None,
+            None,
+        )
+        .await;
+    let ops: Vec<&str> = history["lifecycle"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["operation"].as_str().unwrap())
+        .collect();
+    assert_eq!(ops, vec!["created", "deleted", "restored"]);
+}

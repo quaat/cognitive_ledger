@@ -435,7 +435,10 @@ async fn runtime_identity_serves_the_workflow_but_cannot_touch_schema_or_history
         "SET session_replication_role = replica",
         "CREATE FUNCTION smuggled() RETURNS int LANGUAGE sql AS 'SELECT 1'",
         "SELECT setval('proposals_proposal_id_seq', 1)",
-        "INSERT INTO refs (graph_id, branch, head, version, protected) VALUES ('x', 'y', 'z', 1, false)",
+        // `protected` is insertable since 0012 (branch creation, ADR-0022); back-dating a ref
+        // or a lifecycle event is not.
+        "INSERT INTO refs (graph_id, branch, head, version, updated_at) VALUES ('x', 'y', 'z', 1, now())",
+        "INSERT INTO branch_events (graph_id, branch, tenant_id, lifecycle_version, operation, status_after, head, ref_version, principal_id, principal_type, recorded_at) VALUES ('x','y','t',2,'deleted','deleted','z',1,'p','agent', now())",
         "INSERT INTO projection_outbox (graph_id, branch, commit_id, ref_version, event_kind, ref_event_id, delivered_at) VALUES ('x','y','z',1,'ref_advanced',1, now())",
         "INSERT INTO decisions (proposal_id, graph_id, branch, candidate_commit, decision, tenant_id, principal_id, principal_type, reason, validation_ids, decided_at) VALUES (1,'x','y','z','rejected','t','p','agent','r','{}', now())",
         // Back-dating the audit timestamp of a validation record or context is not granted.
@@ -820,9 +823,12 @@ async fn grant_function_is_owner_only_idempotent_and_refuses_unknown_roles() {
         })
         .collect();
     for absent in [
-        "refs.protected",
         "refs.created_at",
         "refs.updated_at",
+        "branches.created_at",
+        "branches.updated_at",
+        "branch_events.event_id",
+        "branch_events.recorded_at",
         "projection_outbox.delivered_at",
         "projection_outbox.attempts",
         "projection_outbox.outbox_id",
@@ -845,6 +851,11 @@ async fn grant_function_is_owner_only_idempotent_and_refuses_unknown_roles() {
     for present in [
         "refs.head",
         "refs.version",
+        // ADR-0022: branch creation records protection; `main` stays protected by CHECK.
+        "refs.protected",
+        "branches.status",
+        "branch_events.operation",
+        "idempotency.result_branch_event_id",
         "proposals.candidate_commit",
         "decisions.ref_event_id",
         "idempotency.request_digest",
@@ -1646,10 +1657,31 @@ async fn drifted_column_and_sequence_privileges_are_refused_at_startup() {
     assert!(m.contains("table-level INSERT on public.refs"), "{m}");
     regrant().await;
 
-    // Excess column: INSERT on the excluded refs.protected.
-    owner_exec(&fx, &format!("GRANT INSERT (protected) ON refs TO {role}")).await;
-    let m = assert_refused_by_identity(&fx, "INSERT (protected)").await;
-    assert!(m.contains("holds INSERT on public.refs.protected"), "{m}");
+    // Excess column: INSERT on the excluded refs.updated_at (back-dating a ref).
+    owner_exec(&fx, &format!("GRANT INSERT (updated_at) ON refs TO {role}")).await;
+    let m = assert_refused_by_identity(&fx, "INSERT (updated_at)").await;
+    assert!(m.contains("holds INSERT on public.refs.updated_at"), "{m}");
+    regrant().await;
+    // Excess column on the branch tables: back-dating a lifecycle event.
+    owner_exec(
+        &fx,
+        &format!("GRANT INSERT (recorded_at) ON branch_events TO {role}"),
+    )
+    .await;
+    let m = assert_refused_by_identity(&fx, "INSERT (recorded_at) on branch_events").await;
+    assert!(
+        m.contains("holds INSERT on public.branch_events.recorded_at"),
+        "{m}"
+    );
+    regrant().await;
+    // Excess UPDATE on a branch's immutable policy.
+    owner_exec(
+        &fx,
+        &format!("GRANT UPDATE (require_validation) ON branches TO {role}"),
+    )
+    .await;
+    let m = assert_refused_by_identity(&fx, "UPDATE (require_validation) on branches").await;
+    assert!(m.contains("branches.require_validation"), "{m}");
     regrant().await;
 
     // Excess UPDATE on an audit column that must stay write-once.
@@ -2401,7 +2433,7 @@ async fn validation_persistence_runs_under_the_runtime_identity_and_its_controls
     PostgresLedgerStore::connect(&fx.runtime_db_url, V1Binding::Reject)
         .await
         .expect("healthy after restoring the CHECK");
-    // The idempotency operation CHECK (which since 0010 admits `validate`) must be present;
+    // The idempotency operation CHECK (0010 admits `validate`, 0012 the branch operations) must be present;
     // a `validate` row already exists here, so a pre-0010 definition cannot even be re-added.
     owner_exec(
         &fx,
@@ -2410,7 +2442,7 @@ async fn validation_persistence_runs_under_the_runtime_identity_and_its_controls
     .await;
     let m = assert_refused_by_schema(&fx, &running, "idempotency_operation CHECK dropped").await;
     assert!(m.contains("idempotency_operation"), "{m}");
-    owner_exec(&fx, "ALTER TABLE idempotency ADD CONSTRAINT idempotency_operation CHECK (operation IN ('prepare', 'accept', 'reject', 'validate'))").await;
+    owner_exec(&fx, "ALTER TABLE idempotency ADD CONSTRAINT idempotency_operation CHECK (operation IN ('prepare', 'accept', 'reject', 'validate', 'branch_create', 'branch_delete', 'branch_restore'))").await;
     assert_healthy(&fx, "operation CHECK restored").await;
     // A runtime that gained UPDATE on a validation column, or lost a required INSERT column,
     // is refused as an identity drift.

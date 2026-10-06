@@ -52,6 +52,33 @@ Preserve object digest verification and atomic ref updates. Never commit secrets
   require the commit to be indexed under that graph. Migration 0007's composite
   `(graph_id, tenant_id)` foreign keys make tenant/graph agreement a database invariant.
 
+## Branch authorization and lifecycle (Phase 4, ADR-0022)
+- `read`: list, status, lifecycle/movement history, first-parent log. `propose`: create an
+  unprotected branch; prepare on an active branch. `review`: accept/reject. `admin`: create
+  a protected branch, delete, restore. Every branch route is graph- and tenant-scoped like
+  the rest (`NOT_FOUND` for a foreign graph); a branch point outside the graph, unknown, or
+  unreachable from the source head is `422 BRANCH_POINT_UNREACHABLE` (the three are not
+  distinguished, so foreign commit ids are not an oracle).
+- Branch names keep the ref grammar `[A-Za-z0-9._/-]{1,128}` (so `..` or empty segments are
+  legal characters, not structure) and travel only in JSON bodies or `?name=` query
+  parameters, never as path segments or file paths. Branch-point reachability is bounded
+  (100 000 visited commits, 5 s, then `413 RESOURCE_LIMIT`), refuses unknown/foreign commits
+  without walking, and runs before the creating transaction on one pooled connection, so no
+  lock on the source ref is held while walking (a `propose` caller cannot stall acceptance on
+  `main`). Movement pages, the branch list and the first-parent log are capped at 1 000 (no
+  cursor yet); branch history returns the latest `limit` lifecycle events and movements.
+- Database facts (migration 0012): `main` is protected (CHECK), a deleted branch's head
+  cannot move and it admits no proposal (triggers), lifecycle rows are write-once and every
+  status change is exactly one audited event (deferred constraint triggers), policy and
+  identity columns are immutable; the deleted-branch guards read the branch row `FOR SHARE`,
+  so raw writes racing an uncommitted delete are refused. `require_distinct_reviewer`
+  compares accountable parties ({principal, on-behalf-of}), not the principal triple.
+  Residual: the runtime, as trusted writer, can fabricate a consistent lifecycle event (or
+  an unprotected non-`main` ref) within its tenants (ADR-0016 Phase-4 amendment).
+  History responses show principal ids and delegators to every `read` holder of the tenant,
+  like ref history since Phase 1; deployments mapping personal identifiers into principal ids
+  must treat branch history as personal data.
+
 ## Semantic validation boundary (Phase 2, ADR-0014/0018/0019)
 - Capabilities: `validate` (`ledger.validate`) requests a validation of a prepared candidate;
   it grants no power over refs (`review` accepts/rejects). Proposers cannot validate;
@@ -282,7 +309,17 @@ GET that accepts only a parsed plain-http URL whose host is a loopback address o
 `ci-security`'s `container` job builds the image, emits its CycloneDX SBOM and the full JSON
 report first (uploaded even when the gate fails), then fails on any CRITICAL/HIGH finding
 whether or not a fix exists: an unfixed one must be classified in `.trivyignore` with
-rationale and review trigger (it is empty), never dropped by `ignore-unfixed`. The scanner
+rationale and review trigger, never dropped by `ignore-unfixed`. In force since
+2026-10-05: CVE-2026-84782 (`libssl3` 3.0.20, HIGH, Debian `affected`, no fix) — **not
+applicable**: no shipped binary links or references libssl/libcrypto (`readelf -d` NEEDED:
+libgcc_s, libm, libc, ld-linux; rustls/aws-lc-rs only; OpenSSL crates banned). The
+non-linkage premise is **CI-enforced**: `ci-security`'s container job runs
+`scripts/check-runtime-linkage.sh` on the built image before the scan, prints every
+binary's `NEEDED` entries and fails if any names `libssl`/`libcrypto` (so a future
+OpenSSL-linked binary fails CI although Trivy would ignore this CVE; checked against a
+deliberately OpenSSL-linked image). The `deny.toml` crate bans remain as the earlier
+line of defence. Review on a Debian fix (then refresh the digest and drop the exception)
+or any base refresh. The scanner
 version is pinned to the one this classification used.
 Classification of the 2026-09-26 scan (Trivy 0.74.0; 0 CRITICAL, 0 HIGH, 17 MEDIUM, 16 LOW,
 1 UNKNOWN):

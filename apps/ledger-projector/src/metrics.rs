@@ -193,7 +193,7 @@ impl Metrics {
         }
         let _ = writeln!(
             out,
-            "# HELP projection_unconfigured_pending Outbox events of refs without an enabled stream.\n\
+            "# HELP projection_unconfigured_pending Outbox events of projection-eligible refs (main) without an enabled stream.\n\
              # TYPE projection_unconfigured_pending gauge\nprojection_unconfigured_pending {unconfigured_pending}"
         );
         out

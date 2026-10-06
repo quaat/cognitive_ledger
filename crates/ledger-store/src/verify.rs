@@ -93,9 +93,63 @@ const CHECKS: &[(&str, &str)] = &[
              SELECT 1 FROM commit_parents p WHERE p.commit_id = e.new_head AND p.position = 0 AND p.parent_id = e.old_head)",
     ),
     (
-        "every ref event has exactly one accepted decision",
+        "every ref event has exactly one accepted decision (except a created branch's first)",
         "SELECT e.event_id::text FROM ref_events e \
-         WHERE (SELECT count(*) FROM decisions d WHERE d.ref_event_id = e.event_id AND d.decision = 'accepted') <> 1",
+         WHERE (SELECT count(*) FROM decisions d WHERE d.ref_event_id = e.event_id AND d.decision = 'accepted') <> 1 \
+           AND NOT (e.new_version = 1 AND e.operation = 'genesis' \
+                    AND NOT EXISTS (SELECT 1 FROM decisions d WHERE d.ref_event_id = e.event_id) \
+                    AND EXISTS (SELECT 1 FROM branch_events b WHERE b.graph_id = e.graph_id AND b.branch = e.branch \
+                                  AND b.operation = 'created' AND b.lifecycle_version = 1 AND b.head = e.new_head))",
+    ),
+    (
+        "every ref of an active or archived graph is a branch",
+        "SELECT r.graph_id || '/' || r.branch FROM refs r JOIN graphs g ON g.graph_id = r.graph_id \
+         WHERE g.status IN ('active', 'archived') \
+           AND NOT EXISTS (SELECT 1 FROM branches b WHERE b.graph_id = r.graph_id AND b.branch = r.branch)",
+    ),
+    (
+        "a branch's lifecycle version is its event count and its status its latest event's",
+        "SELECT b.graph_id || '/' || b.branch FROM branches b \
+         WHERE b.lifecycle_version <> (SELECT count(*) FROM branch_events e WHERE e.graph_id = b.graph_id AND e.branch = b.branch) \
+            OR b.status <> (SELECT e.status_after FROM branch_events e WHERE e.graph_id = b.graph_id AND e.branch = b.branch \
+                            ORDER BY e.lifecycle_version DESC LIMIT 1)",
+    ),
+    (
+        "a created branch starts at its recorded branch point",
+        "SELECT b.graph_id || '/' || b.branch FROM branches b \
+         WHERE b.origin = 'created' AND NOT EXISTS ( \
+             SELECT 1 FROM ref_events e WHERE e.graph_id = b.graph_id AND e.branch = b.branch \
+               AND e.new_version = 1 AND e.new_head = b.source_commit)",
+    ),
+    (
+        "lifecycle events are numbered 1..n per branch",
+        "SELECT e.graph_id || '/' || e.branch FROM branch_events e GROUP BY e.graph_id, e.branch \
+         HAVING min(e.lifecycle_version) <> 1 OR max(e.lifecycle_version) <> count(*)",
+    ),
+    (
+        "every lifecycle event names a real position of its ref",
+        "SELECT e.event_id::text FROM branch_events e JOIN graphs g ON g.graph_id = e.graph_id \
+         WHERE g.status IN ('active', 'archived') AND NOT EXISTS ( \
+             SELECT 1 FROM ref_events r WHERE r.graph_id = e.graph_id AND r.branch = e.branch \
+               AND r.new_version = e.ref_version AND r.new_head = e.head)",
+    ),
+    (
+        "a created branch's first lifecycle event starts at its source commit",
+        "SELECT e.event_id::text FROM branch_events e JOIN branches b ON b.graph_id = e.graph_id AND b.branch = e.branch \
+         WHERE e.operation = 'created' AND (e.lifecycle_version <> 1 OR e.head IS DISTINCT FROM b.source_commit)",
+    ),
+    (
+        "a deleted branch's ref is where its tombstone left it",
+        "SELECT b.graph_id || '/' || b.branch FROM branches b JOIN refs r USING (graph_id, branch) \
+         JOIN branch_events e ON e.graph_id = b.graph_id AND e.branch = b.branch AND e.lifecycle_version = b.lifecycle_version \
+         WHERE b.status = 'deleted' AND (e.operation <> 'deleted' OR e.head <> r.head OR e.ref_version <> r.version)",
+    ),
+    (
+        "a restore resumes exactly at its tombstone",
+        "SELECT e.event_id::text FROM branch_events e LEFT JOIN branch_events p ON p.graph_id = e.graph_id \
+           AND p.branch = e.branch AND p.lifecycle_version = e.lifecycle_version - 1 \
+         WHERE e.operation = 'restored' AND (p.event_id IS NULL OR p.operation <> 'deleted' \
+           OR p.head <> e.head OR p.ref_version <> e.ref_version)",
     ),
     (
         "every accepted decision has exactly one outbox row",
@@ -126,14 +180,17 @@ const CHECKS: &[(&str, &str)] = &[
         "SELECT 'proposals:' || p.proposal_id FROM proposals p JOIN graphs g ON g.graph_id = p.graph_id WHERE g.tenant_id <> p.tenant_id \
          UNION ALL SELECT 'ref_events:' || e.event_id FROM ref_events e JOIN graphs g ON g.graph_id = e.graph_id WHERE g.tenant_id <> e.tenant_id \
          UNION ALL SELECT 'decisions:' || d.decision_id FROM decisions d JOIN graphs g ON g.graph_id = d.graph_id WHERE g.tenant_id <> d.tenant_id \
-         UNION ALL SELECT 'idempotency:' || i.idempotency_id FROM idempotency i JOIN graphs g ON g.graph_id = i.graph_id WHERE g.tenant_id <> i.tenant_id",
+         UNION ALL SELECT 'idempotency:' || i.idempotency_id FROM idempotency i JOIN graphs g ON g.graph_id = i.graph_id WHERE g.tenant_id <> i.tenant_id \
+         UNION ALL SELECT 'branches:' || b.graph_id || '/' || b.branch FROM branches b JOIN graphs g ON g.graph_id = b.graph_id WHERE g.tenant_id <> b.tenant_id \
+         UNION ALL SELECT 'branch_events:' || e.event_id FROM branch_events e JOIN graphs g ON g.graph_id = e.graph_id WHERE g.tenant_id <> e.tenant_id",
     ),
     (
         "idempotency results reference existing rows",
         "SELECT i.idempotency_id::text FROM idempotency i \
          WHERE (i.result_proposal_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM proposals p WHERE p.proposal_id = i.result_proposal_id)) \
             OR (i.result_decision_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM decisions d WHERE d.decision_id = i.result_decision_id)) \
-            OR (i.result_commit IS NOT NULL AND NOT EXISTS (SELECT 1 FROM commit_index c WHERE c.id = i.result_commit))",
+            OR (i.result_commit IS NOT NULL AND NOT EXISTS (SELECT 1 FROM commit_index c WHERE c.id = i.result_commit)) \
+            OR (i.result_branch_event_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM branch_events b WHERE b.event_id = i.result_branch_event_id))",
     ),
     (
         "idempotency scope is unique (NULL delegation is one value)",
@@ -231,6 +288,8 @@ const COUNTED: &[&str] = &[
     "validation_records",
     "validation_violations",
     "decision_validations",
+    "branches",
+    "branch_events",
 ];
 
 /// The SQL behind a named check (tests run it inside a rolled-back tampering transaction).

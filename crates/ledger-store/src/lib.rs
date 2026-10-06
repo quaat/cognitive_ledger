@@ -577,6 +577,15 @@ pub use postgres_workflow::{
     WorkflowRepository,
 };
 #[cfg(feature = "postgres")]
+mod postgres_branches;
+#[cfg(feature = "postgres")]
+pub use ledger_dag::TraversalLimits;
+#[cfg(feature = "postgres")]
+pub use postgres_branches::{
+    BranchEvent, BranchInfo, BranchLifecycleRequest, BranchOutcome, BranchPolicy,
+    CreateBranchRequest, RefMovement,
+};
+#[cfg(feature = "postgres")]
 mod postgres_projection;
 #[cfg(feature = "postgres")]
 pub use postgres_projection::{

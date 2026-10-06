@@ -1,0 +1,11 @@
+{
+  "operation": "branch_create",
+  "graph_id": "0b0a2a1c-2e3d-4f50-8a61-72b384c5d6e7",
+  "name": "release/2026-q4",
+  "source": "review/curation-2026",
+  "policy": {
+    "protected": true,
+    "require_validation": false,
+    "require_distinct_reviewer": true
+  }
+}

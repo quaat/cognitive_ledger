@@ -6,3 +6,15 @@
 # an ID, a rationale and a review trigger; an empty list means no exception is in force.
 #
 # Format: one CVE/advisory id per line, preceded by a comment with the classification.
+
+# CVE-2026-84782 — libssl3 3.0.20-1~deb12u2 (OpenSSL), HIGH, Debian status `affected`
+# (no fixed version), first reported by the 2026-10-05 scan. NOT APPLICABLE to the
+# process: ledger-server, ledger-admin and ledger-projector use rustls/aws-lc-rs (no
+# openssl crate in Cargo.lock; deny.toml bans it); `readelf -d` NEEDED on all three is
+# libgcc_s, libm, libc, ld-linux only and none references libssl/libcrypto. The library is
+# present only because gcr.io/distroless/cc-debian12 ships it. The premise is CI-enforced:
+# scripts/check-runtime-linkage.sh (ci-security, container job) fails if any shipped
+# binary's NEEDED entries name libssl/libcrypto. Review trigger: a Debian 12
+# fix (then refresh the distroless digest and remove this line), any distroless base
+# refresh, or any dependency that would link OpenSSL.
+CVE-2026-84782

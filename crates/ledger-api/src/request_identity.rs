@@ -44,6 +44,17 @@
 //! -- validate -- field candidate · RequestedContext hints (tagged base_kb / ontology /
 //!                shapes pairs, opt reasoning_profile, source-pin set)
 //! ```
+//! `sculpin-ledger-branch-request/v1` (ADR-0022, Plan 0008) covers the branch lifecycle
+//! operations; a separate domain, so no v1/v2 byte changes:
+//!
+//! ```text
+//! "sculpin-ledger-branch-request/v1\0"
+//! field operation  branch_create | branch_delete | branch_restore
+//! field graph_id · field name
+//! -- branch_create --   field source · opt from_commit · u8 protected
+//!                       · u8 require_validation · u8 require_distinct_reviewer   (0x00 | 0x01)
+//! -- branch_delete / branch_restore --   opt reason
+//! ```
 //! `field` = u32 big-endian length + UTF-8 bytes; `opt` = 0x00 absent-or-empty | 0x01 + non-empty
 //! field. Vectors live in `fixtures/golden/requests/` and are cross-checked by
 //! `scripts/golden/request_v1_reference.py`.
@@ -53,6 +64,7 @@ use ledger_validation_protocol::{RequestedContext, SemanticEnvironmentId, Valida
 
 pub const REQUEST_IDENTITY_HEADER: &[u8] = b"sculpin-ledger-request/v1\0";
 pub const REQUEST_IDENTITY_V2_HEADER: &[u8] = b"sculpin-ledger-request/v2\0";
+pub const BRANCH_REQUEST_IDENTITY_HEADER: &[u8] = b"sculpin-ledger-branch-request/v1\0";
 
 /// The normalized, typed content of a mutation request — everything the digest covers.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -106,6 +118,25 @@ pub enum CanonicalRequest {
         candidate: CommitId,
         requested: RequestedContext,
     },
+    BranchCreate {
+        graph: GraphId,
+        name: String,
+        source: String,
+        from_commit: Option<CommitId>,
+        protected: bool,
+        require_validation: bool,
+        require_distinct_reviewer: bool,
+    },
+    BranchDelete {
+        graph: GraphId,
+        name: String,
+        reason: Option<String>,
+    },
+    BranchRestore {
+        graph: GraphId,
+        name: String,
+        reason: Option<String>,
+    },
 }
 
 fn field(out: &mut Vec<u8>, value: &str) {
@@ -138,6 +169,9 @@ impl CanonicalRequest {
             }
             Self::AcceptValidated { .. } | Self::RejectValidated { .. } | Self::Validate { .. } => {
                 REQUEST_IDENTITY_V2_HEADER.to_vec()
+            }
+            Self::BranchCreate { .. } | Self::BranchDelete { .. } | Self::BranchRestore { .. } => {
+                BRANCH_REQUEST_IDENTITY_HEADER.to_vec()
             }
         };
         match self {
@@ -256,6 +290,49 @@ impl CanonicalRequest {
                 requested
                     .encode_into(&mut out)
                     .expect("requested context was validated by the handler");
+            }
+            Self::BranchCreate {
+                graph,
+                name,
+                source,
+                from_commit,
+                protected,
+                require_validation,
+                require_distinct_reviewer,
+            } => {
+                field(&mut out, "branch_create");
+                field(&mut out, graph.as_str());
+                field(&mut out, name);
+                field(&mut out, source);
+                opt(
+                    &mut out,
+                    from_commit.as_ref().map(ToString::to_string).as_deref(),
+                );
+                out.push(u8::from(*protected));
+                out.push(u8::from(*require_validation));
+                out.push(u8::from(*require_distinct_reviewer));
+            }
+            Self::BranchDelete {
+                graph,
+                name,
+                reason,
+            }
+            | Self::BranchRestore {
+                graph,
+                name,
+                reason,
+            } => {
+                field(
+                    &mut out,
+                    if matches!(self, Self::BranchDelete { .. }) {
+                        "branch_delete"
+                    } else {
+                        "branch_restore"
+                    },
+                );
+                field(&mut out, graph.as_str());
+                field(&mut out, name);
+                opt(&mut out, reason.as_deref());
             }
         }
         out

@@ -10,6 +10,7 @@ publish = false
 async-trait.workspace = true
 fs2 = "0.4.3"
 ledger-core = { path = "../ledger-core" }
+ledger-dag = { path = "../ledger-dag" }
 ledger-rdf = { path = "../ledger-rdf" }
 ledger-validation-protocol = { path = "../ledger-validation-protocol" }
 serde.workspace = true
