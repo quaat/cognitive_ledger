@@ -1,6 +1,6 @@
 # Benchmark architecture (Phase 6A, M0)
 
-Status: accepted for Plan 0010 ([execution plan](../exec-plans/active/0010-phase6a-benchmark-foundation.md)).
+Status: accepted for Plan 0010 ([execution plan](../exec-plans/completed/0010-phase6a-benchmark-foundation.md)).
 Requirements: [INTEGRATION_PLAN.md](INTEGRATION_PLAN.md) (the supplied benchmark programme).
 This document records the M0 assessment and the boundaries every later benchmark milestone
 must keep.

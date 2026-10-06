@@ -8,7 +8,7 @@
 - Migration 0009 aborts on a corrupt `immutable_objects` row with a raw `23514` naming no ids (the README convention is guards that name rows); the runbook says to run `verify` first. Add a pre-check guard that lists offending ids, and document the `ACCESS EXCLUSIVE` hashing window. Also: a graph moved from `importing` to `active` after raw ref moves has no `ref_events` for them and fails the verifier's version-equals-events check permanently — activation needs an audited path (Phase 4 admin flow).
 - Fault injection (Plan 0005 slice 4): the lost-response-after-COMMIT case is deterministic only in the `FailPoint` unit test; at the HTTP level random SIGKILLs hit the sub-millisecond COMMIT-to-response window by chance (0–3 observations per run). A `fault-injection` cargo feature that aborts the process right after the workflow transaction commits — compiled only into a separate qualification image, never into the runtime image — would make it deterministic.
 
-- Repository governance (observed 2026-10-06): the GitHub `main` branch has no branch protection or ruleset. Before a production release, enable a ruleset requiring a pull request, the required CI checks (ci-fast, ci-integration, ci-security, ci-fuzz), a review, and no direct pushes to `main`. Not changed automatically (repository policy is the owner's).
+- Repository governance (observed 2026-10-06): the GitHub `main` branch has no branch protection or ruleset. Before a production release, enable a ruleset requiring a pull request, the required CI checks (ci-benchmark, ci-fast, ci-fuzz, ci-integration, ci-security), a review, and no direct pushes to `main`. `ci-benchmark` is the Phase-6A correctness gate (the dataset manifests, the oracle assertions and `ledger-admin verify`); its timings never gate. `scripts/check-doc-consistency.py` keeps this list equal to the PR-gating workflows. Not changed automatically (repository policy is the owner's).
 
 ## Phase 2 (Plan 0006) external prerequisites and residuals
 
@@ -194,14 +194,18 @@
 - Residual write authority of the runtime identity (ADR-0016): it can fabricate a consistent forward ref move with its audit rows or pre-seed idempotency results within its tenants. Closing it needs `SECURITY DEFINER` write functions (with pinned `search_path`) as the only write path, and ideally a cargo feature gate so `ledger-server` cannot link the migrating constructors (`connect_and_migrate`, `from_pool`, `with_ref`).
 - `mark_superseded` has no idempotency record; a retry after a lost response reports `LINEAGE_MISMATCH`. Give it a scope/key if it becomes an API operation. PostgreSQL 17's `transaction_timeout` would bound a workflow transaction that keeps issuing statements; consider it once PG17 is the floor.
 - Identical prepares whose content, actor and microsecond `recorded_at` coincide under two different keys collide on `proposals_candidate_unique`; reported as `LINEAGE_MISMATCH` (not a 500) — acceptable, extremely unlikely.
-- **Intermittent hang (observed 2026-10-06, hosted `ci-integration` run 37524260391,
-  first attempt).** `pg_graphs_migration::upgrade_refuses_graphs_without_a_derivable_owner`
-  stalled for 36 minutes until cancelled; the rerun passed.
-  - The test runs a migration that is expected to fail on a pool. The item below (advisory
-    lock kept after a failed migration) is the suspected, unconfirmed cause.
-  - `ci-integration` has no `timeout-minutes` and the suites no per-test timeout, so a hang
-    costs up to the 6-hour default.
-  - Add a job timeout and run that migration on a dedicated connection.
+- **Intermittent hang, mitigated (Plan 0011).** Observed 2026-10-06 in hosted
+  `ci-integration` run 37524260391, first attempt:
+  `pg_graphs_migration::upgrade_refuses_graphs_without_a_derivable_owner` stalled for 36
+  minutes; the rerun passed.
+  - Every expected-failure migration in that suite now runs on a dedicated connection that
+    is closed afterwards (`migrate_expecting_failure`). It is bounded to 120 s, and the
+    suite asserts that no advisory lock remains.
+  - `a_failed_migration_keeps_its_advisory_lock_on_a_pooled_connection_only` establishes
+    the mechanism: a failed pooled run does leave the lock held.
+  - `ci-integration` now has `timeout-minutes: 30`.
+  - The original hang did not reproduce in 25 local runs (15 isolated, 10 full-suite), so
+    the causal link is unproven. The fix is consistent with the suspected cause.
 - Failed sqlx migration runs keep their advisory lock on the pooled connection; library constructors that migrate on a caller's pool inherit this. Run migrations on a dedicated connection or through the explicit `schema` entry points from a fresh process.
 - Evaluate `cargo-deny`, SBOM, and container scanning with classified findings (`cargo audit` is now a blocking gate via `scripts/check-supply-chain.sh`; its single exception, RUSTSEC-2023-0071 for the lockfile-only `rsa` under `sqlx-mysql`, is re-proven on every run and must be deleted when sqlx/rsa move).
 - Third-party GitHub Actions are pinned by commit SHA (Plan 0005 slice 2); bumping them is a deliberate change with the release name in the comment. The distroless runtime base is pinned by digest and must be refreshed when the classified container findings gain fixes (`docs/quality/security.md`).

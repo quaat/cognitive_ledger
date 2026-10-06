@@ -12,9 +12,9 @@ use ledger_core::{
 };
 use ledger_rdf::{Operation, OperationKind, Patch};
 use ledger_store::{GraphStatus, NewGraph, PgGraphs, PostgresImmutableStore, V1Binding};
-use sqlx::{PgPool, Row, postgres::PgPoolOptions};
+use sqlx::{Connection, PgConnection, PgPool, Row, postgres::PgPoolOptions};
 use std::borrow::Cow;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const IGNORE: &str =
     "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL";
@@ -65,6 +65,50 @@ async fn fresh_database(prefix: &str) -> (String, PgPool) {
         .await
         .unwrap();
     (url, pool)
+}
+
+/// Bound for any single migration run in these tests: a hang fails the test, never the job.
+const MIGRATION_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Advisory locks held in the current database (by any session).
+async fn advisory_locks(pool: &PgPool) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' \
+         AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// Run a migration that is **expected to fail** on a dedicated connection, as an operator's
+/// `ledger-admin migrate` does, never on a shared pool. A failed sqlx migration run keeps
+/// its session-level advisory lock on the connection that ran it (tech-debt), so a pooled
+/// connection would carry the lock into later use. Closing (or dropping) the dedicated
+/// connection ends the session and releases it. Afterwards no advisory lock may remain in
+/// the database (regression check, polled to a bound: session teardown is asynchronous).
+async fn migrate_expecting_failure(
+    url: &str,
+    migrator: sqlx::migrate::Migrator,
+    pool: &PgPool,
+) -> sqlx::migrate::MigrateError {
+    let mut conn = PgConnection::connect(url).await.unwrap();
+    let error = tokio::time::timeout(MIGRATION_DEADLINE, migrator.run(&mut conn))
+        .await
+        .expect("a failing migration must fail, not hang")
+        .expect_err("this migration must be refused");
+    // A connection left in a failed state may refuse a graceful close; dropping it still
+    // ends the session.
+    let _ = conn.close().await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while advisory_locks(pool).await > 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the failed migration's advisory lock outlived its dedicated connection"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    error
 }
 
 /// A migrator restricted to versions `<= upto` (the historical "deployed" state).
@@ -880,10 +924,7 @@ async fn upgrade_refuses_graphs_without_a_derivable_owner() {
     .execute(&pool)
     .await
     .unwrap();
-    let error = sqlx::migrate!("../../migrations")
-        .run(&pool)
-        .await
-        .expect_err("migration 0004 must refuse to guess tenants for team-alpha/team-beta");
+    let error = migrate_expecting_failure(&url, sqlx::migrate!("../../migrations"), &pool).await;
     let message = error.to_string();
     assert!(message.contains("team-alpha, team-beta"), "{message}");
     assert!(message.contains("no derivable tenant owner"), "{message}");
@@ -918,15 +959,15 @@ async fn upgrade_refuses_graphs_without_a_derivable_owner() {
         .execute(&pool)
         .await
         .unwrap();
-    // A failed sqlx migration run leaves its session-level advisory lock on the pooled
-    // connection that ran it; a real operator retries from a fresh process, so reconnect.
-    pool.close().await;
-    let pool = PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .unwrap();
-    sqlx::migrate!("../../migrations").run(&pool).await.unwrap();
+    // The failed run's lock ended with its dedicated connection: the retry (on the same
+    // pool, as an operator re-running `ledger-admin migrate`) proceeds, bounded.
+    tokio::time::timeout(
+        MIGRATION_DEADLINE,
+        sqlx::migrate!("../../migrations").run(&pool),
+    )
+    .await
+    .expect("the retried migration must not wait on a stale lock")
+    .unwrap();
     let t: Option<String> = sqlx::query("SELECT to_regclass('public.graphs')::text AS t")
         .fetch_one(&pool)
         .await
@@ -1127,7 +1168,7 @@ async fn migration_0007_backfills_actor_scope_and_refuses_unbound_or_mismatched_
     pool.close().await;
 
     // Unbound row: an idempotency row without a resolvable proposal/decision fails the upgrade.
-    let (_url, pool) = fresh_database("ledger_0007_unbound").await;
+    let (url, pool) = fresh_database("ledger_0007_unbound").await;
     migrator_up_to(6).run(&pool).await.unwrap();
     PgGraphs::new(pool.clone())
         .create(&new_graph(&graph, "tenant-a", None))
@@ -1143,10 +1184,7 @@ async fn migration_0007_backfills_actor_scope_and_refuses_unbound_or_mismatched_
     .execute(&pool)
     .await
     .unwrap();
-    let error = sqlx::migrate!("../../migrations")
-        .run(&pool)
-        .await
-        .unwrap_err();
+    let error = migrate_expecting_failure(&url, sqlx::migrate!("../../migrations"), &pool).await;
     assert!(
         error.to_string().contains("cannot be bound to an actor"),
         "{error}"
@@ -1154,7 +1192,7 @@ async fn migration_0007_backfills_actor_scope_and_refuses_unbound_or_mismatched_
     pool.close().await;
 
     // Mismatched actor: an idempotency row whose principal differs from its proposal's.
-    let (_url, pool) = fresh_database("ledger_0007_actor").await;
+    let (url, pool) = fresh_database("ledger_0007_actor").await;
     migrator_up_to(6).run(&pool).await.unwrap();
     PgGraphs::new(pool.clone())
         .create(&new_graph(&graph, "tenant-a", None))
@@ -1193,15 +1231,12 @@ async fn migration_0007_backfills_actor_scope_and_refuses_unbound_or_mismatched_
     .execute(&pool)
     .await
     .unwrap();
-    let error = sqlx::migrate!("../../migrations")
-        .run(&pool)
-        .await
-        .unwrap_err();
+    let error = migrate_expecting_failure(&url, sqlx::migrate!("../../migrations"), &pool).await;
     assert!(error.to_string().contains("disagree"), "{error}");
     pool.close().await;
 
     // Mismatched tenant: an audit row whose graph belongs to another tenant fails the upgrade.
-    let (_url, pool) = fresh_database("ledger_0007_mismatch").await;
+    let (url, pool) = fresh_database("ledger_0007_mismatch").await;
     migrator_up_to(6).run(&pool).await.unwrap();
     PgGraphs::new(pool.clone())
         .create(&new_graph(&graph, "tenant-a", None))
@@ -1227,15 +1262,54 @@ async fn migration_0007_backfills_actor_scope_and_refuses_unbound_or_mismatched_
     .execute(&pool)
     .await
     .unwrap();
-    let error = sqlx::migrate!("../../migrations")
-        .run(&pool)
-        .await
-        .unwrap_err();
+    let error = migrate_expecting_failure(&url, sqlx::migrate!("../../migrations"), &pool).await;
     assert!(
         error
             .to_string()
             .contains("does not belong to their tenant"),
         "{error}"
     );
+    pool.close().await;
+}
+
+/// Characterizes the hazard `migrate_expecting_failure` avoids (tech-debt): a failed sqlx
+/// migration run on a **pool** returns its connection to the pool still holding the
+/// migrator's session-level advisory lock, so whatever reuses that connection, or waits for
+/// the lock from elsewhere, inherits it. The same failure on a dedicated connection that is
+/// then closed leaves no lock. If sqlx ever releases the lock on failure, the first half of
+/// this test fails and the tech-debt entry can be closed.
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn a_failed_migration_keeps_its_advisory_lock_on_a_pooled_connection_only() {
+    let unowned_ref = |pool: PgPool| async move {
+        sqlx::query("INSERT INTO refs (graph_id, branch, head) VALUES ('team-x', 'main', $1)")
+            .bind("sha256:2222222222222222222222222222222222222222222222222222222222222222")
+            .execute(&pool)
+            .await
+            .unwrap();
+    };
+    // On a pool: the lock outlives the failed run on an idle pooled connection.
+    let (_url, pool) = fresh_database("ledger_lock_pool").await;
+    migrator_up_to(3).run(&pool).await.unwrap();
+    unowned_ref(pool.clone()).await;
+    let failed = tokio::time::timeout(
+        MIGRATION_DEADLINE,
+        sqlx::migrate!("../../migrations").run(&pool),
+    )
+    .await
+    .expect("bounded");
+    assert!(failed.is_err(), "migration 0004 refuses the unowned ref");
+    assert!(
+        advisory_locks(&pool).await > 0,
+        "the failed pooled run left its advisory lock held"
+    );
+    pool.close().await;
+
+    // On a dedicated connection: closing it releases the lock (asserted inside).
+    let (url, pool) = fresh_database("ledger_lock_dedicated").await;
+    migrator_up_to(3).run(&pool).await.unwrap();
+    unowned_ref(pool.clone()).await;
+    migrate_expecting_failure(&url, sqlx::migrate!("../../migrations"), &pool).await;
+    assert_eq!(advisory_locks(&pool).await, 0);
     pool.close().await;
 }

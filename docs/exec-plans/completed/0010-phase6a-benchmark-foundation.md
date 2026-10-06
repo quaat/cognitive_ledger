@@ -1,11 +1,10 @@
 # Plan 0010: Phase 6A — benchmark foundation before reconstruction optimization
 
-Status: **in progress** (started 2026-10-06). Branch `claude/p6a-benchmark-foundation` from
-`main` at `c7a94d57a573f6cbf650f39a5a779c3aeebf6b1e`. That commit is the PR #10 merge on top of
-the PR #11 Phase-5 merge `319367f`; see
-[Plan 0009](../completed/0009-phase5-diff-and-merge.md). It differs from the reviewed Phase-5
-head `fb9d0d8` only by the two-line `taiki-e/install-action` pin bump in `ci-fuzz.yml` and
-`ci-security.yml`. No gate is reported as passed until it is executable and has run.
+Status: **complete** (started 2026-10-06; merged as PR #12, merge commit `646b029`, whose
+tree is identical to the reviewed head `9f593d2`). Branch `claude/p6a-benchmark-foundation`
+from `main` at `c7a94d57a573f6cbf650f39a5a779c3aeebf6b1e` (the PR #10 merge on top of the PR #11
+Phase-5 merge `319367f`; see [Plan 0009](0009-phase5-diff-and-merge.md)). Continued by Plan 0011
+(Phase 6B).
 
 ## Goal
 Phase 6 ("Reconstruction scalability", `product_development_plan.md` §24 and Phase 6) must

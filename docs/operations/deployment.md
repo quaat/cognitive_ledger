@@ -17,10 +17,12 @@ roles. Never give a serving container the owner URL (the server warns if it sees
 ## Sequence
 1. PostgreSQL 15+ up; create the runtime role: `CREATE ROLE ledger_runtime LOGIN PASSWORD …`.
 2. `LEDGER_MIGRATION_DATABASE_URL=… ledger-admin migrate --runtime-role ledger_runtime`
-   — applies migrations 0001…0010 on one dedicated owner connection (60 s lock timeout,
+   — applies every migration embedded in this build (`migrations/`, up to the build's
+   `ledger_store::schema::REQUIRED_SCHEMA_VERSION`) on one dedicated owner connection (60 s lock timeout,
    so a running replica or a held migration lock fails loudly instead of hanging), grants
    the role (idempotent; the role must be a plain identifier, must not be a superuser and
-   must not hold `CREATE` on the schema), then prints `schema at 0010 (required 0010)`.
+   must not hold `CREATE` on the schema), then prints `schema at NNNN (required NNNN)`, where
+   both numbers must equal the build's `REQUIRED_SCHEMA_VERSION`.
    The owner identity should itself not be a superuser in production (an ordinary database
    owner suffices; `pg_least_privilege` exercises that shape). If a database was populated
    through `ledger-admin migrate-fs-to-pg`, pass `--runtime-role` there too or run
@@ -28,7 +30,8 @@ roles. Never give a serving container the owner URL (the server warns if it sees
 3. Provision graphs: `ledger-admin graph create --graph <id> --tenant <id> --status active`.
 4. Start the servers with `LEDGER_DATABASE_URL` (runtime role), `LEDGER_AUTH_MODE=oidc`,
    issuer/audience/JWKS, limits. Startup connects, applies the session limits, **verifies**
-   the schema is exactly 0010 with contiguous, checksum-matching history and every
+   the schema is exactly at the build's `REQUIRED_SCHEMA_VERSION` with contiguous,
+   checksum-matching history and every
    integrity trigger enabled, and refuses otherwise (behind: "run ledger-admin migrate";
    ahead: "deploy a newer build"; absent/corrupt metadata or a disabled guard: refuse), then
    verifies its own identity (not a superuser, not the owner, no `CREATE`, exactly the
