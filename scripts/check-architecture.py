@@ -73,7 +73,7 @@ def refuse(crate, names, forbidden, what):
 core_forbidden = ("axum", "sqlx", "postgres", "reqwest", "hyper", "bollard", "docker", "aws-sdk", "fluree",
                   "pyshacl", "jena", "ledger-store", "ledger-api", "ledger-server", "ledger-projection-fuseki",
                   "ledger-projector")
-for crate in ("ledger-core", "ledger-rdf", "ledger-dag", "ledger-validation-protocol", "ledger-projection"):
+for crate in ("ledger-core", "ledger-rdf", "ledger-dag", "ledger-merge", "ledger-validation-protocol", "ledger-projection"):
     refuse(crate, transitive(crate), core_forbidden, "transitive")
     refuse(crate, direct(crate), core_forbidden, "direct")
     # Backstop: the previous whole-manifest substring scan.

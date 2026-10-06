@@ -666,3 +666,258 @@ async fn generated_back_edge_is_a_cycle() {
     }
     assert_eq!(injected, SEEDS);
 }
+
+// ---------------------------------------------------------------------------------------
+// Phase 5 (ADR-0024): merge base, ahead/behind, analysis — against the brute-force closure
+// ---------------------------------------------------------------------------------------
+
+/// Slow reference: the maximal elements of reach[t] ∩ reach[s] (c is dominated if it is
+/// reachable from another common ancestor d ≠ c), ascending by commit id.
+fn oracle_base(g: &Generated, t: usize, s: usize) -> MergeBase {
+    let common: Vec<usize> = g.reach[t].intersection(&g.reach[s]).copied().collect();
+    let mut best: Vec<CommitId> = common
+        .iter()
+        .filter(|&&c| !common.iter().any(|&d| d != c && g.reach[d].contains(&c)))
+        .map(|&c| id(c as u64))
+        .collect();
+    best.sort();
+    match best.len() {
+        0 => MergeBase::Unrelated,
+        1 => MergeBase::Unique(best.remove(0)),
+        _ => MergeBase::Ambiguous(best),
+    }
+}
+
+#[tokio::test]
+async fn generated_merge_base_and_analysis_match_oracle() {
+    // All ordered pairs of every generated DAG against a cubic oracle: 100 seeds keep the
+    // debug-mode run short while still covering every outcome (asserted below).
+    const MERGE_SEEDS: u64 = 100;
+    let (mut unique, mut ambiguous, mut unrelated) = (0, 0, 0);
+    for seed in 0..MERGE_SEEDS {
+        let g = generate(seed);
+        let n = g.parents.len();
+        for t in 0..n {
+            for s in 0..n {
+                let (ti, si) = (id(t as u64), id(s as u64));
+                let want = oracle_base(&g, t, s);
+                match &want {
+                    MergeBase::Unique(_) => unique += 1,
+                    MergeBase::Ambiguous(_) => ambiguous += 1,
+                    MergeBase::Unrelated => unrelated += 1,
+                }
+                let ahead = g.reach[s].difference(&g.reach[t]).count();
+                let behind = g.reach[t].difference(&g.reach[s]).count();
+                // The standalone entry points on a deterministic half of the pairs (the
+                // shared `ancestry` core is covered on every pair through `analyze`).
+                if (t + s + seed as usize) % 2 == 0 {
+                    // Symmetric by definition.
+                    assert_eq!(merge_base(&g.dag, &si, &ti, L).await.unwrap(), want);
+                    assert_eq!(
+                        ahead_behind(&g.dag, &ti, &si, L).await.unwrap(),
+                        (ahead, behind),
+                        "seed {seed}: ahead_behind({t}, {s})"
+                    );
+                }
+                let a = analyze(&g.dag, &ti, &si, L).await.unwrap();
+                let relation = if t == s {
+                    Relation::Equal
+                } else if g.reach[t].contains(&s) {
+                    Relation::SourceContained
+                } else if g.reach[s].contains(&t) {
+                    Relation::FastForward
+                } else {
+                    Relation::Divergent(want.clone())
+                };
+                assert_eq!(
+                    a,
+                    Analysis {
+                        relation,
+                        ahead: if t == s { 0 } else { ahead },
+                        behind: if t == s { 0 } else { behind },
+                    },
+                    "seed {seed}: analyze({t}, {s})"
+                );
+                // The unique base of a divergent pair is a common ancestor of both.
+                if let Relation::Divergent(MergeBase::Unique(b)) = &a.relation {
+                    assert!(is_ancestor(&g.dag, b, &ti, L).await.unwrap());
+                    assert!(is_ancestor(&g.dag, b, &si, L).await.unwrap());
+                }
+            }
+        }
+    }
+    // The generator must actually exercise every outcome.
+    assert!(
+        unique > 0 && ambiguous > 0 && unrelated > 0,
+        "{unique}/{ambiguous}/{unrelated}"
+    );
+}
+
+/// Fork from 0: target 0 <- 1 <- 2, source 0 <- 3 <- 4.
+fn fork() -> MemoryDag {
+    MemoryDag::new()
+        .commit(id(0), [])
+        .commit(id(1), [id(0)])
+        .commit(id(2), [id(1)])
+        .commit(id(3), [id(0)])
+        .commit(id(4), [id(3)])
+}
+
+#[tokio::test]
+async fn fixtures_linear_fork_nested_and_diamond() {
+    let lin = linear(10);
+    let a = analyze(&lin, &id(3), &id(7), L).await.unwrap();
+    assert_eq!(
+        a,
+        Analysis {
+            relation: Relation::FastForward,
+            ahead: 4,
+            behind: 0
+        }
+    );
+    let a = analyze(&lin, &id(7), &id(3), L).await.unwrap();
+    assert_eq!(
+        a,
+        Analysis {
+            relation: Relation::SourceContained,
+            ahead: 0,
+            behind: 4
+        }
+    );
+    assert_eq!(
+        analyze(&lin, &id(5), &id(5), L).await.unwrap().relation,
+        Relation::Equal
+    );
+
+    let f = fork();
+    let a = analyze(&f, &id(2), &id(4), L).await.unwrap();
+    assert_eq!(
+        a,
+        Analysis {
+            relation: Relation::Divergent(MergeBase::Unique(id(0))),
+            ahead: 2,
+            behind: 2
+        }
+    );
+    // Nested fork: 5 branches from 3; base(2, 5) is still 0, base(4, 5) is 3.
+    let nested = fork().commit(id(5), [id(3)]);
+    assert_eq!(
+        merge_base(&nested, &id(2), &id(5), L).await.unwrap(),
+        MergeBase::Unique(id(0))
+    );
+    assert_eq!(
+        merge_base(&nested, &id(4), &id(5), L).await.unwrap(),
+        MergeBase::Unique(id(3))
+    );
+    // Diamond: 0 <- {1, 2} <- 3 = [1, 2]; then 4 <- 3 and 5 <- 1: base(4, 5) = 1.
+    let diamond = MemoryDag::new()
+        .commit(id(0), [])
+        .commit(id(1), [id(0)])
+        .commit(id(2), [id(0)])
+        .commit(id(3), [id(1), id(2)])
+        .commit(id(4), [id(3)])
+        .commit(id(5), [id(1)]);
+    assert_eq!(
+        merge_base(&diamond, &id(4), &id(5), L).await.unwrap(),
+        MergeBase::Unique(id(1))
+    );
+}
+
+#[tokio::test]
+async fn repeated_merge_and_ping_pong_terminate_in_containment() {
+    // target 2, source 4 diverge from 0; integration I = 10 = [2, 4] (ADR-0023).
+    let mut dag = fork().commit(id(10), [id(2), id(4)]);
+    // Repeating the merge: the source is contained.
+    assert_eq!(
+        analyze(&dag, &id(10), &id(4), L).await.unwrap().relation,
+        Relation::SourceContained
+    );
+    // The source advances (5 <- 4): divergent again, base = the old source head.
+    dag.insert(id(5), [id(4)]);
+    let a = analyze(&dag, &id(10), &id(5), L).await.unwrap();
+    assert_eq!(a.relation, Relation::Divergent(MergeBase::Unique(id(4))));
+    assert_eq!((a.ahead, a.behind), (1, 3));
+    // Merging the target back into the source (source branch at 5, incoming 10 + 11 = [10, 5]):
+    // integration on the source side is fast-forward class, and afterwards both directions
+    // are contained — ping-pong terminates.
+    dag.insert(id(11), [id(10), id(5)]);
+    assert_eq!(
+        analyze(&dag, &id(5), &id(11), L).await.unwrap().relation,
+        Relation::FastForward
+    );
+    dag.insert(id(12), [id(5), id(11)]); // the source's integration commit
+    assert_eq!(
+        analyze(&dag, &id(12), &id(11), L).await.unwrap().relation,
+        Relation::SourceContained
+    );
+    assert_eq!(
+        analyze(&dag, &id(11), &id(12), L).await.unwrap().relation,
+        Relation::FastForward
+    );
+}
+
+#[tokio::test]
+async fn criss_cross_is_ambiguous_and_never_picks_one() {
+    // 1 and 2 fork from 0; 3 = [1, 2] and 4 = [2, 1] (criss-cross); 5 <- 3, 6 <- 4.
+    let dag = MemoryDag::new()
+        .commit(id(0), [])
+        .commit(id(1), [id(0)])
+        .commit(id(2), [id(0)])
+        .commit(id(3), [id(1), id(2)])
+        .commit(id(4), [id(2), id(1)])
+        .commit(id(5), [id(3)])
+        .commit(id(6), [id(4)]);
+    let mut want = vec![id(1), id(2)];
+    want.sort();
+    assert_eq!(
+        merge_base(&dag, &id(5), &id(6), L).await.unwrap(),
+        MergeBase::Ambiguous(want.clone())
+    );
+    assert_eq!(
+        analyze(&dag, &id(5), &id(6), L).await.unwrap().relation,
+        Relation::Divergent(MergeBase::Ambiguous(want))
+    );
+}
+
+#[tokio::test]
+async fn unrelated_missing_cycle_and_limits_fail_closed() {
+    let two_roots = MemoryDag::new()
+        .commit(id(0), [])
+        .commit(id(1), [id(0)])
+        .commit(id(2), [])
+        .commit(id(3), [id(2)]);
+    assert_eq!(
+        merge_base(&two_roots, &id(1), &id(3), L).await.unwrap(),
+        MergeBase::Unrelated
+    );
+    let missing = MemoryDag::new().commit(id(1), [id(0)]).commit(id(2), []);
+    assert!(matches!(
+        merge_base(&missing, &id(1), &id(2), L).await,
+        Err(DagError::UnknownCommit(c)) if c == id(0)
+    ));
+    assert!(matches!(
+        analyze(&missing, &id(2), &id(1), L).await,
+        Err(DagError::UnknownCommit(_))
+    ));
+    let cycle = MemoryDag::new()
+        .commit(id(1), [id(2)])
+        .commit(id(2), [id(1)])
+        .commit(id(3), []);
+    assert!(matches!(
+        merge_base(&cycle, &id(1), &id(3), L).await,
+        Err(DagError::Cycle(_))
+    ));
+    // Deep history: 10 000 linear commits plus a fork at the top; bounded both ways.
+    let mut deep = linear(10_000);
+    deep.insert(id(20_000), [id(9_998)]);
+    let a = analyze(&deep, &id(9_999), &id(20_000), L).await.unwrap();
+    assert_eq!(
+        a.relation,
+        Relation::Divergent(MergeBase::Unique(id(9_998)))
+    );
+    assert_eq!((a.ahead, a.behind), (1, 1));
+    assert!(matches!(
+        analyze(&deep, &id(9_999), &id(20_000), limit(5_000)).await,
+        Err(DagError::VisitLimit { .. })
+    ));
+}

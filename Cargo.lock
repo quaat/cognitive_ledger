@@ -996,6 +996,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ledger-merge"
+version = "0.1.0"
+dependencies = [
+ "ledger-core",
+ "ledger-rdf",
+]
+
+[[package]]
 name = "ledger-projection"
 version = "0.1.0"
 dependencies = [

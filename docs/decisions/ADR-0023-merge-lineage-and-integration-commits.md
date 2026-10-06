@@ -1,7 +1,9 @@
 # Merge lineage: integration commits, not ref jumps
 
 ## Status
-Proposed (2026-10-06, Plan 0009 / Phase 5). Decides how a merge moves a target ref under
+Accepted (2026-10-06, Plan 0009 / Phase 5), after independent architecture, invariant and
+storage/concurrency reviews. The amendments they required are folded in: the no-change
+class, the commit envelope, the ADR-0008 citation and the corrected claims. Decides how a merge moves a target ref under
 migration 0009's movement invariant and how a merge fits the proposal → validation →
 decision model. Implementation needs migration 0013 (additive). No commit, patch, state,
 request or validation identity changes.
@@ -89,11 +91,14 @@ I.patch   = diff(state(target_head), merged_state)
   decision (the merge apply). One ref event installs it, with one outbox row, one
   idempotency result and one validation, all under the target's policy. Every existing
   invariant and verify check applies as-is.
-- I carries its own provenance: who integrated, when, why, and with which strategy and
-  validation. The source commits keep theirs.
+- I carries its own provenance: who integrated, when and why (actor, `recorded_at`,
+  message, evidence). The strategy, base and algorithm live in the merge row, and the
+  validation in its own record (ADR-0009 keeps validation out of the envelope). The source
+  commits keep their provenance.
 - The two-parent shape records the ancestry. After the merge, the source head is an
-  ancestor of the target head, so repeating the merge is classified *already contained*
-  and creates nothing.
+  ancestor of the target head, so repeating the same direction is classified *already
+  contained* and creates nothing. Merging back in the other direction is covered by the
+  no-change rule below.
 
 ## Decision
 Option C.
@@ -118,6 +123,7 @@ Classification (ADR-0024 defines merge base and ancestry):
 |---|---|---|
 | `ALREADY_EQUAL` | target head = source head | nothing; no commit, no event |
 | `ALREADY_CONTAINED` | source head is an ancestor of target head | nothing; no commit, no event |
+| `NO_CHANGE` | the merged state (below) equals the target state | nothing; no commit, no event |
 | `FAST_FORWARD` | target head is an ancestor of source head | integration commit, state = source state |
 | `DIVERGENT` | neither | three-way merge from the unique merge base; integration commit, state = merged state |
 
@@ -131,28 +137,52 @@ Classification (ADR-0024 defines merge base and ancestry):
 - apply is an acceptance of that proposal with the merge-specific staleness checks
   (ADR-0024), under the **target** branch's policy.
 
-A merge candidate may have an **empty patch**: its state equals the target state (for
-example, all source changes are already present, or `take-target` resolved every
-difference). It still records ancestry. The ordinary prepare's `NO_EFFECTIVE_CHANGE`
-refusal does not apply to merges.
+**No empty integrations.** A merge whose merged state equals the target's state is
+classified `NO_CHANGE` and creates nothing. Examples: a fast-forward to a source with the
+same state, every source change already present, or `take-target` resolving every
+difference. This keeps ADR-0008's rule that an empty effective delta on a protected ref
+produces no commit, and it makes two-way synchronization reach a fixed point:
+1. After `I1 = [T, S]` on main, merging main into feature creates at most one
+   state-changing integration.
+2. Merging feature into main is then either contained or `NO_CHANGE`.
 
-**Ref event kind.** Migration 0013 extends `ref_events.operation` with `merge` (additive
-CHECK superset), so operators can distinguish integrations from ordinary advances. Every
-`merge` event installs a two-parent candidate that has a merge row. Every `advance` event
-installs a candidate with at most one parent. `verify` checks both directions.
+Ancestry is recorded only by state-changing integrations. A `NO_CHANGE` source remains
+"not contained", and re-previewing it stays a no-op.
+
+**Envelope of an integration commit** (persistent identity):
+- `activity = "merge"`;
+- `message` and `evidence_refs` are client-supplied and optional; they are part of the
+  `sculpin-ledger-merge-request/v1` identity;
+- `event_time` and `source_system` are absent;
+- `actor` is the authenticated proposer and `recorded_at` is server-assigned, as for every
+  commit;
+- parents are `[target_head, source_head]` and the patch is `diff(state(T), M)`.
+
+**Ref event kind.** Migration 0013 adds `merge` to `ref_events.operation`, so operators
+can distinguish integrations from ordinary advances. It replaces both the operation CHECK
+and the shape CHECK, since the shape CHECK alone would refuse `merge` rows.
+- Database triggers enforce that every `merge` event installs a two-parent candidate with
+  a merge row whose target head is the event's old head, and that every `advance` event
+  installs a candidate with at most one parent and no merge row. `verify` checks both
+  directions.
+- `genesis` is not constrained: a branch created at an integration commit has a `genesis`
+  event on a two-parent head.
+- The ordinary accept path keeps refusing merge candidates. Only the merge apply path
+  (ADR-0024) installs them.
 
 **Not changed:** migration 0009 and every other migration up to 0012, commit-v2 encoding
 and vectors, reconstruction (first-parent), projection (the projector sees an ordinary
 accepted head on `main`), and the request domains of Phases 1–4.
 
 ## Consequences
-- Every integration adds exactly one commit to the target's history, including
-  fast-forward-class integrations. Target history therefore never shares head ids with the
+- Every state-changing integration adds exactly one commit to the target's history,
+  including fast-forward-class integrations; nothing else adds a commit. Target history therefore never shares head ids with the
   source. Tooling that wants "is the source fully integrated?" asks for ancestry
   (`ALREADY_CONTAINED`), not head equality.
 - Merging the target back into the source after an integration is a `FAST_FORWARD`-class
-  integration on the source branch (the integration commit is a descendant of the source
-  head). It produces its own integration commit there.
+  integration on the source branch, because the integration commit is a descendant of the
+  source head. It produces its own integration commit only if it changes the source's
+  state.
 - First-parent history of the target lists integration commits, not the source's
   individual commits. The source commits stay reachable through parent 1 (`ancestors`,
   `is_ancestor`), and their provenance is intact.

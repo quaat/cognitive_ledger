@@ -7,7 +7,11 @@
 //! - [`is_ancestor`]: is a commit reachable from another through any parent edges (used to
 //!   validate that a requested historical branch point is reachable from a source head);
 //! - [`first_parent_history`]: the first-parent chain from a head;
-//! - [`ancestors`]: every commit reachable from a head, each once, in a deterministic order.
+//! - [`ancestors`]: every commit reachable from a head, each once, in a deterministic order;
+//! - [`merge_base`], [`ahead_behind`] and [`analyze`]: the Phase-5 merge inputs (ADR-0024) —
+//!   the unique best common ancestor (or an explicit ambiguous / unrelated answer), how many
+//!   commits each side has that the other lacks, and the ancestry relation that classifies a
+//!   merge (equal / source contained / fast-forward / divergent, ADR-0023).
 //!
 //! Every traversal is iterative (no recursion, so 100k-deep linear history cannot overflow
 //! the stack), keeps a visited set (each distinct commit is fetched from the provider at most
@@ -15,11 +19,11 @@
 //! bounded by [`TraversalLimits`] and fails closed on corruption: a missing parent is
 //! [`DagError::UnknownCommit`] and a cycle presented by the provider is [`DagError::Cycle`].
 //!
-//! Out of scope: merge-base computation and three-way merge.
+//! Out of scope: three-way state merge (`ledger-merge`) and anything that reads RDF.
 //!
 //! The crate is infrastructure-free: it never talks to a database, HTTP or containers.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Instant;
 
 use ledger_core::CommitId;
@@ -90,6 +94,8 @@ struct Walk<'a, P: ParentProvider + ?Sized> {
     provider: &'a P,
     limits: TraversalLimits,
     colour: HashMap<CommitId, Colour>,
+    /// When set, every fetched commit's parents are recorded ([`ancestry`]).
+    record: Option<HashMap<CommitId, Vec<CommitId>>>,
 }
 
 enum DfsOutcome {
@@ -105,6 +111,7 @@ impl<'a, P: ParentProvider + ?Sized> Walk<'a, P> {
             provider,
             limits,
             colour: HashMap::new(),
+            record: None,
         }
     }
 
@@ -129,7 +136,11 @@ impl<'a, P: ParentProvider + ?Sized> Walk<'a, P> {
             .await
             .map_err(DagError::Provider)?;
         self.check_deadline()?;
-        parents.ok_or_else(|| DagError::UnknownCommit(id.clone()))
+        let parents = parents.ok_or_else(|| DagError::UnknownCommit(id.clone()))?;
+        if let Some(record) = &mut self.record {
+            record.insert(id.clone(), parents.clone());
+        }
+        Ok(parents)
     }
 
     /// Iterative DFS with white/grey/black colouring from `start`, following parents in
@@ -264,6 +275,170 @@ pub async fn ancestors<P: ParentProvider + ?Sized>(
     })
     .await?;
     Ok(order)
+}
+
+/// Every commit reachable from a head (including the head) with its parents, as fetched
+/// during one bounded traversal. Fails closed like [`ancestors`].
+#[derive(Clone, Debug, Default)]
+pub struct Ancestry {
+    parents: HashMap<CommitId, Vec<CommitId>>,
+}
+
+impl Ancestry {
+    pub fn contains(&self, id: &CommitId) -> bool {
+        self.parents.contains_key(id)
+    }
+    pub fn len(&self) -> usize {
+        self.parents.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.parents.is_empty()
+    }
+}
+
+/// The ancestry of `head`: every reachable commit with its parents (one bounded traversal).
+pub async fn ancestry<P: ParentProvider + ?Sized>(
+    provider: &P,
+    head: &CommitId,
+    limits: TraversalLimits,
+) -> Result<Ancestry, DagError<P::Error>> {
+    let mut walk = Walk::new(provider, limits);
+    walk.record = Some(HashMap::new());
+    walk.dfs(head, |_| false).await?;
+    Ok(Ancestry {
+        parents: walk.record.take().unwrap_or_default(),
+    })
+}
+
+/// The merge base of two commits (ADR-0024).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MergeBase {
+    /// Exactly one best common ancestor.
+    Unique(CommitId),
+    /// Several best common ancestors (criss-cross history), in ascending id order. v1 refuses
+    /// to choose one: no iteration-, time- or id-based pick.
+    Ambiguous(Vec<CommitId>),
+    /// No common ancestor (unrelated roots).
+    Unrelated,
+}
+
+/// The best common ancestors of two ancestries: the common ancestors that are not a proper
+/// ancestor of another common ancestor (the maximal elements of `A(a) ∩ A(b)` under the
+/// ancestor order), ascending by id.
+pub fn best_common_ancestors(a: &Ancestry, b: &Ancestry) -> Vec<CommitId> {
+    let common: Vec<&CommitId> = a.parents.keys().filter(|c| b.contains(c)).collect();
+    // Every proper ancestor of a common ancestor is itself common (it is reachable from both
+    // sides), so marking what the common set reaches through parents finds the dominated
+    // ones without leaving `a`'s recorded edges.
+    let mut dominated: HashSet<&CommitId> = HashSet::new();
+    let mut stack: Vec<&CommitId> = common
+        .iter()
+        .flat_map(|c| a.parents.get(*c).into_iter().flatten())
+        .collect();
+    while let Some(c) = stack.pop() {
+        if dominated.insert(c) {
+            stack.extend(a.parents.get(c).into_iter().flatten());
+        }
+    }
+    let best: BTreeSet<CommitId> = common
+        .into_iter()
+        .filter(|c| !dominated.contains(c))
+        .cloned()
+        .collect();
+    best.into_iter().collect()
+}
+
+fn classify_base(best: Vec<CommitId>) -> MergeBase {
+    match best.len() {
+        0 => MergeBase::Unrelated,
+        1 => MergeBase::Unique(best.into_iter().next().expect("one element")),
+        _ => MergeBase::Ambiguous(best),
+    }
+}
+
+/// The merge base of `a` and `b` (two bounded traversals; each is charged against `limits`
+/// separately).
+pub async fn merge_base<P: ParentProvider + ?Sized>(
+    provider: &P,
+    a: &CommitId,
+    b: &CommitId,
+    limits: TraversalLimits,
+) -> Result<MergeBase, DagError<P::Error>> {
+    let left = ancestry(provider, a, limits).await?;
+    let right = ancestry(provider, b, limits).await?;
+    Ok(classify_base(best_common_ancestors(&left, &right)))
+}
+
+/// `(ahead, behind)` of `source` relative to `target`: commits reachable from `source` but
+/// not from `target`, and the reverse.
+pub async fn ahead_behind<P: ParentProvider + ?Sized>(
+    provider: &P,
+    target: &CommitId,
+    source: &CommitId,
+    limits: TraversalLimits,
+) -> Result<(usize, usize), DagError<P::Error>> {
+    let t = ancestry(provider, target, limits).await?;
+    let s = ancestry(provider, source, limits).await?;
+    Ok(counts(&t, &s))
+}
+
+fn counts(t: &Ancestry, s: &Ancestry) -> (usize, usize) {
+    let ahead = s.parents.keys().filter(|c| !t.contains(c)).count();
+    let behind = t.parents.keys().filter(|c| !s.contains(c)).count();
+    (ahead, behind)
+}
+
+/// How a source head relates to a target head (ADR-0023 classification; tests in order).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Relation {
+    /// `target == source`.
+    Equal,
+    /// The source head is an ancestor of the target head: nothing to integrate.
+    SourceContained,
+    /// The target head is an ancestor of the source head (fast-forward class; base = target).
+    FastForward,
+    /// Neither contains the other; carries the merge base.
+    Divergent(MergeBase),
+}
+
+/// The full merge analysis of `source` into `target` from one traversal per side.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Analysis {
+    pub relation: Relation,
+    /// Commits the source has that the target lacks.
+    pub ahead: usize,
+    /// Commits the target has that the source lacks.
+    pub behind: usize,
+}
+
+pub async fn analyze<P: ParentProvider + ?Sized>(
+    provider: &P,
+    target: &CommitId,
+    source: &CommitId,
+    limits: TraversalLimits,
+) -> Result<Analysis, DagError<P::Error>> {
+    let t = ancestry(provider, target, limits).await?;
+    if target == source {
+        return Ok(Analysis {
+            relation: Relation::Equal,
+            ahead: 0,
+            behind: 0,
+        });
+    }
+    let s = ancestry(provider, source, limits).await?;
+    let (ahead, behind) = counts(&t, &s);
+    let relation = if t.contains(source) {
+        Relation::SourceContained
+    } else if s.contains(target) {
+        Relation::FastForward
+    } else {
+        Relation::Divergent(classify_base(best_common_ancestors(&t, &s)))
+    };
+    Ok(Analysis {
+        relation,
+        ahead,
+        behind,
+    })
 }
 
 /// An in-memory, `HashMap`-backed [`ParentProvider`] for tests (including other crates'

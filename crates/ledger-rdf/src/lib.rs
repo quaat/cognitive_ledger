@@ -1,6 +1,8 @@
 //! Restricted deterministic RDF patch protocol for the walking skeleton.
 
+mod diff;
 mod effective_delta;
+pub use diff::{DiffSummary, StateDiff, StructuralKey, diff};
 pub use effective_delta::{DeltaError, DeltaPolicy, apply_patch, effective_delta};
 
 use ledger_core::{ContentId, PatchId};

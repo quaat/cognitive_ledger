@@ -1,117 +1,182 @@
-# Diff, merge base, structural conflicts, merge preview and stale-safe apply
+# Diff, merge base, structural conflicts, merge preview/propose and stale-safe apply
 
 ## Status
-Proposed (2026-10-06, Plan 0009 / Phase 5). Builds on ADR-0023 (integration commits). Adds:
-- a new, separately versioned preview-token identity (`sculpin-ledger-merge-preview/v1`);
-- a request-identity domain (`sculpin-ledger-merge-request/v1`);
+Accepted (2026-10-06, Plan 0009 / Phase 5). This revision includes the independent
+pre-implementation reviews (architecture, invariant, storage/concurrency; see "Review
+resolutions"). It builds on ADR-0023 (integration commits) and adds:
+- two separately versioned identities, the preview token `sculpin-ledger-merge-preview/v1`
+  and the request domain `sculpin-ledger-merge-request/v1`;
 - migration 0013 (additive).
 
 No existing canonical identity changes.
 
 ## Context
-Phase 5 must compare and merge divergent branches deterministically, without weakening
-existing guarantees. Those guarantees are: immutable DAG history, the target branch's
-policy, Phase-2 semantic validation, and stale-safe acceptance.
-
-Constraints:
-- RDF state is a set of canonical quads (`BTreeSet<Quad>`, `sculpin-rdf-state/v1`). There
-  is no ordering and there are no blank nodes.
-- The commit graph is a DAG (two-parent commits from ADR-0023), not a tree.
-- Semantic validity belongs to Sculpin. The ledger only verifies the integrity and
-  applicability of a validation record (ADR-0014/0018/0019).
+Phase 5 must compare and merge divergent branches deterministically. It must preserve
+immutable DAG history, migration 0009, the target branch's policy, Phase-2 semantic
+validation and stale-safe acceptance. Constraints:
+- RDF state is a set of canonical quads (`BTreeSet<Quad>`, `sculpin-rdf-state/v1`), with
+  no ordering and no blank nodes.
+- The commit graph is a DAG with two-parent commits, not a tree.
+- Semantic validity belongs to Sculpin (ADR-0014/0018/0019).
+- The product specification requires that merge preview be side-effect free, and that apply
+  re-check both heads and fail rather than apply a stale preview.
 
 ## Decision
 
 ### Ancestry and merge base (`ledger-dag`, infrastructure-free)
-- `ancestors(c)` includes `c`. Traversal follows **all** parents, and is bounded
-  (`TraversalLimits`: visit limit and deadline). It fails closed on cycles and on missing
-  parents. The provider enforces same-graph lookup (ADR-0022 `GraphParents`).
-- **Common ancestors** of T and S: `A(T) ∩ A(S)`. **Best** common ancestors: the common
-  ancestors that are not a proper ancestor of another common ancestor (the maximal
-  elements).
-- **Merge base**:
+- `ancestors(c)` includes `c`. It follows **all** parents, is bounded by
+  `TraversalLimits` (a visit limit and a **mandatory** deadline on every merge entry
+  point), and fails closed on cycles and missing parents. The provider enforces same-graph
+  lookup.
+- **Best common ancestors** of T and S are the maximal elements of `A(T) ∩ A(S)` under the
+  ancestor order. **Merge base**:
   - one best common ancestor → that commit;
-  - none → `UNRELATED_HISTORIES`. Merge is refused in v1, because there is no implicit
-    empty base;
-  - more than one (criss-cross) → `AMBIGUOUS_MERGE_BASE`. Merge is refused in v1, and the
-    set is reported. Choosing by iteration order, time or id is forbidden. Synthesizing a
-    virtual base needs a later ADR.
-- `ahead_behind(T, S) = (|A(S) \ A(T)|, |A(T) \ A(S)|)`: commits the source has that the
-  target lacks, and the reverse.
-- **Classification** is exactly ADR-0023's table. Tests are evaluated in order: equal,
-  then source ∈ A(T) (contained), then target ∈ A(S) (fast-forward), otherwise divergent.
-  The merge base is computed only for `DIVERGENT`. For `FAST_FORWARD` the base is T by
-  definition.
-- v1 computes both ancestor sets in memory, each bounded by the traversal limits. Deep
-  histories that exceed the limits are refused with `RESOURCE_LIMIT`, never answered
-  wrongly. Generation numbers and checkpoints are Phase 6.
+  - none → `UNRELATED_HISTORIES`, refused;
+  - more than one (criss-cross) → `AMBIGUOUS_MERGE_BASE`, refused. The response lists the
+    candidates in ascending id order.
+- **Explicit base.** The client may name `base`. It must be one of the best common
+  ancestors: for an ambiguous history this resolves the ambiguity; for a unique one it must
+  equal that base. Otherwise the request fails with `422 INVALID_MERGE_BASE`. The base used
+  is bound in the token and the merge row, so the choice is the client's, deterministic
+  and audited. The ledger never picks by iteration order, time or id.
+- `ahead_behind(T, S) = (|A(S) \ A(T)|, |A(T) \ A(S)|)`.
+- **Classification** uses one pair of ancestry walks (`analyze`). The checks are, in order:
+  1. equal;
+  2. source ∈ A(T) → contained;
+  3. target ∈ A(S) → fast-forward;
+  4. otherwise divergent, with the base above.
+
+  A request with source branch = target branch is invalid (`400`).
+- Walks over very long histories hit the visit limit (100 000 by default). The answer is
+  then `RESOURCE_LIMIT`, never a wrong result. Generation numbers and checkpoints are
+  Phase 6 work.
 
 ### State diff (`ledger-rdf`, infrastructure-free)
-- `diff(A, B) = { deletes: A − B, adds: B − A }`. Both are `BTreeSet<Quad>`, i.e. the
-  canonical byte order of `sculpin-rdf-state/v1`, independent of hash maps, row order or
-  scheduling.
-- **Structural key** of a quad: `(graph, subject, predicate)`, using canonical N-Triples
-  terms; the graph is the default graph or a named-graph IRI. The object is deliberately
-  not part of the key.
-- Diff output also exposes the affected structural keys (`BTreeSet`) and summary counts.
-  It is usable independently of merge (compare, history explanation, Sculpin tooling).
+`diff(A, B) = { deletes: A − B, adds: B − A }` as `BTreeSet<Quad>`, which is the canonical
+state byte order.
+- The **structural key** of a quad is `(graph, subject, predicate)`, compared on canonical
+  N-Triples terms. The default graph is `None` and orders before named graphs, which order
+  by term bytes. The object is deliberately not part of the key.
+- The diff also exposes the affected keys, the affected `(graph, subject)` pairs, and
+  summary counts.
 
-### Three-way structural merge (`ledger-merge`, infrastructure-free)
-Inputs: base B, target T, source S as states. Partition all quads of `B ∪ T ∪ S` by
-structural key k. Write `X|k` for the quads of X with key k.
-- **Unchanged-or-one-sided key**: if `T|k = B|k`, the result is `S|k`; if `S|k = B|k`, the
-  result is `T|k`.
-- **Convergent key**: if `T|k = S|k`, the result is `T|k` (both sides made the same change;
-  this is not a conflict).
-- **Conflicting key**: `T|k ≠ B|k`, `S|k ≠ B|k` and `T|k ≠ S|k`. Examples:
-  - target X→Y, source X→Z;
-  - target deletes the slot, source changes it;
-  - both add different values to an empty slot.
+### Three-way structural merge (`ledger-merge`, infrastructure-free, synchronous)
+Inputs are the states B (base), T (target) and S (source). For each structural key k, with
+`X|k` meaning the quads of X under key k:
 
-  These are resolved only by the strategy:
-  - `abort` — no candidate. The preview reports the conflicts. This is the default.
-  - `take-target` — `T|k`.
-  - `take-source` — `S|k`.
-  - `union` — `T|k ∪ S|k` (RDF set union of both sides' results for that slot. This can
-    keep a statement one side deleted if the other side still has it. "Union" means set
-    union, never "semantically acceptable").
-- **Merged state** `M = ⋃_k result(k)`. The candidate patch is `diff(T, M)`, which is exact
-  because every add is absent from T and every delete is present in T.
-- **Conflict report**: per conflicting key, the key and `B|k`, `T|k`, `S|k`, in key order.
-  It is capped at 1 000 keys plus the total count. There is no time-, confidence-, AI- or
-  ontology-based resolution; the ledger stays deterministic, and semantic adequacy is
-  Sculpin's job.
-- `FAST_FORWARD` is the special case B = T, so M = S and there are no conflicts.
+| condition | result |
+|---|---|
+| `T\|k = B\|k` or `T\|k = S\|k` | `S\|k` |
+| `S\|k = B\|k` | `T\|k` |
+| otherwise | **conflict** — resolved by the strategy only |
 
-### Merge preview (side-effect-free with respect to accepted state)
-`POST /v1/graphs/{graph}/merges/preview {source, target, strategy}` (`propose` capability on
-the target):
-1. Read both heads, classify, and compute the merge base and states. This runs before any
-   transaction and holds no lock, like Phase-4 reachability.
-2. `ALREADY_EQUAL` and `ALREADY_CONTAINED` return the classification only. Nothing is
-   persisted.
-3. `DIVERGENT` with conflicts under `abort` returns the conflicts only. Nothing is
-   persisted.
-4. Otherwise one transaction runs. It re-checks both heads unlocked; if they changed, it
-   returns `MERGE_STALE` and the client re-previews. It then persists the candidate commit
-   `I` (parents `[T, S]`, patch `diff(T, M)`), the proposal on the target with
-   `expected_head = T`, and the write-once `merge_proposals` row (source branch and head,
-   base, classification, strategy, conflict count, preview token).
-5. The response contains:
-   - classification, heads and base;
-   - ahead/behind;
-   - target-delta and source-delta summaries;
-   - conflicts;
-   - the candidate id and its state digest;
-   - the preview token.
+Strategies:
+- `abort` (the default): no merged state;
+- `take-target`: `T|k`;
+- `take-source`: `S|k`;
+- `union`: `T|k ∪ S|k`.
 
-Preview never moves a ref, never writes a decision or an outbox row, and never marks
-anything accepted.
+`union` is set union. It can retain a statement that one side deleted, and it never means
+"semantically acceptable".
+
+The slot key also flags multi-valued predicates (for example, two different `rdf:type`
+additions on one subject) as conflicts. That is deliberately conservative; a per-quad
+strategy can be added later as a new algorithm id.
+
+The merged state is `M = ⋃_k result(k)`. The candidate patch is `diff(T, M)`, which is
+exact. `reconstruct(I) = M`, because reconstruction applies the patch to parent 0's state.
+
+The algorithm is identified as **`structural-slot/v1`**. That id is bound in the token and
+recorded in the merge row, so any later explanation can recompute exactly the same
+comparison.
+
+**Conflict report.** Conflicting keys are listed in ascending key order. At most 1 000 keys
+are listed in detail, each with at most 64 quads per side and a `truncated` flag per side;
+the total count is always given.
+
+**No-change.** If `M` equals T's state, the merge is classified `NO_CHANGE` and creates
+nothing (ADR-0023 amendment). This covers fast-forward with equal states and divergent
+merges whose result is the target state. It stops two-way synchronization from producing
+an endless chain of empty integration commits, and it respects ADR-0008's
+no-empty-commit rule.
+
+### Three operations: preview (read), propose (persist), apply (accept)
+
+**`POST /v1/graphs/{graph}/merges/preview`** — body `{source, target, strategy, base?}`,
+`read` capability. **Side-effect free**: no transaction writes, no idempotency row, nothing
+persisted.
+- Reads both heads without locks, runs `analyze`, reconstructs B, T and S, and runs the
+  three-way merge.
+- Returns:
+  - classification (`ALREADY_EQUAL`, `ALREADY_CONTAINED`, `NO_CHANGE`, `FAST_FORWARD` or
+    `DIVERGENT`);
+  - heads, base (or the ambiguous candidate list), and ahead/behind;
+  - target-delta and source-delta summaries, plus the conflict report;
+  - the merged-state digest;
+  - the **preview token** when a candidate would result.
+- Runs under the expensive-operation admission control. The memory budget is the
+  reconstruction limits applied to every state, and M is checked against them too.
+
+**`POST /v1/graphs/{graph}/merges/propose`** — body `{source, target, strategy, base?,
+token, message?, evidence_refs?}`, `propose` capability on the target, `Idempotency-Key`
+required.
+- The completed result is replayed first, before anything is recomputed (the Phase-4
+  lesson).
+- It then recomputes exactly as preview does, before any transaction and without locks. If
+  the recomputed token differs from `token`, it returns `MERGE_STALE`: something moved, so
+  the client previews again.
+- `ALREADY_*`, `NO_CHANGE` and `abort`-with-conflicts are refused (`409 MERGE_NOTHING_TO_DO`
+  or `409 MERGE_CONFLICT`); nothing is persisted or recorded. A later request with the same
+  key may therefore persist a proposal, which is intended: nothing happened the first time.
+- Otherwise it runs one transaction. The transaction:
+  1. checks the stored result again under the idempotency advisory lock;
+  2. locks the target branch `FOR SHARE` (`BRANCH_DELETED` if it is deleted);
+  3. re-reads both heads and both branch statuses; on any change it returns `MERGE_STALE`;
+  4. checks the prepare limits (`depth(T) + 1`, and the size of M);
+  5. persists:
+     - the integration commit `I` (parents `[T, S]`, patch `diff(T, M)`, envelope per
+       ADR-0023);
+     - the proposal on the target (`expected_head = T`, `requested_patch_id =
+       effective_patch_id = I.patch`, because a merge has no separately requested patch);
+     - the write-once `merge_proposals` row.
+
+**`POST /v1/graphs/{graph}/merges/apply`** — body `{proposal, token, validation_id?,
+semantic_environment_id?, reason?}`, `review` capability, `Idempotency-Key` required. It is
+a **separate path** from ordinary accept, which keeps refusing every candidate that has a
+merge row or two parents. Ordinary `reject` may close a merge proposal. In one transaction:
+1. Check the stored result again (replay first, as above).
+2. **Lock protocol.** Both refs, in ascending branch-name order (target `FOR UPDATE`, source
+   `FOR SHARE`); then both branch rows `FOR SHARE`, in the same order; then the per-proposal
+   lock.
+   - Every multi-ref lock is taken before any branch lock, in one total order. Ordinary
+     accept and branch creation lock one ref and then its branch; delete and restore lock
+     only a branch. So no wait cycle exists.
+   - Two opposite merges (A into B, B into A) serialize. The second sees the moved source and
+     returns `MERGE_STALE`. This prevents the write-skew that would otherwise create a
+     permanent criss-cross.
+3. Compare **stored values only**; nothing is reconstructed under the lock. The request's
+   token must equal the merge row's token. The current target head and source head must
+   equal the row's. Both branches must be active. Any difference returns `MERGE_STALE`.
+   If the proposal is already decided, the error names that decision.
+4. The **target** branch's policy is authoritative:
+   - the deployment floor;
+   - `require_validation`;
+   - `require_distinct_reviewer`, comparing merge proposer and applier as accountable
+     parties;
+   - protection.
+
+   A weaker source policy never applies. Validation binding is the ordinary ADR-0019
+   binding on the merge candidate: a conforming, unsuperseded validation of this candidate,
+   whose environment is the one the reviewer names. Its `candidate_state_digest` must equal
+   the merge row's digest.
+5. Install `I` in one transaction: a `merge` ref event, the decision, the outbox row
+   (`event_kind = ref_advanced`; projected if the target is `main`) and the idempotency
+   result.
+
+Any movement since the preview, or since the propose, returns `MERGE_STALE`. Apply never
+recomputes.
 
 ### Preview token v1
-Canonical bytes, using the same field primitives as the other request domains
-(`field` = u32 BE length plus UTF-8; `u8` enums):
-
 ```text
 "sculpin-ledger-merge-preview/v1\0"
 field graph_id
@@ -119,104 +184,136 @@ field source_branch · field source_head
 field target_branch · field target_head
 field merge_base
 u8    classification   (1 fast_forward, 2 divergent)
-u8    strategy         (0 abort, 1 take_target, 2 take_source, 3 union)
-field candidate_commit · field candidate_state_digest
+u8    strategy         (0 abort, 1 take_target, 2 take_source, 3 union; normalized to 0
+                        for fast_forward, which cannot conflict)
+field merge_algorithm  ("structural-slot/v1")
+field merged_state_digest
 ```
+- `field` is a u32 BE length followed by UTF-8; `u8` values are fixed-width.
+- `token = "sha256:" || hex(sha256(bytes))`.
+- The token is a **confirmation digest** of what the client previewed. It is not an
+  authenticator. It is recomputable on any replica, from the heads and states or from the
+  persisted merge row. No correlation id, wall-clock time or replica identity is bound.
+- The candidate commit id is not bound, because it does not exist at preview time. It is
+  bound to the token through the merge row, which the propose transaction writes together
+  with the candidate.
+- Golden vectors in Rust are matched by an independent Python reference encoder.
+- The **semantic environment is bound at apply**, by ADR-0019. This deliberately departs
+  from the product plan §17 field list, because validation happens after the candidate
+  exists. Revalidating the same candidate in a new environment requires no new preview.
 
-`token = "sha256:" || hex(sha256(bytes))`.
-
-Correlation ids, wall-clock times and replica identity are never bound. The token is
-recomputable from the persisted merge row and the candidate, so it works across replicas
-without server session state. Rust golden vectors are matched by an independent Python
-reference encoder.
-
-The semantic environment is not inside the token. It is bound at apply time by the
-existing Phase-2 rule (ADR-0019): the apply must cite a conforming, unsuperseded validation
-of **this candidate** in the **current** environment. A preview validated in E1 cannot be
-applied when E2 is required. The validation's environment identity and its Virtual A-Box
-source versions are what change. Virtual A-Box triples are never persisted in the commit.
-
-### Stale-safe apply
-`POST /v1/graphs/{graph}/merges/apply {proposal, preview_token, validation_id?,
-semantic_environment_id?, reason?}` (`review` capability, plus the target's policy). It runs
-in the ordinary acceptance transaction:
-1. Lock the target ref `FOR UPDATE`, then the target branch `FOR SHARE` (the Phase-4 lock
-   order). Check that the target is active, and that its head equals the preview's target
-   head; otherwise `MERGE_STALE`.
-2. Recompute the token from the persisted merge row; it must equal the request's token
-   (`MERGE_STALE`/`IDEMPOTENCY_CONFLICT`-style refusal on mismatch).
-3. Read the source ref and branch **without locks**. The source head must equal the
-   preview's source head and the source must be active; otherwise `MERGE_STALE`. A
-   committed source movement after this read is ordered after the merge. The merge
-   integrated the authoritative head of its read. Not locking the source avoids a lock
-   cycle between two opposite merges.
-4. The **target** branch's policy is authoritative:
-   - the deployment floor (production requires validation);
-   - `require_validation`;
-   - `require_distinct_reviewer` (merge proposer vs applier, as accountable parties);
-   - protection.
-
-   The source branch's weaker policy never applies. Validation binding is exactly the
-   ordinary accept's (ADR-0019) on the merge candidate.
-5. Install `I` with a `merge` ref event (ADR-0023), the decision, the outbox row (projected
-   if the target is `main`, ignored otherwise) and the idempotency result, all in one
-   transaction. Migration 0009 holds because `I.parents[0] = T`.
-
-Any movement since the preview is `MERGE_STALE`. Apply never recomputes a different merge
-under an old token. The client asks for a new preview.
+Virtual A-Box: a change in a source version changes the environment id (ADR-0018). An apply
+that names the new environment against a validation made in the old one is
+`VALIDATION_STALE`. Until Phase 8 this gate runs against the protocol-conformant fake
+validator and is labelled accordingly. Virtual A-Box triples are never persisted in the
+commit.
 
 ### Idempotency and request identity
-- Preview and apply require `Idempotency-Key`. They are new idempotency operations,
-  `merge_preview` and `merge_apply`, with results bound to the merge proposal and the
-  decision respectively.
-- The request digest is `sculpin-ledger-merge-request/v1`: operation, graph, then the
-  operation's fields (source, target, strategy; or proposal, token, validation,
-  environment, reason). It has golden vectors and the Python reference.
-- **Completed requests replay first.** As learned in Phase 4, a stored result is looked up
-  before any reconstruction, DAG walk or head check, and is replayed or refused as a
-  conflict. The scoped transaction checks again under the advisory lock, which remains the
-  serialization point.
+- **Operations.** `merge_propose` (result kind `merge_proposed`: proposal and candidate)
+  and `merge_apply` (result kind `merge_applied`: decision, ref version and commit). Both
+  are enforced by a shape CHECK.
+- **Request digest.** The new domain `sculpin-ledger-merge-request/v1` encodes the
+  operation, the graph and every field that reaches persistence or the decision:
+  - propose: source, target, strategy, base (opt), token, message (opt), evidence (sorted
+    set);
+  - apply: proposal, token, validation id (opt), environment (opt), reason (opt).
+
+  Golden vectors and the Python reference cover it.
+- Preview is a read and has no idempotency. A completed propose or apply replays before
+  any recomputation, and the scoped transaction remains the serialization point.
 
 ### Concurrency (forced-interleaving tests required)
-- apply vs ordinary acceptance on the target: target ref lock; the loser gets `MERGE_STALE`
-  or `HEAD_CHANGED`;
-- apply vs source acceptance: both orders are valid; either the merge integrated the old
-  source head, or it is stale;
-- two applies to the same target: one wins;
-- apply vs target delete or restore, and preview then delete;
-- the same preview applied on two replicas;
-- a lost response replayed.
+Each case must have a test:
+- apply vs ordinary target accept;
+- apply vs source accept, in both orders;
+- **opposite applies (A into B and B into A): exactly one succeeds**;
+- a three-branch ring (A into B, B into C, C into A);
+- two applies of one proposal across replicas;
+- apply vs target delete or restore;
+- propose vs head movement;
+- a lost response after the apply commit.
 
-Exactly one valid target movement commits in every case. No merge lands on a deleted
-target.
+Exactly one valid target movement commits. No merge lands on a deleted target, and no
+criss-cross is created by concurrency.
 
-### Migration 0013 (additive)
-- `merge_proposals`: write-once, keyed by `proposal_id`, with composite FKs to `proposals`
-  and `commit_index`. It holds source branch and head, base, classification, strategy,
-  conflict count and preview token.
-- `ref_events.operation` gains `merge`.
-- Idempotency operations and results for the merge operations.
-- Verifier model and `verify` checks:
-  - a `merge` event's candidate has two parents and a merge row whose source head is
-    parent 1;
-  - an `advance` event's candidate has fewer than two parents.
-- Runtime grant re-issued; projector unchanged.
+### Migration 0013 (additive, database-enforced)
+- **`merge_proposals`** (write-once trigger). Columns:
+  - `proposal_id`, `graph_id`, `target_branch`, `candidate_commit` — a composite FK to
+    `proposals_identity`;
+  - `target_head`, `source_branch`, `source_head`, `merge_base`, `base_explicit`,
+    `classification`, `strategy`, `merge_algorithm`, `conflict_count`,
+    `merged_state_digest`, `preview_token` (UNIQUE), `created_at`.
+
+  Further constraints:
+  - FKs `(graph_id, source_head)` and `(graph_id, merge_base)` to `commit_index`, and
+    `(graph_id, source_branch)` to `branches`;
+  - CHECKs, written as flat ANDs: enum values; `conflict_count >= 0`; fast-forward implies
+    zero conflicts and `merge_base = target_head`; source branch ≠ target branch; the
+    token and digest formats;
+  - a BEFORE INSERT trigger requiring that the candidate has two parents, that parent 0 is
+    the proposal's `expected_head` and the row's `target_head`, and that parent 1 is
+    `source_head`.
+- **`ref_events`.** The `operation` CHECK and the shape CHECK are replaced:
+  - `genesis`: no old head, version 1;
+  - `advance` and `merge`: an old head, and `new_version = old_version + 1`.
+
+  A BEFORE INSERT trigger requires:
+  - `advance` ⇒ the new head has at most one parent and no merge row;
+  - `merge` ⇒ a merge row for the new head on this branch, with `target_head = old_head`.
+
+  `genesis` is unconstrained, because a branch created at an integration commit is a
+  genesis on a two-parent commit.
+- **`decisions`.** An accepted decision on a candidate with a merge row must reference a
+  `merge` event (trigger).
+- **`idempotency`.** The operation and result CHECKs and the shape CHECK cover
+  `merge_propose` and `merge_apply`.
+- **Verifier.**
+  - Every new trigger, check and table is modelled in the verifier.
+  - `verify` adds:
+    - both directions of the merge/advance rules;
+    - parent 0 of every candidate equals the proposal's `expected_head`;
+    - `merge_apply` results point to `merge` events;
+    - offline recomputation of the token and of the merged-state digest from the
+      reconstructed candidate.
+- **Grants.** The runtime grant is re-issued with column-level INSERT and SELECT on
+  `merge_proposals`. The projector is unchanged.
+
+## Review resolutions (2026-10-06)
+
+| finding (reviewer) | resolution |
+|---|---|
+| Opposite applies both commit (write skew) → permanent criss-cross (storage P0; invariant, architecture P1) | sorted two-ref lock protocol; source re-checked under its share lock; forced test |
+| Ordinary accept could install a merge candidate (all three) | separate apply path; database triggers on `ref_events` and `decisions`; ordinary accept refuses |
+| `ref_events_genesis_shape` forbids `merge` rows (all three) | shape CHECK replaced in 0013 |
+| Apply would reconstruct under the target lock (storage P1) | digest, heads and token stored in the merge row; apply compares stored values; verify recomputes offline |
+| Two-way sync loops and empty commits contradict ADR-0008 (invariant, architecture, storage) | `NO_CHANGE` class creates nothing |
+| Preview persisted state, against the spec's "side-effect free" (architecture P1) | preview / propose / apply split |
+| Integration-commit envelope undecided (architecture P1) | ADR-0023 envelope; client fields in the request identity |
+| No escape from criss-cross (architecture P1) | explicit `base` restricted to the best common ancestors |
+| Merge semantics not versioned (invariant, architecture) | `structural-slot/v1` in the token and the row |
+| Merge size and depth limits (invariant, storage) | prepare limits on M and on depth |
+| Admission control and memory (storage) | expensive-operation slot; mandatory deadline; one ancestry pair per operation |
+| Idempotency of outcomes that persist nothing (invariant, storage) | not recorded; stated |
+| `requested_patch_id` is NOT NULL (invariant) | equals the effective patch |
+| Conflict report unbounded in bytes (invariant, architecture) | 64 quads per side, with `truncated` |
 
 ## Alternatives considered
-- **Object-level conflict key** `(graph, subject, predicate, object)`: this finds
-  conflicts only when the identical quad is both added and deleted, and silently unions
-  competing values of a slot. Rejected in favour of the conservative slot key.
-- **Choosing one criss-cross base** (first found, newest, smallest id): non-deterministic
-  or arbitrary. Rejected; `AMBIGUOUS_MERGE_BASE`.
-- **Server-side preview sessions**: these do not work across replicas and are not
-  auditable. Rejected in favour of a persisted proposal plus a recomputable token.
-- **Recomputing on apply when heads moved**: this applies something nobody previewed or
-  validated. Rejected.
+- **Object-level conflict key** `(graph, subject, predicate, object)`: this silently unions
+  competing values of a slot. Rejected as the default; it could become a later algorithm id.
+- **Choosing a criss-cross base automatically** (first found, newest, smallest id):
+  arbitrary. Rejected; the client may choose explicitly instead.
+- **Server-side preview sessions**: these do not work across replicas and leave no audit
+  trail. Rejected in favour of a recomputable token plus a persisted proposal.
+- **Recomputing at apply when heads have moved**: this applies something nobody previewed
+  or validated. Rejected.
+- **Locking only the target at apply**: this admits the opposite-merge write skew.
+  Rejected.
 
 ## Consequences
-- Merges reuse the proposal, validation, decision, projection and idempotency machinery,
-  with no merge-specific projector logic.
-- A conflicting divergent merge under `abort` leaves no trace. A merge resolved by strategy
-  records the strategy in the merge row and in the token.
-- Ambiguous and unrelated histories are refused in v1. A virtual-base ADR can lift this
-  later without changing stored identities.
+- Merges reuse the proposal, validation, decision, projection and idempotency machinery.
+  The projector has no merge-specific logic.
+- Exploration (`preview`) never writes anything. Each persisted proposal is a deliberate
+  `propose`, and its candidate remains immutable evidence (there is no GC in v1).
+- Ambiguous and unrelated histories need an explicit base or are refused. Criss-cross can
+  no longer be created by concurrent applies, but it can still arise from deliberate
+  historical branching (ADR-0022).

@@ -22,10 +22,15 @@ base, diff, conflicts, strategies, preview token, apply).
 3. `ledger-rdf`: deterministic `diff`, structural keys, summaries.
 4. `ledger-merge` (new, infrastructure-free): classification, three-way structural merge,
    strategies `abort | take-target | take-source | union`, conflict report; property tests.
-5. Migration 0013, verifier, grants; repository merge preview (proposal + merge row +
-   token) and apply (staleness, target policy, validation binding, `merge` ref event).
+5. Migration 0013 (ADR-0024 list: `merge_proposals`, `ref_events` operation + shape,
+   merge/advance and decision triggers, idempotency, grants), verifier; repository
+   `merge_preview` (read-only), `merge_propose` (token-checked, persists candidate +
+   proposal + merge row) and `merge_apply` (sorted two-ref lock protocol, stored-value
+   staleness, target policy, validation binding, `merge` ref event); ordinary accept keeps
+   refusing merge candidates.
 6. Preview token v1 and merge request identity: Rust goldens + Python reference.
-7. HTTP: `POST …/merges/preview`, `POST …/merges/apply`; OpenAPI.
+7. HTTP: `POST …/merges/preview` (read), `…/merges/propose` (propose), `…/merges/apply`
+   (review); OpenAPI.
 8. Forced-interleaving merge races; repeated merge; `main` merge projected by the Phase-3
    projector; Virtual A-Box-dependent validation (environment change → refusal).
 9. Upgrade 0012 → 0013, backup/restore, integration, stress regression; reviews; Codex.
@@ -64,6 +69,18 @@ complete; the live Sculpin semantic service is an external product-integration p
 carried into Phase 8 / production qualification.
 
 ## Discoveries
+- Pre-implementation reviews (architecture, invariant, storage/concurrency; 2026-10-06)
+  found no fault with the integration-commit choice and the merge-base/merge-rule
+  definitions, and required: a sorted two-ref lock protocol at apply (opposite applies
+  otherwise both commit and leave a permanent criss-cross — rated P0 by the storage
+  reviewer), database enforcement that ordinary accept cannot install merge candidates,
+  replacing `ref_events_genesis_shape`, stored digest/heads for lock-time comparisons, a
+  `NO_CHANGE` class (two-way sync otherwise loops forever on empty integrations, and empty
+  commits contradict ADR-0008), a read-only preview split from a persisting propose
+  (product spec: preview MUST be side-effect free), a fixed integration-commit envelope, an
+  explicit `base` for criss-cross, the `structural-slot/v1` algorithm id, prepare limits on
+  merged states, and admission control. All folded into ADR-0023/0024 before code
+  (ADR-0024 "Review resolutions"); the product spec's merge paragraph is amended.
 - Option A (stepping the target through the source's commits) is incompatible with
   `decisions_one_per_candidate` / `proposals_candidate_unique` and verify's
   one-decision-per-event invariant, and would accept intermediate states never validated
