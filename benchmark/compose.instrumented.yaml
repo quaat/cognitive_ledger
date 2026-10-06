@@ -1,0 +1,17 @@
+# Benchmark-only PostgreSQL instrumentation (Plan 0011, reconstruction characterization).
+# Layered over compose.yaml by scripts/benchmark-recon.sh ONLY. It never changes the
+# production-shaped defaults: pg_stat_statements is preloaded, I/O timing is tracked, and
+# the extension is created in its own `bench_stats` schema (outside the ledger's `public`
+# schema) by the script. Results produced under it record that the configuration differs.
+services:
+  postgres:
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - track_io_timing=on
+      - -c
+      - pg_stat_statements.track=all
+      - -c
+      - pg_stat_statements.max=10000

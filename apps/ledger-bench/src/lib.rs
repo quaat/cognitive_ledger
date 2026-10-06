@@ -15,6 +15,7 @@ pub mod archive;
 pub mod bear;
 pub mod dataset;
 pub mod manifest;
+pub mod recon;
 pub mod result;
 pub mod runner;
 pub mod synthetic;

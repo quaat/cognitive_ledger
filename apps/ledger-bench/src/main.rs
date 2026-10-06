@@ -14,6 +14,11 @@
 //! ledger-bench fetch <dataset> [--manifests <dir>] [--cache <dir>]   (network: pinned sources)
 //! ledger-bench prepare <dataset> [--manifests <dir>] [--cache <dir>] (offline extraction)
 //! ledger-bench clean <dataset> [--all] [--cache <dir>]
+//! ledger-bench recon --replica <url> --out <dir> [--states 1,1000,10000]
+//!                    [--depths 1,10,100,500,1000,2500,5000] [--reps 20] [--warmup 3]
+//!                    [--preview-reps 10] [--cold-depths 100,1000,5000] [--cold-reps 3]
+//!                    [--restart-cmd <shell>] [--server-cgroup <dir>] [--postgres-cgroup <dir>]
+//!                    [--meta key=value]...   (reconstruction characterization; scripts/benchmark-recon.sh)
 //! ```
 //!
 //! Every command except `fetch` is offline. Exit status: 0 pass; 1 correctness failure or
@@ -24,6 +29,7 @@ use ledger_bench::{
     bear,
     dataset::{self, Context, Dataset, PROFILES, verify_manifest},
     manifest::Manifest,
+    recon,
     result::{
         BenchResult, Counts, DatasetInfo, DatasetResult, Environment, OpStats, Performance,
         RESULT_SCHEMA, Resources, RunInfo, markdown, stats,
@@ -468,6 +474,124 @@ fn annotate(path: &Path, pairs: impl Iterator<Item = String>) -> Result<(), Stri
     write_result(path.parent().unwrap_or(Path::new(".")), &r)
 }
 
+fn list(v: &str) -> Result<Vec<usize>, String> {
+    v.split(',')
+        .map(|x| {
+            x.trim()
+                .parse::<usize>()
+                .map_err(|_| format!("bad list {v:?}"))
+        })
+        .collect()
+}
+
+async fn recon_command(mut argv: impl Iterator<Item = String>) -> ExitCode {
+    let mut cfg = recon::ReconConfig {
+        replica: String::new(),
+        owner_database_url: std::env::var("LEDGER_BENCH_OWNER_DATABASE_URL").unwrap_or_default(),
+        secret: std::env::var("LEDGER_BENCH_HS256_SECRET").unwrap_or_default(),
+        issuer: "https://dev-issuer.example/".into(),
+        audience: "api://sculpin-ledger-dev".into(),
+        states: vec![1, 1_000, 10_000],
+        depths: vec![1, 10, 100, 500, 1_000, 2_500, 5_000],
+        reps: 20,
+        warmup: 3,
+        preview_reps: 10,
+        cold_depths: vec![100, 1_000, 5_000],
+        cold_reps: 3,
+        restart_cmd: None,
+        server_cgroup: None,
+        postgres_cgroup: None,
+        run_id: format!("{}-{}", unix_ms(), std::process::id()),
+    };
+    let mut out = PathBuf::new();
+    let mut meta = BTreeMap::new();
+    let parsed: Result<(), String> = (|| {
+        while let Some(flag) = argv.next() {
+            let mut value = || argv.next().ok_or_else(|| format!("{flag} needs a value"));
+            match flag.as_str() {
+                "--replica" => cfg.replica = value()?.trim_end_matches('/').to_owned(),
+                "--owner-database-url" => cfg.owner_database_url = value()?,
+                "--out" => out = value()?.into(),
+                "--states" => cfg.states = list(&value()?)?,
+                "--depths" => cfg.depths = list(&value()?)?,
+                "--reps" => cfg.reps = value()?.parse().map_err(|_| "--reps")?,
+                "--warmup" => cfg.warmup = value()?.parse().map_err(|_| "--warmup")?,
+                "--preview-reps" => {
+                    cfg.preview_reps = value()?.parse().map_err(|_| "--preview-reps")?
+                }
+                "--cold-depths" => cfg.cold_depths = list(&value()?)?,
+                "--cold-reps" => cfg.cold_reps = value()?.parse().map_err(|_| "--cold-reps")?,
+                "--restart-cmd" => cfg.restart_cmd = Some(value()?),
+                "--server-cgroup" => cfg.server_cgroup = Some(value()?.into()),
+                "--postgres-cgroup" => cfg.postgres_cgroup = Some(value()?.into()),
+                "--meta" => {
+                    let kv = value()?;
+                    let (k, v) = kv.split_once('=').ok_or("--meta takes key=value")?;
+                    meta.insert(k.to_owned(), v.to_owned());
+                }
+                _ => return Err(USAGE.into()),
+            }
+        }
+        Ok(())
+    })();
+    if let Err(e) = parsed {
+        eprintln!("{e}");
+        return ExitCode::from(2);
+    }
+    if !is_loopback(&cfg.replica)
+        || !dsn_is_loopback(&cfg.owner_database_url)
+        || cfg.secret.is_empty()
+        || out.as_os_str().is_empty()
+    {
+        eprintln!(
+            "recon needs a loopback --replica and owner database, LEDGER_BENCH_HS256_SECRET and --out"
+        );
+        return ExitCode::from(2);
+    }
+    let started = Instant::now();
+    let mut r = recon::run(&cfg).await;
+    r.meta = meta;
+    r.meta.insert(
+        "wall_s".into(),
+        format!("{:.0}", started.elapsed().as_secs_f64()),
+    );
+    let env = environment(&cfg.replica, "see the meta postgres entry");
+    r.environment = BTreeMap::from([
+        ("os".into(), env.os),
+        ("kernel".into(), env.kernel),
+        ("cpu".into(), format!("{} × {}", env.cpus, env.cpu_model)),
+        ("mem_total_mib".into(), (env.mem_total_kib / 1024).to_string()),
+        ("states".into(), format!("{:?}", cfg.states)),
+        ("depths".into(), format!("{:?}", cfg.depths)),
+        ("reps".into(), format!("{} (+{} warm-up); previews {}; cold {} at {:?}", cfg.reps, cfg.warmup, cfg.preview_reps, cfg.cold_reps, cfg.cold_depths)),
+        ("cache_conditions".into(), "warm: after warm-up on an active database; db-restart-cold: first operation after a PostgreSQL restart (OS page cache NOT dropped)".into()),
+    ]);
+    let write = || -> Result<(), String> {
+        std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
+        std::fs::write(
+            out.join("recon.json"),
+            serde_json::to_string_pretty(&r).map_err(|e| e.to_string())? + "\n",
+        )
+        .map_err(|e| e.to_string())?;
+        std::fs::write(out.join("recon.md"), recon::markdown(&r)).map_err(|e| e.to_string())
+    };
+    if let Err(e) = write() {
+        eprintln!("writing results: {e}");
+        return ExitCode::from(1);
+    }
+    println!(
+        "RECON {} ({} points, {} failures)",
+        r.status.to_uppercase(),
+        r.points.len(),
+        r.failures.len()
+    );
+    if r.status == "pass" {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let mut argv = std::env::args().skip(1);
@@ -536,6 +660,7 @@ async fn main() -> ExitCode {
             }
             ExitCode::from(exit)
         }
+        "recon" => recon_command(argv).await,
         "fetch" | "prepare" | "clean" => {
             let Some(id) = argv.next() else {
                 eprintln!("{USAGE}");
