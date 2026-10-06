@@ -2374,3 +2374,213 @@ async fn deleted_branches_are_readable_but_frozen_and_lifecycle_retries_replay()
         .collect();
     assert_eq!(ops, vec!["created", "deleted", "restored"]);
 }
+
+/// Phase 5 over HTTP (ADR-0023/0024): read-only preview, propose, and apply onto `main`
+/// bound to a validation of the merged candidate. The merged state's acceptability depends
+/// on the external (Virtual A-Box) source version: validated under D-A it conforms, under
+/// D-B it does not; an apply naming another environment than its validation's is stale.
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn a_validated_merge_onto_main_binds_the_merged_state_in_its_semantic_environment() {
+    let h = harness().await;
+    let g = h.graph("tenant-mg").await;
+    let admin = token("tenant-mg", "operator", &ADMIN);
+    let agent = token("tenant-mg", "agent-7", &ROLES);
+    let reviewer = token("tenant-mg", "reviewer-1", &ROLES);
+    let reader = token("tenant-mg", "reader", &["ledger.read"]);
+    let c100 = h.main_history(&g, &admin, 1).await.remove(0);
+    let (status, created) = h
+        .create_branch(
+            &g,
+            &agent,
+            "mg-b",
+            json!({"name": "agent/m", "source": "main"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    // Divergence: the branch adds A-Box-dependent material, main adds something else.
+    let s1 = h
+        .step_on(
+            &g,
+            &agent,
+            "agent/m",
+            &c100,
+            "<urn:material:abox-dependent> <urn:p> \"m\" .",
+        )
+        .await;
+    let m1 = h
+        .step_on(
+            &g,
+            &admin,
+            "main",
+            &c100,
+            "<urn:main:other> <urn:p> \"o\" .",
+        )
+        .await;
+    let body = json!({"source": "agent/m", "target": "main"});
+    // Preview is a read: the reader may preview, nothing is written.
+    let (status, p) = h
+        .call(
+            "POST",
+            &format!("/v1/graphs/{g}/merges/preview"),
+            &reader,
+            None,
+            Some(body.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{p}");
+    assert_eq!(p["classification"], "divergent");
+    assert_eq!(p["merge_base"], c100);
+    assert_eq!(
+        (p["ahead"].as_i64(), p["behind"].as_i64()),
+        (Some(1), Some(1))
+    );
+    let token_v = p["preview_token"].as_str().unwrap().to_owned();
+    // Propose needs the propose capability.
+    let mut propose = body.clone();
+    propose["preview_token"] = json!(token_v);
+    let (status, _) = h
+        .call(
+            "POST",
+            &format!("/v1/graphs/{g}/merges/propose"),
+            &reader,
+            Some("mg-p0"),
+            Some(propose.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, pr) = h
+        .call(
+            "POST",
+            &format!("/v1/graphs/{g}/merges/propose"),
+            &agent,
+            Some("mg-p1"),
+            Some(propose.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{pr}");
+    let candidate = pr["candidate"].as_str().unwrap().to_owned();
+    assert_eq!(pr["merged_state_digest"], p["merged_state_digest"]);
+    assert_eq!(
+        h.head(&g).await,
+        Some((m1.clone(), 2)),
+        "propose moves nothing"
+    );
+    // Validate the merged candidate under two external versions.
+    let pin = |v: &str| json!({"sources_revision": format!("catalog-{v}")});
+    let (sa, va) = h
+        .validate(&g, &agent, &candidate, "mg-va", pin("D-A"))
+        .await;
+    let (sb, vb) = h
+        .validate(&g, &agent, &candidate, "mg-vb", pin("D-B"))
+        .await;
+    assert_eq!(
+        (sa, sb),
+        (StatusCode::CREATED, StatusCode::CREATED),
+        "{va} {vb}"
+    );
+    assert_eq!(
+        (va["conforms"].as_bool(), vb["conforms"].as_bool()),
+        (Some(true), Some(false))
+    );
+    let apply = |validation: &Value, environment: &Value| {
+        json!({
+            "proposal_id": pr["proposal_id"], "preview_token": token_v,
+            "validation_id": validation["validation_id"],
+            "semantic_environment_id": environment["semantic_environment_id"],
+            "reason": "merge reviewed",
+        })
+    };
+    let path = format!("/v1/graphs/{g}/merges/apply");
+    // Non-conforming under D-B: rejected.
+    let (status, e) = h
+        .call(
+            "POST",
+            &path,
+            &reviewer,
+            Some("mg-a1"),
+            Some(apply(&vb, &vb)),
+        )
+        .await;
+    assert_eq!(
+        (status, e["code"].as_str()),
+        (StatusCode::CONFLICT, Some("VALIDATION_REJECTED")),
+        "{e}"
+    );
+    // The D-A validation cited in the D-B environment: stale (the A-Box version changed).
+    let (status, e) = h
+        .call(
+            "POST",
+            &path,
+            &reviewer,
+            Some("mg-a2"),
+            Some(apply(&va, &vb)),
+        )
+        .await;
+    assert_eq!(e["code"].as_str(), Some("VALIDATION_STALE"), "{status} {e}");
+    // Conforming in its own environment: applied onto main.
+    let (status, a) = h
+        .call(
+            "POST",
+            &path,
+            &reviewer,
+            Some("mg-a3"),
+            Some(apply(&va, &va)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{a}");
+    assert_eq!(a["head"], candidate);
+    assert_eq!(h.head(&g).await, Some((candidate.clone(), 3)));
+    let (_, again) = h
+        .call(
+            "POST",
+            &path,
+            &reviewer,
+            Some("mg-a3"),
+            Some(apply(&va, &va)),
+        )
+        .await;
+    assert_eq!(again["replayed"], true);
+    // The merged state holds both sides.
+    let (status, st) = h
+        .call(
+            "GET",
+            &format!("/v1/graphs/{g}/commits/{candidate}/state"),
+            &agent,
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let quads: Vec<&str> = st["quads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|q| q.as_str().unwrap())
+        .collect();
+    assert!(quads.contains(&"<urn:material:abox-dependent> <urn:p> \"m\" ."));
+    assert!(quads.contains(&"<urn:main:other> <urn:p> \"o\" ."));
+    // Repeating the merge: contained. Another tenant sees nothing.
+    let (_, p2) = h
+        .call(
+            "POST",
+            &format!("/v1/graphs/{g}/merges/preview"),
+            &reader,
+            None,
+            Some(body.clone()),
+        )
+        .await;
+    assert_eq!(p2["classification"], "already_contained");
+    let foreign = token("tenant-other", "x", &ROLES);
+    let (status, _) = h
+        .call(
+            "POST",
+            &format!("/v1/graphs/{g}/merges/preview"),
+            &foreign,
+            None,
+            Some(body),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let _ = s1;
+}

@@ -583,7 +583,9 @@ mod postgres_merge;
 #[cfg(feature = "postgres")]
 pub use ledger_dag::TraversalLimits;
 #[cfg(feature = "postgres")]
-pub use ledger_merge::{Conflict as MergeConflictReport, Strategy as MergeStrategy};
+pub use ledger_merge::{
+    Conflict as MergeConflictReport, Side as MergeSide, Strategy as MergeStrategy,
+};
 #[cfg(feature = "postgres")]
 pub use postgres_branches::{
     BranchEvent, BranchInfo, BranchLifecycleRequest, BranchOutcome, BranchPolicy,

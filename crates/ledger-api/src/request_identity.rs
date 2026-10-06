@@ -55,6 +55,19 @@
 //!                       · u8 require_validation · u8 require_distinct_reviewer   (0x00 | 0x01)
 //! -- branch_delete / branch_restore --   opt reason
 //! ```
+//! `sculpin-ledger-merge-request/v1` (ADR-0024, Plan 0009) covers merge propose and apply;
+//! a separate domain again (merge preview is a read and has no request identity):
+//!
+//! ```text
+//! "sculpin-ledger-merge-request/v1\0"
+//! field operation  merge_propose | merge_apply
+//! field graph_id
+//! -- merge_propose --  field source · field target · field strategy · opt base
+//!                      · field preview_token · opt message
+//!                      · u32 evidence_count · field evidence_ref × count (sorted, unique)
+//! -- merge_apply --    field proposal_id (decimal) · field preview_token
+//!                      · opt validation_id · opt semantic_environment_id · opt reason
+//! ```
 //! `field` = u32 big-endian length + UTF-8 bytes; `opt` = 0x00 absent-or-empty | 0x01 + non-empty
 //! field. Vectors live in `fixtures/golden/requests/` and are cross-checked by
 //! `scripts/golden/request_v1_reference.py`.
@@ -65,6 +78,7 @@ use ledger_validation_protocol::{RequestedContext, SemanticEnvironmentId, Valida
 pub const REQUEST_IDENTITY_HEADER: &[u8] = b"sculpin-ledger-request/v1\0";
 pub const REQUEST_IDENTITY_V2_HEADER: &[u8] = b"sculpin-ledger-request/v2\0";
 pub const BRANCH_REQUEST_IDENTITY_HEADER: &[u8] = b"sculpin-ledger-branch-request/v1\0";
+pub const MERGE_REQUEST_IDENTITY_HEADER: &[u8] = b"sculpin-ledger-merge-request/v1\0";
 
 /// The normalized, typed content of a mutation request — everything the digest covers.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -137,6 +151,25 @@ pub enum CanonicalRequest {
         name: String,
         reason: Option<String>,
     },
+    MergePropose {
+        graph: GraphId,
+        source: String,
+        target: String,
+        /// `abort` | `take-target` | `take-source` | `union`.
+        strategy: String,
+        base: Option<CommitId>,
+        preview_token: String,
+        message: Option<String>,
+        evidence_refs: Vec<String>,
+    },
+    MergeApply {
+        graph: GraphId,
+        proposal_id: i64,
+        preview_token: String,
+        validation_id: Option<ValidationId>,
+        semantic_environment_id: Option<SemanticEnvironmentId>,
+        reason: Option<String>,
+    },
 }
 
 fn field(out: &mut Vec<u8>, value: &str) {
@@ -172,6 +205,9 @@ impl CanonicalRequest {
             }
             Self::BranchCreate { .. } | Self::BranchDelete { .. } | Self::BranchRestore { .. } => {
                 BRANCH_REQUEST_IDENTITY_HEADER.to_vec()
+            }
+            Self::MergePropose { .. } | Self::MergeApply { .. } => {
+                MERGE_REQUEST_IDENTITY_HEADER.to_vec()
             }
         };
         match self {
@@ -332,6 +368,61 @@ impl CanonicalRequest {
                 );
                 field(&mut out, graph.as_str());
                 field(&mut out, name);
+                opt(&mut out, reason.as_deref());
+            }
+            Self::MergePropose {
+                graph,
+                source,
+                target,
+                strategy,
+                base,
+                preview_token,
+                message,
+                evidence_refs,
+            } => {
+                field(&mut out, "merge_propose");
+                field(&mut out, graph.as_str());
+                field(&mut out, source);
+                field(&mut out, target);
+                field(&mut out, strategy);
+                opt(&mut out, base.as_ref().map(ToString::to_string).as_deref());
+                field(&mut out, preview_token);
+                opt(&mut out, message.as_deref());
+                let mut evidence = evidence_refs.clone();
+                evidence.sort_unstable();
+                evidence.dedup();
+                out.extend_from_slice(
+                    &u32::try_from(evidence.len())
+                        .expect("bounded")
+                        .to_be_bytes(),
+                );
+                for e in &evidence {
+                    field(&mut out, e);
+                }
+            }
+            Self::MergeApply {
+                graph,
+                proposal_id,
+                preview_token,
+                validation_id,
+                semantic_environment_id,
+                reason,
+            } => {
+                field(&mut out, "merge_apply");
+                field(&mut out, graph.as_str());
+                field(&mut out, &proposal_id.to_string());
+                field(&mut out, preview_token);
+                opt(
+                    &mut out,
+                    validation_id.as_ref().map(ToString::to_string).as_deref(),
+                );
+                opt(
+                    &mut out,
+                    semantic_environment_id
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .as_deref(),
+                );
                 opt(&mut out, reason.as_deref());
             }
         }

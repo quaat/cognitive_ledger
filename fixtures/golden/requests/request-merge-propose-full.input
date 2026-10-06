@@ -1,0 +1,11 @@
+{
+  "operation": "merge_propose",
+  "graph_id": "0b0a2a1c-2e3d-4f50-8a61-72b384c5d6e7",
+  "source": "review/curation-2026",
+  "target": "main",
+  "strategy": "union",
+  "base": "sha256:73399c34028c2686df761ff8e508ebfb7aa40bb982ff9bcfe9dfc0d432ef903c",
+  "preview_token": "sha256:5b1d7c0e2a9f4c3b8e6d1a0f9c8b7a6e5d4c3b2a1f0e9d8c7b6a5f4e3d2c1b0a",
+  "message": "integrate the reviewed curation",
+  "evidence_refs": ["urn:evidence:z", "urn:evidence:a", "urn:evidence:z"]
+}

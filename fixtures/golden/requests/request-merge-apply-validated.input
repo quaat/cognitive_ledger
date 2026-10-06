@@ -1,0 +1,9 @@
+{
+  "operation": "merge_apply",
+  "graph_id": "0b0a2a1c-2e3d-4f50-8a61-72b384c5d6e7",
+  "proposal_id": 42,
+  "preview_token": "sha256:5b1d7c0e2a9f4c3b8e6d1a0f9c8b7a6e5d4c3b2a1f0e9d8c7b6a5f4e3d2c1b0a",
+  "validation_id": "sha256:3e992f18de784b6565bc0b40d87327eae68659b912a0c4f721b4e0d8f9549029",
+  "semantic_environment_id": "sha256:2d9e3abaf29a65fafe0f7ad89d1a7b79c9cf4310226c6066e251fdf31216ad12",
+  "reason": "validated in the current environment"
+}

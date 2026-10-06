@@ -23,6 +23,7 @@ FIXTURES = ROOT / "fixtures" / "golden" / "requests"
 HEADER = b"sculpin-ledger-request/v1\0"
 HEADER_V2 = b"sculpin-ledger-request/v2\0"
 HEADER_BRANCH = b"sculpin-ledger-branch-request/v1\0"
+HEADER_MERGE = b"sculpin-ledger-merge-request/v1\0"
 
 
 def field(value: str) -> bytes:
@@ -108,10 +109,40 @@ def encode_branch(req: dict) -> bytes:
     return bytes(out)
 
 
+def encode_merge(req: dict) -> bytes:
+    """`sculpin-ledger-merge-request/v1` (ADR-0024): merge propose and apply."""
+    out = bytearray(HEADER_MERGE)
+    op = req["operation"]
+    out += field(op)
+    out += field(req["graph_id"])
+    if op == "merge_propose":
+        out += field(req["source"])
+        out += field(req["target"])
+        out += field(req.get("strategy") or "abort")
+        out += optional(req.get("base"))
+        out += field(req["preview_token"])
+        out += optional(req.get("message"))
+        evidence = sorted(set(req.get("evidence_refs", [])), key=lambda e: e.encode())
+        out += struct.pack(">I", len(evidence))
+        for e in evidence:
+            out += field(e)
+    elif op == "merge_apply":
+        out += field(str(req["proposal_id"]))
+        out += field(req["preview_token"])
+        out += optional(req.get("validation_id"))
+        out += optional(req.get("semantic_environment_id"))
+        out += optional(req.get("reason"))
+    else:
+        raise ValueError(op)
+    return bytes(out)
+
+
 def encode(req: dict) -> bytes:
     op = req["operation"]
     if op.startswith("branch_"):
         return encode_branch(req)
+    if op.startswith("merge_"):
+        return encode_merge(req)
     if op == "validate" or (op in ("accept", "reject") and "validation_id" in req):
         return encode_v2(req)
     out = bytearray(HEADER)
