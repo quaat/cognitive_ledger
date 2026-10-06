@@ -105,12 +105,12 @@ The CI budget is measured, not assumed; any size adjustment is recorded with its
 - [x] M0 assessment and `BENCHMARK_ARCHITECTURE.md`; reviewed (architecture review, no P0/P1)
 - [x] M1 harness (`apps/ledger-bench`): dataset lifecycle, client, result schema, report, provenance
 - [x] M2 generator, oracle and runner; unit tests; local `ci` run green; mutation-tested
-- [ ] CI workflow `ci-benchmark`: hosted run green, with its duration (recorded after push)
+- [x] CI workflow `ci-benchmark`: hosted run green, with its duration recorded (below)
 - [x] Baselines: `ci`, `local` and the Plan 0005 constant-state control on the unchanged implementation
 - [x] Extraction plans (`DATASETS.md`): BEAR-B, `tkgl-smallpedia`, `thgl-software`; reviewed (security review)
 - [x] Docs: `docs/benchmarks/*`, performance-testing, roadmap reconciliation
 - [x] Reviews (5, read-only, Opus); every confirmed finding fixed or recorded below
-- [ ] Gates and evidence, then **stop for review**: no M3 and no checkpoint work
+- [x] Gates and evidence; **stopped for review**: no M3 and no checkpoint work
 
 ## Decisions
 1. **The harness is a new workspace application, `apps/ledger-bench`.** It is not an
@@ -245,7 +245,8 @@ Linux 5.10, Docker; Compose PostgreSQL 17.2). Production code is identical to `c
 | `check-supply-chain` | not required: no new external crate (`Cargo.lock` gains only the `ledger-bench` package). It runs again in hosted `ci-security` |
 | PostgreSQL 15/17 suites | not run: no database-facing production code changed |
 | `test-integration.sh` | runs in hosted `ci-integration`; no production path changed |
-| Hosted CI | recorded after push |
+| Hosted CI, PR #12 head `6b1902d` | all green: ci-fast 37522776889, ci-security 37522776971 (dependency-review, supply-chain, container), ci-integration 37522777076 (docker), ci-fuzz 37522777014 (address, none), **ci-benchmark 37522777454** |
+| **Official `ci` result** (hosted, clean checkout of the PR merge ref `b12b0f1`; `tracked_changes=0`, `untracked_files=0`) | `BENCHMARK PASS`: 1,115 assertions, 0 failed; `VERIFY OK`. Both manifests validated, with checksums identical to the workstation's (cross-machine determinism). Job 5 min 4 s: harness build 90 s, validation 5 s, stack build and start 174 s, **run 11 s**, verify 2 s. Server peak 42 MiB and PostgreSQL 124 MiB (cgroup `memory.peak`). Host: 4 × AMD EPYC 9V45, 16 GiB, kernel 6.17. The result is the `benchmark-ci` artifact of run 37522777454 |
 
 Explicitly not done in Phase 6A:
 - checkpoints, caches, change index, migrations;
