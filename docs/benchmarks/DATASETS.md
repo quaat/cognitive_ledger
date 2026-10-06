@@ -160,10 +160,16 @@ written before verification.
   - no-op churn (in both CB files) is present in both versions;
   - split TB annotations of one triple (13 triples, 733 extra lines) have disjoint version
     lists.
-- **IC divergence:** pinned as counts (`ic_lineage_divergence_in_window`), not hidden. An
-  IC-lineage dataset is possible later and needs its own review.
+  - IC ⊆ TB at **every** source version (all 89, `ic_subset_of_tb_versions_checked`): IC
+    only drops statements the changesets keep.
+- **IC divergence:** pinned as counts (`ic_lineage_divergence_in_window`,
+  `ic_lineage_divergence_all_versions`), not hidden. An IC-lineage dataset is possible later
+  and needs its own review.
+- TB and CB are two encodings of the selected lineage, and BEAR probably derived TB from
+  the changesets. Their agreement shows that the extraction reads both consistently. It does
+  not establish an external ground truth.
 
-**Extraction** (`bear-b-day-extract/1`, deterministic):
+**Extraction** (`bear-b-day-extract/2`, deterministic):
 - Every triple is normalized through the ledger's canonical N-Quads rules
   (`ledger_rdf::Quad`). This is a labelled dependency of the oracle on the ledger's frozen
   canonical form.

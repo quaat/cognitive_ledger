@@ -57,7 +57,7 @@ use std::{
 };
 
 pub const EXTRACTION_ALGORITHM: &str = "BEAR-B day: TB/CB changeset lineage, anchored at IC version 1, canonical N-Quads, 12-version max-change window";
-pub const EXTRACTION_VERSION: &str = "bear-b-day-extract/1";
+pub const EXTRACTION_VERSION: &str = "bear-b-day-extract/2";
 const ARTIFACT_FORMAT: &str = "sculpin-ledger-bench-prepared/v1";
 const WINDOW: usize = 12;
 /// Ingestion batching (the API caps a request at 10,000 operations and 2 MiB; limits are
@@ -631,11 +631,12 @@ pub fn prepare(ctx: &Context, id: &str) -> Result<(String, u64, Extraction), Str
         ));
         prev = next;
     }
-    for k in start..start + WINDOW {
+    // The IC lineage only drops statements the changesets keep: IC ⊆ TB at **every** source
+    // version, checked here for all of them (not only the window). A violation means the
+    // documented relation between the two lineages no longer holds.
+    let mut divergence_all = 0u64;
+    for k in 0..versions {
         let (tb, icv) = (state(k), ic(k + 1, &mut norm)?);
-        // The IC lineage only drops statements the changesets keep: IC ⊆ TB at every
-        // selected version (verified on the source). A violation means the documented
-        // relation between the two lineages no longer holds.
         if !icv.is_subset(&tb) {
             return Err(format!(
                 "IC file {:06} holds {} statements outside TB v{k}: the documented lineage relation does not hold",
@@ -643,7 +644,11 @@ pub fn prepare(ctx: &Context, id: &str) -> Result<(String, u64, Extraction), Str
                 icv.difference(&tb).count()
             ));
         }
-        divergence += tb.difference(&icv).count() as u64;
+        let missing = tb.difference(&icv).count() as u64;
+        divergence_all += missing;
+        if (start..start + WINDOW).contains(&k) {
+            divergence += missing;
+        }
     }
     norm.finish()?;
     let prepared = Prepared { start, base, steps };
@@ -662,6 +667,8 @@ pub fn prepare(ctx: &Context, id: &str) -> Result<(String, u64, Extraction), Str
     counts.insert("triples_first_version".into(), prepared.base.len() as u64);
     counts.insert("triples_last_version".into(), prev.len() as u64);
     counts.insert("ic_lineage_divergence_in_window".into(), divergence);
+    counts.insert("ic_lineage_divergence_all_versions".into(), divergence_all);
+    counts.insert("ic_subset_of_tb_versions_checked".into(), versions as u64);
     counts.insert("canonicalization_rewrites".into(), norm.rewritten);
 
     let extraction = Extraction {
@@ -830,6 +837,13 @@ fn load(ctx: &Context, id: &str) -> Result<(Manifest, ArtifactHeader, Prepared, 
         ));
     }
     let (header, prepared) = parse_artifact(&bytes)?;
+    if header.dataset != id {
+        return Err(format!(
+            "prepared artifact {} is for dataset {:?}, not {id:?}",
+            path.display(),
+            header.dataset
+        ));
+    }
     Ok((manifest, header, prepared, bytes))
 }
 
@@ -1219,6 +1233,18 @@ mod tests {
         tampered[last] ^= 1;
         std::fs::write(&path, &tampered).unwrap();
         assert!(load(&ctx, "bear-b-ci").unwrap_err().contains("prepare"));
+        // An artifact of another dataset, even one whose hash the manifest pins, is refused.
+        let other = render_artifact("bear-b-other", &x, &p);
+        std::fs::write(&path, &other).unwrap();
+        m.output.artifact_sha256 = Some(sha256_hex(&other));
+        m.output.artifact_bytes = Some(other.len() as u64);
+        std::fs::write(
+            manifests.join("bear-b-ci.json"),
+            serde_json::to_vec(&m).unwrap(),
+        )
+        .unwrap();
+        let err = load(&ctx, "bear-b-ci").unwrap_err();
+        assert!(err.contains("is for dataset \"bear-b-other\""), "{err}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

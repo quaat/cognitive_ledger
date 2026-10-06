@@ -286,7 +286,7 @@ integrity rules against real PostgreSQL, including a non-superuser owner.
   and by expression fingerprint on readiness; the three content-address CHECKs (objects,
   contexts, records) additionally by rolled-back semantic probes at start-up; the runtime role's exact per-column INSERT/UPDATE
   grants, absence of table-level writes, DELETE/TRUNCATE/TRIGGER/REFERENCES, and USAGE on
-  exactly the audit sequences. ASan fuzzing passes on the hosted runner (`ci-fuzz` matrix `none`/`address`, pinned
+  exactly the audit sequences. ASan fuzzing passes on the hosted runner (`ci-fuzz` matrix `fuzz-sanitizer (none|address)`, aggregated by the required `fuzz` job; pinned
   nightly, explicit target triple; the local host's ASan start-up crash is host-specific);
   a 900 s-per-target campaign under both sanitizers (≈2.2 G executions, no crash) is recorded in the plan and repeats weekly. The **live Entra ID issuer smoke test
   (`scripts/live-issuer-smoke.sh`; pending: no tenant credentials available to the runs;

@@ -39,6 +39,23 @@ script then runs `ledger-bench recon` and ends with `ledger-admin verify`. Outpu
 `target/benchmark/<UTC>-recon/{recon.json,recon.md}`. See [METRICS.md](METRICS.md#reconstruction-characterization)
 for what each operation isolates.
 
+- **Invalid configurations are refused before anything runs** (exit 2):
+  - empty `--states` or `--depths`, or a state size of 0;
+  - `--reps` or `--preview-reps` of 0;
+  - `--cold-depths` without `--restart-cmd`, with `--cold-reps 0`, or with a depth that is
+    not in `--depths`;
+  - a depth whose depth + 1 exceeds the server's reconstruction limit (`--depth-limit`,
+    which the script reads from the compose configuration).
+- **Official runs come from a clean checkout only.** The result records `build_rev`,
+  `tracked_changes`, `untracked_files`, the input hash and the images, and `official=yes`
+  only when there are no tracked changes and no untracked files. `recon.md` marks every
+  other run **NON-OFFICIAL**. For architecture evidence, run from a detached worktree:
+
+  ```sh
+  git worktree add --detach target/recon-tree <revision>
+  target/recon-tree/scripts/benchmark-recon.sh
+  ```
+
 The script:
 1. builds `ledger-bench` (release);
 2. **validates the datasets of every profile (`ci` and `local`) against their committed

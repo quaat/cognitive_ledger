@@ -5,7 +5,7 @@
 # pg_stat_statements in schema bench_stats, track_io_timing. Builds constant-state histories
 # (1 / 1,000 / 10,000 quads) to depth 5,000 through the public API, then measures API state
 # reads, direct store reconstruction, the fold's CPU work, prepare and merge previews per
-# depth, warm and database-restart cold, with PostgreSQL statement and cgroup CPU/memory
+# depth, warm and after a database restart (db-restart-first-ledger-op), with PostgreSQL statement and cgroup CPU/memory
 # deltas. Ends with `ledger-admin verify`. Takes about an hour or more.
 # Usage: scripts/benchmark-recon.sh [extra ledger-bench recon flags...]
 # Output: target/benchmark/<UTC>-recon/{recon.json,recon.md,verify.log,...}
@@ -36,23 +36,39 @@ cgroup_dir() {
 }
 SERVER_CG=$(cgroup_dir ledger); PG_CG=$(cgroup_dir postgres)
 PG_CONTAINER=$("${COMPOSE[@]}" ps -q postgres)
+REV=$(git rev-parse HEAD)
+DIRTY=$(git status --porcelain --untracked-files=no | wc -l | tr -d ' ')
+UNTRACKED=$(git status --porcelain --untracked-files=normal | grep -c '^??' || true)
+# Official architecture evidence only from a clean checkout of a recorded revision (for
+# example a detached `git worktree`); anything else is labelled non-official in the result.
+if [ "${DIRTY}" = 0 ] && [ "${UNTRACKED}" = 0 ]; then OFFICIAL=yes; else OFFICIAL="no (tracked_changes=${DIRTY}, untracked_files=${UNTRACKED})"; fi
+INPUTS=$(cat Dockerfile compose.yaml benchmark/compose.instrumented.yaml Cargo.lock | sha256sum | cut -d' ' -f1)
+# The server's reconstruction depth limit (compose override, else the server default).
+DEPTH_LIMIT=$("${COMPOSE[@]}" config | sed -n 's/.*LEDGER_LIMIT_RECONSTRUCTION_DEPTH: *"\{0,1\}\([0-9]*\).*/\1/p' | head -1)
+DEPTH_LIMIT=${DEPTH_LIMIT:-10000}
 export LEDGER_BENCH_HS256_SECRET=development-only-hs256-secret-not-for-production-use
 export LEDGER_BENCH_OWNER_DATABASE_URL='postgres://ledger:ledger-development-only@127.0.0.1:55432/ledger?sslmode=disable'
 set +e
 ./target/release/ledger-bench recon --replica http://127.0.0.1:8080 --out "${OUT}" \
-  --restart-cmd "docker restart ${PG_CONTAINER} >/dev/null" \
+  --restart-cmd "docker restart ${PG_CONTAINER} >/dev/null" --depth-limit "${DEPTH_LIMIT}" \
   ${SERVER_CG:+--server-cgroup "${SERVER_CG}"} ${PG_CG:+--postgres-cgroup "${PG_CG}"} \
-  --meta "build_rev=$(git rev-parse HEAD)" --meta "tracked_changes=$(git status --porcelain --untracked-files=no | wc -l | tr -d ' ')" \
+  --meta "build_rev=${REV}" --meta "tracked_changes=${DIRTY}" --meta "untracked_files=${UNTRACKED}" \
+  --meta "official=${OFFICIAL}" \
+  --meta "inputs_sha256(Dockerfile,compose.yaml,benchmark/compose.instrumented.yaml,Cargo.lock)=${INPUTS}" \
+  --meta "rustc=$(rustc --version)" --meta "server_toolchain=$(grep -m1 '^FROM' Dockerfile)" \
+  --meta "docker=$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo unknown)" \
+  --meta "compose=$(docker compose version --short 2>/dev/null || echo unknown)" \
+  --meta "compose_project=ledger-qual-recon" \
   --meta "postgres=$("${COMPOSE[@]}" exec -T postgres psql -U ledger -d ledger -tAc 'SHOW server_version')" \
+  --meta "postgres_image=$(docker inspect --format '{{.Image}}' "${PG_CONTAINER}")" \
   --meta "postgres_config=benchmark-only instrumentation override (pg_stat_statements, track_io_timing=on); differs from the production-shaped compose.yaml" \
   --meta "server_image=$(docker inspect --format '{{.Image}}' "$("${COMPOSE[@]}" ps -q ledger)")" \
   --meta "acceptance_mode=unvalidated-development" "$@" 2>&1 | tee "${OUT}/run.log"
 STATUS=${PIPESTATUS[0]}
-set +e
 "${COMPOSE[@]}" run --rm migrate verify >"${OUT}/verify.log" 2>&1
 VERIFY=$?
 set -e
 tail -1 "${OUT}/verify.log"
 if [ "${VERIFY}" != 0 ] || ! grep -q "VERIFY OK" "${OUT}/verify.log"; then echo "FAIL: verify" >&2; STATUS=1; fi
-echo "report: ${OUT}/recon.md"
+echo "report: ${OUT}/recon.md (official: ${OFFICIAL})"
 exit "${STATUS}"

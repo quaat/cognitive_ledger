@@ -26,7 +26,9 @@ permissions: {contents: read}
 env:
   FUZZ_TOOLCHAIN: nightly-2026-09-25
 jobs:
-  fuzz:
+  # The matrix reports one check per sanitizer ("fuzz-sanitizer (none)", "… (address)").
+  # Branch protection requires the stable aggregate `fuzz` below instead.
+  fuzz-sanitizer:
     runs-on: ubuntu-latest
     timeout-minutes: 300
     strategy:
@@ -80,3 +82,19 @@ jobs:
             target/fuzz/*/*.log
             fuzz/artifacts/**
           if-no-files-found: ignore
+
+  # Stable required check: succeeds only if every matrix job succeeded. `if: always()` makes
+  # it run (and fail) when a matrix job failed or was cancelled, instead of being skipped,
+  # which a required check would treat as passing.
+  fuzz:
+    needs: fuzz-sanitizer
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every sanitizer job succeeded
+        env:
+          RESULT: ${{ needs.fuzz-sanitizer.result }}
+        run: |
+          echo "fuzz-sanitizer matrix result: ${RESULT}"
+          [ "${RESULT}" = success ]

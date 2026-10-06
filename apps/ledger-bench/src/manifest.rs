@@ -111,8 +111,13 @@ impl Manifest {
         if self.manifest_schema != MANIFEST_SCHEMA {
             return fail(&format!("manifest_schema must be {MANIFEST_SCHEMA}"));
         }
-        if !self.output.workload_checksum.starts_with("sha256:") {
-            return fail("output.workload_checksum must be sha256:…");
+        if !self
+            .output
+            .workload_checksum
+            .strip_prefix("sha256:")
+            .is_some_and(is_sha256)
+        {
+            return fail("output.workload_checksum must be sha256:<64 lowercase hex digits>");
         }
         match self.kind.as_str() {
             "generated" => {
@@ -208,7 +213,7 @@ pub(crate) mod tests {
             }),
             output: Output {
                 commits: 1,
-                workload_checksum: "sha256:00".into(),
+                workload_checksum: format!("sha256:{}", "c".repeat(64)),
                 artifact_sha256: Some("b".repeat(64)),
                 artifact_bytes: Some(1),
             },
@@ -233,6 +238,26 @@ pub(crate) mod tests {
         let mut m = extracted();
         m.extraction = None;
         assert!(m.check_complete().unwrap_err().contains("extraction"));
+        for bad in [
+            "sha256:00".to_owned(),
+            "c".repeat(64),
+            format!("sha256:{}", "C".repeat(64)),
+            format!("sha256:{}", "c".repeat(65)),
+            format!("sha256:{}g", "c".repeat(63)),
+            format!("SHA256:{}", "c".repeat(64)),
+        ] {
+            let mut m = extracted();
+            m.output.workload_checksum = bad.clone();
+            assert!(
+                m.check_complete()
+                    .unwrap_err()
+                    .contains("workload_checksum"),
+                "{bad}"
+            );
+        }
+        let mut m = extracted();
+        m.output.artifact_sha256 = Some("B".repeat(64));
+        assert!(m.check_complete().unwrap_err().contains("artifact"));
         let mut m = extracted();
         m.manifest_schema = "sculpin-ledger-bench-manifest/v1".into();
         assert!(m.check_complete().unwrap_err().contains("manifest_schema"));

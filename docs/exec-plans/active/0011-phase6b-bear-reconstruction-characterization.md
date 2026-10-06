@@ -22,7 +22,7 @@ bottleneck. The evidence decides; checkpoints are not assumed.
    - HTTP serialization, transfer and client decoding.
 2. How does each part scale with **ancestry depth at a fixed state size** (1, 1,000 and
    10,000 quads; depths 1–5,000), and with **state size at a fixed depth**?
-3. How do warm and **database-restart cold** reconstructions differ? OS page-cache cold is
+3. How do warm and **post-restart (`db-restart-first-ledger-op`)** reconstructions differ? OS page-cache cold is
    claimed only if the host cache is actually dropped, which this workstation does not do.
 4. How much server and PostgreSQL CPU, and how much memory, does each part use?
 5. How much of a merge preview is ancestry traversal, and how much is its three
@@ -52,7 +52,7 @@ bottleneck. The evidence decides; checkpoints are not assumed.
    The API path is measured against the direct store path (`persisted`), with prepare,
    merge preview and ancestry traversal separately. It uses a benchmark-only PostgreSQL
    configuration with `pg_stat_statements` and `track_io_timing`, cgroup CPU and memory, and
-   warm versus database-restart cold.
+   warm versus `db-restart-first-ledger-op`.
 4. **Production-qualification matrix**: a read-only categorization of the remaining
    blockers.
 5. **A recommendation** for the first Phase-6 optimization, plus the inputs to the
@@ -121,13 +121,15 @@ Every item of the Phase-6B gate in the task holds, the recommendation is written
    - The three BEAR-B day encodings do not describe one history. IC(1) plus the cumulative
      CB changesets equals TB at all 89 versions (88 steps). From version 2 on, the IC files
      also drop stale values that no changeset deletes.
-   - IC ⊆ TB holds at every version; the extractor fails if it does not.
+   - IC ⊆ TB holds at every one of the 89 versions. The extractor checks all of them
+     (`bear-b-day-extract/2`) and fails on any violation.
    - The extractor takes TB as the oracle and hard-checks two things:
      - anchor TB(v0) == IC(1);
      - at every step, CB's net change == TB's version difference. Changeset no-op churn is
        allowed only where both versions contain it.
    - IC's divergence inside the window is pinned as a manifest count
-     (`ic_lineage_divergence_in_window`).
+     (`ic_lineage_divergence_in_window`); the divergence over all versions is pinned as
+     `ic_lineage_divergence_all_versions`.
    - TB and CB are two encodings of one lineage (BEAR likely derived TB from the
      changesets). Their agreement shows that the extraction reads both consistently, not
      that the lineage is "true".
@@ -144,8 +146,12 @@ Every item of the Phase-6B gate in the task holds, the recommendation is written
 5. **Instrumentation is benchmark-only.** `benchmark/compose.instrumented.yaml` enables
    `pg_stat_statements` (schema `bench_stats`) and `track_io_timing`. Every recon result
    records that override. Production defaults are unchanged.
-6. **Cold means database-restart cold** (`docker restart` of PostgreSQL: shared buffers
-   empty, OS page cache warm). No OS-cold claim is made.
+6. **The post-restart condition is `db-restart-first-ledger-op`** (`docker restart` of
+   PostgreSQL). It restarts the PostgreSQL processes and shared buffers. Before the measured
+   operation, the server's `/ready` probe, the reconnecting pool and the window's
+   statistics queries run, so the measured reconstruction is the first *ledger*
+   reconstruction, not the first database operation. The OS page cache is warm, and no
+   OS-cold claim is made.
 7. **The pg_graphs_migration hang: cause unknown, the fix is defensive** (tech-debt entry).
 
 ## Discoveries
@@ -153,8 +159,10 @@ Every item of the Phase-6B gate in the task holds, the recommendation is written
   - IC and CB/TB diverge as described in Decisions 1.
   - 13 TB triples are written across 733 annotation lines with disjoint version lists.
     They are merged, and overlapping lists fail.
-  - Normalization rewrote 3,207 source spellings to canonical N-Quads with 0 collisions. The
-    count bounds what the shared canonicalizer could mask.
+  - Normalization rewrote 17,710 source lines to canonical N-Quads, counted per parse over
+    TB, CB and all 89 IC files (IC file 1 is parsed twice, for the anchor and for the
+    subset check), with 0 collisions. The count bounds
+    what the shared canonicalizer could mask.
 - **A failed sqlx migration keeps its advisory lock on the connection it ran on.** sqlx
   0.8 does not unlock on error. A pooled connection carries the lock into later use;
   `a_failed_migration_keeps_its_advisory_lock_on_a_pooled_connection_only` pins this.

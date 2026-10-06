@@ -23,17 +23,38 @@
 //! - `api` / `merge_preview_divergent`: a preview of two branches forked at that commit:
 //!   three reconstructions at about that depth plus the ancestry walk.
 //!
-//! Around each measured batch it records:
-//! - `pg_stat_statements` deltas for the role that ran it (runtime role for API batches,
-//!   owner for store batches): calls, rows, shared block hits and reads, temporary blocks,
-//!   block read time and execution time. These are 8 KiB buffer counts from PostgreSQL's
-//!   statistics, not physical disk bytes.
-//! - cgroup CPU deltas of the server and PostgreSQL containers, and their memory.
+//! **Correctness.** Every point is verified exactly, outside the timed region: the state a
+//! path returned (API reply, store reconstruction, prefetched fold) must have the oracle's
+//! digest (sorted canonical lines, SHA-256) for that commit, not merely its cardinality.
+//!
+//! **Measurement window** around each measured batch, in this order:
+//! 1. reset `pg_stat_statements`, read the baseline statement totals;
+//! 2. read the baseline cgroup CPU counters (after the statistics queries, so their CPU is
+//!    outside the window);
+//! 3. the measured operations, and nothing else;
+//! 4. read the ending cgroup CPU counters and memory immediately;
+//! 5. read the ending statement totals (after the CPU reading, so the statistics query's CPU
+//!    is outside the window); derive per-operation deltas.
+//!
+//! What each figure contains:
+//! - `pg.*`: `pg_stat_statements` deltas for the role that ran the batch (runtime role for
+//!   API batches, owner for store batches), statistics queries excluded by text: calls,
+//!   rows, shared block hits and reads, temporary blocks, block read time and execution
+//!   time. Block figures are 8 KiB buffer counts, **not physical I/O bytes**: a "read" may be
+//!   served by the OS page cache.
+//! - `cpu.server_cpu_ms` / `cpu.postgres_cpu_ms`: cgroup v2 `cpu.stat usage_usec` deltas of
+//!   the whole container: every process in it, including PostgreSQL background workers
+//!   (checkpointer, WAL writer, autovacuum) that happen to run during the window.
+//! - `cpu.*_memory_bytes`: `memory.current` right after the batch (page cache included).
 //!
 //! **Cache conditions.**
 //! - `warm`: after warm-up repetitions on an active database.
-//! - `db-restart-cold`: the first operation after PostgreSQL was restarted (`--restart-cmd`)
-//!   and the server reported ready again.
+//! - `db-restart-first-ledger-op` (see [`FIRST_AFTER_RESTART`]): PostgreSQL was restarted
+//!   (`--restart-cmd`: process and shared buffers restarted); then, before the measured
+//!   operation, the server's `/ready` probe, the reconnecting pool and the window's
+//!   statistics queries ran. The measured reconstruction is the first *ledger
+//!   reconstruction* after the restart, not the first PostgreSQL operation, so shared buffers
+//!   are not untouched (the catalog and statistics pages are already loaded).
 //!
 //! An OS-page-cache-cold condition is never claimed: the host cache is not dropped.
 
@@ -59,6 +80,8 @@ const RUNTIME_ROLE: &str = "ledger_runtime";
 const OWNER_ROLE: &str = "ledger";
 const STATS_SCHEMA: &str = "bench_stats";
 const BULK: usize = 5_000;
+/// Cache label of the measurements after a PostgreSQL restart (module docs).
+pub const FIRST_AFTER_RESTART: &str = "db-restart-first-ledger-op";
 
 pub struct ReconConfig {
     pub replica: String,
@@ -76,7 +99,57 @@ pub struct ReconConfig {
     pub restart_cmd: Option<String>,
     pub server_cgroup: Option<PathBuf>,
     pub postgres_cgroup: Option<PathBuf>,
+    /// The server's reconstruction depth limit (`LEDGER_LIMIT_RECONSTRUCTION_DEPTH`).
+    pub depth_limit: usize,
     pub run_id: String,
+}
+
+impl ReconConfig {
+    /// Refuse a configuration that would panic, silently measure nothing, or ask for depths
+    /// the stack cannot reconstruct.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.states.is_empty() || self.depths.is_empty() {
+            return Err("--states and --depths must not be empty".into());
+        }
+        if self.states.contains(&0) {
+            return Err(
+                "--states must not contain 0 (a constant-state history needs ≥ 1 quad)".into(),
+            );
+        }
+        let max_quads = ReconstructionLimits::DEVELOPMENT.max_quads;
+        if let Some(s) = self.states.iter().find(|s| **s > max_quads) {
+            return Err(format!(
+                "state size {s} exceeds the reconstruction limit of {max_quads} quads"
+            ));
+        }
+        if self.reps == 0 || self.preview_reps == 0 {
+            return Err("--reps and --preview-reps must be at least 1".into());
+        }
+        // The divergent merge preview reconstructs one commit beyond the measured depth, and
+        // the store path runs under ReconstructionLimits::DEVELOPMENT.
+        let limit = self
+            .depth_limit
+            .min(ReconstructionLimits::DEVELOPMENT.max_depth);
+        if let Some(d) = self.depths.iter().find(|d| **d + 1 > limit) {
+            return Err(format!(
+                "depth {d} cannot be measured: depth + 1 must be within the reconstruction depth limit {limit}"
+            ));
+        }
+        if !self.cold_depths.is_empty() {
+            if self.cold_reps == 0 {
+                return Err("--cold-reps must be at least 1 when --cold-depths is given".into());
+            }
+            if self.restart_cmd.is_none() {
+                return Err(
+                    "--cold-depths needs --restart-cmd (or pass an empty --cold-depths)".into(),
+                );
+            }
+            if let Some(d) = self.cold_depths.iter().find(|d| !self.depths.contains(d)) {
+                return Err(format!("cold depth {d} is not one of --depths"));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -111,7 +184,7 @@ pub struct ReconPoint {
     pub canonical_state_bytes: u64,
     pub category: String,
     pub op: String,
-    /// `warm` or `db-restart-cold`.
+    /// `warm` or [`FIRST_AFTER_RESTART`].
     pub cache: String,
     pub n: usize,
     pub p50_ms: f64,
@@ -348,20 +421,26 @@ fn fingerprint(state: &BTreeSet<String>, fold_ops: u64) -> (usize, u64, String, 
     )
 }
 
-/// `pg_stat_statements` totals for one role in the current database.
-async fn pg_totals(owner: &PgPool, role: &str) -> Option<[f64; 7]> {
-    let read_time: String = if sqlx::query_scalar::<_, bool>(&format!(
+/// The block-read-time column of this PostgreSQL version (`shared_blk_read_time` from 17).
+async fn read_time_column(owner: &PgPool) -> Option<&'static str> {
+    let modern = sqlx::query_scalar::<_, bool>(&format!(
         "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = '{STATS_SCHEMA}.pg_stat_statements'::regclass \
          AND attname = 'shared_blk_read_time')"
     ))
     .fetch_one(owner)
     .await
-    .ok()?
-    {
-        "shared_blk_read_time".into()
+    .ok()?;
+    Some(if modern {
+        "shared_blk_read_time"
     } else {
-        "blk_read_time".into()
-    };
+        "blk_read_time"
+    })
+}
+
+/// `pg_stat_statements` totals for one role in the current database (statistics queries,
+/// which mention `pg_stat_statements`, excluded).
+async fn pg_totals(owner: &PgPool, read_time: Option<&str>, role: &str) -> Option<[f64; 7]> {
+    let read_time = read_time?;
     let row = sqlx::query(&format!(
         "SELECT COALESCE(sum(calls),0)::float8 c, COALESCE(sum(rows),0)::float8 r, \
          COALESCE(sum(shared_blks_hit),0)::float8 h, COALESCE(sum(shared_blks_read),0)::float8 rd, \
@@ -394,35 +473,103 @@ fn cgroup_memory(dir: &Option<PathBuf>) -> Option<u64> {
         .ok()
 }
 
-struct Window {
-    pg: Option<[f64; 7]>,
-    server_cpu: Option<u64>,
-    pg_cpu: Option<u64>,
+/// Container CPU counters and memory at one instant.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct CpuReading {
+    server_usec: Option<u64>,
+    postgres_usec: Option<u64>,
+    server_memory: Option<u64>,
+    postgres_memory: Option<u64>,
 }
 
-async fn open_window(cfg: &ReconConfig, owner: &PgPool, role: &str) -> Window {
-    // Statement statistics are reset so the batch alone is attributed; the reset itself
-    // and the totals query are excluded by the query filter.
-    let _ = sqlx::query(&format!("SELECT {STATS_SCHEMA}.pg_stat_statements_reset()"))
-        .execute(owner)
-        .await;
-    Window {
-        pg: pg_totals(owner, role).await,
-        server_cpu: cgroup_cpu_usec(&cfg.server_cgroup),
-        pg_cpu: cgroup_cpu_usec(&cfg.postgres_cgroup),
+fn read_cpu(cfg: &ReconConfig) -> CpuReading {
+    CpuReading {
+        server_usec: cgroup_cpu_usec(&cfg.server_cgroup),
+        postgres_usec: cgroup_cpu_usec(&cfg.postgres_cgroup),
+        server_memory: cgroup_memory(&cfg.server_cgroup),
+        postgres_memory: cgroup_memory(&cfg.postgres_cgroup),
     }
 }
 
+struct Window {
+    pg: Option<[f64; 7]>,
+    cpu: CpuReading,
+}
+
+/// Opens a window (module docs, steps 1–2): statistics first, CPU baseline last.
+async fn open_window(
+    cfg: &ReconConfig,
+    owner: &PgPool,
+    read_time: Option<&str>,
+    role: &str,
+) -> Window {
+    open_with(
+        || async {
+            // Reset so the batch alone is attributed; the reset and the totals query are
+            // excluded by the totals query's filter.
+            let _ = sqlx::query(&format!("SELECT {STATS_SCHEMA}.pg_stat_statements_reset()"))
+                .execute(owner)
+                .await;
+            pg_totals(owner, read_time, role).await
+        },
+        || read_cpu(cfg),
+    )
+    .await
+}
+
+/// Closes a window (steps 4–5): CPU immediately, statistics afterwards.
 async fn close_window(
     cfg: &ReconConfig,
     owner: &PgPool,
+    read_time: Option<&str>,
     role: &str,
     w: Window,
     ops: usize,
 ) -> (Option<PgDelta>, Option<CpuDelta>) {
+    close_with(
+        w,
+        ops,
+        || read_cpu(cfg),
+        || pg_totals(owner, read_time, role),
+    )
+    .await
+}
+
+/// The ordering of [`open_window`], separated from the sources so it can be tested.
+async fn open_with<P, F>(pg: P, cpu: impl FnOnce() -> CpuReading) -> Window
+where
+    P: FnOnce() -> F,
+    F: std::future::Future<Output = Option<[f64; 7]>>,
+{
+    let pg = pg().await;
+    Window { pg, cpu: cpu() }
+}
+
+/// The ordering of [`close_window`], separated from the sources so it can be tested.
+async fn close_with<P, F>(
+    w: Window,
+    ops: usize,
+    cpu: impl FnOnce() -> CpuReading,
+    pg: P,
+) -> (Option<PgDelta>, Option<CpuDelta>)
+where
+    P: FnOnce() -> F,
+    F: std::future::Future<Output = Option<[f64; 7]>>,
+{
+    let end_cpu = cpu();
+    let end_pg = pg().await;
+    derive(&w, end_pg, end_cpu, ops)
+}
+
+/// Per-operation deltas of one window.
+fn derive(
+    w: &Window,
+    end_pg: Option<[f64; 7]>,
+    end: CpuReading,
+    ops: usize,
+) -> (Option<PgDelta>, Option<CpuDelta>) {
     let n = ops.max(1) as f64;
-    let after = pg_totals(owner, role).await;
-    let pg = match (w.pg, after) {
+    let pg = match (w.pg, end_pg) {
         (Some(a), Some(b)) => Some(PgDelta {
             calls: (b[0] - a[0]) / n,
             rows: (b[1] - a[1]) / n,
@@ -439,12 +586,19 @@ async fn close_window(
         _ => None,
     };
     let cpu = CpuDelta {
-        server_cpu_ms: delta(w.server_cpu, cgroup_cpu_usec(&cfg.server_cgroup)),
-        postgres_cpu_ms: delta(w.pg_cpu, cgroup_cpu_usec(&cfg.postgres_cgroup)),
-        server_memory_bytes: cgroup_memory(&cfg.server_cgroup),
-        postgres_memory_bytes: cgroup_memory(&cfg.postgres_cgroup),
+        server_cpu_ms: delta(w.cpu.server_usec, end.server_usec),
+        postgres_cpu_ms: delta(w.cpu.postgres_usec, end.postgres_usec),
+        server_memory_bytes: end.server_memory,
+        postgres_memory_bytes: end.postgres_memory,
     };
     (pg, Some(cpu))
+}
+
+/// The oracle digest of a reconstructed state (sorted canonical lines).
+fn state_digest(state: &BTreeSet<Quad>) -> String {
+    let mut lines: Vec<&str> = state.iter().map(Quad::as_str).collect();
+    lines.sort_unstable();
+    oracle_digest(lines)
 }
 
 fn point(
@@ -483,7 +637,7 @@ fn us(d: Duration) -> u64 {
 }
 
 /// The fold's CPU work on prefetched objects: hash, decode, apply.
-fn fold_cpu(chain: &[(Vec<u8>, Vec<u8>)]) -> Result<usize, String> {
+fn fold_cpu(chain: &[(Vec<u8>, Vec<u8>)]) -> Result<BTreeSet<Quad>, String> {
     let mut state: BTreeSet<Quad> = BTreeSet::new();
     for (commit, patch) in chain {
         let _ = ContentId::for_bytes(commit);
@@ -501,7 +655,7 @@ fn fold_cpu(chain: &[(Vec<u8>, Vec<u8>)]) -> Result<usize, String> {
             }
         }
     }
-    Ok(state.len())
+    Ok(state)
 }
 
 /// Commit and patch bytes from genesis to `id` (parent-0 order, genesis first).
@@ -596,6 +750,7 @@ async fn run_inner(cfg: &ReconConfig, result: &mut ReconResult) -> Result<(), St
     let store = PostgresLedgerStore::from_pool_migrated(owner.clone(), V1Binding::Reject);
     let client = Client::new(cfg);
     let limits = ReconstructionLimits::DEVELOPMENT;
+    let rt = read_time_column(&owner).await;
 
     // ---- build (concurrently per state size; not measured) ----
     let started = Instant::now();
@@ -625,7 +780,7 @@ async fn run_inner(cfg: &ReconConfig, result: &mut ReconResult) -> Result<(), St
                     .expect(reqwest::Method::GET, &state_path, false, None, 200)
                     .await?;
             }
-            let w = open_window(cfg, &owner, RUNTIME_ROLE).await;
+            let w = open_window(cfg, &owner, rt, RUNTIME_ROLE).await;
             let mut samples = Vec::new();
             let mut last = Value::Null;
             for _ in 0..cfg.reps {
@@ -636,7 +791,7 @@ async fn run_inner(cfg: &ReconConfig, result: &mut ReconResult) -> Result<(), St
                 bytes = n;
                 last = v;
             }
-            let (pg, cpu) = close_window(cfg, &owner, RUNTIME_ROLE, w, cfg.reps).await;
+            let (pg, cpu) = close_window(cfg, &owner, rt, RUNTIME_ROLE, w, cfg.reps).await;
             let lines: Vec<&str> = last["quads"]
                 .as_array()
                 .map(|a| a.iter().filter_map(Value::as_str).collect())
@@ -664,8 +819,9 @@ async fn run_inner(cfg: &ReconConfig, result: &mut ReconResult) -> Result<(), St
                     .await
                     .map_err(|e| e.to_string())?;
             }
-            let w = open_window(cfg, &owner, OWNER_ROLE).await;
+            let w = open_window(cfg, &owner, rt, OWNER_ROLE).await;
             let mut samples = Vec::new();
+            let mut states = Vec::with_capacity(cfg.reps);
             for _ in 0..cfg.reps {
                 let t = Instant::now();
                 let s = store
@@ -674,16 +830,24 @@ async fn run_inner(cfg: &ReconConfig, result: &mut ReconResult) -> Result<(), St
                     .await
                     .map_err(|e| e.to_string())?;
                 samples.push(us(t.elapsed()));
-                if s.len() != quads {
-                    check(
-                        result,
-                        "store reconstruction size",
-                        false,
-                        format!("S={} depth={depth}", h.states),
-                    );
-                }
+                states.push(s);
             }
-            let (pg, cpu) = close_window(cfg, &owner, OWNER_ROLE, w, cfg.reps).await;
+            let (pg, cpu) = close_window(cfg, &owner, rt, OWNER_ROLE, w, cfg.reps).await;
+            // Untimed: every timed result equals the oracle state exactly.
+            let wrong = states
+                .iter()
+                .filter(|s| s.len() != quads || state_digest(s) != digest)
+                .count();
+            drop(states);
+            check(
+                result,
+                "store reconstruction equals the oracle state (digest)",
+                wrong == 0,
+                format!(
+                    "S={} depth={depth}: {wrong} of {} differ",
+                    h.states, cfg.reps
+                ),
+            );
             result.points.push(point(
                 h,
                 depth,
@@ -696,21 +860,25 @@ async fn run_inner(cfg: &ReconConfig, result: &mut ReconResult) -> Result<(), St
             // The fold's CPU work alone, on prefetched objects.
             let chain = prefetch_chain(&owner, &h.ids[..=depth]).await?;
             let mut samples = Vec::new();
+            let mut wrong = 0;
             for i in 0..cfg.warmup + cfg.reps {
                 let t = Instant::now();
-                let n = fold_cpu(&chain)?;
+                let state = fold_cpu(&chain)?;
+                let elapsed = t.elapsed();
                 if i >= cfg.warmup {
-                    samples.push(us(t.elapsed()));
+                    samples.push(us(elapsed));
                 }
-                if n != quads {
-                    check(
-                        result,
-                        "fold_cpu size",
-                        false,
-                        format!("S={} depth={depth}", h.states),
-                    );
+                // Untimed (after the elapsed time was taken).
+                if state.len() != quads || state_digest(&state) != digest {
+                    wrong += 1;
                 }
             }
+            check(
+                result,
+                "prefetched fold equals the oracle state (digest)",
+                wrong == 0,
+                format!("S={} depth={depth}: {wrong} differ", h.states),
+            );
             result.points.push(point(
                 h,
                 depth,
@@ -742,7 +910,7 @@ async fn run_inner(cfg: &ReconConfig, result: &mut ReconResult) -> Result<(), St
                     .expect(reqwest::Method::POST, &path, true, Some(&prepare(i)), 201)
                     .await?;
             }
-            let w = open_window(cfg, &owner, RUNTIME_ROLE).await;
+            let w = open_window(cfg, &owner, rt, RUNTIME_ROLE).await;
             let mut samples = Vec::new();
             for i in 0..cfg.reps {
                 let (_, t, _) = client
@@ -756,7 +924,7 @@ async fn run_inner(cfg: &ReconConfig, result: &mut ReconResult) -> Result<(), St
                     .await?;
                 samples.push(us(t));
             }
-            let (pg, cpu) = close_window(cfg, &owner, RUNTIME_ROLE, w, cfg.reps).await;
+            let (pg, cpu) = close_window(cfg, &owner, rt, RUNTIME_ROLE, w, cfg.reps).await;
             result.points.push(point(
                 h,
                 depth,
@@ -817,7 +985,7 @@ async fn run_inner(cfg: &ReconConfig, result: &mut ReconResult) -> Result<(), St
                         h.states, v["classification"]
                     ),
                 );
-                let w = open_window(cfg, &owner, RUNTIME_ROLE).await;
+                let w = open_window(cfg, &owner, rt, RUNTIME_ROLE).await;
                 let mut samples = Vec::new();
                 for _ in 0..cfg.preview_reps {
                     let (_, t, _) = client
@@ -831,7 +999,8 @@ async fn run_inner(cfg: &ReconConfig, result: &mut ReconResult) -> Result<(), St
                         .await?;
                     samples.push(us(t));
                 }
-                let (pg, cpu) = close_window(cfg, &owner, RUNTIME_ROLE, w, cfg.preview_reps).await;
+                let (pg, cpu) =
+                    close_window(cfg, &owner, rt, RUNTIME_ROLE, w, cfg.preview_reps).await;
                 result.points.push(point(
                     h,
                     depth,
@@ -842,55 +1011,62 @@ async fn run_inner(cfg: &ReconConfig, result: &mut ReconResult) -> Result<(), St
                 ));
             }
 
-            // Database-restart cold: the first operation after a PostgreSQL restart.
-            if cfg.cold_depths.contains(&depth) && cfg.restart_cmd.is_some() {
+            // After a PostgreSQL restart: the first ledger reconstruction (module docs).
+            if cfg.cold_depths.contains(&depth) {
                 for (category, op) in [("api", "state_read"), ("persisted", "store_reconstruct")] {
+                    let role = if category == "api" {
+                        RUNTIME_ROLE
+                    } else {
+                        OWNER_ROLE
+                    };
                     let mut samples = Vec::new();
                     let mut reads = Vec::new();
+                    let mut wrong = 0;
                     for _ in 0..cfg.cold_reps {
                         restart_database(cfg, &client).await?;
-                        let w = open_window(
-                            cfg,
-                            &owner,
-                            if category == "api" {
-                                RUNTIME_ROLE
-                            } else {
-                                OWNER_ROLE
-                            },
-                        )
-                        .await;
+                        let w = open_window(cfg, &owner, rt, role).await;
                         let t = Instant::now();
-                        if category == "api" {
-                            client
+                        let got = if category == "api" {
+                            let (v, _, _) = client
                                 .expect(reqwest::Method::GET, &state_path, false, None, 200)
                                 .await?;
+                            Err(v)
                         } else {
-                            store
+                            Ok(store
                                 .workflows()
                                 .reconstruct(&id, &limits)
                                 .await
-                                .map_err(|e| e.to_string())?;
-                        }
+                                .map_err(|e| e.to_string())?)
+                        };
                         samples.push(us(t.elapsed()));
-                        let (pg, _) = close_window(
-                            cfg,
-                            &owner,
-                            if category == "api" {
-                                RUNTIME_ROLE
-                            } else {
-                                OWNER_ROLE
-                            },
-                            w,
-                            1,
-                        )
-                        .await;
+                        let (pg, _) = close_window(cfg, &owner, rt, role, w, 1).await;
                         reads.push(pg);
+                        // Untimed exact check of the measured result.
+                        let ok = match &got {
+                            Ok(state) => state.len() == quads && state_digest(state) == digest,
+                            Err(v) => {
+                                let lines: Vec<&str> = v["quads"]
+                                    .as_array()
+                                    .map(|a| a.iter().filter_map(Value::as_str).collect())
+                                    .unwrap_or_default();
+                                lines.len() == quads && oracle_digest(lines) == digest
+                            }
+                        };
+                        if !ok {
+                            wrong += 1;
+                        }
                     }
+                    check(
+                        result,
+                        "state after a database restart equals the oracle state (digest)",
+                        wrong == 0,
+                        format!("S={} depth={depth} {op}: {wrong} differ", h.states),
+                    );
                     let pg = average_pg(&reads);
                     result.points.push(point(
                         h,
                         depth,
-                        (category, op, "db-restart-cold"),
+                        (category, op, FIRST_AFTER_RESTART),
                         &mut samples,
                         None,
                         (pg, None),
@@ -967,10 +1143,17 @@ pub fn markdown(r: &ReconResult) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     let _ = writeln!(out, "# Reconstruction characterization: **{}**\n", r.status);
+    if r.meta.get("official").map(String::as_str) != Some("yes") {
+        let _ = writeln!(
+            out,
+            "> **NON-OFFICIAL RUN** (official = `{}`): not from a clean checkout of a recorded revision; not architecture evidence.\n",
+            r.meta.get("official").map_or("unset", String::as_str)
+        );
+    }
     let _ = writeln!(
         out,
-        "Generated from `recon.json` ({}); the JSON is authoritative. p95/p99 only for n ≥ 20. PostgreSQL figures are per operation, from `pg_stat_statements` (8 KiB buffer counts, not physical disk bytes). CPU is cgroup `cpu.stat` per operation; memory is `memory.current` after the batch (page cache included).\n",
-        r.schema
+        "Generated from `recon.json` ({}); the JSON is authoritative. p95/p99 only for n ≥ 20. PostgreSQL figures are per operation, from `pg_stat_statements` (8 KiB buffer counts, not physical disk bytes). CPU is cgroup `cpu.stat` per operation of the whole container, read immediately around the measured operations (statistics queries outside); memory is `memory.current` after the batch (page cache included). `{}`: PostgreSQL restarted, then readiness and statistics queries, then the measured first ledger reconstruction; OS page cache not dropped.\n",
+        r.schema, FIRST_AFTER_RESTART
     );
     let _ = writeln!(out, "| | |\n|---|---|");
     for (k, v) in r.meta.iter().chain(&r.environment) {
@@ -1087,7 +1270,150 @@ mod tests {
             (commit(&p1), p1.canonical_bytes()),
             (commit(&p2), p2.canonical_bytes()),
         ];
-        assert_eq!(fold_cpu(&chain).unwrap(), 1);
+        let state = fold_cpu(&chain).unwrap();
+        let expected: BTreeSet<String> = [quad(0, 1)].into_iter().collect();
+        assert_eq!(state_digest(&state), fingerprint(&expected, 0).2);
+    }
+
+    #[test]
+    fn a_same_cardinality_wrong_state_does_not_match_the_oracle_digest() {
+        let expected: BTreeSet<String> = [quad(0, 1), quad(1, 1)].into_iter().collect();
+        let right: BTreeSet<Quad> = expected.iter().map(|q| q.parse().unwrap()).collect();
+        let wrong: BTreeSet<Quad> = [quad(0, 1), quad(1, 2)]
+            .iter()
+            .map(|q| q.parse().unwrap())
+            .collect();
+        let digest = fingerprint(&expected, 0).2;
+        assert_eq!(state_digest(&right), digest);
+        assert_eq!(wrong.len(), right.len());
+        assert_ne!(state_digest(&wrong), digest);
+    }
+
+    fn config() -> ReconConfig {
+        ReconConfig {
+            replica: "http://127.0.0.1:8080".into(),
+            owner_database_url: String::new(),
+            secret: "s".into(),
+            issuer: String::new(),
+            audience: String::new(),
+            states: vec![1, 1_000, 10_000],
+            depths: vec![1, 10, 100, 500, 1_000, 2_500, 5_000],
+            reps: 20,
+            warmup: 3,
+            preview_reps: 10,
+            cold_depths: vec![100, 1_000, 5_000],
+            cold_reps: 3,
+            restart_cmd: Some("true".into()),
+            server_cgroup: None,
+            postgres_cgroup: None,
+            depth_limit: 10_000,
+            run_id: "t".into(),
+        }
+    }
+
+    #[test]
+    fn invalid_configurations_are_refused_before_running() {
+        assert_eq!(config().validate(), Ok(()));
+        type Mutation = fn(&mut ReconConfig);
+        let cases: Vec<(Mutation, &str)> = vec![
+            (|c| c.states = vec![], "empty"),
+            (|c| c.depths = vec![], "empty"),
+            (|c| c.states = vec![1, 0], "contain 0"),
+            (|c| c.states = vec![2_000_000], "exceeds"),
+            (|c| c.reps = 0, "at least 1"),
+            (|c| c.preview_reps = 0, "at least 1"),
+            (|c| c.cold_reps = 0, "--cold-reps"),
+            (|c| c.restart_cmd = None, "--restart-cmd"),
+            (|c| c.cold_depths = vec![7], "not one of --depths"),
+            (|c| c.depths = vec![10_000], "depth limit"),
+            (
+                |c| {
+                    c.depth_limit = 1_000;
+                    c.depths = vec![1_000];
+                    c.cold_depths = vec![];
+                },
+                "depth limit 1000",
+            ),
+        ];
+        for (mutate, needle) in cases {
+            let mut c = config();
+            mutate(&mut c);
+            let err = c.validate().unwrap_err();
+            assert!(err.contains(needle), "{err}");
+        }
+        // No cold measurements: neither a restart command nor cold repetitions are needed.
+        let mut c = config();
+        c.cold_depths = vec![];
+        c.cold_reps = 0;
+        c.restart_cmd = None;
+        assert_eq!(c.validate(), Ok(()));
+    }
+
+    #[test]
+    fn the_cpu_window_excludes_the_statistics_queries() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let log = std::cell::RefCell::new(Vec::new());
+        let cpu = |at: u64| CpuReading {
+            server_usec: Some(at),
+            postgres_usec: Some(at),
+            server_memory: Some(at),
+            postgres_memory: None,
+        };
+        let w = rt.block_on(open_with(
+            || async {
+                log.borrow_mut().push("open: statistics");
+                Some([0.0; 7])
+            },
+            || {
+                log.borrow_mut().push("open: cpu");
+                cpu(1_000)
+            },
+        ));
+        log.borrow_mut().push("measured operations");
+        let (pg, c) = rt.block_on(close_with(
+            w,
+            2,
+            || {
+                log.borrow_mut().push("close: cpu");
+                cpu(5_000)
+            },
+            || async {
+                log.borrow_mut().push("close: statistics");
+                Some([10.0, 4.0, 6.0, 2.0, 0.0, 1.0, 3.0])
+            },
+        ));
+        assert_eq!(
+            *log.borrow(),
+            [
+                "open: statistics",
+                "open: cpu",
+                "measured operations",
+                "close: cpu",
+                "close: statistics"
+            ]
+        );
+        let pg = pg.unwrap();
+        assert_eq!((pg.calls, pg.rows, pg.exec_time_ms), (5.0, 2.0, 1.5));
+        let c = c.unwrap();
+        // (5000 - 1000) µs over 2 operations = 2 ms each.
+        assert_eq!(c.server_cpu_ms, Some(2.0));
+        assert_eq!(c.postgres_cpu_ms, Some(2.0));
+        assert_eq!(c.server_memory_bytes, Some(5_000));
+        assert_eq!(c.postgres_memory_bytes, None);
+    }
+
+    #[test]
+    fn missing_sources_give_no_figures_rather_than_zeros() {
+        let w = Window {
+            pg: None,
+            cpu: CpuReading::default(),
+        };
+        let (pg, c) = derive(&w, Some([1.0; 7]), CpuReading::default(), 3);
+        assert!(pg.is_none());
+        let c = c.unwrap();
+        assert_eq!((c.server_cpu_ms, c.postgres_cpu_ms), (None, None));
     }
 
     #[test]

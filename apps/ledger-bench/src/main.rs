@@ -18,6 +18,7 @@
 //!                    [--depths 1,10,100,500,1000,2500,5000] [--reps 20] [--warmup 3]
 //!                    [--preview-reps 10] [--cold-depths 100,1000,5000] [--cold-reps 3]
 //!                    [--restart-cmd <shell>] [--server-cgroup <dir>] [--postgres-cgroup <dir>]
+//!                    [--depth-limit 10000]  (the server's LEDGER_LIMIT_RECONSTRUCTION_DEPTH)
 //!                    [--meta key=value]...   (reconstruction characterization; scripts/benchmark-recon.sh)
 //! ```
 //!
@@ -501,6 +502,7 @@ async fn recon_command(mut argv: impl Iterator<Item = String>) -> ExitCode {
         restart_cmd: None,
         server_cgroup: None,
         postgres_cgroup: None,
+        depth_limit: ledger_store::ReconstructionLimits::DEVELOPMENT.max_depth,
         run_id: format!("{}-{}", unix_ms(), std::process::id()),
     };
     let mut out = PathBuf::new();
@@ -524,6 +526,9 @@ async fn recon_command(mut argv: impl Iterator<Item = String>) -> ExitCode {
                 "--restart-cmd" => cfg.restart_cmd = Some(value()?),
                 "--server-cgroup" => cfg.server_cgroup = Some(value()?.into()),
                 "--postgres-cgroup" => cfg.postgres_cgroup = Some(value()?.into()),
+                "--depth-limit" => {
+                    cfg.depth_limit = value()?.parse().map_err(|_| "--depth-limit")?
+                }
                 "--meta" => {
                     let kv = value()?;
                     let (k, v) = kv.split_once('=').ok_or("--meta takes key=value")?;
@@ -548,6 +553,10 @@ async fn recon_command(mut argv: impl Iterator<Item = String>) -> ExitCode {
         );
         return ExitCode::from(2);
     }
+    if let Err(e) = cfg.validate() {
+        eprintln!("invalid recon configuration: {e}");
+        return ExitCode::from(2);
+    }
     let started = Instant::now();
     let mut r = recon::run(&cfg).await;
     r.meta = meta;
@@ -560,11 +569,26 @@ async fn recon_command(mut argv: impl Iterator<Item = String>) -> ExitCode {
         ("os".into(), env.os),
         ("kernel".into(), env.kernel),
         ("cpu".into(), format!("{} × {}", env.cpus, env.cpu_model)),
-        ("mem_total_mib".into(), (env.mem_total_kib / 1024).to_string()),
+        (
+            "mem_total_mib".into(),
+            (env.mem_total_kib / 1024).to_string(),
+        ),
         ("states".into(), format!("{:?}", cfg.states)),
         ("depths".into(), format!("{:?}", cfg.depths)),
-        ("reps".into(), format!("{} (+{} warm-up); previews {}; cold {} at {:?}", cfg.reps, cfg.warmup, cfg.preview_reps, cfg.cold_reps, cfg.cold_depths)),
-        ("cache_conditions".into(), "warm: after warm-up on an active database; db-restart-cold: first operation after a PostgreSQL restart (OS page cache NOT dropped)".into()),
+        (
+            "reps".into(),
+            format!(
+                "{} (+{} warm-up); previews {}; cold {} at {:?}",
+                cfg.reps, cfg.warmup, cfg.preview_reps, cfg.cold_reps, cfg.cold_depths
+            ),
+        ),
+        (
+            "cache_conditions".into(),
+            format!(
+                "warm: after warm-up on an active database; {}: PostgreSQL process and shared buffers restarted, then /ready, pool reconnection and statistics queries, then the measured first ledger reconstruction (OS page cache NOT dropped)",
+                recon::FIRST_AFTER_RESTART
+            ),
+        ),
     ]);
     let write = || -> Result<(), String> {
         std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;

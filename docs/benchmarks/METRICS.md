@@ -80,22 +80,45 @@ Per point it records:
 - p50 (p95/p99 only with n ≥ 20) and the mean;
 - response bytes;
 - fold operations and canonical state bytes;
-- per operation from `pg_stat_statements`: calls, rows, shared block hits and reads,
-  temporary blocks, block read time (`track_io_timing`) and execution time. These are
-  PostgreSQL's 8 KiB buffer statistics, not physical disk bytes, and the window is reset per
-  batch;
-- per operation: cgroup `cpu.stat` CPU of the server and PostgreSQL containers, plus
-  `memory.current` after the batch.
+- per operation from `pg_stat_statements`, for the role that ran the batch (statistics
+  queries excluded): calls, rows, shared block hits and reads, temporary blocks, block read
+  time (`track_io_timing`) and execution time. These are PostgreSQL's 8 KiB buffer
+  statistics. They are **not physical I/O bytes**: a block "read" may be served by the OS
+  page cache. The window is reset per batch.
+- per operation: cgroup v2 `cpu.stat usage_usec` of the server and PostgreSQL containers.
+  This is whole-container CPU, so it includes PostgreSQL background workers that run during
+  the window. `memory.current` is read after the batch and includes the page cache.
 
-The cache condition is either `warm` (after warm-up) or `db-restart-cold`: the first
-operation after PostgreSQL was restarted and the server reported ready again. The OS page
-cache is never dropped, so no OS-cold condition is claimed. Results record that PostgreSQL
-ran the benchmark-only instrumentation configuration.
+**Window order** (`recon.rs`, tested):
+1. Reset the statement statistics and read the baseline totals.
+2. Read the baseline CPU.
+3. Run the measured operations.
+4. Read the ending CPU immediately.
+5. Read the ending statement totals.
+
+The statistics queries therefore fall outside the CPU window.
+
+**Correctness** is exact at every point and untimed. Each measured path's result (API
+reply, direct store reconstruction, prefetched fold, and the post-restart reads) must match
+the oracle digest of that commit's state. Equal cardinality is not enough.
+
+**Cache conditions:**
+- `warm`: measured after warm-up repetitions.
+- `db-restart-first-ledger-op`: PostgreSQL was restarted, which restarts its processes and
+  shared buffers. Before the measured operation, the server's `/ready` probe, the reconnecting
+  pool and the window's statistics queries run. The measured operation is therefore the
+  first ledger reconstruction after the restart, not the first PostgreSQL operation, and
+  shared buffers are not untouched.
+- The OS page cache is never dropped, so no OS-cold condition is claimed.
+
+Results record that PostgreSQL ran the benchmark-only instrumentation configuration. A
+result is official only from a clean checkout (`official=yes`: no tracked changes and no
+untracked files). `recon.md` marks every other run **NON-OFFICIAL**.
 
 ## Methodology notes
-- **Everything is warm.** Each head read follows the prepare/accept that just folded the
-  same chain, and PostgreSQL and OS caches are hot. A cold-cache arm is a listed next
-  measurement.
+- **Everything is warm in the `run` profiles.** Each head read follows the prepare/accept
+  that just folded the same chain, and PostgreSQL and OS caches are hot. The `recon` profile
+  adds the `db-restart-first-ledger-op` condition.
 - **The synthetic profiles do not isolate depth from state size.** Every history starts
   from a 6,100-quad (`ci`) or 12,200-quad (`local`) genesis, and `growth` and `churn`
   differ by only a few percent in state size. The depth-isolating control remains the Plan
