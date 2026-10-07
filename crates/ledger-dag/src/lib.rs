@@ -22,8 +22,10 @@
 //! Retrieval is windowed (Plan 0012): a walk asks the provider for a bounded
 //! [`ParentProvider::ancestry_window`] around the commit it needs and keeps the other
 //! entries of the reply for later, so a provider backed by a database answers a deep linear
-//! history in [`window_calls`]`(n, window)` round trips (four ramp calls, then
-//! `ceil((n − 85) / window)` for n > 85) instead of `n`. The window is a retrieval hint
+//! history in [`window_calls`]`(n, window)` round trips (with the production window of 256:
+//! four ramp calls, then `ceil((n − 85) / window)` for n > 85; the ramp is clamped to the
+//! window, so smaller windows reach the full window sooner) instead of `n`. The window is a
+//! retrieval hint
 //! only: visit limits count commits the walk enters, every answer is still derived from the
 //! parents the provider returned for exactly that commit, and a provider that cannot batch
 //! keeps the default window of one commit.

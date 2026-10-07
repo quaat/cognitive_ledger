@@ -13,15 +13,19 @@ changes.
   canonical envelope whose SHA-256 is its id; `get_commit` decodes bytes and verifies the
   digest and never trusts the index for content. The first-parent chain that reconstruction
   folds is the chain the envelopes name.
-- **`commit_index` and `commit_parents` are derived acceleration structures.** Only
-  `PostgresImmutableStore::put_commit` writes them, in the same transaction as the bytes,
-  from values derived by decoding those bytes; the rows are write-once (migration 0005
-  triggers forbid `UPDATE`/`DELETE`). ADR-0012 calls the index *verified*: it can be
-  re-derived from the bytes at any time, and `verify_commit_index` is that re-derivation.
-  The same rows already carry authority for other public answers: the ref-advance predicate
-  `new_head.parents[0] == expected_head` is a join on `commit_parents` position 0 (ADR-0012,
-  migration 0006), and every DAG walk (branch history, historical branch points, merge base,
-  merge classification) reads parents from `commit_parents` through `GraphParents`.
+- **`commit_index` and `commit_parents` are derived acceleration structures.** One code
+  path writes them, `PostgresImmutableStore::publish_commit_in` (reached from `put_commit`,
+  from `prepare` and from merge apply), in the same transaction as the object bytes, from
+  the commit being published and checked against its canonical bytes before the transaction
+  commits (`check_parent_rows`); the rows are write-once (migration 0005 triggers forbid
+  `UPDATE` and `DELETE`; the runtime identity holds `INSERT`, which publication needs).
+  ADR-0012 calls the index *verified*: it can be re-derived from the bytes at any time, and
+  `verify_commit_index` is that re-derivation. The same rows already carry authority for
+  other public answers: the ref-advance rule `new_head.parents[0] == expected_head` is
+  evaluated from the position-0 row (the accept-time query in `postgres_workflow.rs` and the
+  migration 0009 ref-movement trigger), and every DAG walk (branch history, historical
+  branch points, merge base, merge classification) reads parents from `commit_parents`
+  through `GraphParents`.
 - **The scalar reconstruction of Phases 1–6B never consulted `commit_parents`.** It read one
   commit object, decoded it, followed `parents[0]` from the bytes, and repeated: two
   statements per ancestor. On a database whose index rows disagreed with the bytes it
@@ -85,19 +89,35 @@ None (genesis)       None                  end of chain
   `commit_parents` before Phase 6C and still does; the windowed prefetch adds no new trust
   (contiguity against `parent_count` is checked with the same wording) and reports damage
   only for the anchor a walk actually asks for.
-- **Sound databases are unaffected.** Rows written by `put_commit` agree with the bytes by
-  construction, so on a database that only ledger write paths have written the new rule
-  never fires. Every identity, limit, error wording for the other error classes,
+- **Scope of the comparison.** Reconstruction reads exactly one derived claim per commit,
+  the position-0 row, and that is the claim it checks. `parent_count`, position-1 rows and
+  `commit_index.patch_id` are not read by reconstruction and are therefore neither trusted
+  nor checked there (the `pg_retrieval` matrix pins that a wrong `parent_count` or a
+  position-1 row without a position-0 row still reconstructs from the bytes); the DAG layer
+  checks the rows' contiguity against `parent_count` but has no bytes to compare them with,
+  and `verify_commit_index` checks every column. Extending the fail-closed rule to claims
+  reconstruction does not read would be a further decision, not an application of this one.
+- **Sound databases are unaffected.** Rows written by `publish_commit_in` agree with the
+  bytes by construction, so on a database that only ledger code paths have written the new
+  rule never fires. Every identity, limit, error wording for the other error classes,
   transaction boundary and API representation is unchanged (Plan 0012 invariants; the
   `pg_retrieval` differential and corruption matrices pin this on PostgreSQL 17 and 15).
 
 ## Compatibility analysis
 This is an intentional behavioural change on **pre-existing corrupt databases only**: a
 database in which a `commit_parents` position-0 row names something other than the parent
-its child's bytes name. Such a row cannot be produced through any ledger write path
-(publication derives it from the bytes in the same transaction and the rows are
-write-once); it requires an owner-privileged statement with the write-once trigger disabled,
-a restore that mixed states, or storage-level corruption.
+its child's bytes name. No ledger code path writes such a row (publication checks it against
+the bytes in the same transaction, and `UPDATE`/`DELETE` are trigger-blocked). It can arise
+from: a direct `INSERT` of a position-0 row for a commit that has none — a genesis, or a
+commit whose row was never written — issued with the **runtime** database credential, which
+must hold `INSERT` on `commit_parents` to publish commits (the runtime identity's residual
+write authority is ADR-0016's accepted residual risk; the `pg_retrieval` matrix builds its
+genesis case with exactly such an `INSERT`); an owner-privileged `UPDATE` with the write-once
+trigger disabled; a restore that mixed states; or storage-level corruption. For the holder
+of the runtime credential this ADR changes the effect of such an `INSERT` from a silent
+inconsistency (DAG answers and the advance rule from the row, state from the bytes) into a
+visible refusal of that history; the same credential could already corrupt the DAG answers
+and ref advances, so no new authority is created, and the defect becomes observable.
 
 On such a database the error a reader receives can change in class and in position
 (examples pinned by the `pg_retrieval` corruption matrix, where each row is the scalar
@@ -189,7 +209,8 @@ rewritten.
   name are the available paths; in both the bytes, not the row, are the reference.
 
 **Why the absence of a pre-upgrade whole-database check is acceptable.** The change
-affects only databases that are already corrupt in a way the ledger cannot cause, the
+affects only databases that are already corrupt in a way no ledger code path causes (the
+routes above need the database credential, an owner session or storage damage), the
 effect is a refused read of exactly the misdescribed history (not a wrong answer, not a
 lost write), the refusal names the commit, and the pre-upgrade reference behaviour was
 *worse* in the one respect that matters (serving through the inconsistency). The upgrade

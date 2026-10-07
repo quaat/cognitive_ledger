@@ -95,9 +95,11 @@ amendment).
   windows of at most 256 commits per statement, with the recursion capped at 1,024 rows
   (`ledger_store::RetrievalWindows::DEFAULT`). They bound the work and memory of one
   statement and change no limit or state; a window is `O(256 envelopes)` or `≤ 8 MiB +
-  one object` of memory while it is folded. One error changed: a `commit_parents`
-  position-0 row that contradicts the commit bytes (impossible through the ledger's write
-  paths; detected by `verify_commit_index`, not by `ledger-admin verify`'s SQL checks) is
+  one object` of object bytes, held about twice over while the rows are copied out of the
+  driver (as the scalar reads were), while it is folded. One error changed: a
+  `commit_parents` position-0 row that contradicts the commit bytes (written by no ledger
+  code path; a direct `INSERT` with the database credential can create one, ADR-0016
+  residual; detected by `verify_commit_index`, not by `ledger-admin verify`'s SQL checks) is
   now `CorruptObject` for every read of that history, where earlier releases silently
   followed the bytes (ADR-0025, which also lists how the error surfaces and how to
   investigate the blamed commit). No shipped command performs this verification over a

@@ -118,8 +118,10 @@ from an outer join is a typed missing-object error for that id, never a shorter 
 - Every commit that a reachable commit names as `parents[0]` is itself indexed
   (`publish_commit_in` refuses unindexed parents, migration 0006 lets refs target only
   indexed commits, the fs→pg migration indexes everything). A first-parent chain that the
-  index cannot continue while the bytes do is therefore corruption, which `ledger-admin
-  verify` already reports (`check_parent_rows`).
+  index cannot continue while the bytes do is therefore corruption, which
+  `verify_commit_index` reports (`check_parent_rows` is the publication/re-derivation
+  check; `ledger-admin verify`'s SQL checks catch a parent-row count disagreeing with
+  `parent_count`, a foreign parent and an unindexed parent).
 - The scalar algorithm never consulted the index; it followed bytes. Where the index
   *contradicts* the bytes (a `commit_parents` position-0 row naming another parent, a
   malformed id, or a parent for a genesis) the scalar path silently followed the bytes and
@@ -281,8 +283,9 @@ RetrievalWindows::DEFAULT.bytes    = 8 MiB object bytes returned per window, cut
 RetrievalWindows::DEFAULT.ancestry = 256   commits per DAG prefetch window; SQL recursion
                                      depth bound = window - 1; recursion rows capped at
                                      4 × window (id, depth) pairs (`REACH_PAIRS_PER_COMMIT`),
-                                     so one statement is at most 1,024 index-probe steps on
-                                     any DAG shape; also capped at max_visited - visited and
+                                     so one statement is at most 1,024 recursion rows (one to
+                                     three index probes each) on any DAG shape; also capped
+                                     at max_visited - visited and
                                      at the entries a bounded history still wants
 window ramp (`ledger_dag::WINDOW_RAMP`): a walk asks for 1, then 4, 16, 64, then full
                                      windows, so a search that stops after a few commits
@@ -295,8 +298,10 @@ reconstruction depth limit:   unchanged (`ReconstructionLimits::max_depth`, chec
 deadline:                     DAG walks keep `TraversalLimits::deadline`, checked around
                                 every provider call and on every cache hit; a walk can
                                 overshoot it by at most one window statement (bounded by
-                                the pair cap above; `statement_timeout` remains the hard
-                                bound); reconstruction has no store-level deadline today
+                                the pair cap above; with the `test-hooks` window of 1 the
+                                provider call is `parents()`, two statements;
+                                `statement_timeout` remains the hard bound);
+                                reconstruction has no store-level deadline today
                                 and gains none (the HTTP request timeout and PostgreSQL
                                 `statement_timeout` bound it, as before)
 memory:                       reconstruction: O(depth) patch ids + the bounded state +

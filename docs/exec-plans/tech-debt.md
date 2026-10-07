@@ -184,8 +184,24 @@
   bytes as before. Such a row is detected by `PostgresImmutableStore::verify_commit_index` (the
   ADR-0012 re-derivation from bytes), which `ledger-admin verify` does **not** run: its SQL
   checks catch a parent-row count disagreeing with `parent_count`, a foreign parent and an
-  unindexed parent only. Add the re-derivation (or a bounded sample of it) to
-  `ledger-admin verify` so operators can diagnose the new failure mode before an upgrade.
+  unindexed parent, and its merge-row checks reconstruct through the windowed path (so a
+  contradicted row behind a merge candidate surfaces there); no check re-derives every row.
+  Add the re-derivation (or a bounded sample of it) to `ledger-admin verify` so operators
+  can diagnose the new failure mode before an upgrade.
+- Closure-review residuals (Plan 0012, 2026-10-07; all P3, none a defect): (a) the
+  ancestry recursion's pair cap (`REACH_PAIRS_PER_COMMIT`) is tested only through statement
+  counts and the hand-copied `EXPLAIN` diagnostic, not by asserting the recursion's actual
+  row count on the production statement; the bound also assumes the planner keeps the
+  index-probe plan for the recursive step (measured at 30,000 objects). (b) Which commits
+  of a merge-heavy DAG fill a window when the pair cap cuts a recursion level is
+  plan-dependent (`capped` has no `ORDER BY`); answers never change (a window is a
+  prefetch), statement counts on such DAGs are bounded, not exact. (c) `ledger-dag`'s
+  deadline checks after a window call and before serving a prefetched commit are exercised
+  only with window 1; tight `max_visited` is compared windowed-vs-unwindowed only for
+  `ancestors`. (d) A window's object bytes are held about twice over while `sqlx` rows are
+  copied into owned buffers (≈ 2 × (8 MiB + one object); the scalar reads copied the same
+  way). (e) The `ledger-admin` pools set no `statement_timeout`, so the window statements
+  `ledger-admin verify` runs are bounded by their SQL limits only (pre-existing).
 - The retrieval windows (256 objects / 8 MiB / 256 commits, recursion cap 4 rows per
   commit, ramp 1/4/16/64) are fixed public constants (`RetrievalWindows::DEFAULT`) with a
   `test-hooks` setter, not operator configuration. Revisit only with a measured reason
