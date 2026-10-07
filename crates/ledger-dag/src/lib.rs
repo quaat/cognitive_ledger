@@ -57,7 +57,10 @@ pub trait ParentProvider: Send + Sync {
     /// the provider knows are returned (an unknown `start` yields an empty window), each
     /// at most once, with exactly the parents [`Self::parents`] would return for it. The
     /// walk treats the extra entries purely as prefetched answers; it never infers
-    /// reachability from a commit's presence in a window.
+    /// reachability from a commit's presence in a window. A provider reports an error only
+    /// for `start` itself: a prefetched commit it cannot answer for (corrupt rows) is left
+    /// out, so that a walk which never needs it is unaffected and one that does fails at
+    /// the same point as an unwindowed walk, when it asks for it as an anchor.
     ///
     /// The default returns `start` alone, which makes every existing provider a window of
     /// one. Batching providers override it with a bounded, set-based fetch.
@@ -74,6 +77,25 @@ pub trait ParentProvider: Send + Sync {
             .map(|parents| vec![(start.clone(), parents)])
             .unwrap_or_default())
     }
+}
+
+/// Growth factor of the window a walk asks for: the first provider call asks for one
+/// commit, the next for four, then sixteen, and so on, until the provider's own window
+/// caps it. [`window_calls`] gives the resulting number of calls for a linear walk.
+pub const WINDOW_RAMP: usize = 4;
+
+/// The number of provider calls a walk makes to retrieve `commits` commits in a row from
+/// a provider whose window is `window` (linear history; the ramp of [`WINDOW_RAMP`] then
+/// full windows). Zero commits need no call.
+pub fn window_calls(commits: usize, window: usize) -> usize {
+    let window = window.max(1);
+    let (mut done, mut ask, mut calls) = (0usize, 1usize, 0usize);
+    while done < commits {
+        done += ask.min(window);
+        calls += 1;
+        ask = ask.saturating_mul(WINDOW_RAMP);
+    }
+    calls
 }
 
 /// Bounds on a single traversal call.
@@ -143,6 +165,11 @@ struct Walk<'a, P: ParentProvider + ?Sized> {
     /// `max_visited` entries, so memory stays bounded by the visit limit even when the
     /// provider's windows are wide.
     prefetched: HashMap<CommitId, Vec<CommitId>>,
+    /// The most commits the next window may ask for. It starts at one and quadruples
+    /// after every provider call ([`WINDOW_RAMP`]), so a search that ends after a few
+    /// commits (a branch point near the head, a short history page) costs a few small
+    /// windows, while a deep walk reaches the provider's full window after four calls.
+    ramp: usize,
     /// When set, every fetched commit's parents are recorded ([`ancestry`]).
     record: Option<HashMap<CommitId, Vec<CommitId>>>,
 }
@@ -162,6 +189,7 @@ impl<'a, P: ParentProvider + ?Sized> Walk<'a, P> {
             kind,
             colour: HashMap::new(),
             prefetched: HashMap::new(),
+            ramp: 1,
             record: None,
         }
     }
@@ -176,9 +204,14 @@ impl<'a, P: ParentProvider + ?Sized> Walk<'a, P> {
     /// Fetches the parents of a commit that has not been visited yet, charging it against
     /// the visit limit and checking the deadline around the provider call. A commit already
     /// prefetched by an earlier window is served from memory; otherwise the provider is
-    /// asked for a window anchored at the commit, bounded by the remaining visit budget,
-    /// and the window's other entries are kept for later.
-    async fn load(&mut self, id: &CommitId) -> Result<Vec<CommitId>, DagError<P::Error>> {
+    /// asked for a window anchored at the commit, bounded by the remaining visit budget
+    /// (and by `wanted`, the most commits the caller can still use), and the window's
+    /// other entries are kept for later.
+    async fn load(
+        &mut self,
+        id: &CommitId,
+        wanted: usize,
+    ) -> Result<Vec<CommitId>, DagError<P::Error>> {
         let visited = self.colour.len();
         if visited >= self.limits.max_visited {
             return Err(DagError::VisitLimit { visited });
@@ -188,7 +221,11 @@ impl<'a, P: ParentProvider + ?Sized> Walk<'a, P> {
             Some(parents) => parents,
             None => {
                 // `visited < max_visited`, so the budget is at least one.
-                let max = self.limits.max_visited - visited;
+                let max = (self.limits.max_visited - visited)
+                    .min(wanted)
+                    .min(self.ramp)
+                    .max(1);
+                self.ramp = self.ramp.saturating_mul(WINDOW_RAMP);
                 let window = self
                     .provider
                     .ancestry_window(id, max, self.kind)
@@ -231,7 +268,7 @@ impl<'a, P: ParentProvider + ?Sized> Walk<'a, P> {
             parents: Vec<CommitId>,
             next: usize,
         }
-        let parents = self.load(start).await?;
+        let parents = self.load(start, usize::MAX).await?;
         self.colour.insert(start.clone(), Colour::Grey);
         if on_enter(start) {
             return Ok(DfsOutcome::Hit);
@@ -249,7 +286,7 @@ impl<'a, P: ParentProvider + ?Sized> Walk<'a, P> {
                     Some(Colour::Grey) => return Err(DagError::Cycle(parent)),
                     Some(Colour::Black) => {}
                     None => {
-                        let parents = self.load(&parent).await?;
+                        let parents = self.load(&parent, usize::MAX).await?;
                         self.colour.insert(parent.clone(), Colour::Grey);
                         if on_enter(&parent) {
                             return Ok(DfsOutcome::Hit);
@@ -309,7 +346,9 @@ pub async fn first_parent_history<P: ParentProvider + ?Sized>(
     let mut walk = Walk::new(provider, limits, WindowKind::FirstParent);
     let mut current = head.clone();
     loop {
-        let parents = walk.load(&current).await?;
+        // A window never larger than the entries still wanted: a damaged or missing commit
+        // beyond `max` is never read, exactly as before.
+        let parents = walk.load(&current, max - history.len()).await?;
         walk.colour.insert(current.clone(), Colour::Grey);
         history.push(current);
         if history.len() >= max {

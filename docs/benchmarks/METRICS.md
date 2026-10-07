@@ -101,9 +101,11 @@ The statistics queries therefore fall outside the CPU window.
 **Statement-count gate (Plan 0012).** `PG calls` per operation is the deterministic
 measure of retrieval scaling. Before Plan 0012 a state read was `2 × depth` statements
 (+ 2 constants on the API path) and a contained merge preview `2 × depth` per side. With
-windowed retrieval a state read is `2 × ceil(depth / 256)` and an ancestry walk
-`ceil(visited / 256)` per side; a result whose calls grow with depth at about 2 per
-ancestor is a regression of the retrieval path, whatever its latency.
+windowed retrieval a state read is `2 × ceil(depth / 256)` and a linear ancestry walk
+`4 + ceil((visited − 85) / 256)` per side (ramp 1, 4, 16, 64, then 256; merge-heavy
+histories need more windows, each bounded); the `recon` histories are linear. A result
+whose calls grow with depth at about 2 per ancestor is a regression of the retrieval
+path, whatever its latency.
 
 **Correctness** is exact at every point and untimed. Each measured path's result (API
 reply, direct store reconstruction, prefetched fold, and the post-restart reads) must match

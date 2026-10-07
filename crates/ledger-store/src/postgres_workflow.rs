@@ -566,7 +566,7 @@ impl WorkflowRepository {
     #[cfg(feature = "test-hooks")]
     #[must_use]
     pub fn with_retrieval_windows(mut self, windows: RetrievalWindows) -> Self {
-        self.windows = windows;
+        self.windows = windows.checked();
         self
     }
 
@@ -1046,6 +1046,7 @@ impl WorkflowRepository {
                 limits.max_depth
             ))
         }
+        let windows = windows.checked();
         let mut chain: Vec<PatchId> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut cursor = Some(head.clone());
@@ -1060,48 +1061,49 @@ impl WorkflowRepository {
             }
             let max_rows = windows.objects.min(limits.max_depth - seen.len());
             let rows = fetch_first_parent_window(conn, &anchor, max_rows, windows).await?;
+            // The commit each row must be: the anchor, then whatever the previous row's
+            // bytes named as parent 0. The index never chooses it.
+            let mut expected = anchor;
             for row in rows {
-                if !seen.insert(row.id.clone()) {
-                    return Err(cycle(&row.id));
+                let (object, next_hint) = row.expect(&expected)?;
+                if !seen.insert(expected.clone()) {
+                    return Err(cycle(&expected));
                 }
                 if seen.len() > limits.max_depth {
                     return Err(depth_exceeded(limits));
                 }
-                let id = row.id.0.clone();
-                let bytes = row
-                    .object
+                let id = expected.0.clone();
+                let bytes = object
                     .verified()?
                     .ok_or_else(|| LedgerError::NotFound(id.clone()))?;
                 let commit = crate::decode_commit_object(&id, &bytes)?
                     .ok_or_else(|| LedgerError::NotFound(id.clone()))?;
                 // Parent zero is the state reconstruction parent in every envelope version.
                 // The index only said which row to fetch next; the bytes decide. A hint the
-                // bytes contradict (another parent, or a parent for a genesis) is corruption
-                // and is never followed. A silent index (no position-0 row) is not a claim:
-                // the bytes' parent anchors the next window, exactly as the scalar walk
-                // followed it, and `ledger-admin verify` reports the missing row.
+                // bytes contradict (another id, a malformed id, or a parent for a genesis)
+                // is corruption and is never followed. A silent index (no position-0 row)
+                // is not a claim: the bytes' parent anchors the next window, exactly as the
+                // scalar walk followed it (`verify_commit_index`, the ADR-0012 re-derivation,
+                // reports the missing row).
                 let parent = commit.parents().first().cloned();
-                match (&parent, &row.next_hint) {
-                    (Some(decoded), Some(hinted)) if decoded != hinted => {
-                        return Err(LedgerError::CorruptObject {
-                            id,
-                            reason: "commit_parents position 0 disagrees with the commit bytes"
-                                .into(),
-                        });
-                    }
-                    (None, Some(_)) => {
-                        return Err(LedgerError::CorruptObject {
-                            id,
-                            reason: "commit_parents position 0 disagrees with the commit bytes"
-                                .into(),
-                        });
-                    }
-                    _ => {}
+                let contradicted = match (&parent, &next_hint) {
+                    (Some(decoded), Some(hinted)) => decoded.to_string() != *hinted,
+                    (None, Some(_)) => true,
+                    _ => false,
+                };
+                if contradicted {
+                    return Err(LedgerError::CorruptObject {
+                        id,
+                        reason: "commit_parents position 0 disagrees with the commit bytes".into(),
+                    });
                 }
                 // Only the patch id is retained: memory is proportional to depth, not to
                 // the envelopes' metadata.
                 chain.push(commit.patch().clone());
-                cursor = parent;
+                cursor = parent.clone();
+                if let Some(parent) = parent {
+                    expected = parent;
+                }
             }
         }
         let mut state = BTreeSet::new();

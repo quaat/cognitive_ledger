@@ -180,12 +180,24 @@
   `PostgresImmutableStore` it would still cost two statements per ancestor.
 - The index/bytes rule of windowed reconstruction: a `commit_parents` position-0 row that
   contradicts the decoded commit is `CorruptObject`, where the scalar walk silently followed
-  the bytes (Plan 0012 Decision 1). Such a database is already reported corrupt by
-  `ledger-admin verify`; a silent index (no row) is followed from the bytes as before.
-- The retrieval windows (256 objects / 8 MiB / 256 commits) are crate-internal constants
-  with a `test-hooks` setter, not operator configuration. Revisit only with a measured
-  reason (Plan 0012 M4 records the per-window cost); a configuration surface would need the
+  the bytes (Plan 0012 Decision 1); a silent index (no row) is followed from the bytes as
+  before. Such a row is detected by `PostgresImmutableStore::verify_commit_index` (the
+  ADR-0012 re-derivation from bytes), which `ledger-admin verify` does **not** run: its SQL
+  checks catch a parent-row count disagreeing with `parent_count`, a foreign parent and an
+  unindexed parent only. Add the re-derivation (or a bounded sample of it) to
+  `ledger-admin verify` so operators can diagnose the new failure mode before an upgrade.
+- The retrieval windows (256 objects / 8 MiB / 256 commits, recursion cap 4 rows per
+  commit, ramp 1/4/16/64) are fixed public constants (`RetrievalWindows::DEFAULT`) with a
+  `test-hooks` setter, not operator configuration. Revisit only with a measured reason
+  (Plan 0012 M4 records the per-window cost); a configuration surface would need the
   limits-pairing discussion of the production-qualification matrix.
+- Ancestry windows on merge-heavy DAGs hold fewer distinct commits than on linear history
+  (the recursion stops at the pair cap), so the statement count lies between the linear
+  formula and one per commit; each statement stays bounded. A walk can overshoot its
+  `TraversalLimits::deadline` by one such statement. Validation, projection and
+  `ledger-admin verify` reconstruct through `state_at_on` with the default windows (not
+  the `test-hooks` setter), so their window-boundary coverage comes from the shared
+  implementation, not from their own suites.
 - The statement-count tests (`pg_retrieval`) count sqlx's `sqlx::query` tracing events on
   the test thread. They pin the formula `2 × ceil(depth / window)` exactly and will need
   adjusting if sqlx changes its per-statement logging, or if a path gains a constant

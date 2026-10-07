@@ -46,11 +46,15 @@ The Plan 0011 characterization measured two PostgreSQL statements per reconstruc
 ancestor and two per visited commit per ancestry side, with the per-statement round trip
 dominating latency. Plan 0012 made retrieval windowed: `state_at_on` issues
 `2 × ceil(depth / 256)` statements (one chain window joined to the commit bytes, one patch
-window), and `GraphParents` answers an ancestry walk in `ceil(visited / 256)` statements
-per side. The benchmark harness did not change: the `recon` profile's `pg.calls` column is
-the deterministic gate for this scaling (statement count per operation), and the
-correctness oracle is unchanged. The fold, the limits and the production decoders are
-the same code; `fold_cpu` remains a lower bound of the non-I/O work.
+window), and `GraphParents` answers a linear ancestry walk in
+`4 + ceil((visited − 85) / 256)` statements per side (the walk ramps 1, 4, 16, 64, then
+256; on merge-heavy DAGs a window holds fewer distinct commits and the count lies between
+that and one per commit). These formulas are pinned by the `pg_retrieval` statement-count
+tests; the official `recon` profile confirms them on the production stack (Plan 0012 M4).
+The benchmark harness did not change: the `recon` profile's `pg.calls` column is the
+deterministic gate for this scaling (statement count per operation), and the correctness
+oracle is unchanged. The fold, the limits and the production decoders are the same code;
+`fold_cpu` remains a lower bound of the non-I/O work.
 
 ## 2. Subsystem boundary
 

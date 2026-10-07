@@ -40,7 +40,8 @@ impl RetrievalWindows {
         ancestry: 256,
     };
 
-    fn checked(self) -> Self {
+    /// Every window at least one object, byte and commit (a zero would never advance).
+    pub(crate) fn checked(self) -> Self {
         Self {
             objects: self.objects.max(1),
             bytes: self.bytes.max(1),
@@ -66,6 +67,12 @@ pub(crate) struct FetchedObject {
 }
 
 impl FetchedObject {
+    /// Wrap bytes the database returned for `id` (the id the caller asked for, never one
+    /// echoed by the database).
+    pub(crate) fn unverified(id: ContentId, bytes: Option<Vec<u8>>) -> Self {
+        Self { id, bytes }
+    }
+
     /// `Ok(None)`: no such object. `Err(CorruptObject)`: the stored bytes do not hash to
     /// the id (the wording of every scalar object read in this crate). `Ok(Some)`: verified.
     pub(crate) fn verified(self) -> Result<Option<Vec<u8>>, LedgerError> {
@@ -142,7 +149,11 @@ pub(crate) async fn fetch_objects_window(
     }
     let mut out = Vec::with_capacity(served.len());
     for (position, (ord, id, bytes)) in served.into_iter().enumerate() {
-        let expected = &requested[position];
+        let Some(expected) = requested.get(position) else {
+            return Err(LedgerError::Storage(
+                "retrieval window reply has more rows than the request".into(),
+            ));
+        };
         if usize::try_from(ord).ok() != Some(position + 1) || &id != expected {
             return Err(LedgerError::Storage(
                 "retrieval window reply is not a prefix of the request".into(),
@@ -159,12 +170,36 @@ pub(crate) async fn fetch_objects_window(
 /// `(depth, id, next_hint, bytes)` as the chain-window statement returns it.
 type RawChainRow = (i64, String, Option<String>, Option<Vec<u8>>);
 
-/// One row of a first-parent chain window: the commit the index placed at this depth, the
-/// id the index names as its first parent (`None`: no position-0 row), and its object.
+/// One row of a first-parent chain window, as the index placed it: the id the index names
+/// at this depth, the id it names as the first parent (`None`: no position-0 row), and the
+/// object bytes. Index strings are not parsed here: the caller consumes rows in chain
+/// order through [`ChainRow::expect`], which checks that the row is the commit the bytes
+/// of the previous row named (or the anchor), so a malformed or foreign index string is
+/// reported at the row whose bytes it contradicts, with the precedence of the scalar walk.
 pub(crate) struct ChainRow {
-    pub(crate) id: CommitId,
-    pub(crate) next_hint: Option<CommitId>,
-    pub(crate) object: FetchedObject,
+    id: String,
+    next_hint: Option<String>,
+    bytes: Option<Vec<u8>>,
+}
+
+impl ChainRow {
+    /// Consume the row as `expected` (the anchor, or the previous row's decoded
+    /// `parents[0]`): the object under the trusted id, and the index's hint for the next
+    /// row as the raw string it holds.
+    pub(crate) fn expect(
+        self,
+        expected: &CommitId,
+    ) -> Result<(FetchedObject, Option<String>), LedgerError> {
+        if self.id != expected.to_string() {
+            return Err(LedgerError::Storage(
+                "chain window reply does not follow the chain it was asked for".into(),
+            ));
+        }
+        Ok((
+            FetchedObject::unverified(expected.0.clone(), self.bytes),
+            self.next_hint,
+        ))
+    }
 }
 
 /// A window of the first-parent chain from `anchor`, discovered through `commit_parents`
@@ -172,9 +207,9 @@ pub(crate) struct ChainRow {
 /// joined to the objects in one statement (Plan 0012 M2). Rows come in chain order,
 /// `anchor` first, at most `max_rows`, cut by `windows.bytes` like
 /// [`fetch_objects_window`]. The recursion discovers one id beyond the served rows so
-/// every served row carries an exact `next_hint`. Objects are unverified
-/// [`FetchedObject`]s: the caller verifies them in chain order and must confirm from the
-/// decoded bytes that `parents[0]` equals `next_hint` before following it.
+/// every served row carries an exact `next_hint`. The caller consumes the rows in chain
+/// order ([`ChainRow::expect`]), verifies each object, and must confirm from the decoded
+/// bytes that `parents[0]` equals `next_hint` before following it.
 pub(crate) async fn fetch_first_parent_window(
     conn: &mut PgConnection,
     anchor: &CommitId,
@@ -228,20 +263,15 @@ pub(crate) async fn fetch_first_parent_window(
                 "chain window reply is not a contiguous prefix".into(),
             ));
         }
-        let id: CommitId = id.parse()?;
-        if position == 0 && &id != anchor {
+        if position == 0 && id != anchor.to_string() {
             return Err(LedgerError::Storage(
                 "chain window reply does not start at its anchor".into(),
             ));
         }
-        let object = FetchedObject {
-            id: id.0.clone(),
-            bytes,
-        };
         out.push(ChainRow {
             id,
-            next_hint: next_hint.map(|h| h.parse()).transpose()?,
-            object,
+            next_hint,
+            bytes,
         });
     }
     if out.is_empty() {

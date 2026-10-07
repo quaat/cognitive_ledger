@@ -8,23 +8,34 @@ which is `main` at `646b029` plus the reviewed Phase-6B changes. Continues
 **Base reconciliation (recorded, not yet resolved).** The task required starting from the
 `main` that results from merging PR #13. At the start of this plan PR #13 was still open
 (CI green, mergeable, two Codex P2 comments outstanding; previous PRs were all merged by the
-repository owner, never by the agent). The two comments were fixed on the PR branch
-(`d05113d`), and this branch was created on top of that head so that the Phase-6B
-benchmark tooling (`ledger-bench recon`, `scripts/benchmark-recon.sh`) and documents this
-plan builds on are present. PR #13 touches no production crate (`git diff --name-only
-646b029..d05113d -- crates apps/ledger-server apps/ledger-projector migrations` lists only
-three test files), so the production code this plan changes is byte-identical on `main`
-and on the Phase-6B head. **Before this plan's PR is merged, this branch must be rebased
-onto (or merged with) the post-#13 `main`, and the result re-checked**; if `main` then
-differs from `d05113d` in anything but the merge commit, the difference is recorded here.
-Until then the PR for this plan is opened against `claude/p6b-bear-reconstruction`.
+repository owner, never by the agent). The two comments were fixed on the PR branch, whose
+head is now `d05113d`, and this branch was created on top of that head so that the
+Phase-6B benchmark tooling (`ledger-bench recon`, `scripts/benchmark-recon.sh`) and the
+documents this plan builds on are present. PR #13 touches no production crate
+(`git diff --name-only 646b029..d05113d -- crates apps/ledger-server apps/ledger-projector
+migrations` lists only three test files), so the production code this plan changes is
+byte-identical on `main` and on the Phase-6B head. The M4 "before" measurement is taken at
+`d05113d` (identical production code to `main`). **Before this plan's PR is merged:**
+(1) PR #13 is merged by the owner; (2) this branch is rebased onto the resulting `main`
+and the PR retargeted from `claude/p6b-bear-reconstruction` to `main`; (3) if `main` then
+differs from `d05113d` in anything but the merge commit, the difference is recorded here;
+(4) `check-fast`, the PostgreSQL suites and hosted CI are re-run on the rebased head.
+Until then the PR is opened against `claude/p6b-bear-reconstruction`.
+
+**Migration impact:** none (no schema, index or migration change; `git diff d05113d --
+migrations` is empty). **Affected crates:** `ledger-dag`, `ledger-store` (plus their tests,
+`scripts/test-integration.sh`, documentation). `ledger-api`, `ledger-core`, `ledger-rdf`,
+protocol and golden files are untouched.
 
 ## Goal
 Remove the dominant cost that Phase 6B measured, **≈ 2 PostgreSQL statements per
 reconstructed ancestor and ≈ 2 per visited commit per ancestry side**, by retrieving
 commits, patches and parent edges in **bounded windows** instead of one row at a time,
 while leaving every ledger semantic, identity, limit, error and transaction boundary
-exactly as it is. The deterministic gate is the statement count; latency is observed.
+exactly as it is on a sound store (the one intended exception, Decision 1: a
+`commit_parents` position-0 row that contradicts the commit bytes is now `CorruptObject`
+where the scalar walk silently followed the bytes). The deterministic gate is the
+statement count; latency is observed.
 
 ## Evidence driving the work (Plan 0011, two official runs)
 - `state_at_on` issues 2 statements per ancestor (commit object, patch object): statements
@@ -109,13 +120,17 @@ outer join is a typed missing-object error for that id, never a shorter history.
   index cannot continue while the bytes do is therefore corruption, which `ledger-admin
   verify` already reports (`check_parent_rows`).
 - The scalar algorithm never consulted the index; it followed bytes. Where the index
-  *contradicts* the bytes (a `commit_parents` position-0 row naming another parent, or a
-  parent for a genesis) the scalar path silently followed the bytes and the windowed path
-  fails with `CorruptObject`. This is the one intended, documented behaviour difference,
-  and it only applies to databases that `ledger-admin verify` already classifies as
-  corrupt. A *missing* row is not a contradiction: the windowed path follows the bytes
-  there too, so a missing commit behind a silent index is still `NotFound`, as before.
-  **Decision 1** below.
+  *contradicts* the bytes (a `commit_parents` position-0 row naming another parent, a
+  malformed id, or a parent for a genesis) the scalar path silently followed the bytes and
+  the windowed path fails with `CorruptObject`. This is the one intended, documented
+  behaviour difference. Such rows cannot be written through any ledger path (publication
+  verifies them against the decoded bytes before commit, and the rows are write-once);
+  `PostgresImmutableStore::verify_commit_index` (the ADR-0012 re-derivation, reachable from
+  the fs→pg migration and tests) reports them, while `ledger-admin verify`'s SQL checks
+  catch only a row count disagreeing with `parent_count`, a foreign parent or an unindexed
+  parent (tech-debt). A *missing* row is not a contradiction: the windowed path follows
+  the bytes there too, so a missing commit behind a silent index is still `NotFound`, as
+  before. **Decision 1** below.
 
 ## M0 — the scalar algorithms as implemented at `d05113d`
 
@@ -196,6 +211,7 @@ equal / source-contained / fast-forward / divergent from the two recorded ancest
 | branch log (`first_parent_history`) | 2 per entry | branch read |
 | historical branch point (`is_ancestor`) | 2 per visited commit until the hit | source ref read, index existence |
 | `ledger-admin verify` merge rows | as preview + a fourth reconstruction | per row reads |
+| fs→pg migration (admin-only, unchanged) | `Ledger::state_at` over the trait: 2 per ancestor; `get_content` once per object | per object |
 
 ### Indexes available (migrations 0002/0003; no change in this plan)
 - `immutable_objects(id)` primary key (`id = $1` and `id = ANY($1)` are index lookups);
@@ -234,48 +250,73 @@ re-checked in M4 on the benchmark database (≈ 30,000 objects).
 
 ### Windows and bounds
 ```text
-RECONSTRUCTION_WINDOW_OBJECTS = 256   commits per chain window, patches per patch window
-RETRIEVAL_WINDOW_BYTES        = 8 MiB object bytes returned per window, cut in SQL (the
-                                first object of a window is always served, so a window
-                                holds at most 8 MiB + one object; one object is at most
-                                the ingest body limit, 2 MiB by default)
-ANCESTRY_WINDOW_COMMITS       = 256   commits per DAG prefetch window; SQL recursion depth
-                                bound = window - 1; also capped at max_visited - visited
+RetrievalWindows::DEFAULT.objects  = 256   commits per chain window, patches per patch window
+RetrievalWindows::DEFAULT.bytes    = 8 MiB object bytes returned per window, cut in SQL (the
+                                     first object of a window is always served, so a window
+                                     holds at most 8 MiB + one object; "one object" is the
+                                     largest stored object, which the scalar path read whole
+                                     too: an API patch is at most the 2 MiB body limit, a
+                                     merge patch at most the 256 MiB state limit, an fs→pg
+                                     import is unbounded by the ledger)
+RetrievalWindows::DEFAULT.ancestry = 256   commits per DAG prefetch window; SQL recursion
+                                     depth bound = window - 1; recursion rows capped at
+                                     4 × window (id, depth) pairs (`REACH_PAIRS_PER_COMMIT`),
+                                     so one statement is at most 1,024 index-probe steps on
+                                     any DAG shape; also capped at max_visited - visited and
+                                     at the entries a bounded history still wants
+window ramp (`ledger_dag::WINDOW_RAMP`): a walk asks for 1, then 4, 16, 64, then full
+                                     windows, so a search that stops after a few commits
+                                     (a branch point near the head) costs a few small
+                                     statements instead of one full window
 maximum total traversal visits: unchanged (`TraversalLimits::max_visited`, counted as
                                 distinct commits entered by the walk, not as rows fetched)
 reconstruction depth limit:   unchanged (`ReconstructionLimits::max_depth`, checked before
                                 the (max_depth + 1)-th commit is used, as today)
 deadline:                     DAG walks keep `TraversalLimits::deadline`, checked around
-                                every provider call and on every cache hit; reconstruction
-                                has no store-level deadline today and gains none (the
-                                HTTP request timeout and PostgreSQL `statement_timeout`
-                                bound it, as before)
+                                every provider call and on every cache hit; a walk can
+                                overshoot it by at most one window statement (bounded by
+                                the pair cap above; `statement_timeout` remains the hard
+                                bound); reconstruction has no store-level deadline today
+                                and gains none (the HTTP request timeout and PostgreSQL
+                                `statement_timeout` bound it, as before)
 memory:                       reconstruction: O(depth) patch ids + the bounded state +
                                 one window (≤ 256 envelopes, ≤ 8 MiB + 1 object of
                                 patches); DAG walk: the colour map (≤ max_visited) + a
-                                parent cache of at most max_visited + window entries
+                                parent cache capped at max_visited entries
 ```
 Why 256: Plan 0011 puts one round trip at ≈ 100 µs on the measured topology and the fold
 at ≥ 10 µs per level; at K = 256 the amortized round trip is < 1 µs per level, under 10 %
-of the fold, and a window's recursive query is 256 primary-key probes (sub-millisecond,
-see the plans). Larger windows buy nothing measurable and cost memory. The constants are
-crate-internal; tests exercise windows of 1, 2, 3 and larger through a
-`test-hooks`-gated setter so the exact-window, one-over-window and short-history cases
-are cheap. They are not operator configuration: Phase 6C does not add a limit.
+of the fold, and a chain window of 256 executes in 2.0 ms (≈ 8 µs per ancestor, M0
+table). Larger windows buy nothing measurable and cost memory. The values are fixed
+public constants (`ledger_store::RetrievalWindows::DEFAULT`), changeable only through a
+`test-hooks`-gated setter so tests exercise windows of 1, 2, 3 and larger (exact-window,
+one-over-window and short-history cases). They are not operator configuration: Phase 6C
+does not add a limit.
 
 ### Expected statement complexity (written before implementation)
 ```text
 reconstruction, depth d:        2 × ceil(d / 256)          (was 2 × d)
-                                + ceil(patch_bytes / 8 MiB) extra patch windows when the
-                                  byte cut fires before 256 patches (the count bound still
-                                  holds: never more than 2 × d)
-ancestry walk, N visited:       ceil(N / 256) per side      (was 2 × N per side)
-contained preview, depth d:     2 × ceil(d / 256) + 3 constants (was 4 × d + 3)
-divergent preview, depth d:     2 × ceil(d / 256) + 3 × 2 × ceil(d / 256) + 3  (was 10 × d + 3)
-first-parent history, n:        ceil(n / 256)               (was 2 × n)
+                                + extra windows when the 8 MiB byte cut fires before 256
+                                  objects (the count bound still holds: never more than
+                                  2 × d)
+ancestry walk, N commits in a   window_calls(N, 256) = 4 + ceil((N − 85) / 256) per side
+  row (linear history):         for N > 85 (the ramp 1, 4, 16, 64, then full windows)
+                                (was 2 × N per side)
+ancestry walk, merge-heavy DAG: between window_calls(N, 256) and N statements per side
+                                (a window holds fewer distinct commits when the recursion
+                                reaches commits at several depths and stops at the pair
+                                cap); each statement bounded as above
+contained preview, depth d:     2 × window_calls(d, 256) + 3 constants, linear (was 4 × d + 3)
+divergent preview, depth d:     2 × window_calls(d, 256) + 3 × 2 × ceil(d / 256) + 3
+                                (was 10 × d + 3)
+first-parent history, n:        window_calls(n, 256), never a window beyond the n wanted
+                                (was 2 × n)
 ```
 The gate: at depth 5,000 the reconstruction issues 40 statements, not 10,000; the contained
-merge walk 40, not 20,000.
+merge walk 2 × 24 = 48, not 20,000. The linear formulas are pinned exactly by the
+`pg_retrieval` statement-count tests (depth 1,000 and 10,000 reconstructions, histories
+of 1–1,000 entries, previews at depth 300); the merge-heavy bound by the Fibonacci-DAG
+test; the official `recon` profile (M4) confirms them on the production stack.
 
 ### M1 — `fetch_objects_window(conn, ids, max_bytes)`
 One statement, bound array parameter, request order preserved through `unnest … WITH
@@ -290,15 +331,16 @@ from the first unserved id. Count is capped by the caller (≤ 256 ids) and asse
 ### M2 — windowed `state_at_on`
 Phase A (chain): while `cursor = Some(c)`: if `seen.len() >= max_depth` the next commit
 would exceed the limit → the scalar `ResourceLimit` wording without a fetch. Otherwise one
-statement anchored at `c`: a recursive CTE over `commit_parents` position 0 of at most
-`min(256, max_depth + 1 - seen.len()) + 1` ids (one more than served, so every served row
-has an exact `next_hint`: the hinted parent id, or `NULL` when the index has no position-0
-row), `LEFT JOIN immutable_objects` for the served rows, the byte cut, rows ordered by
-depth. Locally, in depth order: cycle check and depth check exactly as the scalar loop,
-`None` bytes → `NotFound(id)`, hash check, `decode_commit_object`, then `decoded
-parents[0] == next_hint` (both absent or equal) else `CorruptObject{id, "commit_parents
-position 0 disagrees with the commit bytes"}`; push the patch id; the window's last decoded
-`parents[0]` (from bytes) becomes the next anchor. Phase B (patches): the chain reversed,
+statement anchored at `c`: a recursive CTE over `commit_parents` position 0 that serves
+`min(256, max_depth − seen.len())` rows and discovers one id more, so every served row
+has an exact `next_hint` (the hinted parent id as the raw index string, or `NULL` when the
+index has no position-0 row), `LEFT JOIN immutable_objects` for the served rows, the byte
+cut, rows ordered by depth. Locally, in depth order, each row is consumed as the commit it
+must be (the anchor, then the previous row's decoded `parents[0]`; the index never chooses
+it, and index strings are never parsed before the bytes that name them are decoded):
+cycle check and depth check exactly as the scalar loop, `None` bytes → `NotFound(id)`,
+hash check against the trusted id, `decode_commit_object`, then the hint rule below; push
+the patch id; the window's last decoded `parents[0]` (from bytes) becomes the next anchor. Phase B (patches): the chain reversed,
 in windows of ≤ 256 ids through `fetch_objects_window`; for every id in order: `None` →
 `NotFound`, then `validate_patch_bytes`, then `apply_bounded`. Precedence, wording,
 `Reconstructed{state, bytes, depth}` and the connection are unchanged.
@@ -310,20 +352,27 @@ like the scalar walk, and the next window is anchored there; `(None, None)` is g
 
 ### M3 — `ParentProvider::ancestry_window`
 ```rust
-async fn ancestry_window(&self, start: &CommitId, max: usize)
+async fn ancestry_window(&self, start: &CommitId, max: usize, kind: WindowKind)
     -> Result<Vec<(CommitId, Vec<CommitId>)>, Self::Error>  // default: parents(start) only
 ```
-`Walk` keeps a `known` map filled from windows; `load(id)` serves from it, otherwise asks
-for a window anchored at `id` with `max = min(window, max_visited - visited)` (never 0),
-and reports `UnknownCommit(id)` when the anchor is not in the reply. The visit limit counts
+`Walk` keeps a `prefetched` map filled from windows; `load(id)` serves from it, otherwise
+asks for a window anchored at `id` with `max = min(window, max_visited - visited, entries
+the caller still wants)` (never 0), and reports `UnknownCommit(id)` when the anchor is not
+in the reply. A provider reports damage only for the anchor; a damaged prefetched commit
+is left out of the window and, if the walk needs it, fails when it is asked for as an
+anchor — so a bounded history or an early-exit reachability check that never reaches the
+damage answers exactly as the unwindowed walk did (review finding, M3). The visit limit counts
 commits entered; the deadline is checked before/after each window call and on each cache
-hit. `first_parent_history` asks for first-parent windows. `GraphParents` implements the
-hook with a bounded recursive CTE (`UNION`, depth ≤ max − 1, parents joined through
-`commit_index` of the same graph so a foreign graph is never walked, `DISTINCT ON (id)`
-then `ORDER BY depth, id LIMIT max`), returning for each commit its `parent_count` and
-`commit_parents` rows; contiguity is checked locally with today's wording. The
-`parents` method stays as it is (window = 1 reproduces today's behaviour exactly; the
-differential tests use it as the reference).
+hit. `first_parent_history` asks for first-parent windows capped at the entries still wanted.
+`GraphParents` implements the hook with a bounded recursive CTE (`UNION`, depth ≤ max − 1,
+parents joined through `commit_index` of the same graph so a foreign graph is never
+walked, the recursion's output capped at 4 × max `(id, depth)` pairs so a merge-heavy DAG
+bounds the statement's work instead of multiplying it, `DISTINCT ON (id)` then `ORDER BY
+depth, id LIMIT max`), returning for each commit its `parent_count` and `commit_parents`
+rows; contiguity is checked locally with today's wording, and only the anchor's own
+damage is reported (a damaged prefetched commit is left out and fails when asked for as
+an anchor). The `parents` method stays as it is (window = 1 reproduces today's behaviour
+exactly; the differential tests use it as the reference).
 
 ## Work
 - [x] M0: plan, algorithms, census, bounds, complexity (this document); query plans
@@ -344,10 +393,17 @@ differential tests use it as the reference).
 ## Decisions
 1. **Index/bytes disagreement is corruption in the windowed path** (see Assumptions). The
    scalar path followed bytes and ignored the index. ADR-0012 defines the index as a
-   derived view that must agree with the bytes, `ledger-admin verify` reports a
+   derived view that must agree with the bytes, `verify_commit_index` reports a
    disagreement as corruption, and the task requires that a hint contradicted by the bytes
-   is never followed silently. Reconstruction therefore fails closed on such a database.
-   Recorded as the only intended behaviour difference; covered by tests on both sides.
+   is never followed silently. Reconstruction therefore fails closed on such a database,
+   and it does so at the contradicted commit, in chain order: on such a database the
+   error can precede a `NotFound`, `InvalidPatch`, patch-level `ResourceLimit` or even the
+   depth limit that the scalar walk would have reported later (HTTP 500 where it was 404
+   or 413). Every state read, prepare, validation, projection and merge-row verification of
+   that head is affected. Operators upgrading a database that was never verified by
+   `verify_commit_index` should run it first (tech-debt: make it part of `ledger-admin
+   verify`). Recorded as the only intended behaviour difference; covered by tests on both
+   sides, including the precedence cases.
 2. **Two statements per reconstruction window**, not three: the chain hint and the commit
    bytes are one query (the recursive CTE joined to `immutable_objects`), the patches
    another. A separate "hint then objects" pair would be simpler to reuse but costs 50 %
@@ -355,8 +411,21 @@ differential tests use it as the reference).
 3. **The prefetch hook is a method with a default on `ParentProvider`**, not a second
    trait: every existing provider (including other crates' test providers) keeps compiling
    and behaving as before, and the DAG algorithms stay generic over the one boundary.
-4. **Window constants are crate-internal**, exercised through a `test-hooks` setter. No new
-   operator limit, no `ReconstructionLimits` field.
+4. **Window constants are fixed public values** (`RetrievalWindows::DEFAULT`), changeable
+   only through a `test-hooks` setter. No new operator limit, no `ReconstructionLimits`
+   field.
+5. **The walk ramps its window** (1, 4, 16, 64, then the provider's window) instead of
+   asking for a full window on the first miss, so a branch point near the head or a short
+   history page costs about what it did, while deep walks reach full windows after four
+   statements. Review finding (shallow regression of `is_ancestor`).
+6. **The ancestry recursion is capped at 4 (id, depth) pairs per requested commit.** On a
+   merge-heavy DAG the recursion reaches one commit at many depths; without the cap a
+   single statement's work was bounded only by the depth bound (review finding, four
+   reviewers). With it a statement is at most 1,024 steps on any shape, and a window may
+   hold fewer distinct commits (more statements, each bounded).
+7. **Only the anchor's damage is reported by a window.** A damaged prefetched commit is
+   left out, so bounded histories and early-exit reachability checks that never reach it
+   answer as the unwindowed walk did (review finding).
 
 ## Discoveries
 - A recursive CTE's anchor `SELECT 0` is `INT4`; sqlx refuses to decode it as `i64`
@@ -380,10 +449,13 @@ differential tests use it as the reference).
 - Error precedence drift between the scalar and windowed paths: mitigated by the
   differential tests on corrupted databases and by verifying windows in chain order,
   stopping at the first error.
-- Recursive-CTE row growth on merge-heavy DAGs (`(id, depth)` pairs): bounded by the
-  depth bound and `LIMIT`; measured on the merge-heavy synthetic history in M0/M4.
+- Recursive-CTE row growth on merge-heavy DAGs (`(id, depth)` pairs): bounded by the pair
+  cap (Decision 6); the M0 diagnostic prints the plan on a 3,000-commit Fibonacci DAG and
+  the `pg_retrieval` Fibonacci test pins the statement bound; the official `recon`
+  profile is linear and does not cover this shape (reported as such in M4).
 - Shallow-history regression (a recursive query costs more than one primary-key read):
-  measured and reported at depth 1 and 10, not hidden.
+  the ramp (Decision 5) removes it for walks; depth-1 and depth-10 reconstruction is
+  reported from the M4 before/after runs, not hidden.
 
 ## Gates
 `check-fast` (fmt, clippy, tests, architecture, doc links, doc consistency, goldens);
@@ -394,11 +466,20 @@ result; official `recon` from a clean worktree at the final revision, plus the s
 base revision on the same host.
 
 ## Evidence
+Revisions: `e9a8681` is the first implementation checkpoint; the review-driven fixes
+(anchor-only window errors, first-parent window cap, lazy chain-row checks, recursion
+pair cap, window ramp, zero-window guards) and the reworked tests are the next commit
+(recorded below as "review fixes"); hashes are updated as the branch advances.
+
 | Gate | Revision | Result |
 |---|---|---|
-| `ledger-dag` unit tests (28, incl. the window property test over 60 seeded DAGs × 5 window sizes, deep-linear window-call counts, limits/cycles/unknowns across windows, evasive-provider test) | working tree, 2026-10-07 | 28 passed |
-| `pg_retrieval` (PostgreSQL 17.2): scalar-vs-windowed equivalence at depths 1–20 with 10 window configurations, merge commit, limits exact/+1, quads/bytes limits, absent head, patch-as-head; v1 imported + v2 history; ≈ 200 KiB patches under 100 KiB / 1-byte budgets; corruption matrix (13 cases × 10 windows); DAG equivalence (12 branch pairs × 4 strategies × 8 windows, first-parent histories, tight limits, 42 historical branch points); DAG corruption matrix (6 cases × 8 windows); one-connection prepare/preview; statement counts (`2 × ceil(1000 / w)` for w ∈ {256, 100, 1, byte-cut, 10,000}; history `ceil(1000 / w)`; contained and divergent previews at depth 300) | working tree, 2026-10-07 | 9 passed |
-| Existing PostgreSQL store suites with the windowed code (`pg_immutable_store` 9, `pg_workflow` 14, `pg_branches` 18, `pg_merge` 27, `pg_verify` 4, `pg_validation` 9, `pg_projection` 7, `pg_cas_race` 1, `pg_fs_migration` 8, `pg_graphs_migration` 8, `pg_least_privilege` 19 with `--test-threads=1`) and API suites (`pg_api` 13, `pg_validation_api` 23) | working tree, 2026-10-07 | all passed |
+| `ledger-dag` unit tests: 32 (the window property test over 60 seeded DAGs × 5 window sizes; generated back edges and visit limits under every window; deep-linear window-call counts along the ramp; limits/cycles/unknowns across windows; damage beyond a bounded history; evasive and overfilling providers; `window_calls`) | review fixes | 32 passed |
+| `pg_retrieval` (11 tests) on PostgreSQL 17.2 and 15.19, default parallelism: scalar-vs-windowed equivalence at depths 1–20 × 10 window configurations, merge commit, limits exact/+1, quads/bytes limits, absent head, patch-as-head; v1 imported + v2 history; ≈ 200 KiB patches under 100 KiB / 1-byte budgets; duplicate patch ids and byte cuts at ±1 of every prefix; corruption matrix (24 cases incl. v1 damage, unknown envelope version, a malformed envelope at a window boundary, four precedence cases, a malformed index id, a contradicted hint at the depth limit; × 10 windows, blamed ids pinned); DAG equivalence (15 branch pairs with pinned classes incl. criss-cross and a 10-round merge-heavy branch × 4 strategies × 8 windows; every preview input reconstructed through the scalar reference; first-parent histories; tight limits; 4 × 14 historical branch points); DAG corruption matrix (7 cases × 8 windows, reasons pinned, damage beyond bounded reads invisible); one-connection prepare / preview / propose / apply; statement counts on a dedicated one-connection pool (`2 × ceil(1000 / w)` for w ∈ {256, 100, 1, byte-cut, 10,000}; 80 statements at the exact 10,000 depth limit and the same refusal one beyond it; histories of 1–1,000 entries × 6 windows along the ramp; contained and divergent previews at depth 300); Fibonacci DAG of 600 (bounded, ≥ 4× fewer statements than scalar) | review fixes | 11 passed on 17.2; 11 passed on 15.19 |
+| Existing PostgreSQL store suites with the windowed code on 17.2 (`pg_immutable_store` 9, `pg_workflow` 14, `pg_branches` 18, `pg_merge` 27, `pg_verify` 4, `pg_validation` 9, `pg_projection` 7, `pg_cas_race` 1, `pg_fs_migration` 8, `pg_graphs_migration` 8, `pg_least_privilege` 19 with `--test-threads=1`) and API suites (`pg_api` 13, `pg_validation_api` 23) | `e9a8681` + fixes | all passed |
+| The same store and API suites on PostgreSQL 15.19 (`--test-threads=1`) | review fixes | all passed (9, 14, 18, 27, 4, 9, 7, 1, 8, 8, 19; 13, 23) |
+| `check-fast` (fmt, clippy `-D warnings` incl. test targets, workspace tests, architecture, doc links, doc consistency, goldens) | `e9a8681` | pass (re-run on the final head recorded below) |
+| `check-supply-chain.sh` (cargo audit with the one documented exception re-proven, cargo deny advisories/licenses/bans/sources, CycloneDX SBOMs) | review fixes (lockfile: two dev-dependency edges) | pass |
+| M0 query plans | `e9a8681` | see the M0 table |
 
 ## Deferred work
 - `Ledger::state_at_bounded` over the trait (filesystem backend) stays scalar.

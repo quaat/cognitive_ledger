@@ -100,6 +100,14 @@ pub struct RefMovement {
     pub recorded_at: String,
 }
 
+/// How many `(id, depth)` pairs an ancestry window's recursion may produce per requested
+/// commit before it stops (so a window of 256 commits costs at most 1,024 recursion rows,
+/// each one index probe of `commit_parents` and one of `commit_index`). Linear history needs
+/// one pair per commit; merge-heavy history reaches commits at several depths and may
+/// therefore fill a window with fewer distinct commits, costing more windows, never more
+/// work per statement.
+const REACH_PAIRS_PER_COMMIT: usize = 4;
+
 /// Commit parents of one graph, read on one connection (immutable rows; a commit not indexed
 /// under the graph is unknown — foreign commits never resolve). Fails closed on a parent list
 /// that disagrees with the indexed `parent_count` (corruption, never "fewer parents").
@@ -178,21 +186,34 @@ impl ParentProvider for GraphParents<'_> {
     /// only if it is indexed under the graph (an unknown or foreign anchor yields an empty
     /// window and no work). Row order is not trusted: rows are grouped by commit and each
     /// group is checked for contiguity exactly as [`Self::parents`] does.
+    ///
+    /// Only the anchor's own damage is reported here. A prefetched commit whose rows fail
+    /// the check is left out of the window instead: the walk may never need it (a bounded
+    /// history, an early exit), and if it does, it comes back as an anchor and fails there
+    /// with the same error the unwindowed walk reports at that point.
     async fn ancestry_window(
         &self,
         start: &CommitId,
         max: usize,
         kind: WindowKind,
     ) -> Result<Vec<(CommitId, Vec<CommitId>)>, LedgerError> {
-        let max = self.window.min(max).max(1);
-        if max == 1 {
+        if self.window <= 1 {
+            // The Phase-4/5 walk, one commit per call: the reference implementation.
             return Ok(self
                 .parents(start)
                 .await?
                 .map(|parents| vec![(start.clone(), parents)])
                 .unwrap_or_default());
         }
+        let max = self.window.min(max).max(1);
         let first_parent_only = matches!(kind, WindowKind::FirstParent);
+        // The recursion produces (id, depth) pairs level by level; `UNION` removes
+        // duplicate pairs, not duplicate ids, so a merge-heavy history can reach one commit
+        // at many depths. `capped` stops the recursion after a fixed number of pairs (the
+        // single-reference CTE is evaluated on demand, so the limit ends the work), which
+        // bounds a statement by `REACH_ROWS_PER_WINDOW` index probes whatever the DAG
+        // shape; a window then simply holds fewer distinct commits and the walk asks
+        // again. Linear history reaches `max` distinct commits in `max` pairs.
         let mut conn = self.conn.lock().await;
         let rows = sqlx::query(
             "WITH RECURSIVE reach(id, depth) AS ( \
@@ -203,8 +224,10 @@ impl ParentProvider for GraphParents<'_> {
                  JOIN commit_parents p ON p.commit_id = r.id AND (NOT $5 OR p.position = 0) \
                  JOIN commit_index ci ON ci.id = p.parent_id AND ci.graph_id = $2 \
                  WHERE r.depth + 1 < $3 \
+             ), capped AS ( \
+                 SELECT id, depth FROM reach LIMIT $6 \
              ), nearest AS ( \
-                 SELECT DISTINCT ON (id) id, depth FROM reach ORDER BY id, depth \
+                 SELECT DISTINCT ON (id) id, depth FROM capped ORDER BY id, depth \
              ), w AS ( \
                  SELECT id FROM nearest ORDER BY depth, id LIMIT $4 \
              ) \
@@ -218,6 +241,7 @@ impl ParentProvider for GraphParents<'_> {
         .bind(i64::try_from(max).unwrap_or(i64::MAX))
         .bind(i64::try_from(max).unwrap_or(i64::MAX))
         .bind(first_parent_only)
+        .bind(i64::try_from(max.saturating_mul(REACH_PAIRS_PER_COMMIT)).unwrap_or(i64::MAX))
         .fetch_all(&mut **conn)
         .await
         .map_err(db_error)?;
@@ -242,10 +266,18 @@ impl ParentProvider for GraphParents<'_> {
         }
         let mut out = Vec::with_capacity(groups.len());
         for (id, (parent_count, mut parents)) in groups {
-            let commit: CommitId = id.parse()?;
+            let is_anchor = id == start.to_string();
+            let commit: CommitId = match id.parse() {
+                Ok(commit) => commit,
+                Err(e) if is_anchor => return Err(e),
+                Err(_) => continue,
+            };
             parents.sort_by_key(|(position, _)| *position);
-            let parents = parents_from_rows(&commit, parent_count, &parents)?;
-            out.push((commit, parents));
+            match parents_from_rows(&commit, parent_count, &parents) {
+                Ok(parents) => out.push((commit, parents)),
+                Err(e) if is_anchor => return Err(e),
+                Err(_) => {}
+            }
         }
         Ok(out)
     }
@@ -1001,6 +1033,43 @@ impl WorkflowRepository {
                 .collect::<Result<_, _>>()?,
             movements,
         )))
+    }
+
+    /// Every commit reachable from `head` in the graph, as one bounded ancestry walk over
+    /// the repository's windows: the number of commits, for statement-count tests on
+    /// histories built without refs (`test-hooks` builds only).
+    #[cfg(feature = "test-hooks")]
+    pub async fn ancestry_probe(
+        &self,
+        tenant: &TenantId,
+        graph: &GraphId,
+        head: &CommitId,
+        limits: TraversalLimits,
+    ) -> Result<usize, LedgerError> {
+        self.readable_graph(tenant, graph).await?;
+        let mut conn = self.pool.acquire().await.map_err(db_error)?;
+        let provider = GraphParents {
+            conn: Mutex::new(&mut *conn),
+            graph: graph.clone(),
+            window: self.windows.ancestry,
+        };
+        ledger_dag::ancestors(&provider, head, limits)
+            .await
+            .map(|a| a.len())
+            .map_err(|e| match e {
+                DagError::UnknownCommit(c) => LedgerError::NotFound(c.0),
+                DagError::VisitLimit { visited } => {
+                    LedgerError::ResourceLimit(format!("ancestry exceeded {visited} commits"))
+                }
+                DagError::Deadline => {
+                    LedgerError::ResourceLimit("ancestry exceeded its time limit".into())
+                }
+                DagError::Cycle(c) => LedgerError::CorruptObject {
+                    id: c.0,
+                    reason: "commit cycle".into(),
+                },
+                DagError::Provider(e) => e,
+            })
     }
 
     /// Bounded first-parent commit history from `head` within the graph (tenant-scoped).

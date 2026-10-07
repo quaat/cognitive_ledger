@@ -593,7 +593,7 @@ compile_error!(
 /// start when it does.
 pub const TEST_HOOKS_COMPILED: bool = cfg!(feature = "test-hooks");
 #[cfg(feature = "postgres")]
-pub use ledger_dag::TraversalLimits;
+pub use ledger_dag::{TraversalLimits, WINDOW_RAMP, window_calls};
 #[cfg(feature = "postgres")]
 pub use ledger_merge::{
     Conflict as MergeConflictReport, InvalidReportLimit, ReportLimits as MergeReportLimits,

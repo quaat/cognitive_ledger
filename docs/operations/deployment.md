@@ -92,9 +92,14 @@ amendment).
   bytes, export bytes, request seconds, concurrent expensive operations).
 - Retrieval windows (Plan 0012) are not configuration: reconstruction fetches commits and
   patches in windows of at most 256 objects or 8 MiB per statement and ancestry walks in
-  windows of at most 256 commits per statement (`ledger_store::RetrievalWindows::DEFAULT`).
-  They bound the work and memory of one statement and change no limit, state or error; a
-  window is `O(256 envelopes)` or `≤ 8 MiB + one object` of memory while it is folded.
+  windows of at most 256 commits per statement, with the recursion capped at 1,024 rows
+  (`ledger_store::RetrievalWindows::DEFAULT`). They bound the work and memory of one
+  statement and change no limit or state; a window is `O(256 envelopes)` or `≤ 8 MiB +
+  one object` of memory while it is folded. One error changed: a `commit_parents`
+  position-0 row that contradicts the commit bytes (impossible through the ledger's write
+  paths; detected by `verify_commit_index`, not by `ledger-admin verify`'s SQL checks) is
+  now `CorruptObject` for every read of that history, where earlier releases silently
+  followed the bytes. Verify an unverified database before upgrading.
 - Database session (every runtime connection): `LEDGER_DB_STATEMENT_TIMEOUT_MS` (30000),
   `LEDGER_DB_LOCK_TIMEOUT_MS` (10000), `LEDGER_DB_IDLE_IN_TRANSACTION_TIMEOUT_MS`
   (60000), `LEDGER_DB_MAX_CONNECTIONS` (16); values are milliseconds up to 2³¹−1. A
