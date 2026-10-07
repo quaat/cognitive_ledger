@@ -5,7 +5,7 @@ Measured on the unchanged production code of `d27e7f8` (the M1 change adds only
 documentation) against two throwaway containers on this workstation: PostgreSQL 17.2
 (`postgres:17.2-bookworm`, `127.0.0.1:55433`) and PostgreSQL 15.19 (`postgres:15-bookworm`,
 `127.0.0.1:55434`), both with a 1 GiB `/dev/shm`. The final figures below are from the runs
-after the five independent reviews (the plan's Evidence table names the commit). Commands:
+after the five independent reviews, at code revision `647be51`. Commands:
 
 ```bash
 export PATH=$HOME/.cargo/bin:$PATH
