@@ -1,6 +1,6 @@
 # Plan 0012: Phase 6C — batched reconstruction and DAG/ancestry retrieval
 
-Status: **in progress** (started 2026-10-07). Branch `claude/p6c-batched-retrieval` from the
+Status: **implementation, M4 and reviews complete; open: hosted CI on PR #14, the local `test-integration.sh`/`benchmark.sh bear` reruns, the base reconciliation steps (1)–(4) below** (started 2026-10-07). Branch `claude/p6c-batched-retrieval` from the
 Phase-6B head `d05113d` (PR #13 head `aabdd11` plus the two Codex P2 fixes of 2026-10-07),
 which is `main` at `646b029` plus the reviewed Phase-6B changes. Continues
 [Plan 0011](../completed/0011-phase6b-bear-reconstruction-characterization.md).
@@ -19,12 +19,13 @@ byte-identical on `main` and on the Phase-6B head. The M4 "before" measurement i
 (1) PR #13 is merged by the owner; (2) this branch is rebased onto the resulting `main`
 and the PR retargeted from `claude/p6b-bear-reconstruction` to `main`; (3) if `main` then
 differs from `d05113d` in anything but the merge commit, the difference is recorded here;
-(4) `check-fast`, the PostgreSQL suites and hosted CI are re-run on the rebased head.
-Until then the PR is opened against `claude/p6b-bear-reconstruction`.
+(4) `check-fast`, the PostgreSQL suites, `test-integration.sh`, `benchmark.sh bear` and hosted CI are re-run on the rebased head.
+Until then PR #14 is open against `claude/p6b-bear-reconstruction`; the PR workflows trigger on every `pull_request`, so hosted CI runs on it. Step (4) includes `test-integration.sh` and `benchmark.sh bear`.
 
 **Migration impact:** none (no schema, index or migration change; `git diff d05113d --
 migrations` is empty). **Affected crates:** `ledger-dag`, `ledger-store` (plus their tests,
-`scripts/test-integration.sh`, documentation). `ledger-api`, `ledger-core`, `ledger-rdf`,
+`scripts/test-integration.sh`, documentation, `Cargo.lock` with two dev-dependency edges,
+`fuzz/Cargo.lock`). `ledger-api`, `ledger-core`, `ledger-rdf`,
 protocol and golden files are untouched.
 
 ## Goal
@@ -128,7 +129,8 @@ outer join is a typed missing-object error for that id, never a shorter history.
   `PostgresImmutableStore::verify_commit_index` (the ADR-0012 re-derivation, reachable from
   the fs→pg migration and tests) reports them, while `ledger-admin verify`'s SQL checks
   catch only a row count disagreeing with `parent_count`, a foreign parent or an unindexed
-  parent (tech-debt). A *missing* row is not a contradiction: the windowed path follows
+  parent; its scoped form `verify_commits` runs in the fs→pg migration, and no shipped
+  command runs it over a whole database (tech-debt). A *missing* row is not a contradiction: the windowed path follows
   the bytes there too, so a missing commit behind a silent index is still `NotFound`, as
   before. **Decision 1** below.
 
@@ -483,7 +485,8 @@ triggered by these small patches) are covered only by the M0 diagnostic `EXPLAIN
 3,000-commit Fibonacci DAG, the `pg_retrieval` Fibonacci statement-bound test and the
 byte-cut equivalence tests, not by latency measurements on the production stack. The
 per-statement bound on other DAG shapes is a construction argument from the pair cap,
-measured on that one DAG.
+measured on that one DAG. The before run predates the before/after protocol now in
+`RUNNING_BENCHMARKS.md` and does not meet it for its build phase (the overlap above).
 
 **Residual cost and the checkpoint question.** After batching, a reconstruction costs
 ≈ 25 µs per ancestor plus the state-size cost at the head (≈ 17 ms at 10,000 quads for
@@ -512,8 +515,10 @@ of milliseconds at depth, would reopen the question with these numbers as its in
       `GraphParents` window query; `first_parent_history` first-parent windows
 - [x] Corruption/adversarial matrix (PG), differential tests (PG + in-memory), transaction
       ownership tests, criss-cross/two-parent tests, statement-count tests
-- [ ] Gates: check-fast, PG 17 + PG 15 suites, integration, upgrade, benchmark ci/bear,
-      verify, fuzz, supply chain, container, hosted CI
+- [x] Gates (local): check-fast, PG 17 + PG 15 suites, upgrade, fuzz, supply chain,
+      container image/linkage; `ledger-admin verify` inside both official `recon` runs
+- [ ] Gates (pending): hosted CI on PR #14; `test-integration.sh` and `benchmark.sh bear`
+      locally (host port 8080 busy; `bear` has no hosted equivalent) — see Evidence
 - [x] M4: before/after `recon` on this host from clean worktrees; residual estimate;
       checkpoint decision
 - [x] Independent reviews (8), P0/P1 resolved
@@ -522,16 +527,16 @@ of milliseconds at depth, would reopen the question with these numbers as its in
 ## Decisions
 1. **Index/bytes disagreement is corruption in the windowed path** (see Assumptions). The
    scalar path followed bytes and ignored the index. ADR-0012 defines the index as a
-   derived view that must agree with the bytes, `verify_commit_index` reports a
-   disagreement as corruption, and the task requires that a hint contradicted by the bytes
+   derived view that must agree with the bytes, `verify_commit_index` (reachable today
+   only from tests and, scoped, from the fs→pg migration) reports a disagreement as
+   corruption, and the task requires that a hint contradicted by the bytes
    is never followed silently. Reconstruction therefore fails closed on such a database,
    and it does so at the contradicted commit, in chain order: on such a database the
    error can precede a `NotFound`, `InvalidPatch`, patch-level `ResourceLimit` or even the
    depth limit that the scalar walk would have reported later (HTTP 500 where it was 404
    or 413). Every state read, prepare, validation, projection and merge-row verification of
-   that head is affected. Operators upgrading a database that was never verified by
-   `verify_commit_index` should run it first (tech-debt: make it part of `ledger-admin
-   verify`). Recorded as the only intended behaviour difference; covered by tests on both
+   that head is affected. No shipped command performs that verification over a whole
+   database yet (tech-debt: make it part of `ledger-admin verify`). Recorded as the only intended behaviour difference; covered by tests on both
    sides, including the precedence cases.
 2. **Two statements per reconstruction window**, not three: the chain hint and the commit
    bytes are one query (the recursive CTE joined to `immutable_objects`), the patches
@@ -550,9 +555,9 @@ of milliseconds at depth, would reopen the question with these numbers as its in
 6. **The ancestry recursion is capped at 4 (id, depth) pairs per requested commit.** On a
    merge-heavy DAG the recursion reaches one commit at many depths; without the cap a
    single statement's work was bounded only by the depth bound (review finding, four
-   reviewers). With it a statement is at most 1,024 recursion rows by construction
-   (measured on one Fibonacci DAG), and a window may hold fewer distinct commits (more
-   statements, each bounded).
+   reviewers). With it a statement is at most 1,024 recursion rows (two index probes
+   each) by construction, measured on one Fibonacci DAG, and a window may hold fewer
+   distinct commits (more statements, each bounded).
 7. **Only the anchor's damage is reported by a window.** A damaged prefetched commit is
    left out, so bounded histories and early-exit reachability checks that never reach it
    answer as the unwindowed walk did (review finding).
@@ -605,32 +610,48 @@ base revision on the same host.
 | Security / tenant isolation | no P0; P1: the same unbounded recursion work (client-triggerable through preview and branch creation) | Same fix. SQL construction, graph scoping, entry points, error hygiene, test-only exclusion and privileges all pass. |
 | Test completeness | P1: `pg_retrieval` was not in `test-integration.sh`; P1: the statement-count arithmetic no longer matched after the history cap; P1: precedence untested, previews never compared with the scalar reconstruction; P2: merge-heavy branch missing, genesis-cycle case not a cycle, carve-outs, throwaway databases never dropped | Wired into the script; counts recomputed along the ramp on a dedicated connection with statement summaries; four precedence cases; every preview input through the scalar reference; 10-round merge-heavy branch with pinned classes; cycle reasons pinned; databases dropped with `FORCE`. |
 | Architecture / documentation consistency | P1: "`ledger-admin verify` reports the disagreement" was false; P1: "no error changed" contradicted Decision 1; P1: "the index is never an authority" overstated for DAG walks; P2: stale formulas, constant names, "crate-internal", evidence revisions, unmeasured claims | All corrected (`verify_commit_index` is the re-derivation; tech-debt asks for it in `ledger-admin verify`); boundaries, dependency direction and the no-migration/no-API claims confirmed. |
-| Benchmark methodology (M4) | gate and conclusion supported; P1: preview formulas off by the harness's depth index, "4× everywhere" overstated (3.5–5×), build-time comparison contaminated, "≈ 10 µs server" and the depth-1 bound not measured; P2: labels (inputs hash, 0.031, 51–57 %, fold caveat, cross-host factor, "any shape", byte cut, linear-only) | All corrected in the plan, baselines, qualification matrix, roadmap note, METRICS, BENCHMARK_ARCHITECTURE; `verify.log`/`run.log` archived; before/after protocol added to RUNNING_BENCHMARKS. |
+| Benchmark methodology (M4) | gate and conclusion supported; P1: preview formulas off by the harness's depth index, "4× everywhere" overstated (3.5–5.2×), build-time comparison contaminated, "≈ 10 µs server" and the depth-1 bound not measured; P2: labels (inputs hash, 0.031, 51–57 %, fold caveat, cross-host factor, "any shape", byte cut, linear-only) | All corrected in the plan, baselines, qualification matrix, roadmap note, METRICS, BENCHMARK_ARCHITECTURE; `verify.log`/`run.log` archived; before/after protocol added to RUNNING_BENCHMARKS. |
 
 ## Evidence
-Revisions: `e9a8681` is the first implementation checkpoint; the review-driven fixes
-(anchor-only window errors, first-parent window cap, lazy chain-row checks, recursion
-pair cap, window ramp, zero-window guards) and the reworked tests are the next commit
-(recorded below as "review fixes"); hashes are updated as the branch advances.
+Revisions: `e9a8681` is the first implementation checkpoint; `7408a3e` carries the
+review-driven fixes (anchor-only window errors, first-parent window cap, lazy chain-row
+checks, recursion pair cap, window ramp, zero-window guards) and the reworked tests, and
+is the code head: `7ec018d` and the later commits change docs, `fuzz/Cargo.lock` and
+doc comments only (`git diff 7408a3e HEAD --stat -- crates` shows comment lines only),
+so the official after `recon` at `7408a3e` measures the final code.
 
 | Gate | Revision | Result |
 |---|---|---|
-| `ledger-dag` unit tests: 32 (the window property test over 60 seeded DAGs × 5 window sizes; generated back edges and visit limits under every window; deep-linear window-call counts along the ramp; limits/cycles/unknowns across windows; damage beyond a bounded history; evasive and overfilling providers; `window_calls`) | review fixes | 32 passed |
+| `ledger-dag` unit tests: 32 (the window property test over 60 seeded DAGs × 5 window sizes; generated back edges and visit limits under every window; deep-linear window-call counts along the ramp; limits/cycles/unknowns across windows; damage beyond a bounded history; evasive and overfilling providers; `window_calls`) | `7408a3e` | 32 passed |
 | `pg_retrieval` (11 tests) on PostgreSQL 17.2 and 15.19, default parallelism: scalar-vs-windowed equivalence at depths 1–20 × 10 window configurations, merge commit, limits exact/+1, quads/bytes limits, absent head, patch-as-head; v1 imported + v2 history; ≈ 200 KiB patches under 100 KiB / 1-byte budgets; duplicate patch ids and byte cuts at ±1 of every prefix; corruption matrix (24 cases incl. v1 damage, unknown envelope version, a malformed envelope at a window boundary, four precedence cases, a malformed index id, a contradicted hint at the depth limit; × 10 windows, blamed ids pinned); DAG equivalence (15 branch pairs with pinned classes incl. criss-cross and a 10-round merge-heavy branch × 4 strategies × 8 windows; every preview input reconstructed through the scalar reference; first-parent histories; tight limits; 4 × 14 historical branch points); DAG corruption matrix (7 cases × 8 windows, reasons pinned, damage beyond bounded reads invisible); one-connection prepare / preview / propose / apply; statement counts on a dedicated one-connection pool (`2 × ceil(1000 / w)` for w ∈ {256, 100, 1, byte-cut, 10,000}; 80 statements at the exact 10,000 depth limit and the same refusal one beyond it; histories of 1–1,000 entries × 6 windows along the ramp; contained and divergent previews at depth 300); Fibonacci DAG of 600 (bounded, ≥ 4× fewer statements than scalar) | review fixes | 11 passed on 17.2; 11 passed on 15.19 |
 | Existing PostgreSQL store suites with the windowed code on 17.2 (`pg_immutable_store` 9, `pg_workflow` 14, `pg_branches` 18, `pg_merge` 27, `pg_verify` 4, `pg_validation` 9, `pg_projection` 7, `pg_cas_race` 1, `pg_fs_migration` 8, `pg_graphs_migration` 8, `pg_least_privilege` 19 with `--test-threads=1`) and API suites (`pg_api` 13, `pg_validation_api` 23) | `e9a8681` + fixes | all passed |
 | The same store and API suites on PostgreSQL 15.19 (`--test-threads=1`) | review fixes | all passed (9, 14, 18, 27, 4, 9, 7, 1, 8, 8, 19; 13, 23) |
-| `check-fast` (fmt, clippy `-D warnings` incl. test targets, workspace tests, architecture, doc links, doc consistency, goldens) | `e9a8681` | pass (re-run on the final head recorded below) |
-| `check-supply-chain.sh` (cargo audit with the one documented exception re-proven, cargo deny advisories/licenses/bans/sources, CycloneDX SBOMs) | review fixes (lockfile: two dev-dependency edges) | pass |
-| M0 query plans | `e9a8681` | see the M0 table |
-| Official `recon`, before (clean worktree `d05113d`, `official=yes`) | `d05113d` | `RECON PASS`, 144 points, 186 exact checks, 0 failures; `VERIFY OK` (wall 38 min including the history build, which overlapped a compile job; not a result) |
+| `check-fast` (fmt, clippy `-D warnings` incl. test targets, workspace tests, architecture, doc links, doc consistency, goldens) | `e9a8681` | pass |
+| `check-supply-chain.sh` (cargo audit with the one documented exception re-proven, cargo deny advisories/licenses/bans/sources, CycloneDX SBOMs) | `7408a3e` (lockfile: two dev-dependency edges) | pass |
+| M0 query plans (two diagnostic runs) | `e9a8681`, `7408a3e` | see the M0 tables |
+| `check-fast` on the review-fixes head (fmt, clippy `-D warnings` with test targets, workspace tests incl. 32 `ledger-dag`, architecture, doc links, doc consistency, goldens) | `7408a3e` | pass |
+| `scripts/fuzz.sh 60` (nightly-2026-09-25, cargo-fuzz, sanitizer none; 7 targets: commit_decode, patch_canonical, prepare_body, quad_parse, request_identity, timestamp, validation_decode) | `7408a3e` | `FUZZ OK`, no crash; `fuzz/Cargo.lock` refreshed (ledger-dag, ledger-merge entries) |
+| `scripts/upgrade-p5.sh` (previous `5216bce` schema 12 → working tree schema 13; old-API workload, byte-identical rows, replay, merge on the upgraded graph, projector backlog, refusals both ways, clean == upgraded) | `7408a3e` | `UPGRADE-P5 OK` |
+| Production image build + `scripts/check-runtime-linkage.sh` | `7408a3e` | `RUNTIME LINKAGE OK` (no shipped binary links libssl/libcrypto); the Trivy scan runs only in hosted `ci-security` |
+| `scripts/test-integration.sh` (local) | `7408a3e` | first run: the real-PostgreSQL suites up to and including `pg_retrieval` passed, then `pg_least_privilege` failed with "sorry, too many clients already" under cargo's 16-way parallelism (tech-debt; every suite passes individually, see above); the rerun with `RUST_TEST_THREADS=4` and the local `benchmark.sh ci`/`bear` runs could not bind host port 8080 (a developer process unrelated to this work holds it) and are queued to run when it frees; hosted `ci-integration` covers the integration suites and `ci-benchmark` the `ci` profile; `benchmark.sh bear` has no hosted equivalent and remains a pending local gate |
+| Backup/restore, migration regression | — | not applicable: no storage-format, schema or migration change in this PR (`git diff d05113d -- migrations` is empty); `upgrade-p5.sh` re-run above |
+| `check-fast` on the final docs head | final head | recorded at closure |
+| Hosted CI on PR #14 (test-merge of the head into `claude/p6b-bear-reconstruction`) | head | pending at the time of writing; recorded below when settled |
+| Official `recon`, before (clean worktree `d05113d`, `official=yes`) | `d05113d` | `RECON PASS`, 144 points, 186 exact checks, 0 failures; `VERIFY OK` (wall 38 min including the history build, which overlapped a compile and test job; not a result) |
 | Official `recon`, after (clean worktree `7408a3e`, `official=yes`) | `7408a3e` | `RECON PASS`, 144 points, 186 exact checks, 0 failures; `VERIFY OK` (wall 12 min); statement counts per the closed forms in M4 at every depth |
 
 ## Deferred work
 - `Ledger::state_at_bounded` over the trait (filesystem backend) stays scalar.
 - The checkpoint ADR inputs are updated from the M4 residual, not implemented.
+- A shipped command for the whole-database index re-derivation (`verify_commit_index`
+  in `ledger-admin verify`), the `pg_least_privilege` parallelism, and latency
+  measurements of merge-heavy shapes and the byte cut: tech-debt.
+- The local `test-integration.sh` and `benchmark.sh bear` reruns (host port busy) and the
+  base reconciliation steps.
 
 ## Completion criteria
 Every box above checked with evidence; statement counts in the official `recon` scale with
 windows (formula above), not with depth; every corruption and differential test passes;
 no P0/P1 review finding open; `CHECKPOINT-ADR-READY` restated with the post-batching
-residual.
+residual; hosted CI green on the rebased head and the base reconciliation steps (1)–(4)
+done.

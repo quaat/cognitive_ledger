@@ -1753,12 +1753,12 @@ Only implement optimizations justified by measurements.
 > recommendation was to batch retrieval before anything else (`CHECKPOINT-ADR-READY: NO`).
 > **Phase 6C (Plan 0012)** delivered that: windowed retrieval of commits, patches and
 > parent edges (256 objects / 8 MiB per statement, the index a hint the verified bytes
-> must confirm), `2 × ceil(depth / 256)` statements per reconstruction instead of
-> `2 × depth`, and a 3.5–4.3× lower per-ancestor cost on the same host (linear
+> must confirm), `2 × ceil(n / 256)` statements for a reconstruction of n commits instead
+> of `2n`, and a 3.5–5.2× lower per-ancestor cost on the same host (linear
 > histories), with every identity,
 > limit, error (one documented exception on corrupt indexes) and transaction boundary
-> unchanged and no migration. The residual is ≈ 25 µs per ancestor (≈ 0.3 s at the
-> 10,000 ceiling); checkpoints stay unjustified until a target depth and budget are
+> unchanged and no migration. The residual is ≈ 25 µs per ancestor (≈ 0.25–0.3 s at the
+> 10,000 ceiling, extrapolated); checkpoints stay unjustified until a target depth and budget are
 > declared (`CHECKPOINT-ADR-READY: NO`). The deliverables below that remain — checkpoints
 > and their verification, a reconstruction cache, streaming export, the change index,
 > history lookup APIs, orphan cleanup — are not started.

@@ -16,8 +16,9 @@ use std::str::FromStr;
 /// Bounds of one retrieval window (Plan 0012). Reconstruction and ancestry walks fetch
 /// immutable rows in windows of this size instead of one row per ancestor; the windows
 /// bound memory and the work of one statement, and are not a correctness parameter: every
-/// window size yields the same states, histories and errors. Crate-internal defaults; the
-/// `test-hooks` feature lets tests shrink them to exercise the window boundaries.
+/// window size yields the same states, histories and errors. Fixed public defaults
+/// (`RetrievalWindows::DEFAULT`), not operator configuration; the `test-hooks` feature lets
+/// tests shrink them to exercise the window boundaries.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RetrievalWindows {
     /// Commits per first-parent chain window and patches per patch window (≥ 1).
@@ -32,7 +33,7 @@ pub struct RetrievalWindows {
 impl RetrievalWindows {
     /// 256 objects and 8 MiB per window: at the ≈ 100 µs per round trip Plan 0011 measured,
     /// the amortized round trip per ancestor is under 1 µs (under a tenth of the fold's
-    /// ≥ 10 µs), while a window's recursive query is 256 primary-key probes and its memory
+    /// ≥ 10 µs), while a window's recursive query is 256 index probes and its memory
     /// at most 256 envelopes or 8 MiB plus one object.
     pub const DEFAULT: Self = Self {
         objects: 256,

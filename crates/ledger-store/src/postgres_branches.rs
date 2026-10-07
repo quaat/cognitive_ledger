@@ -211,8 +211,8 @@ impl ParentProvider for GraphParents<'_> {
         // duplicate pairs, not duplicate ids, so a merge-heavy history can reach one commit
         // at many depths. `capped` stops the recursion after a fixed number of pairs (the
         // single-reference CTE is evaluated on demand, so the limit ends the work), which
-        // bounds a statement by `REACH_ROWS_PER_WINDOW` index probes whatever the DAG
-        // shape; a window then simply holds fewer distinct commits and the walk asks
+        // bounds a statement by `max × REACH_PAIRS_PER_COMMIT` recursion rows whatever the
+        // DAG shape; a window then simply holds fewer distinct commits and the walk asks
         // again. Linear history reaches `max` distinct commits in `max` pairs.
         let mut conn = self.conn.lock().await;
         let rows = sqlx::query(
