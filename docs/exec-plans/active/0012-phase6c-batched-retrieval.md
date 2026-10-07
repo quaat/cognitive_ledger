@@ -33,7 +33,7 @@ Remove the dominant cost that Phase 6B measured, **≈ 2 PostgreSQL statements p
 reconstructed ancestor and ≈ 2 per visited commit per ancestry side**, by retrieving
 commits, patches and parent edges in **bounded windows** instead of one row at a time,
 while leaving every ledger semantic, identity, limit, error and transaction boundary
-exactly as it is on a sound store (the one intended exception, Decision 1: a
+exactly as it is on a sound store (the one intended exception, Decision 1 / ADR-0025: a
 `commit_parents` position-0 row that contradicts the commit bytes is now `CorruptObject`
 where the scalar walk silently followed the bytes). The deterministic gate is the
 statement count; latency is observed.
@@ -111,8 +111,8 @@ an ancestry answer unverified:
 - parents for DAG walks: `commit_parents` rows → contiguity against `parent_count`
   (exactly as `GraphParents::parents` does today).
 
-A disagreement between a hint and the bytes is `CorruptObject`. A row missing from an
-outer join is a typed missing-object error for that id, never a shorter history.
+A disagreement between a hint and the bytes is `CorruptObject` (ADR-0025). A row missing
+from an outer join is a typed missing-object error for that id, never a shorter history.
 
 ## Assumptions
 - Every commit that a reachable commit names as `parents[0]` is itself indexed
@@ -132,7 +132,7 @@ outer join is a typed missing-object error for that id, never a shorter history.
   parent; its scoped form `verify_commits` runs in the fs→pg migration, and no shipped
   command runs it over a whole database (tech-debt). A *missing* row is not a contradiction: the windowed path follows
   the bytes there too, so a missing commit behind a silent index is still `NotFound`, as
-  before. **Decision 1** below.
+  before. **Decision 1** below, recorded as ADR-0025.
 
 ## M0 — the scalar algorithms as implemented at `d05113d`
 
@@ -517,16 +517,22 @@ of milliseconds at depth, would reopen the question with these numbers as its in
       ownership tests, criss-cross/two-parent tests, statement-count tests
 - [x] Gates (local): check-fast, PG 17 + PG 15 suites, upgrade, fuzz, supply chain,
       container image/linkage; `ledger-admin verify` inside both official `recon` runs
-- [ ] Gates (pending): hosted CI on PR #14; `test-integration.sh` and `benchmark.sh bear`
-      locally (host port 8080 busy; `bear` has no hosted equivalent) — see Evidence
+- [x] Gates (hosted): CI on PR #14 green on the final head (incl. the integration stack
+      with `pg_retrieval` and the `ci` benchmark profile with bear-b-ci) — see Evidence
+- [ ] Gates (pending locally): `test-integration.sh` with `RUST_TEST_THREADS=4` and
+      `benchmark.sh bear` (host port 8080 busy; `bear` has no hosted equivalent)
 - [x] M4: before/after `recon` on this host from clean worktrees; residual estimate;
       checkpoint decision
-- [x] Independent reviews (8), P0/P1 resolved
+- [x] Independent reviews (8), P0/P1 resolved; external Codex review of PR #14: one P1
+      (ADR required for the Decision 1 invariant change) — resolved by ADR-0025 (see
+      Reviews); re-review requested after the closure commits
 - [ ] Docs reconciled; completion report
 
 ## Decisions
-1. **Index/bytes disagreement is corruption in the windowed path** (see Assumptions). The
-   scalar path followed bytes and ignored the index. ADR-0012 defines the index as a
+1. **Index/bytes disagreement is corruption in the windowed path** (see Assumptions;
+   **ADR-0025**, added at closure after the Codex P1 review finding that an invariant
+   change recorded only in a plan needs an ADR). The scalar path followed bytes and
+   ignored the index. ADR-0012 defines the index as a
    derived view that must agree with the bytes, `verify_commit_index` (reachable today
    only from tests and, scoped, from the fs→pg migration) reports a disagreement as
    corruption, and the task requires that a hint contradicted by the bytes
@@ -537,7 +543,11 @@ of milliseconds at depth, would reopen the question with these numbers as its in
    or 413). Every state read, prepare, validation, projection and merge-row verification of
    that head is affected. No shipped command performs that verification over a whole
    database yet (tech-debt: make it part of `ledger-admin verify`). Recorded as the only intended behaviour difference; covered by tests on both
-   sides, including the precedence cases.
+   sides, including the precedence cases. ADR-0025 carries the context, the exact hint
+   rule (contradicted → `CorruptObject`; missing/silent → follow the bytes), the
+   compatibility table of old-versus-new outcomes, the alternatives (follow bytes, abandon
+   batching, scalar fallback, fail closed) and the operational consequence for upgrades,
+   including that the whole-database re-derivation stays deferred.
 2. **Two statements per reconstruction window**, not three: the chain hint and the commit
    bytes are one query (the recursive CTE joined to `immutable_objects`), the patches
    another. A separate "hint then objects" pair would be simpler to reuse but costs 50 %
@@ -610,6 +620,7 @@ base revision on the same host.
 | Security / tenant isolation | no P0; P1: the same unbounded recursion work (client-triggerable through preview and branch creation) | Same fix. SQL construction, graph scoping, entry points, error hygiene, test-only exclusion and privileges all pass. |
 | Test completeness | P1: `pg_retrieval` was not in `test-integration.sh`; P1: the statement-count arithmetic no longer matched after the history cap; P1: precedence untested, previews never compared with the scalar reconstruction; P2: merge-heavy branch missing, genesis-cycle case not a cycle, carve-outs, throwaway databases never dropped | Wired into the script; counts recomputed along the ramp on a dedicated connection with statement summaries; four precedence cases; every preview input through the scalar reference; 10-round merge-heavy branch with pinned classes; cycle reasons pinned; databases dropped with `FORCE`. |
 | Architecture / documentation consistency | P1: "`ledger-admin verify` reports the disagreement" was false; P1: "no error changed" contradicted Decision 1; P1: "the index is never an authority" overstated for DAG walks; P2: stale formulas, constant names, "crate-internal", evidence revisions, unmeasured claims | All corrected (`verify_commit_index` is the re-derivation; tech-debt asks for it in `ledger-admin verify`); boundaries, dependency direction and the no-migration/no-API claims confirmed. |
+| External Codex review of PR #14 (reviewed `7ec018d`) | P1: the Decision 1 behaviour change (index/bytes disagreement → `CorruptObject`) is an invariant change recorded only in this plan; AGENTS.md requires an ADR | ADR-0025 written and indexed (context, exact hint rule, compatibility table, four alternatives, operational consequence incl. the deferred whole-database verifier); three compatibility cases the ADR's table states but the matrix did not pin were added to `pg_retrieval` (contradicted hint ahead of a missing older commit, of a corrupt older patch, of the quad limit); `deployment.md`, tech-debt, the qualification matrix, ARCHITECTURE and the roadmap note cross-reference the ADR. Thread resolved after the commit. |
 | Benchmark methodology (M4) | gate and conclusion supported; P1: preview formulas off by the harness's depth index, "4× everywhere" overstated (3.5–5.2×), build-time comparison contaminated, "≈ 10 µs server" and the depth-1 bound not measured; P2: labels (inputs hash, 0.031, 51–57 %, fold caveat, cross-host factor, "any shape", byte cut, linear-only) | All corrected in the plan, baselines, qualification matrix, roadmap note, METRICS, BENCHMARK_ARCHITECTURE; `verify.log`/`run.log` archived; before/after protocol added to RUNNING_BENCHMARKS. |
 
 ## Evidence
@@ -623,7 +634,7 @@ so the official after `recon` at `7408a3e` measures the final code.
 | Gate | Revision | Result |
 |---|---|---|
 | `ledger-dag` unit tests: 32 (the window property test over 60 seeded DAGs × 5 window sizes; generated back edges and visit limits under every window; deep-linear window-call counts along the ramp; limits/cycles/unknowns across windows; damage beyond a bounded history; evasive and overfilling providers; `window_calls`) | `7408a3e` | 32 passed |
-| `pg_retrieval` (11 tests) on PostgreSQL 17.2 and 15.19, default parallelism: scalar-vs-windowed equivalence at depths 1–20 × 10 window configurations, merge commit, limits exact/+1, quads/bytes limits, absent head, patch-as-head; v1 imported + v2 history; ≈ 200 KiB patches under 100 KiB / 1-byte budgets; duplicate patch ids and byte cuts at ±1 of every prefix; corruption matrix (24 cases incl. v1 damage, unknown envelope version, a malformed envelope at a window boundary, four precedence cases, a malformed index id, a contradicted hint at the depth limit; × 10 windows, blamed ids pinned); DAG equivalence (15 branch pairs with pinned classes incl. criss-cross and a 10-round merge-heavy branch × 4 strategies × 8 windows; every preview input reconstructed through the scalar reference; first-parent histories; tight limits; 4 × 14 historical branch points); DAG corruption matrix (7 cases × 8 windows, reasons pinned, damage beyond bounded reads invisible); one-connection prepare / preview / propose / apply; statement counts on a dedicated one-connection pool (`2 × ceil(1000 / w)` for w ∈ {256, 100, 1, byte-cut, 10,000}; 80 statements at the exact 10,000 depth limit and the same refusal one beyond it; histories of 1–1,000 entries × 6 windows along the ramp; contained and divergent previews at depth 300); Fibonacci DAG of 600 (bounded, ≥ 4× fewer statements than scalar) | review fixes | 11 passed on 17.2; 11 passed on 15.19 |
+| `pg_retrieval` (11 tests) on PostgreSQL 17.2 and 15.19, default parallelism: scalar-vs-windowed equivalence at depths 1–20 × 10 window configurations, merge commit, limits exact/+1, quads/bytes limits, absent head, patch-as-head; v1 imported + v2 history; ≈ 200 KiB patches under 100 KiB / 1-byte budgets; duplicate patch ids and byte cuts at ±1 of every prefix; corruption matrix (24 cases at this revision — 27 from the closure commit, ADR-0025 — incl. v1 damage, unknown envelope version, a malformed envelope at a window boundary, four precedence cases, a malformed index id, a contradicted hint at the depth limit; × 10 windows, blamed ids pinned); DAG equivalence (15 branch pairs with pinned classes incl. criss-cross and a 10-round merge-heavy branch × 4 strategies × 8 windows; every preview input reconstructed through the scalar reference; first-parent histories; tight limits; 4 × 14 historical branch points); DAG corruption matrix (7 cases × 8 windows, reasons pinned, damage beyond bounded reads invisible); one-connection prepare / preview / propose / apply; statement counts on a dedicated one-connection pool (`2 × ceil(1000 / w)` for w ∈ {256, 100, 1, byte-cut, 10,000}; 80 statements at the exact 10,000 depth limit and the same refusal one beyond it; histories of 1–1,000 entries × 6 windows along the ramp; contained and divergent previews at depth 300); Fibonacci DAG of 600 (bounded, ≥ 4× fewer statements than scalar) | review fixes | 11 passed on 17.2; 11 passed on 15.19 |
 | Existing PostgreSQL store suites with the windowed code on 17.2 (`pg_immutable_store` 9, `pg_workflow` 14, `pg_branches` 18, `pg_merge` 27, `pg_verify` 4, `pg_validation` 9, `pg_projection` 7, `pg_cas_race` 1, `pg_fs_migration` 8, `pg_graphs_migration` 8, `pg_least_privilege` 19 with `--test-threads=1`) and API suites (`pg_api` 13, `pg_validation_api` 23) | `e9a8681` + fixes | all passed |
 | The same store and API suites on PostgreSQL 15.19 (`--test-threads=1`) | review fixes | all passed (9, 14, 18, 27, 4, 9, 7, 1, 8, 8, 19; 13, 23) |
 | `check-fast` (fmt, clippy `-D warnings` incl. test targets, workspace tests, architecture, doc links, doc consistency, goldens) | `e9a8681` | pass |
@@ -636,7 +647,7 @@ so the official after `recon` at `7408a3e` measures the final code.
 | `scripts/test-integration.sh` (local) | `7408a3e` | first run: the real-PostgreSQL suites up to and including `pg_retrieval` passed, then `pg_least_privilege` failed with "sorry, too many clients already" under cargo's 16-way parallelism (tech-debt; every suite passes individually, see above); the rerun with `RUST_TEST_THREADS=4` and the local `benchmark.sh ci`/`bear` runs could not bind host port 8080 (a developer process unrelated to this work holds it) and are queued to run when it frees; hosted `ci-integration` covers the integration suites and `ci-benchmark` the `ci` profile; `benchmark.sh bear` has no hosted equivalent and remains a pending local gate |
 | Backup/restore, migration regression | — | not applicable: no storage-format, schema or migration change in this PR (`git diff d05113d -- migrations` is empty); `upgrade-p5.sh` re-run above |
 | `check-fast` on the final docs head | final head | recorded at closure |
-| Hosted CI on PR #14 (test-merge of the head into `claude/p6b-bear-reconstruction`) | head | pending at the time of writing; recorded below when settled |
+| Hosted CI on PR #14 (test-merge of the head into `claude/p6b-bear-reconstruction`), final head `adf4cae` | `adf4cae` | all success: ci-fast 37597166829 (fast); ci-integration 37597166875 (docker, 11m39s: the compose stack, every real-PostgreSQL suite incl. `pg_retrieval`, the API suites, the containerized HTTP scenario); ci-benchmark 37597166832 (benchmark-ci: synthetic-ledger-ci + bear-b-ci assertions, `VERIFY OK`); ci-fuzz 37597166807 (fuzz-sanitizer none + address, aggregate `fuzz`); ci-security 37597166802 (container, dependency-review, supply-chain). The same five workflows also succeeded on `7ec018d`. |
 | Official `recon`, before (clean worktree `d05113d`, `official=yes`) | `d05113d` | `RECON PASS`, 144 points, 186 exact checks, 0 failures; `VERIFY OK` (wall 38 min including the history build, which overlapped a compile and test job; not a result) |
 | Official `recon`, after (clean worktree `7408a3e`, `official=yes`) | `7408a3e` | `RECON PASS`, 144 points, 186 exact checks, 0 failures; `VERIFY OK` (wall 12 min); statement counts per the closed forms in M4 at every depth |
 

@@ -132,14 +132,31 @@ merge-heavy shapes were not measured for latency (Plan 0012 M0/M4). At the devel
 preview to ≈ 1.2 s. Checkpoints remain unjustified until a target depth and budget exist
 (Plan 0012 M4: `CHECKPOINT-ADR-READY: NO`).
 
-## Checkpoint policy proposal (input to Phase 4/5; no implementation in Plan 0005)
+## Conditional checkpoint design (design input only; not justified by current measurements)
 
-Reconstruction cost is proportional to history length; the cheaper remedies lower the constant
-but not the growth, so a checkpoint (materialized state snapshot) policy is needed before
-production-length histories (a 10,000-commit ref already costs ≈2 s per prepare).
-Constraints the design must respect (from ADR-0008, ADR-0012, ADR-0013, ADR-0016 and the
-product specification, which requires that a corrupt checkpoint is detected and cannot
-redefine commit state):
+**Status after Phase 6C (2026-10-07):** `CHECKPOINT-ADR-READY: NO`. The section below was
+written in Plan 0005 (2026-09-27) when a prepare or state read cost ≈ 0.19–0.20 ms per
+ancestor and a 10,000-commit ref ≈ 2 s; it then said a checkpoint policy "is needed". That
+measurement context is superseded: Phase 6B located the cost in per-statement round trips
+and Phase 6C removed them, so the residual is ≈ 25 µs per ancestor on linear histories,
+≈ 0.25–0.3 s extrapolated for a read or prepare at the development `max_depth` of 10,000
+and ≈ 1.2 s for a divergent merge preview there (table above). No product history-depth
+target or latency budget has been declared. **A checkpoint becomes relevant only if a
+declared target depth and latency budget exceed the measured windowed-retrieval
+envelope** — for example a target of 100,000 commits, or a budget of a few tens of
+milliseconds at depth, would reopen the question with the Phase 6C numbers as its input; a
+target of the order of 10,000 commits with a sub-second budget for reads and prepares is
+met without checkpoints (a divergent merge preview at that depth would not be). The
+roadmap says the same (`product_development_plan.md` §24 and the Phase 6 note): measure →
+batch retrieval → remeasure → checkpoints only if a declared target requires them.
+
+What follows is the design input that remains valid whenever that condition is met. It is
+not an implementation decision; starting it requires the ADR named at the end.
+
+Reconstruction cost is proportional to history length; retrieval batching lowered the
+constant, not the growth. Constraints a checkpoint (materialized state snapshot) design
+must respect (from ADR-0008, ADR-0012, ADR-0013, ADR-0016 and the product specification,
+which requires that a corrupt checkpoint is detected and cannot redefine commit state):
 
 1. **A checkpoint never decides identity.** Under ADR-0008 the effective delta, hence the
    `PatchId`/`CommitId`, depends on the resolved base state. `prepare` therefore may use a
@@ -155,23 +172,26 @@ redefine commit state):
    that, so "verified" means "the writer folded, or a verifier re-folded, and recorded the
    digest match" — checked on every checkpoint before it is trusted, not on a sample.
 3. **Placement:** a checkpoint row `state_checkpoints(commit_id, snapshot_id, quads, bytes,
-   verified_by, created_at)` every *k* commits per ref (k sized from the control run so a
-   fold from the nearest checkpoint stays within tens of milliseconds), written outside the
+   verified_by, created_at)` every *k* commits per ref (k sized from measurements so a
+   fold from the nearest checkpoint stays within the declared budget), written outside the
    acceptance transaction (after COMMIT, idempotent, never blocking acceptance) by a
    dedicated checkpointer identity — not the serving runtime and not a long-lived owner
    credential (ADR-0016 keeps the owner on the operator host): a role with `INSERT` on the
    checkpoint table and `SELECT` elsewhere, excluded from `ledger_grant_runtime`, and the
    server's forbidden-privilege startup check extended to that table.
-4. **Never dropped, never edited.** Snapshot objects live in `immutable_objects` (write-once
-   guard, ADR-0012 leaves large snapshots to object storage later) and index rows are
-   append-only; the `max_depth` limit keeps its ADR-0013 meaning (an accepted head stays
-   readable under the limits that accepted it) because a checkpoint only shortens the fold,
-   its absence never lengthens it beyond the history length that was accepted.
+4. **Never dropped, never edited; always discardable.** Snapshot objects live in
+   `immutable_objects` (write-once guard; ADR-0012 leaves large snapshots to object storage
+   later) and index rows are append-only; the authoritative patches are untouched, so any
+   checkpoint can be ignored or quarantined and the state rebuilt from them. The
+   `max_depth` limit keeps its ADR-0013 meaning (an accepted head stays readable under the
+   limits that accepted it) because a checkpoint only shortens the fold; its absence never
+   lengthens it beyond the history length that was accepted.
 5. **Verification:** every checkpoint is verified (digest equals fold digest) before it is
    ever used; `ledger-admin verify` re-checks a bounded random subset per run, covering the
    full set over a schedule, and asserts "no checkpoint referenced by a prepare was
    unverified".
 
-Decision required before Phase 4 (branches make deep histories more common): the ADR for the
-snapshot format and the checkpoint table (persistent identity of snapshots, who writes them,
-atomicity relative to acceptance, verification before use).
+Decision required *before* any implementation, and only once the condition above holds:
+an ADR for the snapshot format and the checkpoint table (persistent identity of
+snapshots, who writes them, atomicity relative to acceptance, verification before use).
+Plan 0012 did not start that ADR.

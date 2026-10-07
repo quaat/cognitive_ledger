@@ -7,8 +7,8 @@ production code changed in between; only the benchmark harness, tests, CI and do
 Plan 0012 (Phase 6C) changed the retrieval code of reconstruction and ancestry walks
 (`ledger-store`, `ledger-dag`) without a migration or an API change; the two rows it
 affects are updated below. One behaviour to note before an upgrade: a `commit_parents`
-position-0 row that contradicts the commit bytes now fails reconstruction (`deployment.md`,
-Runtime limits). Nothing here was run against a live Entra tenant, a Sculpin
+position-0 row that contradicts the commit bytes now fails reconstruction (ADR-0025;
+`deployment.md`, Runtime limits). Nothing here was run against a live Entra tenant, a Sculpin
 service, or a production Fuseki or PostgreSQL. Rows marked *(inf)* are inferred from code,
 not observed.
 

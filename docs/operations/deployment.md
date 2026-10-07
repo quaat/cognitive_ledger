@@ -99,8 +99,9 @@ amendment).
   position-0 row that contradicts the commit bytes (impossible through the ledger's write
   paths; detected by `verify_commit_index`, not by `ledger-admin verify`'s SQL checks) is
   now `CorruptObject` for every read of that history, where earlier releases silently
-  followed the bytes. No shipped command performs this verification over a whole database
-  yet (tech-debt).
+  followed the bytes (ADR-0025, which also lists how the error surfaces and how to
+  investigate the blamed commit). No shipped command performs this verification over a
+  whole database yet (tech-debt).
 - Database session (every runtime connection): `LEDGER_DB_STATEMENT_TIMEOUT_MS` (30000),
   `LEDGER_DB_LOCK_TIMEOUT_MS` (10000), `LEDGER_DB_IDLE_IN_TRANSACTION_TIMEOUT_MS`
   (60000), `LEDGER_DB_MAX_CONNECTIONS` (16); values are milliseconds up to 2³¹−1. A

@@ -932,6 +932,65 @@ async fn corrupted_objects_and_index_rows_fail_closed_identically_or_stricter() 
                 blamed: Bind::Commit(4),
             },
         },
+        // ADR-0025 compatibility table: a contradicted row is reported in chain order, ahead
+        // of the later error the scalar walk would have reached by following the bytes.
+        Case {
+            name: "ADR-0025: a contradicted hint at commit 5 precedes a missing older commit 2 (scalar: NotFound)",
+            v1: false,
+            damage: vec![
+                (
+                    "UPDATE commit_parents SET parent_id = $2 WHERE commit_id = $1 AND position = 0",
+                    vec![Bind::Commit(5), Bind::Commit(1)],
+                ),
+                (
+                    "DELETE FROM immutable_objects WHERE id = $1",
+                    vec![Bind::Commit(2)],
+                ),
+            ],
+            limits: DEV,
+            head: Head::Top,
+            expect: Expect::ContradictedHint {
+                reference: not_found,
+                blamed: Bind::Commit(5),
+            },
+        },
+        Case {
+            name: "ADR-0025: a contradicted hint at commit 5 precedes a corrupt older patch 1 (scalar: CorruptObject on the patch)",
+            v1: false,
+            damage: vec![
+                (
+                    "UPDATE commit_parents SET parent_id = $2 WHERE commit_id = $1 AND position = 0",
+                    vec![Bind::Commit(5), Bind::Commit(1)],
+                ),
+                (
+                    "UPDATE immutable_objects SET bytes = bytes || 'x'::bytea WHERE id = $1",
+                    vec![Bind::Patch(1)],
+                ),
+            ],
+            limits: DEV,
+            head: Head::Top,
+            expect: Expect::ContradictedHint {
+                reference: corrupt_hash,
+                blamed: Bind::Commit(5),
+            },
+        },
+        Case {
+            name: "ADR-0025: a contradicted hint at commit 5 precedes the quad limit the genesis patch exceeds (scalar: ResourceLimit)",
+            v1: false,
+            damage: vec![(
+                "UPDATE commit_parents SET parent_id = $2 WHERE commit_id = $1 AND position = 0",
+                vec![Bind::Commit(5), Bind::Commit(1)],
+            )],
+            limits: ReconstructionLimits {
+                max_quads: 1,
+                ..DEV
+            },
+            head: Head::Top,
+            expect: Expect::ContradictedHint {
+                reference: |r| matches!(r, Err(LedgerError::ResourceLimit(m)) if m == "reconstructed state exceeds 1 quads"),
+                blamed: Bind::Commit(5),
+            },
+        },
         Case {
             name: "commit_parents position 0 row missing (hint silent, bytes followed)",
             v1: false,

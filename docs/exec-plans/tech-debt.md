@@ -180,8 +180,8 @@
   `PostgresImmutableStore` it would still cost two statements per ancestor.
 - The index/bytes rule of windowed reconstruction: a `commit_parents` position-0 row that
   contradicts the decoded commit is `CorruptObject`, where the scalar walk silently followed
-  the bytes (Plan 0012 Decision 1); a silent index (no row) is followed from the bytes as
-  before. Such a row is detected by `PostgresImmutableStore::verify_commit_index` (the
+  the bytes (ADR-0025, Plan 0012 Decision 1); a silent index (no row) is followed from the
+  bytes as before. Such a row is detected by `PostgresImmutableStore::verify_commit_index` (the
   ADR-0012 re-derivation from bytes), which `ledger-admin verify` does **not** run: its SQL
   checks catch a parent-row count disagreeing with `parent_count`, a foreign parent and an
   unindexed parent only. Add the re-derivation (or a bounded sample of it) to
