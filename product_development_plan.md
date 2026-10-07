@@ -1796,7 +1796,10 @@ performance regression envelope
 > `statement_timeout` = request timeout, no transaction bound) and write paths without
 > admission control. M0 (inventory, concurrency/resource model, test strategy) is in the
 > plan; acceptance tests come before any behaviour change, and the timeout/cancellation/
-> admission model needs an ADR before implementation. Checkpoints are not started (§24).
+> admission model needs an ADR before implementation. M1 (2026-10-07) measured the current
+> behaviour on PostgreSQL 17 and 15, added the deterministic lifecycle suites with red
+> `future_*` acceptance tests, fixed F5/F6, and ADR-0026 is drafted for owner review; M2/M3
+> start only after that review. Checkpoints are not started (§24).
 
 Deliver:
 
@@ -1847,6 +1850,16 @@ Agents should not receive unrestricted low-level ref manipulation.
 Sculpin should determine when feedback is sufficiently meaningful to create a proposal.
 
 The ledger remains deterministic infrastructure.
+
+> **Phase 9 candidate (assessed 2026-10-07, not scheduled): ledger-backed predictive models.**
+> A model learning `P(outcome | state, change, history)` from replayed history is a *consumer*
+> of the Phase 8 tool surface and of ledger exports, owned by Sculpin's cognitive-policy layer
+> (§37/§38); it is never a ledger feature. Ledger-side prerequisites, in order: the Phase 6
+> streaming export / history-lookup API (this is its first named consumer), a read-only export
+> identity (ADR-0016 extension, ADR required), the §30 privacy/retention decision before
+> training on real history, a Sculpin-owned prediction vocabulary, and the §38 regression test.
+> The benchmark side is INTEGRATION_PLAN Milestones 4, 5 and 10. Assessment:
+> `docs/design/neural-prediction-assessment.md`.
 
 ---
 

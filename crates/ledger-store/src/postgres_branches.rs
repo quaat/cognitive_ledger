@@ -785,7 +785,13 @@ impl WorkflowRepository {
             &event,
         )
         .await?;
+        #[cfg(feature = "test-hooks")]
+        self.hook_at(crate::test_hooks::HookPoint::BeforeCommit, &mut tx)
+            .await?;
         tx.commit().await.map_err(db_error)?;
+        #[cfg(feature = "test-hooks")]
+        self.pause_at(crate::test_hooks::HookPoint::AfterCommit)
+            .await;
         Ok(BranchOutcome {
             event,
             replayed: false,
@@ -905,7 +911,13 @@ impl WorkflowRepository {
         )
         .await?;
         Self::record_branch_result(&mut tx, scope, operation, result_kind, &event).await?;
+        #[cfg(feature = "test-hooks")]
+        self.hook_at(crate::test_hooks::HookPoint::BeforeCommit, &mut tx)
+            .await?;
         tx.commit().await.map_err(db_error)?;
+        #[cfg(feature = "test-hooks")]
+        self.pause_at(crate::test_hooks::HookPoint::AfterCommit)
+            .await;
         Ok(BranchOutcome {
             event,
             replayed: false,

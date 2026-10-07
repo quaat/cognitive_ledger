@@ -23,8 +23,8 @@
 
 use crate::{
     Api, BRANCH, Call, Metrics, Op, Outcome, VerifyReport, environment, graph_invariants,
-    is_expected_failure, jitter, mint_claims, now_secs, percentiles, prepare_body, provision,
-    require_loopback,
+    is_expected_failure, is_timeout_class, jitter, mint_claims, now_secs, percentiles,
+    prepare_body, provision, require_loopback,
 };
 use ledger_store::verify;
 use serde::Serialize;
@@ -171,6 +171,17 @@ struct FaultState {
 }
 
 /// Which failure classes leave the outcome in doubt, and how.
+/// The fault run's error policy (`docs/quality/test-strategy.md`): `DEPENDENCY_UNAVAILABLE`
+/// and transport failures are expected while a replica or PostgreSQL is down and are replayed
+/// as in-doubt; `RESOURCE_LIMIT` is admission control. A `DEPENDENCY_TIMEOUT` (lock timeout,
+/// serialization failure, deadlock, statement timeout) is **not** a consequence of a kill and
+/// fails the run, exactly as in the stress and branch modes (Plan 0013 F6: before, the shared
+/// expected-failure filter let it pass here). A timed-out request is still replayed as
+/// in-doubt, so its outcome is verified as well as counted.
+fn fault_unexpected(class: &str) -> bool {
+    !is_expected_failure(class) || is_timeout_class(class)
+}
+
 fn in_doubt_kind(class: &str) -> Option<&'static str> {
     if class == "transport connect" {
         Some("never-sent")
@@ -785,10 +796,9 @@ pub async fn run(argv: impl Iterator<Item = String>) -> ExitCode {
             .collect(),
     };
     let errors = metrics.errors.lock().unwrap().clone();
-    // Dependency failures are expected while PostgreSQL is down; anything else is not.
     let unexpected_errors: BTreeMap<String, u64> = errors
         .iter()
-        .filter(|(k, _)| !is_expected_failure(k))
+        .filter(|(k, _)| fault_unexpected(k))
         .map(|(k, v)| (k.clone(), *v))
         .collect();
     let malformed_responses = state.malformed.lock().unwrap().clone();
@@ -869,7 +879,19 @@ pub async fn run(argv: impl Iterator<Item = String>) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::in_doubt_kind;
+    use super::{fault_unexpected, in_doubt_kind};
+
+    #[test]
+    fn a_dependency_timeout_fails_the_fault_run_but_outages_and_refusals_do_not() {
+        assert!(fault_unexpected("503 DEPENDENCY_TIMEOUT"));
+        assert!(fault_unexpected("401 UNAUTHENTICATED"));
+        assert!(fault_unexpected("500 INTERNAL"));
+        assert!(fault_unexpected("409 IDEMPOTENCY_CONFLICT"));
+        assert!(!fault_unexpected("503 DEPENDENCY_UNAVAILABLE"));
+        assert!(!fault_unexpected("503 RESOURCE_LIMIT"));
+        assert!(!fault_unexpected("transport connect"));
+        assert!(!fault_unexpected("transport other"));
+    }
 
     #[test]
     fn in_doubt_classes_are_split_into_in_flight_and_never_sent() {

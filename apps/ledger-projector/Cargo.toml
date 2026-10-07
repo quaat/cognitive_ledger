@@ -19,7 +19,14 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[features]
+# Deterministic crash windows for the projection tests (`FailPoint`, Plan 0013 F5). Never
+# enabled by the binary; only this crate's test targets turn it on (dev-dependency below).
+test-hooks = []
+
 [dev-dependencies]
+# Self dev-dependency: the test targets (and only they) build the library with `test-hooks`.
+ledger-projector = { path = ".", features = ["test-hooks"] }
 async-trait.workspace = true
 reqwest.workspace = true
 sqlx.workspace = true

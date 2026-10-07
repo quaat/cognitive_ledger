@@ -9,10 +9,18 @@
 # replicas). Use together with compose.yaml:
 #   docker compose -f compose.yaml -f compose.stress.yaml up --build -d --wait ledger ledger-b postgres
 services:
+  # Qualification runs keep the servers' warnings (every error mapped to a 5xx is logged at
+  # `warn` with its correlation id), so a failed fault/stress gate can be diagnosed from
+  # `containers.log`; the development default logs errors only.
+  ledger:
+    environment:
+      RUST_LOG: info
   ledger-b:
     extends:
       file: compose.yaml
       service: ledger
+    environment:
+      RUST_LOG: info
     # `extends` merges lists; override so this replica publishes only its own port.
     ports: !override ["127.0.0.1:8081:8080"]
     depends_on:

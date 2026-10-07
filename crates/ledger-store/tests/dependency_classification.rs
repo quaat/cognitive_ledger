@@ -63,3 +63,33 @@ async fn unreachable_database_is_classified_as_a_dependency_failure_everywhere()
             .await
     ));
 }
+
+/// A connection attempt during PostgreSQL crash recovery or shutdown fails inside the
+/// start-up handshake, which sqlx reports as a `Protocol` error rather than the 57P03 the
+/// server sent (observed as 165 × `500 INTERNAL` across two PostgreSQL kills in the Plan 0013
+/// M1 fault run). The connection is gone and the request is retryable: `DependencyUnavailable`
+/// (503), never a storage fault (500). Driver-level pool and I/O failures classify alike.
+#[test]
+fn driver_protocol_pool_and_io_failures_are_unavailable_not_faults() {
+    for e in [
+        sqlx::Error::Protocol(
+            "Postgres protocol error (reading Authentication): the database system is in recovery mode"
+                .into(),
+        ),
+        sqlx::Error::PoolTimedOut,
+        sqlx::Error::PoolClosed,
+        sqlx::Error::WorkerCrashed,
+        sqlx::Error::Io(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "eof")),
+    ] {
+        let classified = ledger_store::classify_db_error(e);
+        assert!(
+            matches!(classified, LedgerError::DependencyUnavailable(_)),
+            "{classified:?}"
+        );
+    }
+    // A decoding or configuration defect stays a storage fault.
+    assert!(matches!(
+        ledger_store::classify_db_error(sqlx::Error::Decode("bad column".into())),
+        LedgerError::Storage(_)
+    ));
+}

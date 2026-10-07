@@ -17,9 +17,11 @@
 
 use crate::db_error;
 use crate::postgres_branches::GraphParents;
+#[cfg(feature = "test-hooks")]
+use crate::postgres_workflow::FailPoint;
 use crate::postgres_workflow::{
-    FailPoint, Operation, RequestScope, StoredResult, ValidationPolicy, WorkflowRepository,
-    validate_reason, validate_scope_fn,
+    Operation, RequestScope, StoredResult, ValidationPolicy, WorkflowRepository, validate_reason,
+    validate_scope_fn,
 };
 use ledger_core::{AnyCommit, CommitId, CommitV2, ContentId, GraphId, LedgerError, TenantId};
 use ledger_dag::{MergeBase, Relation, TraversalLimits};
@@ -679,6 +681,7 @@ impl WorkflowRepository {
             ),
             _ => db_error(e),
         })?;
+        #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterDecision)?;
         let digest = preview
             .merged_state_digest
@@ -728,6 +731,7 @@ impl WorkflowRepository {
             None,
         )
         .await?;
+        #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::BeforeCommit)?;
         let row = Self::load_merge_row(&mut tx, &scope.graph, proposal_id)
             .await?
@@ -735,7 +739,13 @@ impl WorkflowRepository {
         #[cfg(feature = "test-hooks")]
         self.pause_at(crate::test_hooks::HookPoint::ProposeBeforeCommit)
             .await;
+        #[cfg(feature = "test-hooks")]
+        self.hook_at(crate::test_hooks::HookPoint::BeforeCommit, &mut tx)
+            .await?;
         tx.commit().await.map_err(db_error)?;
+        #[cfg(feature = "test-hooks")]
+        self.pause_at(crate::test_hooks::HookPoint::AfterCommit)
+            .await;
         Ok(Self::proposed_from_row(row, false))
     }
 
@@ -963,6 +973,7 @@ impl WorkflowRepository {
                 "locked target ref disappeared during merge".into(),
             ));
         }
+        #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterRefUpdate)?;
         let actor = scope.principal.actor();
         let ref_event_id: i64 = sqlx::query_scalar(
@@ -985,6 +996,7 @@ impl WorkflowRepository {
         .fetch_one(&mut *tx)
         .await
         .map_err(db_error)?;
+        #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterRefEvent)?;
         let decision_id: i64 = sqlx::query_scalar(
             "INSERT INTO decisions (proposal_id, graph_id, branch, candidate_commit, decision, \
@@ -1017,6 +1029,7 @@ impl WorkflowRepository {
             )
             .await?;
         }
+        #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterDecision)?;
         let outbox_id: i64 = sqlx::query_scalar(
             "INSERT INTO projection_outbox (graph_id, branch, commit_id, ref_version, event_kind, ref_event_id) \
@@ -1030,6 +1043,7 @@ impl WorkflowRepository {
         .fetch_one(&mut *tx)
         .await
         .map_err(db_error)?;
+        #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterOutbox)?;
         Self::record_result(
             &mut tx,
@@ -1043,8 +1057,15 @@ impl WorkflowRepository {
             None,
         )
         .await?;
+        #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::BeforeCommit)?;
+        #[cfg(feature = "test-hooks")]
+        self.hook_at(crate::test_hooks::HookPoint::BeforeCommit, &mut tx)
+            .await?;
         tx.commit().await.map_err(db_error)?;
+        #[cfg(feature = "test-hooks")]
+        self.pause_at(crate::test_hooks::HookPoint::AfterCommit)
+            .await;
         Ok(MergeApplied {
             decision_id,
             ref_event_id,

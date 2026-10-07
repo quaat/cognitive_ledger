@@ -64,8 +64,14 @@ cargo test -p ledger-store --features postgres --test pg_fs_migration -- --ignor
 #         fault injection, DB invariants ---------------------------------------------------
 cargo test -p ledger-store --features postgres --test pg_workflow -- --ignored --nocapture
 
-# --- 1f. Authenticated HTTP API over real PostgreSQL (P1.4) -------------------------------
-cargo test -p ledger-api --test pg_api -- --ignored --nocapture
+# --- 1e'. Request lifecycle vs transaction lifecycle (Plan 0013 M1): drop before/after COMMIT
+#          on every write path, abandoned statements, backend-reuse cancellation hazard,
+#          SQLSTATE mapping through writes, same-key concurrency; `future_*` excluded ---------
+cargo test -p ledger-store --features postgres --test pg_lifecycle -- --ignored --nocapture --skip future_
+
+# --- 1f. Authenticated HTTP API over real PostgreSQL (P1.4); Plan 0013 M1 `p7a_*` lifecycle
+#         tests included, `future_*` (red until M2/M3) excluded by design ----------------------
+cargo test -p ledger-api --test pg_api -- --ignored --nocapture --skip future_
 
 # --- 1g. Least privilege (ADR-0016, P1.5): owner migrates, runtime serves, runtime cannot
 #         alter/drop/disable/rewrite, schema level fail-closed ----------------------------

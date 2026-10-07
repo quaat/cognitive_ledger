@@ -555,6 +555,13 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    if ledger_store::TEST_HOOKS_COMPILED {
+        eprintln!(
+            "ledger-admin: this build contains ledger-store's test-only fault injection \
+             (`test-hooks`); refusing to run"
+        );
+        return ExitCode::FAILURE;
+    }
     let command = match parse_command(env::args().skip(1)) {
         Ok(command) => command,
         Err(message) => {

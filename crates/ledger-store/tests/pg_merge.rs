@@ -1624,12 +1624,13 @@ async fn a_crash_at_any_merge_stage_leaves_nothing_and_the_retry_succeeds() {
     for point in [FailPoint::AfterDecision, FailPoint::BeforeCommit] {
         let before = counts(&store, &g).await;
         let failing = store.workflows().clone().with_failpoint(point);
+        let err = failing
+            .merge_propose(&request("fp-p"), limits())
+            .await
+            .unwrap_err();
         assert!(
-            failing
-                .merge_propose(&request("fp-p"), limits())
-                .await
-                .is_err(),
-            "{point:?}"
+            matches!(&err, LedgerError::Storage(m) if m == &format!("injected failure at {point:?}")),
+            "{point:?}: {err:?}"
         );
         assert_eq!(counts(&store, &g).await, before, "{point:?}");
     }
@@ -1654,9 +1655,10 @@ async fn a_crash_at_any_merge_stage_leaves_nothing_and_the_retry_succeeds() {
     ] {
         let before = counts(&store, &g).await;
         let failing = store.workflows().clone().with_failpoint(point);
+        let err = failing.merge_apply(&apply_request()).await.unwrap_err();
         assert!(
-            failing.merge_apply(&apply_request()).await.is_err(),
-            "{point:?}"
+            matches!(&err, LedgerError::Storage(m) if m == &format!("injected failure at {point:?}")),
+            "{point:?}: {err:?}"
         );
         assert_eq!(counts(&store, &g).await, before, "{point:?}");
         assert_eq!(head(&store, &g, "main").await, (c1.clone(), 1), "{point:?}");

@@ -31,6 +31,8 @@ pub struct Metrics {
     rebuilds: AtomicU64,
     lease_lost: AtomicU64,
     superseded: AtomicU64,
+    /// Simulated crashes (test builds only; never exported).
+    #[cfg(feature = "test-hooks")]
     crashed: AtomicU64,
     duration_count: AtomicU64,
     duration_micros: AtomicU64,
@@ -60,6 +62,7 @@ impl Metrics {
             StepOutcome::LeaseLost => {
                 self.lease_lost.fetch_add(1, Relaxed);
             }
+            #[cfg(feature = "test-hooks")]
             StepOutcome::Crashed(_) => {
                 self.crashed.fetch_add(1, Relaxed);
             }

@@ -19,8 +19,10 @@
 //! stored, digests are compared. Acceptance decisions read the hashed canonical bytes, never
 //! the relational projection columns.
 
+#[cfg(feature = "test-hooks")]
+use crate::FailPoint;
 use crate::{
-    FailPoint, db_error,
+    db_error,
     postgres_workflow::{Operation, RequestScope, StoredResult, WorkflowRepository},
 };
 use ledger_core::{CommitId, ContentId, GraphId, LedgerError, LedgerTimestamp, TenantId};
@@ -106,6 +108,7 @@ pub struct ValidatorOutcome {
 pub struct ValidationRepository {
     pool: PgPool,
     limits: crate::ReconstructionLimits,
+    #[cfg(feature = "test-hooks")]
     failpoint: Option<FailPoint>,
 }
 
@@ -118,6 +121,7 @@ impl ValidationRepository {
         Self {
             pool,
             limits: crate::ReconstructionLimits::DEVELOPMENT,
+            #[cfg(feature = "test-hooks")]
             failpoint: None,
         }
     }
@@ -129,12 +133,14 @@ impl ValidationRepository {
 
     /// Abort `record`'s transaction at `point` (tests only): `AfterLineageValidation` after
     /// the context insert, `AfterDecision` after the record insert, `BeforeCommit` after the
-    /// idempotency result.
+    /// idempotency result. Feature `test-hooks` only.
+    #[cfg(feature = "test-hooks")]
     pub fn with_failpoint(mut self, point: FailPoint) -> Self {
         self.failpoint = Some(point);
         self
     }
 
+    #[cfg(feature = "test-hooks")]
     fn fail_at(&self, point: FailPoint) -> Result<(), LedgerError> {
         if self.failpoint == Some(point) {
             return Err(LedgerError::Storage(format!(
@@ -267,8 +273,10 @@ impl ValidationRepository {
         WorkflowRepository::graph_must_be_active(&mut tx, scope).await?;
         Self::candidate_is_prepared_here(&mut tx, &scope.graph, &ticket.candidate).await?;
         Self::insert_context(&mut tx, scope, &context_bytes, &context_id).await?;
+        #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterLineageValidation)?;
         Self::insert_record(&mut tx, scope, &record_bytes, &validation_id).await?;
+        #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterDecision)?;
         WorkflowRepository::record_result(
             &mut tx,
@@ -282,6 +290,7 @@ impl ValidationRepository {
             Some(&validation_id.0),
         )
         .await?;
+        #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::BeforeCommit)?;
         tx.commit().await.map_err(db_error)?;
         Ok(RecordedValidation {

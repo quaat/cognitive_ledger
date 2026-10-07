@@ -138,8 +138,9 @@ pub struct Rejected {
     pub replayed: bool,
 }
 
-/// Deterministic fault injection: abort the transaction at a named point. Test-only in
-/// intent; production constructs the repository without one.
+/// Deterministic fault injection: abort the transaction at a named point. Test-only:
+/// compiled only with the `test-hooks` feature (Plan 0013 F5), which no binary enables.
+#[cfg(feature = "test-hooks")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FailPoint {
     AfterIdempotencyCheck,
@@ -156,8 +157,10 @@ pub enum FailPoint {
 pub struct WorkflowRepository {
     pub(crate) pool: PgPool,
     pub(crate) immutable: PostgresImmutableStore,
+    #[cfg(feature = "test-hooks")]
     failpoint: Option<FailPoint>,
-    /// A forced-interleaving pause (feature `test-hooks` only; see `crate::test_hooks`).
+    /// A forced-interleaving pause or injected slow statement (feature `test-hooks` only;
+    /// see `crate::test_hooks`).
     #[cfg(feature = "test-hooks")]
     pause: Option<crate::test_hooks::PauseHook>,
     pub(crate) limits: crate::ReconstructionLimits,
@@ -337,8 +340,17 @@ impl PostgresLedgerStore {
 
     /// Fault injection for the validation record transaction (qualification tests only, like
     /// [`WorkflowRepository::with_failpoint`]): the write fails at `point` and rolls back.
+    #[cfg(feature = "test-hooks")]
     pub fn with_validation_failpoint(mut self, point: FailPoint) -> Self {
         self.validations = self.validations.with_failpoint(point);
+        self
+    }
+
+    /// Pause (or inject a slow statement into) every workflow transaction at the hook's
+    /// point (feature `test-hooks` only): the request-lifecycle tests of Plan 0013.
+    #[cfg(feature = "test-hooks")]
+    pub fn with_workflow_pause_hook(mut self, hook: crate::test_hooks::PauseHook) -> Self {
+        self.workflows = self.workflows.with_pause_hook(hook);
         self
     }
 
@@ -552,6 +564,7 @@ impl WorkflowRepository {
         Self {
             pool,
             immutable,
+            #[cfg(feature = "test-hooks")]
             failpoint: None,
             #[cfg(feature = "test-hooks")]
             pause: None,
@@ -635,7 +648,8 @@ impl WorkflowRepository {
         Ok((r.state, r.bytes, r.depth))
     }
 
-    /// Abort every operation's transaction at `point` (tests only).
+    /// Abort every operation's transaction at `point` (tests only; feature `test-hooks`).
+    #[cfg(feature = "test-hooks")]
     pub fn with_failpoint(mut self, point: FailPoint) -> Self {
         self.failpoint = Some(point);
         self
@@ -648,13 +662,30 @@ impl WorkflowRepository {
         self
     }
 
+    /// A hook point outside any transaction (after `COMMIT`): pause only.
     #[cfg(feature = "test-hooks")]
     pub(crate) async fn pause_at(&self, point: crate::test_hooks::HookPoint) {
         if let Some(hook) = &self.pause {
-            hook.at(point).await;
+            // Without a connection a slow-statement hook only signals; it cannot fail.
+            let _ = hook.at(point, None).await;
         }
     }
 
+    /// A hook point inside a transaction: pause, or run the injected slow statements on
+    /// the transaction's connection (so they hold its locks like real work would).
+    #[cfg(feature = "test-hooks")]
+    pub(crate) async fn hook_at(
+        &self,
+        point: crate::test_hooks::HookPoint,
+        conn: &mut PgConnection,
+    ) -> Result<(), LedgerError> {
+        match &self.pause {
+            Some(hook) => hook.at(point, Some(conn)).await,
+            None => Ok(()),
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
     pub(crate) fn fail_at(&self, point: FailPoint) -> Result<(), LedgerError> {
         if self.failpoint == Some(point) {
             return Err(LedgerError::Storage(format!(
@@ -1213,6 +1244,7 @@ impl WorkflowRepository {
         if let Some(stored) = Self::stored_result(&mut tx, scope, Operation::Prepare).await? {
             return Self::replay_prepared(&mut tx, stored, scope).await;
         }
+        #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterIdempotencyCheck)?;
         Self::graph_must_be_active(&mut tx, scope).await?;
         // The branch must exist and be active (ADR-0022); held `FOR SHARE` until commit so a
@@ -1283,6 +1315,7 @@ impl WorkflowRepository {
             base.len() + adds - deletes,
             (base_bytes + add_bytes).saturating_sub(del_bytes),
         )?;
+        #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterLineageValidation)?;
 
         // Content: the requested patch is kept for audit; the effective patch is what the
@@ -1347,6 +1380,7 @@ impl WorkflowRepository {
             _ => db_error(e),
         })?;
         let proposal_id: i64 = row.try_get("proposal_id").map_err(db_error)?;
+        #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterDecision)?;
         Self::record_result(
             &mut tx,
@@ -1360,8 +1394,15 @@ impl WorkflowRepository {
             None,
         )
         .await?;
+        #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::BeforeCommit)?;
+        #[cfg(feature = "test-hooks")]
+        self.hook_at(crate::test_hooks::HookPoint::BeforeCommit, &mut tx)
+            .await?;
         tx.commit().await.map_err(db_error)?;
+        #[cfg(feature = "test-hooks")]
+        self.pause_at(crate::test_hooks::HookPoint::AfterCommit)
+            .await;
         Ok(Prepared {
             proposal_id,
             candidate: candidate_id,
@@ -1520,6 +1561,7 @@ impl WorkflowRepository {
         if request.validation == ValidationPolicy::Required {
             return Err(LedgerError::ValidationRequired);
         }
+        #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterIdempotencyCheck)?;
         Self::graph_must_be_active(&mut tx, scope).await?;
 
@@ -1614,6 +1656,7 @@ impl WorkflowRepository {
             }
             _ => unreachable!("head equality was checked above"),
         };
+        #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterLineageValidation)?;
 
         // Ref movement with version bump.
@@ -1662,6 +1705,7 @@ impl WorkflowRepository {
                 (Some(*version), version + 1)
             }
         };
+        #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterRefUpdate)?;
 
         let actor = scope.principal.actor();
@@ -1692,6 +1736,7 @@ impl WorkflowRepository {
             Self::record_genesis_branch(&mut tx, scope, &request.branch, &request.candidate)
                 .await?;
         }
+        #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterRefEvent)?;
 
         let decision_row = sqlx::query(
@@ -1726,6 +1771,7 @@ impl WorkflowRepository {
             )
             .await?;
         }
+        #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterDecision)?;
 
         let outbox_row = sqlx::query(
@@ -1741,6 +1787,7 @@ impl WorkflowRepository {
         .await
         .map_err(db_error)?;
         let outbox_id: i64 = outbox_row.try_get("outbox_id").map_err(db_error)?;
+        #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterOutbox)?;
 
         Self::record_result(
@@ -1755,8 +1802,15 @@ impl WorkflowRepository {
             None,
         )
         .await?;
+        #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::BeforeCommit)?;
+        #[cfg(feature = "test-hooks")]
+        self.hook_at(crate::test_hooks::HookPoint::BeforeCommit, &mut tx)
+            .await?;
         tx.commit().await.map_err(db_error)?;
+        #[cfg(feature = "test-hooks")]
+        self.pause_at(crate::test_hooks::HookPoint::AfterCommit)
+            .await;
         Ok(Accepted {
             decision_id,
             ref_event_id,
@@ -1820,6 +1874,7 @@ impl WorkflowRepository {
         if let Some(stored) = Self::stored_result(&mut tx, scope, Operation::Reject).await? {
             return Self::replay_rejected(stored, scope);
         }
+        #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterIdempotencyCheck)?;
         Self::graph_must_be_active(&mut tx, scope).await?;
         // Rejection does not depend on the current head, only on the proposal's own
@@ -1897,6 +1952,7 @@ impl WorkflowRepository {
             )
             .await?;
         }
+        #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterDecision)?;
         Self::record_result(
             &mut tx,
@@ -1910,8 +1966,15 @@ impl WorkflowRepository {
             None,
         )
         .await?;
+        #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::BeforeCommit)?;
+        #[cfg(feature = "test-hooks")]
+        self.hook_at(crate::test_hooks::HookPoint::BeforeCommit, &mut tx)
+            .await?;
         tx.commit().await.map_err(db_error)?;
+        #[cfg(feature = "test-hooks")]
+        self.pause_at(crate::test_hooks::HookPoint::AfterCommit)
+            .await;
         Ok(Rejected {
             decision_id,
             replayed: false,
