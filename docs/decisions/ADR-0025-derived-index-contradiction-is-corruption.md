@@ -200,7 +200,8 @@ rewritten.
   run by the `pg_immutable_store`/`pg_graphs_migration` tests and, scoped to the imported
   commits, by `ledger-admin migrate-fs-to-pg`. **No shipped command runs it over a whole
   database; its integration into `ledger-admin verify` remains deferred** and is tracked as
-  tech-debt (`docs/exec-plans/tech-debt.md`, "Phase 6C residuals"). This ADR does not add
+  tech-debt (`docs/exec-plans/tech-debt.md`, "Phase 6C (Plan 0012) residuals and accepted
+  risk"). This ADR does not add
   it: the condition has no ledger-path origin, the failure is fail-closed and names the
   commit, and a verifier feature would be unrelated work in an identity-relevant change.
 - **Remediation** is an operator decision outside the ledger's write paths: the rows are
@@ -225,8 +226,8 @@ production-qualification matrix carries it as a behaviour to note before an upgr
   PostgreSQL 17 and 15 across ten window configurations (a contradicted row on a sound
   history, a malformed row, a parent for a genesis, a contradicted row at the depth limit,
   a contradicted row ahead of a missing older commit, a contradicted row ahead of a corrupt
-  older patch, and the silent-row case), each against the scalar reference kept under
-  `test-hooks`.
+  older patch, a contradicted row ahead of the quad limit, and the silent-row case), each
+  against the scalar reference kept under `test-hooks`.
 - Documentation carrying the rule: `ARCHITECTURE.md` (Phase 6C sentence), Plan 0012
   (Decision 1), `docs/operations/deployment.md` (Runtime limits),
   `docs/quality/production-qualification.md`, `docs/exec-plans/tech-debt.md` (the deferred

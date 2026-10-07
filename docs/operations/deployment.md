@@ -99,7 +99,8 @@ amendment).
   driver (as the scalar reads were), while it is folded. One error changed: a
   `commit_parents` position-0 row that contradicts the commit bytes (written by no ledger
   code path; a direct `INSERT` with the database credential can create one, ADR-0016
-  residual; detected by `verify_commit_index`, not by `ledger-admin verify`'s SQL checks) is
+  residual; detected by `verify_commit_index`, not by `ledger-admin verify`'s SQL checks,
+  though its merge-row checks surface it behind a merge candidate) is
   now `CorruptObject` for every read of that history, where earlier releases silently
   followed the bytes (ADR-0025, which also lists how the error surfaces and how to
   investigate the blamed commit). No shipped command performs this verification over a

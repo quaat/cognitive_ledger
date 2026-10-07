@@ -248,6 +248,7 @@ written before verification.
 ## Recommended sequence
 
 1. **M3 `bear-b-ci`.** Done in Plan 0011, together with the reconstruction characterization.
-2. **Checkpoint ADR.** Draft it from the Plan 0011 measurements.
+2. **Checkpoint ADR.** Only if a declared target depth and latency budget exceed the Phase 6C
+   residual (`CHECKPOINT-ADR-READY: NO`, Plan 0012 M4; `product_development_plan.md` §24).
 3. **`tkgl-smallpedia-ci` and `thgl-software-ci`.** Add them next. By the end of Phase 6 the
    `ci` profile should hold all four reduced datasets.

@@ -1,6 +1,6 @@
 # Plan 0011: Phase 6B — BEAR-B, reconstruction characterization, qualification hygiene
 
-Status: **complete** (2026-10-07; PR #13, awaiting the owner's merge). Branch `claude/p6b-bear-reconstruction` from
+Status: **complete** (2026-10-07; PR #13, merged by the owner as `4c5e445`). Branch `claude/p6b-bear-reconstruction` from
 `main` at `646b0291c2dcd0f50089939ab2622f02dc47d538`. That commit is the PR #12 Phase-6A merge;
 its tree is identical to the reviewed head `9f593d2`, see
 [Plan 0010](../completed/0010-phase6a-benchmark-foundation.md). No gate is reported as passed

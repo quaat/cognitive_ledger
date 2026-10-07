@@ -1,26 +1,35 @@
 # Plan 0012: Phase 6C — batched reconstruction and DAG/ancestry retrieval
 
-Status: **implementation, M4 and reviews complete; open: hosted CI on PR #14, the local `test-integration.sh`/`benchmark.sh bear` reruns, the base reconciliation steps (1)–(4) below** (started 2026-10-07). Branch `claude/p6c-batched-retrieval` from the
+Status: **closing — ADR-0025 added, base reconciled with `main`, PR #14 retargeted to `main`, every executable gate re-run on the retargeted head and green (Evidence); one local gate outstanding: `scripts/benchmark.sh bear` (no hosted equivalent) and the local `scripts/test-integration.sh` run need host port 8080, which an unrelated developer process holds — the hosted `ci-integration` job runs the same `test-integration.sh`. The plan moves to `completed/` when the `bear` run is recorded** (started 2026-10-07). Branch `claude/p6c-batched-retrieval` from the
 Phase-6B head `d05113d` (PR #13 head `aabdd11` plus the two Codex P2 fixes of 2026-10-07),
-which is `main` at `646b029` plus the reviewed Phase-6B changes. Continues
+which was `main` at `646b029` plus the reviewed Phase-6B changes. Continues
 [Plan 0011](../completed/0011-phase6b-bear-reconstruction-characterization.md).
 
-**Base reconciliation (recorded, not yet resolved).** The task required starting from the
-`main` that results from merging PR #13. At the start of this plan PR #13 was still open
-(CI green, mergeable, two Codex P2 comments outstanding; previous PRs were all merged by the
-repository owner, never by the agent). The two comments were fixed on the PR branch, whose
-head is now `d05113d`, and this branch was created on top of that head so that the
-Phase-6B benchmark tooling (`ledger-bench recon`, `scripts/benchmark-recon.sh`) and the
-documents this plan builds on are present. PR #13 touches no production crate
-(`git diff --name-only 646b029..d05113d -- crates apps/ledger-server apps/ledger-projector
-migrations` lists only three test files), so the production code this plan changes is
-byte-identical on `main` and on the Phase-6B head. The M4 "before" measurement is taken at
-`d05113d` (identical production code to `main`). **Before this plan's PR is merged:**
-(1) PR #13 is merged by the owner; (2) this branch is rebased onto the resulting `main`
-and the PR retargeted from `claude/p6b-bear-reconstruction` to `main`; (3) if `main` then
-differs from `d05113d` in anything but the merge commit, the difference is recorded here;
-(4) `check-fast`, the PostgreSQL suites, `test-integration.sh`, `benchmark.sh bear` and hosted CI are re-run on the rebased head.
-Until then PR #14 is open against `claude/p6b-bear-reconstruction`; the PR workflows trigger on every `pull_request`, so hosted CI runs on it. Step (4) includes `test-integration.sh` and `benchmark.sh bear`.
+**Base reconciliation (done 2026-10-07).** The task required starting from the `main` that
+results from merging PR #13. At the start of this plan PR #13 was still open, so this branch
+was created on the PR #13 head `d05113d` (its two outstanding Codex P2 comments fixed there)
+so that the Phase-6B benchmark tooling and documents were present; PR #13 touches no
+production crate, so the production code this plan changes was byte-identical on `main` and
+on that head, and the M4 "before" measurement at `d05113d` measures `main`'s production code.
+The steps recorded here were then carried out:
+1. PR #13 was merged by the repository owner; `main` is `4c5e445`, the PR #13 merge commit.
+2. `git diff d05113d..4c5e445` is **empty**: `main` differs from this plan's base only by
+   that merge commit (verified after `git fetch origin`, 2026-10-07).
+3. No rebase or force push (AGENTS.md): `origin/main` was merged into this branch
+   history-preservingly as `11c0d69` (tree identical to its first parent `725c84e`, so the
+   merge carried no content change), and `git diff origin/main..HEAD` equals
+   `git diff d05113d..HEAD` byte-for-byte: the PR diff against `main` is exactly the
+   Phase 6C work (34 files).
+4. PR #14 was retargeted from `claude/p6b-bear-reconstruction` to `main`
+   (`gh pr edit 14 --base main`); its body's "Base" section records the same.
+5. The gates were re-run on the final head and hosted CI runs on the retargeted PR
+   (Evidence). The official before/after `recon` characterization was **not** repeated:
+   the executable production code is unchanged since the characterized revision `7408a3e`
+   (`git diff 7408a3e..HEAD -- crates apps migrations Cargo.toml Cargo.lock` lists only
+   comment lines in `ledger-dag/src/lib.rs`, `postgres_branches.rs`, `postgres_immutable.rs`
+   and the three test-only matrix cases in `tests/pg_retrieval.rs`), and the reconciliation
+   with `main` carried no content change, so the after run at `7408a3e` measures the final
+   code.
 
 **Migration impact:** none (no schema, index or migration change; `git diff d05113d --
 migrations` is empty). **Affected crates:** `ledger-dag`, `ledger-store` (plus their tests,
@@ -522,16 +531,28 @@ of milliseconds at depth, would reopen the question with these numbers as its in
       ownership tests, criss-cross/two-parent tests, statement-count tests
 - [x] Gates (local): check-fast, PG 17 + PG 15 suites, upgrade, fuzz, supply chain,
       container image/linkage; `ledger-admin verify` inside both official `recon` runs
-- [x] Gates (hosted): CI on PR #14 green on the final head (incl. the integration stack
-      with `pg_retrieval` and the `ci` benchmark profile with bear-b-ci) — see Evidence
-- [ ] Gates (pending locally): `test-integration.sh` with `RUST_TEST_THREADS=4` and
-      `benchmark.sh bear` (host port 8080 busy; `bear` has no hosted equivalent)
+- [x] Gates (hosted, stacked base): CI on PR #14 green on `adf4cae` against
+      `claude/p6b-bear-reconstruction` — superseded as a merge gate by the runs against
+      `main` below
+- [x] Gates (hosted, retargeted to `main`): benchmark-ci, container, dependency-review,
+      docker, fast, fuzz (+ both sanitizer jobs), supply-chain all success on `06b62e1`
+      — see Evidence; the closure commit after it is documentation-only, and its run is
+      recorded on PR #14
+- [x] Gates (local, `06b62e1`): check-fast, PG 17 + PG 15 suites (13 each), upgrade-p5,
+      fuzz, supply chain, container image + runtime linkage — see Evidence
+- [ ] Gates (local, port 8080): `scripts/benchmark.sh bear` and the local
+      `scripts/test-integration.sh` run — **not executed** (host port 8080 held by an
+      unrelated developer process throughout; `ci-integration` runs the same
+      `test-integration.sh` and passed; `bear` has no hosted equivalent, `ci` carries
+      bear-b-ci)
 - [x] M4: before/after `recon` on this host from clean worktrees; residual estimate;
       checkpoint decision
 - [x] Independent reviews (8), P0/P1 resolved; external Codex review of PR #14: one P1
       (ADR required for the Decision 1 invariant change) — resolved by ADR-0025 (see
       Reviews); re-review requested after the closure commits
-- [ ] Docs reconciled; completion report
+- [x] Docs reconciled (ADR-0025 cross-references; checkpoint messaging in the baselines,
+      roadmap §24, Phase 6 note, DATASETS, tech-debt; Plan 0011 status; documentation
+      review findings fixed); completion report in the PR merge-readiness report
 
 ## Decisions
 1. **Index/bytes disagreement is corruption in the windowed path** (see Assumptions;
@@ -539,11 +560,11 @@ of milliseconds at depth, would reopen the question with these numbers as its in
    change recorded only in a plan needs an ADR). The scalar path followed bytes and
    ignored the index. ADR-0012 defines the index as a
    derived view that must agree with the bytes, `verify_commit_index` (reachable today
-   only from tests and, scoped, from the fs→pg migration) reports a disagreement as
+   only from tests; its scoped form `verify_commits` runs in the fs→pg migration) reports a disagreement as
    corruption, and the task requires that a hint contradicted by the bytes
    is never followed silently. Reconstruction therefore fails closed on such a database,
    and it does so at the contradicted commit, in chain order: on such a database the
-   error can precede a `NotFound`, `InvalidPatch`, patch-level `ResourceLimit` or even the
+   error can precede a `NotFound`, an `InvalidPatch`/`CorruptObject` on a patch, a patch-level `ResourceLimit` or even the
    depth limit that the scalar walk would have reported later (HTTP 500 where it was 404
    or 413). Every state read, prepare, validation, projection and merge-row verification of
    that head is affected. No shipped command performs that verification over a whole
@@ -633,7 +654,8 @@ Revisions: `e9a8681` is the first implementation checkpoint; `7408a3e` carries t
 review-driven fixes (anchor-only window errors, first-parent window cap, lazy chain-row
 checks, recursion pair cap, window ramp, zero-window guards) and the reworked tests, and
 is the code head: `7ec018d` and the later commits change docs, `fuzz/Cargo.lock` and
-doc comments only (`git diff 7408a3e HEAD --stat -- crates` shows comment lines only),
+doc comments only (`git diff 7408a3e HEAD --stat -- crates` shows comment lines in three
+production files plus the three test-only ADR-0025 matrix cases in `tests/pg_retrieval.rs`),
 so the official after `recon` at `7408a3e` measures the final code.
 
 | Gate | Revision | Result |
@@ -651,8 +673,20 @@ so the official after `recon` at `7408a3e` measures the final code.
 | Production image build + `scripts/check-runtime-linkage.sh` | `7408a3e` | `RUNTIME LINKAGE OK` (no shipped binary links libssl/libcrypto); the Trivy scan runs only in hosted `ci-security` |
 | `scripts/test-integration.sh` (local) | `7408a3e` | first run: the real-PostgreSQL suites up to and including `pg_retrieval` passed, then `pg_least_privilege` failed with "sorry, too many clients already" under cargo's 16-way parallelism (tech-debt; every suite passes individually, see above); the rerun with `RUST_TEST_THREADS=4` and the local `benchmark.sh ci`/`bear` runs could not bind host port 8080 (a developer process unrelated to this work holds it) and are queued to run when it frees; hosted `ci-integration` covers the integration suites and `ci-benchmark` the `ci` profile; `benchmark.sh bear` has no hosted equivalent and remains a pending local gate |
 | Backup/restore, migration regression | — | not applicable: no storage-format, schema or migration change in this PR (`git diff d05113d -- migrations` is empty); `upgrade-p5.sh` re-run above |
-| `check-fast` on the final docs head | final head | recorded at closure |
-| Hosted CI on PR #14 (test-merge of the head into `claude/p6b-bear-reconstruction`), final head `adf4cae` | `adf4cae` | all success: ci-fast 37597166829 (fast); ci-integration 37597166875 (docker, 11m39s: the compose stack, every real-PostgreSQL suite incl. `pg_retrieval`, the API suites, the containerized HTTP scenario); ci-benchmark 37597166832 (benchmark-ci: synthetic-ledger-ci + bear-b-ci assertions, `VERIFY OK`); ci-fuzz 37597166807 (fuzz-sanitizer none + address, aggregate `fuzz`); ci-security 37597166802 (container, dependency-review, supply-chain). The same five workflows also succeeded on `7ec018d`. |
+| `check-fast` on the retargeted head (fmt, clippy `-D warnings` incl. test targets, workspace tests, architecture, doc links, doc consistency, goldens) | `06b62e1` | pass (exit 0, 2026-10-07 09:40 UTC); re-run on the closure commit before its push, result in the commit message of the push that follows |
+| PostgreSQL 17.2 store + API suites, default parallelism (`pg_least_privilege` `--test-threads=1`) | `06b62e1` | first run against the throwaway test container with Docker's default 64 MiB `/dev/shm`: `pg_validation` 7/9 and `pg_merge` 11/27 failed, every failure `could not resize shared memory segment … No space left on device` (parallel-query DSM under cargo's 16-way test parallelism; a rerun reproduced it), all other suites passed; the container was recreated from the same image digest with `--shm-size=1g` and **every suite passed**: `pg_cas_race` 1, `pg_immutable_store` 9, `pg_retrieval` 11 (27-case matrix), `pg_graphs_migration` 8, `pg_fs_migration` 8, `pg_workflow` 14, `pg_verify` 4, `pg_validation` 9, `pg_projection` 7, `pg_branches` 18, `pg_merge` 27, `pg_least_privilege` 19, `pg_api` 13, `pg_validation_api` 23 (09:46–09:49 UTC). Tech-debt records the shm requirement. |
+| PostgreSQL 15.19 store + API suites, same procedure | `06b62e1` | same picture: 64 MiB shm run failed `pg_validation` 6/9 and `pg_merge` 19/27 with the shm error only; on the recreated 1 GiB-shm container every suite passed with the same counts (09:48–09:51 UTC) |
+| `scripts/upgrade-p5.sh` (previous `5216bce` schema 12 → working tree schema 13; `ledger-admin verify` inside it three times) | `06b62e1` | `UPGRADE-P5 OK`; `VERIFY OK` after population, after the upgraded server's replay, after the merge on the upgraded ledger |
+| `scripts/check-supply-chain.sh` | `06b62e1` | pass (09:47 UTC) |
+| `scripts/fuzz.sh 60` (nightly-2026-09-25, sanitizer none, 7 targets) | `06b62e1` | `FUZZ OK`, no crash (09:47–09:56 UTC) |
+| Production image build + `scripts/check-runtime-linkage.sh` | `06b62e1` | build ok; `RUNTIME LINKAGE OK` (no shipped binary links libssl/libcrypto); the Trivy scan runs in hosted `ci-security` (container: success) |
+| `scripts/test-integration.sh` (local) and `scripts/benchmark.sh bear` (local) | `06b62e1` | **not executed**: both bind host port 8080, held by an unrelated developer process (node) for the whole closure; the previous session's 60-minute wait for the port also expired. Hosted `ci-integration` runs the same script (success on `06b62e1`, below); `benchmark.sh bear` has no hosted equivalent and stays the one outstanding local gate |
+| Hosted CI on PR #14 **targeting `main`** | `06b62e1` | all success: ci-fast 37601866844 (`fast`); ci-integration 37601866862 (`docker`: `test-integration.sh`, i.e. the compose stack, every real-PostgreSQL suite incl. `pg_retrieval` with the 27-case matrix, the API suites, the containerized HTTP scenario); ci-benchmark 37601866892 (`benchmark-ci`: `benchmark.sh ci`, bear-b-ci 185 assertions 0 failed, `VERIFY OK`); ci-fuzz 37601866843 (`fuzz-sanitizer (none)`, `fuzz-sanitizer (address)`, aggregate `fuzz`); ci-security 37601866871 (`container`, `dependency-review`, `supply-chain`). Check-run names match the required-checks list. |
+| External Codex re-review (requested after `06b62e1`) | `06b62e1` | one P2: this plan's status still described the stacked base — fixed in this revision (Status, Base reconciliation); the P1 (ADR) resolved by ADR-0025 |
+| Hosted CI on PR #14 against the stacked base `claude/p6b-bear-reconstruction` (superseded as the merge gate by the `main`-targeted row below), head `adf4cae` | `adf4cae` | all success: ci-fast 37597166829 (fast); ci-integration 37597166875 (docker, 11m39s: the compose stack, every real-PostgreSQL suite incl. `pg_retrieval`, the API suites, the containerized HTTP scenario); ci-benchmark 37597166832 (benchmark-ci: synthetic-ledger-ci + bear-b-ci assertions, `VERIFY OK`); ci-fuzz 37597166807 (fuzz-sanitizer none + address, aggregate `fuzz`); ci-security 37597166802 (container, dependency-review, supply-chain). The same five workflows also succeeded on `7ec018d`. |
+| Base reconciliation (steps 1–5 above) | `11c0d69` | `git diff d05113d..4c5e445` empty; merge tree == `725c84e` tree; `diff <(git diff origin/main..HEAD) <(git diff d05113d..HEAD)` empty; PR #14 base `main`, mergeable |
+| Production code since the characterized revision | `7408a3e..HEAD` | `git diff --stat -- crates apps migrations Cargo.toml Cargo.lock`: `ledger-dag/src/lib.rs` (+3/−1), `postgres_branches.rs` (+2/−2), `postgres_immutable.rs` (+4/−3) — doc comments only — and `tests/pg_retrieval.rs` (+59, three matrix cases); no executable production change, so the official after `recon` stands |
+| `pg_retrieval` with the three ADR-0025 matrix cases (27-case matrix) on PostgreSQL 17.2 (port 55433) and 15 (port 55434) | `725c84e` tree | 11 passed / 0 failed on each (109.9 s and 96.0 s; `explain_window_queries` skipped as in the script) |
 | Official `recon`, before (clean worktree `d05113d`, `official=yes`) | `d05113d` | `RECON PASS`, 144 points, 186 exact checks, 0 failures; `VERIFY OK` (wall 38 min including the history build, which overlapped a compile and test job; not a result) |
 | Official `recon`, after (clean worktree `7408a3e`, `official=yes`) | `7408a3e` | `RECON PASS`, 144 points, 186 exact checks, 0 failures; `VERIFY OK` (wall 12 min); statement counts per the closed forms in M4 at every depth |
 
@@ -662,12 +696,12 @@ so the official after `recon` at `7408a3e` measures the final code.
 - A shipped command for the whole-database index re-derivation (`verify_commit_index`
   in `ledger-admin verify`), the `pg_least_privilege` parallelism, and latency
   measurements of merge-heavy shapes and the byte cut: tech-debt.
-- The local `test-integration.sh` and `benchmark.sh bear` reruns (host port busy) and the
-  base reconciliation steps.
+- The local `test-integration.sh` and `benchmark.sh bear` reruns if host port 8080 is still
+  held at closure (Evidence); the base reconciliation steps are done.
 
 ## Completion criteria
 Every box above checked with evidence; statement counts in the official `recon` scale with
 windows (formula above), not with depth; every corruption and differential test passes;
-no P0/P1 review finding open; `CHECKPOINT-ADR-READY` restated with the post-batching
-residual; hosted CI green on the rebased head and the base reconciliation steps (1)–(4)
-done.
+no P0/P1 review finding open (including the external Codex review); `CHECKPOINT-ADR-READY`
+restated with the post-batching residual; hosted CI green on the head targeting `main` and
+the base reconciliation steps (1)–(5) done.
