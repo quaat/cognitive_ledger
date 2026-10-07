@@ -102,7 +102,7 @@ benchmark-ci, container, dependency-review, docker, fast, fuzz (aggregate; sanit
 37656695032, 37656695042). That run precedes the post-review P1 fixes; the corrected head's run
 is recorded below.
 
-## Post-review fixes (hosted Codex review of `48e323b`; fix revision `FIX_SHA`)
+## Post-review fixes (hosted Codex review of `48e323b`; fix revision `178895a`)
 
 | test | class | 17.2 | 15.19 | measured |
 |---|---|---|---|---|
