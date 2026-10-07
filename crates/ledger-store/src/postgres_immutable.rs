@@ -13,6 +13,276 @@ use ledger_core::{AnyCommit, CommitId, ContentId, GraphId, ImmutableStore, Ledge
 use sqlx::{PgConnection, PgPool, Row, postgres::PgPoolOptions};
 use std::str::FromStr;
 
+/// Bounds of one retrieval window (Plan 0012). Reconstruction and ancestry walks fetch
+/// immutable rows in windows of this size instead of one row per ancestor; the windows
+/// bound memory and the work of one statement, and are not a correctness parameter: every
+/// window size yields the same states, histories and errors. Fixed public defaults
+/// (`RetrievalWindows::DEFAULT`), not operator configuration; the `test-hooks` feature lets
+/// tests shrink them to exercise the window boundaries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetrievalWindows {
+    /// Commits per first-parent chain window and patches per patch window (≥ 1).
+    pub objects: usize,
+    /// Object bytes one window may return before it is cut (the first object of a window
+    /// is always returned, so a window holds at most this many bytes plus one object).
+    pub bytes: usize,
+    /// Commits per DAG ancestry window (≥ 1). `1` is the unwindowed walk of Phase 4/5.
+    pub ancestry: usize,
+}
+
+impl RetrievalWindows {
+    /// 256 objects and 8 MiB per window: at the ≈ 100 µs per round trip Plan 0011 measured,
+    /// the amortized round trip per ancestor is under 1 µs (under a tenth of the fold's
+    /// ≥ 10 µs), while a window's recursive query is 256 index probes and its memory
+    /// at most 256 envelopes or 8 MiB plus one object.
+    pub const DEFAULT: Self = Self {
+        objects: 256,
+        bytes: 8 * 1024 * 1024,
+        ancestry: 256,
+    };
+
+    /// Every window at least one object, byte and commit (a zero would never advance).
+    pub(crate) fn checked(self) -> Self {
+        Self {
+            objects: self.objects.max(1),
+            bytes: self.bytes.max(1),
+            ancestry: self.ancestry.max(1),
+        }
+    }
+}
+
+impl Default for RetrievalWindows {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// One requested object of a retrieval window, before verification. The bytes are reachable
+/// only through [`FetchedObject::verified`], which re-hashes them against the requested id,
+/// so no caller can use stored bytes the database returned without that check; `None`
+/// bytes mean the row does not exist (the caller maps that to its typed missing-object
+/// error, never to a shorter history).
+pub(crate) struct FetchedObject {
+    id: ContentId,
+    bytes: Option<Vec<u8>>,
+}
+
+impl FetchedObject {
+    /// Wrap bytes the database returned for `id` (the id the caller asked for, never one
+    /// echoed by the database).
+    pub(crate) fn unverified(id: ContentId, bytes: Option<Vec<u8>>) -> Self {
+        Self { id, bytes }
+    }
+
+    /// `Ok(None)`: no such object. `Err(CorruptObject)`: the stored bytes do not hash to
+    /// the id (the wording of every scalar object read in this crate). `Ok(Some)`: verified.
+    pub(crate) fn verified(self) -> Result<Option<Vec<u8>>, LedgerError> {
+        let Some(bytes) = self.bytes else {
+            return Ok(None);
+        };
+        if ContentId::for_bytes(&bytes) != self.id {
+            return Err(corrupt(&self.id, "stored bytes do not hash to id"));
+        }
+        Ok(Some(bytes))
+    }
+}
+
+/// Retrieve several immutable objects in one statement on the caller's connection
+/// (Plan 0012 M1). `ids` are bound as one array parameter and never interpolated; the
+/// reply is re-ordered by the request position regardless of the row order PostgreSQL
+/// chose, so the result is a prefix of `ids` in request order: every requested id up to the
+/// cut is accounted for, a missing row as `None` bytes. The cut keeps the window's bytes
+/// bounded: PostgreSQL stops adding rows once the bytes of the preceding rows reach
+/// `max_bytes` (the first row is always served), using the stored length without
+/// detoasting the objects it does not return. The caller continues from the first
+/// unserved id. At most `max_objects` ids may be requested.
+pub(crate) async fn fetch_objects_window(
+    conn: &mut PgConnection,
+    ids: &[ContentId],
+    windows: RetrievalWindows,
+) -> Result<Vec<FetchedObject>, LedgerError> {
+    let windows = windows.checked();
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    if ids.len() > windows.objects {
+        return Err(LedgerError::Storage(format!(
+            "retrieval window of {} objects exceeds the bound {}",
+            ids.len(),
+            windows.objects
+        )));
+    }
+    let requested: Vec<String> = ids.iter().map(ToString::to_string).collect();
+    let rows = sqlx::query(
+        "WITH req AS ( \
+             SELECT r.id, r.ord FROM unnest($1::text[]) WITH ORDINALITY AS r(id, ord) \
+         ), sized AS ( \
+             SELECT r.ord, r.id, o.bytes, \
+                    sum(octet_length(o.bytes)) OVER ( \
+                        ORDER BY r.ord ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING \
+                    ) AS before \
+             FROM req r LEFT JOIN immutable_objects o ON o.id = r.id \
+         ) \
+         SELECT ord, id, bytes FROM sized WHERE before IS NULL OR before < $2 ORDER BY ord",
+    )
+    .bind(&requested)
+    .bind(i64::try_from(windows.bytes).unwrap_or(i64::MAX))
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(db_error)?;
+    let mut served: Vec<(i64, String, Option<Vec<u8>>)> = rows
+        .iter()
+        .map(|row| {
+            Ok((
+                row.try_get("ord").map_err(db_error)?,
+                row.try_get("id").map_err(db_error)?,
+                row.try_get("bytes").map_err(db_error)?,
+            ))
+        })
+        .collect::<Result<_, LedgerError>>()?;
+    served.sort_by_key(|(ord, _, _)| *ord);
+    // Deterministic whatever the row order: the reply must be exactly the positions
+    // 1..=n of the request, each naming the id requested there.
+    if served.is_empty() {
+        return Err(LedgerError::Storage(
+            "retrieval window returned no row for a non-empty request".into(),
+        ));
+    }
+    let mut out = Vec::with_capacity(served.len());
+    for (position, (ord, id, bytes)) in served.into_iter().enumerate() {
+        let Some(expected) = requested.get(position) else {
+            return Err(LedgerError::Storage(
+                "retrieval window reply has more rows than the request".into(),
+            ));
+        };
+        if usize::try_from(ord).ok() != Some(position + 1) || &id != expected {
+            return Err(LedgerError::Storage(
+                "retrieval window reply is not a prefix of the request".into(),
+            ));
+        }
+        out.push(FetchedObject {
+            id: ids[position].clone(),
+            bytes,
+        });
+    }
+    Ok(out)
+}
+
+/// `(depth, id, next_hint, bytes)` as the chain-window statement returns it.
+type RawChainRow = (i64, String, Option<String>, Option<Vec<u8>>);
+
+/// One row of a first-parent chain window, as the index placed it: the id the index names
+/// at this depth, the id it names as the first parent (`None`: no position-0 row), and the
+/// object bytes. Index strings are not parsed here: the caller consumes rows in chain
+/// order through [`ChainRow::expect`], which checks that the row is the commit the bytes
+/// of the previous row named (or the anchor), so a malformed or foreign index string is
+/// reported at the row whose bytes it contradicts, with the precedence of the scalar walk.
+pub(crate) struct ChainRow {
+    id: String,
+    next_hint: Option<String>,
+    bytes: Option<Vec<u8>>,
+}
+
+impl ChainRow {
+    /// Consume the row as `expected` (the anchor, or the previous row's decoded
+    /// `parents[0]`): the object under the trusted id, and the index's hint for the next
+    /// row as the raw string it holds.
+    pub(crate) fn expect(
+        self,
+        expected: &CommitId,
+    ) -> Result<(FetchedObject, Option<String>), LedgerError> {
+        if self.id != expected.to_string() {
+            return Err(LedgerError::Storage(
+                "chain window reply does not follow the chain it was asked for".into(),
+            ));
+        }
+        Ok((
+            FetchedObject::unverified(expected.0.clone(), self.bytes),
+            self.next_hint,
+        ))
+    }
+}
+
+/// A window of the first-parent chain from `anchor`, discovered through `commit_parents`
+/// position 0 (a bounded recursive query; the index is a hint for which rows to fetch) and
+/// joined to the objects in one statement (Plan 0012 M2). Rows come in chain order,
+/// `anchor` first, at most `max_rows`, cut by `windows.bytes` like
+/// [`fetch_objects_window`]. The recursion discovers one id beyond the served rows so
+/// every served row carries an exact `next_hint`. The caller consumes the rows in chain
+/// order ([`ChainRow::expect`]), verifies each object, and must confirm from the decoded
+/// bytes that `parents[0]` equals `next_hint` before following it.
+pub(crate) async fn fetch_first_parent_window(
+    conn: &mut PgConnection,
+    anchor: &CommitId,
+    max_rows: usize,
+    windows: RetrievalWindows,
+) -> Result<Vec<ChainRow>, LedgerError> {
+    let windows = windows.checked();
+    let max_rows = max_rows.clamp(1, windows.objects);
+    let rows = sqlx::query(
+        "WITH RECURSIVE chain(depth, id) AS ( \
+             SELECT 0::bigint, $1::text \
+             UNION ALL \
+             SELECT c.depth + 1, p.parent_id \
+             FROM chain c JOIN commit_parents p ON p.commit_id = c.id AND p.position = 0 \
+             WHERE c.depth < $2 \
+         ), hinted AS ( \
+             SELECT depth, id, lead(id) OVER (ORDER BY depth) AS next_hint FROM chain \
+         ), served AS ( \
+             SELECT h.depth, h.id, h.next_hint, o.bytes, \
+                    sum(octet_length(o.bytes)) OVER ( \
+                        ORDER BY h.depth ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING \
+                    ) AS before \
+             FROM hinted h LEFT JOIN immutable_objects o ON o.id = h.id \
+             WHERE h.depth < $2 \
+         ) \
+         SELECT depth, id, next_hint, bytes FROM served \
+         WHERE before IS NULL OR before < $3 ORDER BY depth",
+    )
+    .bind(anchor.to_string())
+    .bind(i64::try_from(max_rows).unwrap_or(i64::MAX))
+    .bind(i64::try_from(windows.bytes).unwrap_or(i64::MAX))
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(db_error)?;
+    let mut served: Vec<RawChainRow> = rows
+        .iter()
+        .map(|row| {
+            Ok((
+                row.try_get("depth").map_err(db_error)?,
+                row.try_get("id").map_err(db_error)?,
+                row.try_get("next_hint").map_err(db_error)?,
+                row.try_get("bytes").map_err(db_error)?,
+            ))
+        })
+        .collect::<Result<_, LedgerError>>()?;
+    served.sort_by_key(|(depth, _, _, _)| *depth);
+    let mut out = Vec::with_capacity(served.len());
+    for (position, (depth, id, next_hint, bytes)) in served.into_iter().enumerate() {
+        if usize::try_from(depth).ok() != Some(position) {
+            return Err(LedgerError::Storage(
+                "chain window reply is not a contiguous prefix".into(),
+            ));
+        }
+        if position == 0 && id != anchor.to_string() {
+            return Err(LedgerError::Storage(
+                "chain window reply does not start at its anchor".into(),
+            ));
+        }
+        out.push(ChainRow {
+            id,
+            next_hint,
+            bytes,
+        });
+    }
+    if out.is_empty() {
+        return Err(LedgerError::Storage(
+            "chain window returned no row for its anchor".into(),
+        ));
+    }
+    Ok(out)
+}
+
 /// How v1 envelopes (which carry no `graph_id`) are bound to a graph on write
 /// (ADR-0010, "Production v1 graph-binding policy").
 #[derive(Clone, Debug, Eq, PartialEq)]

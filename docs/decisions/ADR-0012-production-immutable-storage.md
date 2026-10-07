@@ -83,7 +83,9 @@ commit_parents      commit_id TEXT REFERENCES commit_index(id)
                     PK (commit_id, position), UNIQUE (commit_id, parent_id)
 ```
 
-Rules:
+Rules (amendment 2026-10-07, ADR-0025: the one writer is `publish_commit_in`, reached from
+`put_commit`, `prepare` and merge apply; an index row that contradicts the verified bytes is
+corruption and reconstruction fails closed on it):
 - Only `PostgresImmutableStore::put_commit` writes `commit_index`/`commit_parents`, in the
   **same transaction** as the object bytes, from values it derived by decoding the bytes
   and checking `id == sha256(bytes)`. Parents are checked against `commit_index` (typed:

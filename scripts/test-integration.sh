@@ -50,6 +50,10 @@ cargo test -p ledger-store --features postgres --test pg_cas_race -- --ignored -
 # --- 1b. Shared PostgreSQL immutable store (ADR-0012) ------------------------------------
 cargo test -p ledger-store --features postgres --test pg_immutable_store -- --ignored --nocapture
 
+# --- 1b'. Windowed retrieval (Plan 0012): scalar-vs-windowed equivalence, corruption
+#          matrices, DAG windows, connection ownership, statement-count gates -----------------
+cargo test -p ledger-store --features postgres --test pg_retrieval -- --ignored --nocapture --skip explain_window_queries
+
 # --- 1c. Graph authority schema (ADR-0010) incl. migration 0007 clean/upgrade -----------
 cargo test -p ledger-store --features postgres --test pg_graphs_migration -- --ignored --nocapture
 

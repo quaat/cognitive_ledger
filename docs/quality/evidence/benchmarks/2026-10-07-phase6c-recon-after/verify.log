@@ -1,0 +1,77 @@
+ Container ledger-qual-recon-postgres-1 Running 
+ Container ledger-qual-recon-postgres-1 Waiting 
+ Container ledger-qual-recon-postgres-1 Healthy 
+ Container ledger-qual-recon-migrate-run-3e06cf243a87 Creating 
+ Container ledger-qual-recon-migrate-run-3e06cf243a87 Created 
+ok   objects are content-addressed (id = sha256(bytes)) (0 violation(s))
+ok   every indexed commit has its object (0 violation(s))
+ok   every indexed commit's patch object exists (0 violation(s))
+ok   parent rows match the indexed parent count (0 violation(s))
+ok   parents belong to the child's graph (0 violation(s))
+ok   every parent is an indexed commit (0 violation(s))
+ok   every ref head is an indexed commit of its graph (0 violation(s))
+ok   ref version equals its event count on active/archived graphs (0 violation(s))
+ok   ref head equals its latest event's new head (0 violation(s))
+ok   ref events form one contiguous chain per ref (0 violation(s))
+ok   every advance is a fast-forward (0 violation(s))
+ok   every ref event has exactly one accepted decision (except a created branch's first) (0 violation(s))
+ok   every ref of an active or archived graph is a branch (0 violation(s))
+ok   a branch's lifecycle version is its event count and its status its latest event's (0 violation(s))
+ok   a created branch starts at its recorded branch point (0 violation(s))
+ok   lifecycle events are numbered 1..n per branch (0 violation(s))
+ok   every lifecycle event names a real position of its ref (0 violation(s))
+ok   a created branch's first lifecycle event starts at its source commit (0 violation(s))
+ok   a deleted branch's ref is where its tombstone left it (0 violation(s))
+ok   a restore resumes exactly at its tombstone (0 violation(s))
+ok   every merge event installs the integration commit of a matching merge proposal (0 violation(s))
+ok   every advance installs a candidate with at most one parent and no merge proposal (0 violation(s))
+ok   every proposal's candidate has its expected head as parent 0 (0 violation(s))
+ok   every merge proposal's target head is its proposal's expected head (0 violation(s))
+ok   every merge-apply result names a merge event (0 violation(s))
+ok   every merge-propose result names its merge proposal and candidate (0 violation(s))
+ok   every merge proposal's candidate has exactly the parents [target head, source head] (0 violation(s))
+ok   every merge proposal's source head was a head of its source branch (0 violation(s))
+ok   an applied merge onto a four-eyes branch was applied by a party distinct from its proposer and source authors (0 violation(s))
+ok   every accepted decision has exactly one outbox row (0 violation(s))
+ok   every outbox row names its event's commit and version (0 violation(s))
+ok   accepted decisions decide the commit their event installed (0 violation(s))
+ok   one terminal decision per candidate (0 violation(s))
+ok   every decision's candidate was proposed on the same graph and branch (0 violation(s))
+ok   audit rows agree with their graph's tenant (0 violation(s))
+ok   idempotency results reference existing rows (0 violation(s))
+ok   idempotency scope is unique (NULL delegation is one value) (0 violation(s))
+ok   no v1 commit is indexed under a production graph (0 violation(s))
+ok   every candidate proposal commit is indexed under its graph (0 violation(s))
+ok   semantic execution contexts are content-addressed (0 violation(s))
+ok   validation records are content-addressed (0 violation(s))
+ok   validation records agree with their context's candidate and state digest (0 violation(s))
+ok   virtual context rows match their context's declared count (0 violation(s))
+ok   result summaries are bounded by the record's reported count (0 violation(s))
+ok   validation records agree with their context's validator (0 violation(s))
+ok   every validation record was produced by at least one validate request (identical records are shared across keys) (0 violation(s))
+ok   accepted decisions cite only conforming validations (0 violation(s))
+ok   decision validation_ids arrays equal the enforced relation (0 violation(s))
+ok   validation audit rows agree with their graph's tenant (0 violation(s))
+ok   idempotency validation results reference existing records (0 violation(s))
+ok   validation records decode from their bytes and their columns agree with them (0 violation(s))
+ok   semantic contexts decode from their bytes and their columns agree with them (0 violation(s))
+ok   every merge proposal recomputes from the DAG and immutable states (0 violation(s))
+count graphs = 4
+count refs = 66
+count immutable_objects = 30706
+count commit_index = 15528
+count commit_parents = 15525
+count proposals = 15528
+count ref_events = 15108
+count decisions = 15045
+count projection_outbox = 15045
+count idempotency = 30636
+count semantic_execution_contexts = 0
+count semantic_virtual_contexts = 0
+count validation_records = 0
+count validation_violations = 0
+count decision_validations = 0
+count branches = 66
+count branch_events = 66
+count merge_proposals = 0
+VERIFY OK

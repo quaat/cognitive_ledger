@@ -90,6 +90,21 @@ amendment).
 ## Runtime limits
 - HTTP: `LEDGER_LIMIT_*` (body, operations, terms, metadata, reconstruction depth/quads/
   bytes, export bytes, request seconds, concurrent expensive operations).
+- Retrieval windows (Plan 0012) are not configuration: reconstruction fetches commits and
+  patches in windows of at most 256 objects or 8 MiB per statement and ancestry walks in
+  windows of at most 256 commits per statement, with the recursion capped at 1,024 rows
+  (`ledger_store::RetrievalWindows::DEFAULT`). They bound the work and memory of one
+  statement and change no limit or state; a window is `O(256 envelopes)` or `≤ 8 MiB +
+  one object` of object bytes, held about twice over while the rows are copied out of the
+  driver (as the scalar reads were), while it is folded. One error changed: a
+  `commit_parents` position-0 row that contradicts the commit bytes (written by no ledger
+  code path; a direct `INSERT` with the database credential can create one, ADR-0016
+  residual; detected by `verify_commit_index`, not by `ledger-admin verify`'s SQL checks,
+  though its merge-row checks surface it behind a merge candidate) is
+  now `CorruptObject` for every read of that history, where earlier releases silently
+  followed the bytes (ADR-0025, which also lists how the error surfaces and how to
+  investigate the blamed commit). No shipped command performs this verification over a
+  whole database yet (tech-debt).
 - Database session (every runtime connection): `LEDGER_DB_STATEMENT_TIMEOUT_MS` (30000),
   `LEDGER_DB_LOCK_TIMEOUT_MS` (10000), `LEDGER_DB_IDLE_IN_TRANSACTION_TIMEOUT_MS`
   (60000), `LEDGER_DB_MAX_CONNECTIONS` (16); values are milliseconds up to 2³¹−1. A

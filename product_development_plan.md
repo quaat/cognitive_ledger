@@ -1055,11 +1055,19 @@ Virtual A-Box graphs may continue to contain transient blank nodes because they 
 
 ---
 
-# 24. Build checkpoints after real reconstruction measurements
+# 24. Evaluate checkpoints only against a declared history-depth / latency budget
 
-Checkpoints are needed, but not before baseline data exists.
+Evaluate checkpoints only when measured reconstruction cost exceeds a declared
+history-depth / latency budget. The Phase 6 sequence is: measure (6A/6B) → batch retrieval
+(6C) → remeasure → checkpoints only if a declared target requires them. After Phase 6C the
+residual is ≈ 25 µs per ancestor on linear histories (≈ 0.25–0.3 s for a read or prepare
+at the development `max_depth` of 10,000, ≈ 1.2 s for a divergent merge preview there,
+extrapolated), and no target depth or budget has been declared, so
+`CHECKPOINT-ADR-READY: NO` (Plan 0012 M4; the conditional design input lives in
+`docs/quality/performance-baselines.md`). The material below is future architecture
+guidance for the day that condition is met, not current work.
 
-Implement:
+If and when it is, implement:
 
 ```text
 Checkpoint
@@ -1088,7 +1096,8 @@ if corrupt → quarantine/ignore
 reconstruct from authoritative patches
 ```
 
-Benchmark first, then choose thresholds based on:
+Benchmark first (done for linear histories through Phase 6C), then choose thresholds
+based on:
 
 ```text
 commit depth
@@ -1747,6 +1756,25 @@ Only implement optimizations justified by measurements.
 > checkpoint, cache or change index is built in 6A. The checkpoint ADR and the deliverables
 > below follow from those measurements, together with the reduced BEAR-B dataset (M3 of
 > the benchmark plan).
+>
+> **Phase 6B (Plan 0011, 2026-10-07)** characterized reconstruction on BEAR-B and
+> constant-state histories: two PostgreSQL statements per ancestor dominated, and the
+> recommendation was to batch retrieval before anything else (`CHECKPOINT-ADR-READY: NO`).
+> **Phase 6C (Plan 0012)** delivered that: windowed retrieval of commits, patches and
+> parent edges (256 objects / 8 MiB per statement, the index a hint the verified bytes
+> must confirm), `2 × ceil(n / 256)` statements for a reconstruction of n commits instead
+> of `2n`, and a 3.5–5.2× lower per-ancestor cost on the same host (linear
+> histories), with every identity,
+> limit, error (one documented exception on corrupt indexes) and transaction boundary
+> unchanged and no migration. The residual is ≈ 25 µs per ancestor (≈ 0.25–0.3 s at the
+> 10,000 ceiling, extrapolated); checkpoints stay unjustified until a target depth and budget are
+> declared (`CHECKPOINT-ADR-READY: NO`; §24 states the condition under which checkpoints
+> are evaluated at all). The one behaviour change of 6C — a derived `commit_parents` row
+> that contradicts verified commit bytes is `CorruptObject`, a missing row is followed from
+> the bytes — is ADR-0025. The deliverables below that remain — checkpoints and their
+> verification, a reconstruction cache, streaming export, the change index, history lookup
+> APIs, orphan cleanup — are not started; checkpoints are gated by §24's condition, the
+> rest by a measured need.
 
 Gate:
 

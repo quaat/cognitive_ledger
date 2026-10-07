@@ -921,3 +921,523 @@ async fn unrelated_missing_cycle_and_limits_fail_closed() {
         Err(DagError::VisitLimit { .. })
     ));
 }
+
+// ---------------------------------------------------------------------------------------
+// Plan 0012: windowed retrieval — a window is a prefetch, never an answer
+// ---------------------------------------------------------------------------------------
+
+/// Forwards windows to an inner provider and counts the window calls.
+struct CountingWindows<P> {
+    inner: P,
+    windows: Mutex<usize>,
+}
+
+impl<P> CountingWindows<P> {
+    fn new(inner: P) -> Self {
+        Self {
+            inner,
+            windows: Mutex::new(0),
+        }
+    }
+    fn windows(&self) -> usize {
+        *self.windows.lock().unwrap()
+    }
+}
+
+#[async_trait::async_trait]
+impl<P: ParentProvider> ParentProvider for CountingWindows<P> {
+    type Error = P::Error;
+    async fn parents(&self, commit: &CommitId) -> Result<Option<Vec<CommitId>>, Self::Error> {
+        self.inner.parents(commit).await
+    }
+    async fn ancestry_window(
+        &self,
+        start: &CommitId,
+        max: usize,
+        kind: WindowKind,
+    ) -> Result<Vec<(CommitId, Vec<CommitId>)>, Self::Error> {
+        *self.windows.lock().unwrap() += 1;
+        self.inner.ancestry_window(start, max, kind).await
+    }
+}
+
+const WINDOWS: [usize; 6] = [1, 2, 3, 7, 64, 100_000];
+
+#[tokio::test]
+async fn windows_do_not_change_any_answer_on_generated_dags() {
+    // Every window size against the unwindowed provider (window 1 is the reference, and it
+    // is also checked against the brute-force closure by the tests above): ancestors, the
+    // first-parent history, reachability of every pair, and the full merge analysis with
+    // both recorded ancestries.
+    for seed in 0..60 {
+        let g = generate(seed);
+        let n = g.parents.len();
+        for &window in &WINDOWS[1..] {
+            let wide = g.dag.clone().with_window(window);
+            for h in 0..n {
+                let head = id(h as u64);
+                assert_eq!(
+                    ancestors(&wide, &head, L).await.unwrap(),
+                    ancestors(&g.dag, &head, L).await.unwrap(),
+                    "seed {seed} window {window}: ancestors({h})"
+                );
+                assert_eq!(
+                    first_parent_history(&wide, &head, usize::MAX, L)
+                        .await
+                        .unwrap(),
+                    first_parent_history(&g.dag, &head, usize::MAX, L)
+                        .await
+                        .unwrap(),
+                    "seed {seed} window {window}: first_parent_history({h})"
+                );
+                for a in 0..n {
+                    let want = is_ancestor(&g.dag, &id(a as u64), &head, L).await.unwrap();
+                    let got = is_ancestor(&wide, &id(a as u64), &head, L).await.unwrap();
+                    assert_eq!(
+                        got, want,
+                        "seed {seed} window {window}: is_ancestor({a}, {h})"
+                    );
+                }
+            }
+            for t in 0..n {
+                for s in 0..n {
+                    let (target, source) = (id(t as u64), id(s as u64));
+                    let want = analyze_with_ancestries(&g.dag, &target, &source, L)
+                        .await
+                        .unwrap();
+                    let got = analyze_with_ancestries(&wide, &target, &source, L)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        got.0, want.0,
+                        "seed {seed} window {window}: analyze({t}, {s})"
+                    );
+                    assert_eq!(
+                        got.1.difference(&got.2),
+                        want.1.difference(&want.2),
+                        "seed {seed} window {window}: target-only({t}, {s})"
+                    );
+                    assert_eq!(
+                        got.2.difference(&got.1),
+                        want.2.difference(&want.1),
+                        "seed {seed} window {window}: source-only({t}, {s})"
+                    );
+                    assert_eq!(
+                        best_common_ancestors(&got.1, &got.2),
+                        best_common_ancestors(&want.1, &want.2),
+                        "seed {seed} window {window}: best common ancestors({t}, {s})"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn windows_cut_provider_calls_on_deep_linear_history() {
+    const N: u64 = 5_000;
+    let head = id(N - 1);
+    for &window in &[1usize, 2, 3, 7, 64, 256, 1_000] {
+        let dag = CountingWindows::new(linear(N).with_window(window));
+        let all = ancestors(&dag, &head, L).await.unwrap();
+        assert_eq!(all.len(), N as usize);
+        assert_eq!(
+            dag.windows(),
+            window_calls(N as usize, window),
+            "window {window}: ancestors"
+        );
+        let dag = CountingWindows::new(linear(N).with_window(window));
+        let fp = first_parent_history(&dag, &head, usize::MAX, L)
+            .await
+            .unwrap();
+        assert_eq!(fp, all);
+        assert_eq!(
+            dag.windows(),
+            window_calls(N as usize, window),
+            "window {window}: first_parent_history"
+        );
+        // A hit stops the search; the ramp keeps a near hit cheap and a far hit costs at
+        // most the windows that cover the commits entered.
+        let dag = CountingWindows::new(linear(N).with_window(window));
+        assert!(is_ancestor(&dag, &id(N - 1_000), &head, L).await.unwrap());
+        assert_eq!(
+            dag.windows(),
+            window_calls(1_000, window),
+            "window {window}: hit"
+        );
+        let dag = CountingWindows::new(linear(N).with_window(window));
+        assert!(is_ancestor(&dag, &id(N - 2), &head, L).await.unwrap());
+        assert_eq!(
+            dag.windows(),
+            window_calls(2, window),
+            "window {window}: near hit"
+        );
+        assert_eq!(window_calls(2, 256), 2);
+        // Merge analysis of two heads on one chain: one walk per side, each with its own
+        // ramp.
+        let dag = CountingWindows::new(linear(N).with_window(window));
+        let analysis = analyze(&dag, &head, &id(N - 1_001), L).await.unwrap();
+        assert_eq!(analysis.relation, Relation::SourceContained);
+        assert_eq!((analysis.ahead, analysis.behind), (0, 1_000));
+        assert_eq!(
+            dag.windows(),
+            window_calls(N as usize, window) + window_calls(N as usize - 1_000, window),
+            "window {window}: analysis"
+        );
+    }
+}
+
+#[tokio::test]
+async fn windows_keep_the_visit_limit_the_deadline_cycles_and_unknowns() {
+    const N: u64 = 50_000;
+    let head = id(N - 1);
+    // The visit limit counts entered commits, not prefetched rows: a window of 1,000 with a
+    // limit of 1,000 behaves exactly like the unwindowed walk, and a limit of 0 calls the
+    // provider not at all.
+    let dag = CountingWindows::new(linear(N).with_window(1_000));
+    assert!(matches!(
+        ancestors(&dag, &head, limit(1_000)).await,
+        Err(DagError::VisitLimit { visited: 1_000 })
+    ));
+    assert_eq!(dag.windows(), window_calls(1_000, 1_000));
+    assert!(matches!(
+        first_parent_history(&dag, &head, usize::MAX, limit(1_000)).await,
+        Err(DagError::VisitLimit { visited: 1_000 })
+    ));
+    assert!(
+        is_ancestor(&dag, &id(N - 500), &head, limit(1_000))
+            .await
+            .unwrap()
+    );
+    let dag = CountingWindows::new(linear(10).with_window(1_000));
+    assert!(matches!(
+        ancestors(&dag, &id(9), limit(0)).await,
+        Err(DagError::VisitLimit { visited: 0 })
+    ));
+    assert_eq!(dag.windows(), 0);
+    // The window a walk asks for never exceeds its remaining budget: with a limit of 10 on a
+    // 10-commit chain the ramp asks for 1, 4 and then the remaining 5.
+    assert_eq!(ancestors(&dag, &id(9), limit(10)).await.unwrap().len(), 10);
+    assert_eq!(dag.windows(), window_calls(10, 1_000));
+    assert_eq!(window_calls(10, 1_000), 3);
+    // A deadline in the past fails before any window.
+    let past = TraversalLimits {
+        max_visited: usize::MAX,
+        deadline: Some(Instant::now() - Duration::from_millis(1)),
+    };
+    let dag = CountingWindows::new(linear(10).with_window(1_000));
+    assert!(matches!(
+        ancestors(&dag, &id(9), past).await,
+        Err(DagError::Deadline)
+    ));
+    assert_eq!(dag.windows(), 0);
+
+    // Cycles crossing a window boundary: 0 <- 1 <- 2 <- 3 <- 4, plus 0's parent is 4.
+    for window in [1usize, 2, 3, 4, 5, 100] {
+        let mut dag = linear(5).with_window(window);
+        dag.insert(id(0), [id(4)]);
+        assert!(
+            matches!(ancestors(&dag, &id(4), L).await, Err(DagError::Cycle(c)) if c == id(4)),
+            "window {window}"
+        );
+        assert!(
+            matches!(first_parent_history(&dag, &id(4), usize::MAX, L).await, Err(DagError::Cycle(c)) if c == id(4)),
+            "window {window}"
+        );
+        assert!(matches!(
+            is_ancestor(&dag, &id(99), &id(4), L).await,
+            Err(DagError::Cycle(_))
+        ));
+        // A hit before the cycle closes still succeeds, whatever the window prefetched.
+        assert!(is_ancestor(&dag, &id(1), &id(4), L).await.unwrap());
+    }
+    // A missing parent crossing a window boundary is still UnknownCommit of that parent,
+    // and an unknown start commit is UnknownCommit of the start.
+    for window in [1usize, 2, 3, 4, 100] {
+        let mut dag = linear(4).with_window(window);
+        dag.insert(id(0), [id(77)]);
+        assert!(
+            matches!(ancestors(&dag, &id(3), L).await, Err(DagError::UnknownCommit(c)) if c == id(77)),
+            "window {window}"
+        );
+        assert!(
+            matches!(first_parent_history(&dag, &id(3), usize::MAX, L).await, Err(DagError::UnknownCommit(c)) if c == id(77)),
+            "window {window}"
+        );
+        assert!(
+            matches!(ancestors(&dag, &id(55), L).await, Err(DagError::UnknownCommit(c)) if c == id(55)),
+            "window {window}"
+        );
+        // Only the first parent is needed by the first-parent history: a merge whose
+        // second parent is unknown still lists its first-parent chain, with any window.
+        let mut dag = linear(4).with_window(window);
+        dag.insert(id(3), [id(2), id(88)]);
+        assert_eq!(
+            first_parent_history(&dag, &id(3), usize::MAX, L)
+                .await
+                .unwrap(),
+            ids(&[3, 2, 1, 0]),
+            "window {window}"
+        );
+        assert!(
+            matches!(ancestors(&dag, &id(3), L).await, Err(DagError::UnknownCommit(c)) if c == id(88)),
+            "window {window}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_window_entry_never_stands_in_for_the_anchor() {
+    // A provider whose windows return other commits but not the anchor: the walk must not
+    // take the anchor's presence for granted (UnknownCommit), and must not use an entry's
+    // presence in a window as evidence of reachability.
+    struct Evasive(MemoryDag);
+    #[async_trait::async_trait]
+    impl ParentProvider for Evasive {
+        type Error = std::convert::Infallible;
+        async fn parents(&self, commit: &CommitId) -> Result<Option<Vec<CommitId>>, Self::Error> {
+            self.0.parents(commit).await
+        }
+        async fn ancestry_window(
+            &self,
+            start: &CommitId,
+            max: usize,
+            kind: WindowKind,
+        ) -> Result<Vec<(CommitId, Vec<CommitId>)>, Self::Error> {
+            let mut w = self.0.ancestry_window(start, max, kind).await?;
+            w.retain(|(c, _)| c != &id(2));
+            Ok(w)
+        }
+    }
+    let dag = Evasive(linear(4).with_window(10));
+    assert!(
+        matches!(ancestors(&dag, &id(3), L).await, Err(DagError::UnknownCommit(c)) if c == id(2))
+    );
+    assert!(matches!(
+        is_ancestor(&dag, &id(0), &id(3), L).await,
+        Err(DagError::UnknownCommit(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_first_parent_history_never_asks_for_more_than_it_still_wants() {
+    // The window a bounded history requests is capped by the entries still wanted, so a
+    // provider is never asked about commits beyond `max`; and damage a provider leaves out
+    // of a window (contract: only the anchor's damage is reported) stays invisible to a
+    // walk that never reaches it.
+    struct Recording {
+        inner: MemoryDag,
+        damaged: CommitId,
+        asked: Mutex<Vec<usize>>,
+    }
+    #[async_trait::async_trait]
+    impl ParentProvider for Recording {
+        type Error = Down;
+        async fn parents(&self, commit: &CommitId) -> Result<Option<Vec<CommitId>>, Self::Error> {
+            if commit == &self.damaged {
+                return Err(Down);
+            }
+            Ok(self.inner.parents(commit).await.unwrap())
+        }
+        async fn ancestry_window(
+            &self,
+            start: &CommitId,
+            max: usize,
+            kind: WindowKind,
+        ) -> Result<Vec<(CommitId, Vec<CommitId>)>, Self::Error> {
+            if start == &self.damaged {
+                return Err(Down);
+            }
+            self.asked.lock().unwrap().push(max);
+            let mut w = self.inner.ancestry_window(start, max, kind).await.unwrap();
+            w.retain(|(c, _)| c != &self.damaged);
+            Ok(w)
+        }
+    }
+    let dag = Recording {
+        inner: linear(20).with_window(1_000),
+        damaged: id(10),
+        asked: Mutex::new(Vec::new()),
+    };
+    // Entries 19..=11 are fine; the damaged 10 is beyond a 9-entry history.
+    assert_eq!(
+        first_parent_history(&dag, &id(19), 9, L).await.unwrap(),
+        ids(&[19, 18, 17, 16, 15, 14, 13, 12, 11])
+    );
+    assert!(
+        dag.asked.lock().unwrap().iter().all(|&m| m <= 9),
+        "{:?}",
+        dag.asked.lock().unwrap()
+    );
+    // One more entry reaches the damage, at the same point as an unwindowed walk.
+    assert!(matches!(
+        first_parent_history(&dag, &id(19), 10, L).await,
+        Err(DagError::Provider(Down))
+    ));
+    // An early hit before the damage succeeds; a full search fails on it.
+    assert!(is_ancestor(&dag, &id(15), &id(19), L).await.unwrap());
+    assert!(matches!(
+        is_ancestor(&dag, &id(0), &id(19), L).await,
+        Err(DagError::Provider(Down))
+    ));
+    assert!(matches!(
+        ancestors(&dag, &id(19), L).await,
+        Err(DagError::Provider(Down))
+    ));
+    // The remaining visit budget caps the window too.
+    let dag = Recording {
+        inner: linear(20).with_window(1_000),
+        damaged: id(99),
+        asked: Mutex::new(Vec::new()),
+    };
+    assert_eq!(
+        ancestors(&dag, &id(19), limit(5))
+            .await
+            .unwrap_err()
+            .to_string(),
+        "traversal visit limit reached after 5 commits"
+    );
+    assert_eq!(*dag.asked.lock().unwrap(), vec![1, 4]);
+}
+
+#[test]
+fn window_calls_follows_the_ramp_then_full_windows() {
+    assert_eq!(window_calls(0, 256), 0);
+    assert_eq!(window_calls(1, 256), 1);
+    assert_eq!(window_calls(5, 256), 2);
+    assert_eq!(window_calls(85, 256), 4);
+    assert_eq!(window_calls(86, 256), 5);
+    assert_eq!(
+        window_calls(5_000, 256),
+        4 + (5_000 - 85usize).div_ceil(256)
+    );
+    assert_eq!(window_calls(1_000, 1), 1_000);
+    assert_eq!(window_calls(7, 2), 4);
+}
+
+#[tokio::test]
+async fn generated_back_edges_are_cycles_under_every_window_and_limits_match() {
+    // The injected-cycle and visit-limit answers are the same for every window size as for
+    // the unwindowed provider, on the generated DAGs.
+    for seed in 0..40 {
+        let g = generate(seed);
+        let n = g.parents.len();
+        for &window in &WINDOWS[1..] {
+            let wide = g.dag.clone().with_window(window);
+            for h in 0..n {
+                let head = id(h as u64);
+                for k in [0usize, 1, 2, 3, n / 2, n] {
+                    let want = ancestors(&g.dag, &head, limit(k))
+                        .await
+                        .map_err(|e| e.to_string());
+                    let got = ancestors(&wide, &head, limit(k))
+                        .await
+                        .map_err(|e| e.to_string());
+                    assert_eq!(want, got, "seed {seed} window {window} head {h} limit {k}");
+                    let want = first_parent_history(&g.dag, &head, k, L).await.unwrap();
+                    let got = first_parent_history(&wide, &head, k, L).await.unwrap();
+                    assert_eq!(want, got, "seed {seed} window {window} head {h} max {k}");
+                }
+            }
+        }
+        let mut g = g;
+        let mut rng = Rng::new(seed ^ 0xC1C1_E5ED);
+        let candidates: Vec<(usize, usize)> = (0..n)
+            .flat_map(|j| g.reach[j].iter().map(move |&i| (i, j)))
+            .filter(|&(i, j)| i != j)
+            .collect();
+        let (i, j) = if candidates.is_empty() {
+            let k = rng.below(n as u64) as usize;
+            (k, k)
+        } else {
+            candidates[rng.below(candidates.len() as u64) as usize]
+        };
+        let pos = rng.below(g.parents[i].len() as u64 + 1) as usize;
+        g.parents[i].insert(pos, j);
+        g.dag
+            .insert(id(i as u64), g.parents[i].iter().map(|&p| id(p as u64)));
+        for &window in &WINDOWS[1..] {
+            let wide = g.dag.clone().with_window(window);
+            for h in 0..n {
+                let head = id(h as u64);
+                let want = ancestors(&g.dag, &head, L).await.map_err(|e| e.to_string());
+                let got = ancestors(&wide, &head, L).await.map_err(|e| e.to_string());
+                assert_eq!(
+                    want, got,
+                    "seed {seed} window {window} head {h} with back edge"
+                );
+                let want = first_parent_history(&g.dag, &head, usize::MAX, L)
+                    .await
+                    .map_err(|e| e.to_string());
+                let got = first_parent_history(&wide, &head, usize::MAX, L)
+                    .await
+                    .map_err(|e| e.to_string());
+                assert_eq!(
+                    want, got,
+                    "seed {seed} window {window} head {h} first-parent with back edge"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_provider_that_overfills_or_repeats_entries_does_not_change_answers() {
+    // Contract violations the walk tolerates: more entries than asked for, and the anchor
+    // listed twice. Answers must still come only from parent edges.
+    struct Loud(MemoryDag);
+    #[async_trait::async_trait]
+    impl ParentProvider for Loud {
+        type Error = std::convert::Infallible;
+        async fn parents(&self, commit: &CommitId) -> Result<Option<Vec<CommitId>>, Self::Error> {
+            self.0.parents(commit).await
+        }
+        async fn ancestry_window(
+            &self,
+            start: &CommitId,
+            _max: usize,
+            kind: WindowKind,
+        ) -> Result<Vec<(CommitId, Vec<CommitId>)>, Self::Error> {
+            let mut w = self.0.ancestry_window(start, usize::MAX, kind).await?;
+            if let Some(first) = w.first().cloned() {
+                w.push(first);
+            }
+            Ok(w)
+        }
+    }
+    for seed in 0..40 {
+        let g = generate(seed);
+        let loud = Loud(g.dag.clone().with_window(1_000));
+        let n = g.parents.len();
+        for h in 0..n {
+            let head = id(h as u64);
+            assert_eq!(
+                ancestors(&loud, &head, L).await.unwrap(),
+                ancestors(&g.dag, &head, L).await.unwrap(),
+                "seed {seed} head {h}"
+            );
+            assert_eq!(
+                ancestors(&loud, &head, limit(2))
+                    .await
+                    .map_err(|e| e.to_string()),
+                ancestors(&g.dag, &head, limit(2))
+                    .await
+                    .map_err(|e| e.to_string()),
+                "seed {seed} head {h} limit 2"
+            );
+        }
+        for t in 0..n {
+            for s in 0..n {
+                assert_eq!(
+                    analyze(&loud, &id(t as u64), &id(s as u64), L)
+                        .await
+                        .unwrap(),
+                    analyze(&g.dag, &id(t as u64), &id(s as u64), L)
+                        .await
+                        .unwrap(),
+                    "seed {seed} analyze({t}, {s})"
+                );
+            }
+        }
+    }
+}

@@ -3,7 +3,12 @@
 **Status: not production-qualified.** This matrix records what stands between the current
 code and a production qualification. It was compiled read-only in Plan 0011 (Phase 6B) from
 code and docs at `2a8a678`, then re-verified by an independent review at `795028e`. No
-production code changed in between; only the benchmark harness, tests, CI and docs did. Nothing here was run against a live Entra tenant, a Sculpin
+production code changed in between; only the benchmark harness, tests, CI and docs did.
+Plan 0012 (Phase 6C) changed the retrieval code of reconstruction and ancestry walks
+(`ledger-store`, `ledger-dag`) without a migration or an API change; the two rows it
+affects are updated below. One behaviour to note before an upgrade: a `commit_parents`
+position-0 row that contradicts the commit bytes now fails reconstruction (ADR-0025;
+`deployment.md`, Runtime limits). Nothing here was run against a live Entra tenant, a Sculpin
 service, or a production Fuseki or PostgreSQL. Rows marked *(inf)* are inferred from code,
 not observed.
 
@@ -37,13 +42,13 @@ P3 means hardening.
 | Production deployment configuration | None. `compose.yaml` is a development harness, and `deployment.md` says "not production-qualified". | deployment-config evidence | P1 | Write the production manifests and record their evidence. |
 | Backup while projection is active | Not qualified (tech-debt). | code change (qualification script) | P2 | Add a projection-under-backup scenario to `scripts/backup-restore.sh`. |
 | Offline verifier residuals | Orphaned detail rows after an FK drop and FK referential actions are unchecked. Merges are verified under fixed limits, and everything is loaded with `fetch_all`. | accepted residual risk | P3 | Add a limits flag and parent-existence checks. |
-| Write ceiling at branch depth 10,000 | `prepare` refuses when `base_depth + 1 > max_depth`, and the default limit (`ReconstructionLimits::DEVELOPMENT`) is 10,000. A branch therefore stops accepting writes at depth 10,000. Raising the server's limit without `LEDGER_PROJECTOR_MAX_DEPTH` stalls projection. `deployment.md` does not mention this ceiling. | code change (ADR first) or accepted residual risk with monitoring | P1 | Document the ceiling and alert on depth now; remove it with the Phase-6 reconstruction work (Plan 0011 recommendation). |
+| Write ceiling at branch depth 10,000 | `prepare` refuses when `base_depth + 1 > max_depth`, and the default limit (`ReconstructionLimits::DEVELOPMENT`) is 10,000. A branch therefore stops accepting writes at depth 10,000. Raising the server's limit without `LEDGER_PROJECTOR_MAX_DEPTH` stalls projection. `deployment.md` does not mention this ceiling. Plan 0012 cut a prepare's cost at depth 3.5× on linear histories (a prepare at the ceiling extrapolates to ≈ 0.3 s) but did not change the ceiling. | code change (ADR first) or accepted residual risk with monitoring | P1 | Document the ceiling and alert on depth now; decide the target depth (Plan 0012 M4). |
 | Server and projector limits differ | The server can accept states up to 256 MiB, but the projector's default `LEDGER_PROJECTOR_MAX_STATE_BYTES` is 48 MiB. A state in between blocks its stream with `STATE_TOO_LARGE`. | deployment-config evidence | P2 | Configure the limits consistently, and document the pairing. |
 | Sculpin deduplication on `invocation_id` | Required by the ADR-0019 amendment (tech-debt). Without it, concurrent same-key validations may record a result from either environment. | external Sculpin dependency | P1 | Sculpin confirms and tests the deduplication. |
 | Runtime identity's residual write authority | It can fabricate a consistent forward ref move or validation records within its tenants (ADR-0016, tech-debt). Closing this needs `SECURITY DEFINER` write paths or signed validator responses. | accepted residual risk | P2 | Decide in an ADR before production. |
 | Per-release qualification on the release candidate | `backup-restore.sh` (ADR-0017 §6), `stress.sh` and the upgrade scripts must be re-run on the candidate. Upgrades are stop-the-world (`deployment.md`); there are no rolling upgrades. | deployment-config evidence | P1 | Run them and record the evidence per release. |
 | Other recorded residuals | See tech-debt: migration 0009 aborts on a corrupt row without naming ids; lost-response fault injection is non-deterministic over HTTP; the intermittent CI hang (cause unknown, defensive fix); unknown-`kid` refusal during the 60 s JWKS throttle; the `cargo audit` exception and container findings; cross-tenant operator audit attribution. | accepted residual risk / decision | P3 | Track in tech-debt. |
-| Reconstruction cost at depth | Parent-0 fold, linear in depth (Plan 0011 characterization; `docs/quality/performance-baselines.md`). `max_depth` is a hard ceiling with no checkpoints. | code change (ADR first) | P2 | See the Plan 0011 recommendation and the checkpoint ADR inputs. |
+| Reconstruction cost at depth | Parent-0 fold, linear in depth: ≈ 25 µs per ancestor after Plan 0012's windowed retrieval (was ≈ 100 µs on the same host), `2 × ceil(n / 256)` statements for n commits instead of `2n`, measured on linear histories (`docs/quality/performance-baselines.md`). `max_depth` is a hard ceiling with no checkpoints. | code change (ADR first) | P2 | Declare the target depth and budget; checkpoints only if the measured residual exceeds it (Plan 0012 M4: `CHECKPOINT-ADR-READY: NO`). |
 
 ## Top code-owned hardening items after Phase 6
 

@@ -985,6 +985,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ledger-dag"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "ledger-core",
+ "thiserror",
+]
+
+[[package]]
 name = "ledger-fuzz"
 version = "0.0.0"
 dependencies = [
@@ -995,6 +1004,14 @@ dependencies = [
  "ledger-validation-protocol",
  "libfuzzer-sys",
  "serde_json",
+]
+
+[[package]]
+name = "ledger-merge"
+version = "0.1.0"
+dependencies = [
+ "ledger-core",
+ "ledger-rdf",
 ]
 
 [[package]]
@@ -1016,6 +1033,8 @@ dependencies = [
  "fs2",
  "hex",
  "ledger-core",
+ "ledger-dag",
+ "ledger-merge",
  "ledger-rdf",
  "ledger-validation-protocol",
  "serde",

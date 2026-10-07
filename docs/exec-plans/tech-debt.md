@@ -173,6 +173,66 @@
   and is not counted; the ledger-dag and ledger-merge property suites against independent
   reference models replace it internally.
 
+## Phase 6C (Plan 0012) residuals and accepted risk
+- `Ledger::state_at_bounded` (the reconstruction over the `ImmutableStore` trait, used by
+  the filesystem backend and the fs→pg migration) stays scalar: one `get_commit` and one
+  `get_content` per ancestor. It is not a PostgreSQL hot path; through
+  `PostgresImmutableStore` it would still cost two statements per ancestor.
+- The index/bytes rule of windowed reconstruction: a `commit_parents` position-0 row that
+  contradicts the decoded commit is `CorruptObject`, where the scalar walk silently followed
+  the bytes (ADR-0025, Plan 0012 Decision 1); a silent index (no row) is followed from the
+  bytes as before. Such a row is detected by `PostgresImmutableStore::verify_commit_index` (the
+  ADR-0012 re-derivation from bytes), which `ledger-admin verify` does **not** run: its SQL
+  checks catch a parent-row count disagreeing with `parent_count`, a foreign parent and an
+  unindexed parent, and its merge-row checks reconstruct through the windowed path (so a
+  contradicted row behind a merge candidate surfaces there); no check re-derives every row.
+  Add the re-derivation (or a bounded sample of it) to `ledger-admin verify` so operators
+  can diagnose the new failure mode before an upgrade.
+- Closure-review residuals (Plan 0012, 2026-10-07; all P3, none a defect): (a) the
+  ancestry recursion's pair cap (`REACH_PAIRS_PER_COMMIT`) is tested only through statement
+  counts and the hand-copied `EXPLAIN` diagnostic, not by asserting the recursion's actual
+  row count on the production statement; the bound also assumes the planner keeps the
+  index-probe plan for the recursive step (measured at 30,000 objects). (b) Which commits
+  of a merge-heavy DAG fill a window when the pair cap cuts a recursion level is
+  plan-dependent (`capped` has no `ORDER BY`); answers never change (a window is a
+  prefetch), statement counts on such DAGs are bounded, not exact. (c) `ledger-dag`'s
+  deadline checks after a window call and before serving a prefetched commit are exercised
+  only with window 1; tight `max_visited` is compared windowed-vs-unwindowed only for
+  `ancestors`. (d) A window's object bytes are held about twice over while `sqlx` rows are
+  copied into owned buffers (≈ 2 × (8 MiB + one object); the scalar reads copied the same
+  way). (e) The `ledger-admin` pools set no `statement_timeout`, so the window statements
+  `ledger-admin verify` runs are bounded by their SQL limits only (pre-existing).
+- The retrieval windows (256 objects / 8 MiB / 256 commits, recursion cap 4 rows per
+  commit, ramp 1/4/16/64) are fixed public constants (`RetrievalWindows::DEFAULT`) with a
+  `test-hooks` setter, not operator configuration. Revisit only with a measured reason
+  (Plan 0012 M4 records the per-window cost); a configuration surface would need the
+  limits-pairing discussion of the production-qualification matrix.
+- Ancestry windows on merge-heavy DAGs hold fewer distinct commits than on linear history
+  (the recursion stops at the pair cap), so the statement count lies between the linear
+  formula and one per commit; each statement stays bounded. A walk can overshoot its
+  `TraversalLimits::deadline` by one such statement. Validation, projection and
+  `ledger-admin verify` reconstruct through `state_at_on` with the default windows (not
+  the `test-hooks` setter), so their window-boundary coverage comes from the shared
+  implementation, not from their own suites.
+- The statement-count tests (`pg_retrieval`) count sqlx's `sqlx::query` tracing events on
+  the test thread. They pin `2 × ceil(n / window)` for reconstructions and `window_calls`
+  along the ramp for histories and previews exactly and will need
+  adjusting if sqlx changes its per-statement logging, or if a path gains a constant
+  statement (the tests subtract measured constants where they exist).
+- `pg_least_privilege` fails when its tests run with cargo's default parallelism (one
+  thread per core, 16 here) against one database: PostgreSQL answers "sorry, too many
+  clients already" and pools time out, because the suite's tests each open several pools.
+  All 19 pass with `--test-threads=1`; a full `scripts/test-integration.sh` run with
+  `RUST_TEST_THREADS=4` has not completed locally yet (host port 8080 was busy). Observed 2026-10-07 before and after the Plan 0012 change; not
+  caused by it; hosted runners have fewer cores. Bound the suite's parallelism in the
+  script, or its pools, rather than relying on the runner. Related (Plan 0012 closure): with
+  Docker's default 64 MiB `/dev/shm`, `pg_validation` and `pg_merge` fail under 16-way test
+  parallelism with `could not resize shared memory segment … No space left on device`
+  (parallel-query dynamic shared memory); every suite passes on a container started with
+  `--shm-size=1g`. `compose.yaml` sets no `shm_size`; hosted runners pass because they run
+  fewer tests at once. Set `shm_size` on the compose PostgreSQL (or document the host
+  requirement) before relying on local full-parallel runs.
+
 ## Later-phase work and accepted residual risk (does not block Phase 2 or the P1.5 gate)
 
 - Design a stable skolemization/import protocol and hostile-input limits around the standards N-Quads parser.
@@ -183,7 +243,7 @@
 - `ledger-admin migrate-fs-to-pg` loads the whole source store into memory (bootstrap scale only) and cannot catch up with a destination ref that has moved past the source HEAD (it is a cutover tool; live writes must stop first).
 - `WorkflowRepository` trusts `RequestScope.request_digest`; since P1.4 the only producer is `ledger-api::request_identity` (server-computed from the parsed request, golden-pinned). If a second producer appears, move the canonical encoding into `ledger-store` so the repository can recompute it.
 - Correlation ids generated by the server are a hash of pid/counter/time (unique, not secret); if they are ever used as capability-bearing tokens they must become cryptographically random. Client-supplied correlation ids are stored verbatim (bounded, printable); a client can reuse another request's id, so investigations must key on the server's own ids (`proposal_id`, `decision_id`, `event_id`) first.
-- Without checkpoints, `ReconstructionLimits::max_depth` is a hard ceiling on branch length (prepare refuses beyond it, by design). Snapshot/materialised base state needs an ADR (Phase 4/5; Plan 0005 records baselines).
+- Without checkpoints, `ReconstructionLimits::max_depth` is a hard ceiling on branch length (prepare refuses beyond it, by design). Snapshot/materialised base state needs an ADR only if §24's condition is met — a declared depth/latency target the measured residual exceeds (Plan 0012 M4: `CHECKPOINT-ADR-READY: NO`; conditional design in `docs/quality/performance-baselines.md`).
 - `WorkflowRepository::accept` enforces `ValidationPolicy::Required`, but the policy still travels with each request; a future in-process caller could pass `NoValidation`. Consider making the policy a repository construction parameter once Phase 2 defines real policies.
 - The Python request-identity reference hashes fixture quads verbatim (they are already canonical N-Quads) and does not implement N-Quads canonicalization itself; its independence covers the envelope layout, not RDF canonicalization (covered by the ledger-rdf goldens).
 - `tenant_id` on audit rows now means both the actor's tenant and the graph's tenant (composite FKs); a cross-tenant platform operator acting on a graph cannot be recorded. Decide before Phase 4/5 admin flows.

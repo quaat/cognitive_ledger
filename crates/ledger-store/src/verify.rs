@@ -465,6 +465,7 @@ async fn verify_merge_rows(pool: &PgPool) -> Result<CheckResult, LedgerError> {
                 let provider = crate::postgres_branches::GraphParents {
                     conn: tokio::sync::Mutex::new(&mut *conn),
                     graph: graph.clone(),
+                    window: crate::RetrievalWindows::DEFAULT.ancestry,
                 };
                 ledger_dag::analyze_with_ancestries(
                     &provider,

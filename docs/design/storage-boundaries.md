@@ -22,6 +22,25 @@ same-graph parent relation from bytes and fail on any tampering. Reads distingui
 one database agree and reconstruct each other's commits; this is the only supported
 multi-replica topology, because a shared ref must never reference node-local content.
 
+**Windowed retrieval (Plan 0012, Phase 6C).** Reconstruction and ancestry walks read
+immutable rows in bounded windows instead of one row per ancestor: a first-parent chain
+window is one statement that follows `commit_parents` position 0 as a *hint* for which
+rows to return (at most 256, cut at 8 MiB) joined to their bytes; a patch window is one
+`unnest … WITH ORDINALITY` / `LEFT JOIN` statement with the same bounds; a DAG window is
+one bounded, graph-scoped recursive statement (at most 4 recursion rows per requested
+commit) returning each commit's `parent_count` and parent rows. For reconstruction the
+index is only a hint: every returned object is re-hashed against the id that was
+requested, decoded by the production decoder and checked against its id, the decoded
+`parents[0]` is compared with the hint (a contradiction is `CorruptObject`, a silent index
+is followed from the bytes as before), and the patch id comes from the decoded commit.
+DAG walks use `commit_parents` as they did before this plan: parent lists are
+contiguity-checked against `parent_count`, not re-derived from bytes (that re-derivation
+is `verify_commit_index`). A missing row is the typed missing-object error for that id,
+never a shorter history. The windows are work bounds, not semantics: on a sound store
+every window size yields the same states, histories, merge relations and errors
+(differentially tested against the scalar reference kept in `test-hooks` builds); the one
+intended difference on a corrupt store is the contradicted-hint error above.
+
 ## Atomic workflow persistence (PostgreSQL, ADR-0013)
 `WorkflowRepository` (reached through the `PostgresLedgerStore` composition root) makes
 every accepted transition one transaction: idempotency result, active-graph check, ref row

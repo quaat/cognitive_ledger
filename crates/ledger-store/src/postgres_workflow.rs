@@ -23,6 +23,9 @@
 //! atomicity is verified, production protected semantic acceptance (Phase 2) is not
 //! enabled, and no validation record is ever fabricated.
 
+use crate::postgres_immutable::{
+    RetrievalWindows, fetch_first_parent_window, fetch_objects_window,
+};
 use crate::{PgGraphs, PostgresImmutableStore, V1Binding, ValidationRepository, db_error};
 use ledger_core::{
     AnyCommit, AuthenticatedPrincipal, CommitId, CommitV2, ContentId, GraphId, LedgerError,
@@ -158,6 +161,10 @@ pub struct WorkflowRepository {
     #[cfg(feature = "test-hooks")]
     pause: Option<crate::test_hooks::PauseHook>,
     pub(crate) limits: crate::ReconstructionLimits,
+    /// Retrieval windows for reconstruction and ancestry walks (Plan 0012): a work bound,
+    /// never a semantic one. The defaults are the production values; only `test-hooks`
+    /// builds can change them.
+    pub(crate) windows: RetrievalWindows,
     /// The validation service this deployment trusts (ADR-0019). Independent of whether a
     /// validator endpoint is configured; without it, validated acceptance fails closed.
     trust: Option<ValidationTrustPolicy>,
@@ -549,8 +556,23 @@ impl WorkflowRepository {
             #[cfg(feature = "test-hooks")]
             pause: None,
             limits: crate::ReconstructionLimits::DEVELOPMENT,
+            windows: RetrievalWindows::DEFAULT,
             trust: None,
         }
+    }
+
+    /// Shrink (or widen) the retrieval windows so tests exercise window boundaries cheaply
+    /// (`test-hooks` builds only; never a deployment setting).
+    #[cfg(feature = "test-hooks")]
+    #[must_use]
+    pub fn with_retrieval_windows(mut self, windows: RetrievalWindows) -> Self {
+        self.windows = windows.checked();
+        self
+    }
+
+    /// The retrieval windows in force.
+    pub fn retrieval_windows(&self) -> RetrievalWindows {
+        self.windows
     }
 
     /// Accept only validations produced by the trusted service (deployment configuration;
@@ -579,7 +601,38 @@ impl WorkflowRepository {
         limits: &crate::ReconstructionLimits,
     ) -> Result<BTreeSet<ledger_rdf::Quad>, LedgerError> {
         let mut conn = self.pool.acquire().await.map_err(db_error)?;
-        Ok(Self::state_at_on(&mut conn, head, limits).await?.state)
+        Ok(
+            Self::state_at_on_windowed(&mut conn, head, limits, self.windows)
+                .await?
+                .state,
+        )
+    }
+
+    /// [`Self::reconstruct`] with the full result (state, canonical bytes, depth), for the
+    /// differential tests of the windowed path (`test-hooks` builds only).
+    #[cfg(feature = "test-hooks")]
+    pub async fn reconstruct_detailed(
+        &self,
+        head: &CommitId,
+        limits: &crate::ReconstructionLimits,
+    ) -> Result<(BTreeSet<ledger_rdf::Quad>, usize, usize), LedgerError> {
+        let mut conn = self.pool.acquire().await.map_err(db_error)?;
+        let r = Self::state_at_on_windowed(&mut conn, head, limits, self.windows).await?;
+        Ok((r.state, r.bytes, r.depth))
+    }
+
+    /// The scalar reference reconstruction of Phases 1–6B (one statement per object, the
+    /// index never consulted), kept verbatim so the windowed production path can be checked
+    /// against it differentially (`test-hooks` builds only).
+    #[cfg(feature = "test-hooks")]
+    pub async fn reconstruct_reference(
+        &self,
+        head: &CommitId,
+        limits: &crate::ReconstructionLimits,
+    ) -> Result<(BTreeSet<ledger_rdf::Quad>, usize, usize), LedgerError> {
+        let mut conn = self.pool.acquire().await.map_err(db_error)?;
+        let r = Self::state_at_on_scalar(&mut conn, head, limits).await?;
+        Ok((r.state, r.bytes, r.depth))
     }
 
     /// Abort every operation's transaction at `point` (tests only).
@@ -945,7 +998,143 @@ impl WorkflowRepository {
     /// Reconstruct the state at `head` on the caller's connection (the workflow
     /// transaction), so a prepare never holds one pool connection while waiting for
     /// another. Bytes are digest-verified exactly as `PostgresImmutableStore` does.
+    /// Retrieval is windowed with the production windows (Plan 0012).
     pub(crate) async fn state_at_on(
+        conn: &mut PgConnection,
+        head: &CommitId,
+        limits: &crate::ReconstructionLimits,
+    ) -> Result<Reconstructed, LedgerError> {
+        Self::state_at_on_windowed(conn, head, limits, RetrievalWindows::DEFAULT).await
+    }
+
+    /// Windowed first-parent reconstruction (Plan 0012 M2). The algorithm, its limits,
+    /// its error precedence and its wording are those of the scalar reference
+    /// (`state_at_on_scalar`): every commit-chain error (cycle, depth, missing, corrupt)
+    /// is raised before any patch is read, and patch errors are raised oldest-first.
+    /// Only the retrieval differs:
+    ///
+    /// - the chain is fetched in windows of `windows.objects` commits, each window one
+    ///   statement that follows `commit_parents` position 0 as a **hint** for which rows
+    ///   to return and joins their bytes;
+    /// - every returned commit is still re-hashed, decoded by the production decoder and
+    ///   checked against its requested id, and its decoded `parents[0]` is compared with
+    ///   the hinted next id — a hint the bytes contradict is `CorruptObject`, never
+    ///   followed; a silent index (no row) is followed by the bytes as the scalar walk did;
+    /// - the next window is anchored at the decoded `parents[0]`, so the chain the fold
+    ///   uses is the one the bytes describe;
+    /// - patches are fetched set-wise in windows (one statement each) and folded in the
+    ///   same oldest-to-newest order, under the same per-patch limit checks.
+    ///
+    /// The depth limit is enforced before the (max_depth + 1)-th commit is used, so a
+    /// window never asks for more commits than the limit allows; the cycle set is carried
+    /// across windows.
+    pub(crate) async fn state_at_on_windowed(
+        conn: &mut PgConnection,
+        head: &CommitId,
+        limits: &crate::ReconstructionLimits,
+        windows: RetrievalWindows,
+    ) -> Result<Reconstructed, LedgerError> {
+        fn cycle(id: &CommitId) -> LedgerError {
+            LedgerError::CorruptObject {
+                id: id.0.clone(),
+                reason: "commit cycle".into(),
+            }
+        }
+        fn depth_exceeded(limits: &crate::ReconstructionLimits) -> LedgerError {
+            LedgerError::ResourceLimit(format!(
+                "reconstruction depth exceeds {} commits",
+                limits.max_depth
+            ))
+        }
+        let windows = windows.checked();
+        let mut chain: Vec<PatchId> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut cursor = Some(head.clone());
+        while let Some(anchor) = cursor.take() {
+            // The scalar loop refuses the (max_depth + 1)-th commit before fetching it; a
+            // repeated id is a cycle first, as there.
+            if seen.len() >= limits.max_depth {
+                if !seen.insert(anchor.clone()) {
+                    return Err(cycle(&anchor));
+                }
+                return Err(depth_exceeded(limits));
+            }
+            let max_rows = windows.objects.min(limits.max_depth - seen.len());
+            let rows = fetch_first_parent_window(conn, &anchor, max_rows, windows).await?;
+            // The commit each row must be: the anchor, then whatever the previous row's
+            // bytes named as parent 0. The index never chooses it.
+            let mut expected = anchor;
+            for row in rows {
+                let (object, next_hint) = row.expect(&expected)?;
+                if !seen.insert(expected.clone()) {
+                    return Err(cycle(&expected));
+                }
+                if seen.len() > limits.max_depth {
+                    return Err(depth_exceeded(limits));
+                }
+                let id = expected.0.clone();
+                let bytes = object
+                    .verified()?
+                    .ok_or_else(|| LedgerError::NotFound(id.clone()))?;
+                let commit = crate::decode_commit_object(&id, &bytes)?
+                    .ok_or_else(|| LedgerError::NotFound(id.clone()))?;
+                // Parent zero is the state reconstruction parent in every envelope version.
+                // The index only said which row to fetch next; the bytes decide. A hint the
+                // bytes contradict (another id, a malformed id, or a parent for a genesis)
+                // is corruption and is never followed. A silent index (no position-0 row)
+                // is not a claim: the bytes' parent anchors the next window, exactly as the
+                // scalar walk followed it (`verify_commit_index`, the ADR-0012 re-derivation,
+                // reports the missing row).
+                let parent = commit.parents().first().cloned();
+                let contradicted = match (&parent, &next_hint) {
+                    (Some(decoded), Some(hinted)) => decoded.to_string() != *hinted,
+                    (None, Some(_)) => true,
+                    _ => false,
+                };
+                if contradicted {
+                    return Err(LedgerError::CorruptObject {
+                        id,
+                        reason: "commit_parents position 0 disagrees with the commit bytes".into(),
+                    });
+                }
+                // Only the patch id is retained: memory is proportional to depth, not to
+                // the envelopes' metadata.
+                chain.push(commit.patch().clone());
+                cursor = parent.clone();
+                if let Some(parent) = parent {
+                    expected = parent;
+                }
+            }
+        }
+        let mut state = BTreeSet::new();
+        let mut total_bytes = 0usize;
+        let order: Vec<&PatchId> = chain.iter().rev().collect();
+        let mut next = 0usize;
+        while next < order.len() {
+            let end = (next + windows.objects).min(order.len());
+            let ids: Vec<ContentId> = order[next..end].iter().map(|p| p.0.clone()).collect();
+            let served = fetch_objects_window(conn, &ids, windows).await?;
+            for (patch_id, object) in order[next..].iter().zip(served) {
+                let bytes = object
+                    .verified()?
+                    .ok_or_else(|| LedgerError::NotFound(patch_id.0.clone()))?;
+                let patch = crate::validate_patch_bytes(patch_id, &bytes)?;
+                crate::apply_bounded(&mut state, &mut total_bytes, &patch, limits)?;
+                next += 1;
+            }
+        }
+        Ok(Reconstructed {
+            state,
+            bytes: total_bytes,
+            depth: chain.len(),
+        })
+    }
+
+    /// The scalar reference (Plan 0012 M0): the reconstruction exactly as Phases 1–6B ran
+    /// it, one statement per commit and one per patch, the index never read. Kept only for
+    /// the differential tests of the windowed path; `test-hooks` builds only.
+    #[cfg(feature = "test-hooks")]
+    pub(crate) async fn state_at_on_scalar(
         conn: &mut PgConnection,
         head: &CommitId,
         limits: &crate::ReconstructionLimits,
@@ -1053,7 +1242,9 @@ impl WorkflowRepository {
         }
         // Base state is immutable content, read on this transaction's connection.
         let base = match &request.expected_head {
-            Some(head) => Self::state_at_on(&mut tx, head, &self.limits).await?,
+            Some(head) => {
+                Self::state_at_on_windowed(&mut tx, head, &self.limits, self.windows).await?
+            }
             None => Reconstructed::default(),
         };
         let Reconstructed {
