@@ -1,7 +1,7 @@
 # Plan 0013 M2 — request lifecycle versus transaction lifecycle (2026-10-07)
 
 Measured on the M2 code of branch `claude/p7a-m2-request-lifecycle` (stacked on the PR #15
-head `9796770`; final figures at the revision recorded in the Plan 0013 Evidence table)
+head `9796770`; final figures at code revision `5e82e4c`)
 against the two throwaway containers of the M1 evidence: PostgreSQL 17.2 (`127.0.0.1:55433`)
 and PostgreSQL 15.19 (`127.0.0.1:55434`). Commands (`RUST_TEST_THREADS=4` for the suites):
 
