@@ -2131,6 +2131,236 @@ async fn a_connection_idle_in_the_pool_longer_than_the_bound_is_borrowed_normall
     assert_eq!(identity().await, before);
 }
 
+/// The named store's backends as `(state, in a transaction?)`, from `pg_stat_activity`.
+async fn transaction_states(owner: &PostgresLedgerStore, app: &str) -> Vec<(String, bool)> {
+    sqlx::query(
+        "SELECT coalesce(state, '') AS state, xact_start IS NOT NULL AS in_xact \
+         FROM pg_stat_activity WHERE application_name = $1 ORDER BY pid",
+    )
+    .bind(app)
+    .fetch_all(owner.pool())
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|r| (r.get::<String, _>("state"), r.get::<bool, _>("in_xact")))
+    .collect()
+}
+
+/// ACCEPTED (M2 review P1, ADR-0026 §8). A request budget that ends after the connection was
+/// acquired but before `BEGIN` returns the clean connection: nothing is sent on it, the backend
+/// is `idle` with no open transaction, nothing is written, the key is unused, and the next
+/// borrower of the one-connection pool begins and commits a normal accept on the same backend.
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn a_request_budget_that_ends_before_begin_returns_the_connection_without_a_transaction() {
+    let owner = store().await;
+    let app = unique("lc-prebegin");
+    let one = named_store(&app, 1).await;
+    let f = fixture(&owner, Op::Accept).await;
+    let before = counts(&owner, &f.g).await;
+    let hook = PauseHook::new(HookPoint::BeforeBegin);
+    let deadline = Instant::now() + Duration::from_millis(300);
+    let mut handle = tokio::spawn(ledger_store::lifecycle::with_request_deadline(
+        deadline,
+        run(
+            one.clone().with_workflow_pause_hook(hook.clone()),
+            &f,
+            Op::Accept,
+            "pre-begin",
+        ),
+    ));
+    reached_or_failed(&hook, &mut handle).await;
+    let pid_before = sessions(&owner, &app).await;
+    assert_eq!(
+        pid_before.len(),
+        1,
+        "the connection is acquired: {pid_before:?}"
+    );
+    // The wait is the scenario: the budget ends while the operation holds the connection
+    // and has not sent BEGIN.
+    tokio::time::sleep_until(tokio::time::Instant::from_std(
+        deadline + Duration::from_millis(50),
+    ))
+    .await;
+    hook.resume();
+    let result = handle.await.unwrap();
+    assert!(
+        matches!(&result, Err(LedgerError::DependencyUnavailable(m)) if m.contains("before the transaction began")),
+        "nothing begun: {result:?}"
+    );
+    wait_until(
+        async || transaction_states(&owner, &app).await == vec![("idle".to_owned(), false)],
+        "the connection to be back in the pool idle and outside any transaction",
+    )
+    .await;
+    assert_eq!(locks_held(&owner, &app).await, 0);
+    assert_eq!(delta(&before, &counts(&owner, &f.g).await), BTreeMap::new());
+    assert_eq!(
+        idempotency_rows(&owner, &f.g, "accept", "pre-begin").await,
+        0
+    );
+    // The next borrower: a fresh transaction on the same backend, committed normally.
+    let retried = run(one.clone(), &f, Op::Accept, "pre-begin").await.unwrap();
+    assert!(!retried.replayed);
+    let after = sessions(&owner, &app).await;
+    assert_eq!(after.len(), 1);
+    assert_eq!(
+        after[0].pid, pid_before[0].pid,
+        "the same pooled backend served the retry"
+    );
+    assert_eq!(
+        transaction_states(&owner, &app).await,
+        vec![("idle".to_owned(), false)]
+    );
+    verify_clean(&owner).await;
+}
+
+/// ACCEPTED (M2 review P1, ADR-0026 §8). The caller's future is dropped while `BEGIN` is in
+/// flight on the server (a slow `BEGIN` injected by the hook, the window in which sqlx 0.8.6
+/// has not yet counted the transaction). The begin runs to completion in its own task and its
+/// transaction is dropped there (rolled back), so the pool gets the connection back `idle`,
+/// outside any transaction, holding no locks; the next borrower begins and commits a normal
+/// accept on the same backend. With a begin raced against a client-side timer this connection
+/// came back `idle in transaction` and the next borrower ran inside the stale transaction.
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn a_caller_dropped_during_begin_never_returns_an_open_transaction_to_the_pool() {
+    let owner = store().await;
+    let app = unique("lc-begindrop");
+    let one = named_store(&app, 1).await;
+    let f = fixture(&owner, Op::Accept).await;
+    let before = counts(&owner, &f.g).await;
+    let hook = PauseHook::slow_begin(Duration::from_millis(800));
+    let handle = tokio::spawn(run(
+        one.clone().with_workflow_pause_hook(hook.clone()),
+        &f,
+        Op::Accept,
+        "begin-drop",
+    ));
+    hook.reached().await;
+    // BEGIN is in flight: the backend is active inside the injected sleep.
+    wait_until(
+        async || sessions(&owner, &app).await.iter().any(active_in_sleep),
+        "BEGIN to be in flight on the server",
+    )
+    .await;
+    let pid = sessions(&owner, &app).await[0].pid;
+    handle.abort();
+    let aborted = handle.await;
+    assert!(
+        aborted.is_err_and(|e| e.is_cancelled()),
+        "the caller was dropped mid-BEGIN"
+    );
+    // Once the server finishes BEGIN the begin task drops its transaction: ROLLBACK, then the
+    // connection returns to the pool. Never `idle in transaction`.
+    wait_until(
+        async || {
+            let states = transaction_states(&owner, &app).await;
+            states.iter().all(|(state, _)| state != "active") && !states.is_empty()
+        },
+        "the slow BEGIN to end",
+    )
+    .await;
+    wait_until(
+        async || transaction_states(&owner, &app).await == vec![("idle".to_owned(), false)],
+        "the connection to be idle outside any transaction",
+    )
+    .await;
+    assert_eq!(locks_held(&owner, &app).await, 0);
+    assert_eq!(delta(&before, &counts(&owner, &f.g).await), BTreeMap::new());
+    assert_eq!(
+        idempotency_rows(&owner, &f.g, "accept", "begin-drop").await,
+        0
+    );
+    // The next borrower of the same backend begins its own transaction and commits.
+    let retried = run(one.clone(), &f, Op::Accept, "begin-drop")
+        .await
+        .unwrap();
+    assert!(!retried.replayed);
+    let after = sessions(&owner, &app).await;
+    assert_eq!(after.len(), 1);
+    assert_eq!(
+        after[0].pid, pid,
+        "the same pooled backend served the retry"
+    );
+    assert_eq!(
+        transaction_states(&owner, &app).await,
+        vec![("idle".to_owned(), false)]
+    );
+    verify_clean(&owner).await;
+}
+
+/// ACCEPTED (M2 review P1, ADR-0026 §2; PostgreSQL 15 is the target: it has no backstop).
+/// Six real statements, each well below `statement_timeout`, run inside a transaction whose
+/// bound is 300 ms. Each goes through the production checked accessor, so the sequence stops
+/// at the first statement that would start past the deadline: the overshoot is one in-flight
+/// statement tail, not the six sequential tails (1.5 s) an unchecked sequence would take. On
+/// PostgreSQL 17 the session-terminating backstop (bound + statement = 2.3 s) is never reached
+/// — defence in depth only.
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn statements_cannot_keep_starting_after_the_transaction_deadline_without_a_backstop() {
+    let owner = store().await;
+    let app = unique("lc-perstmt");
+    let bound = Duration::from_millis(300);
+    let each = Duration::from_millis(250);
+    let bounded = store_with_limits(
+        &app,
+        DbSessionLimits {
+            max_connections: 1,
+            statement_timeout: Duration::from_secs(2),
+            lock_timeout: Duration::from_millis(500),
+            transaction_bound: bound,
+            ..DbSessionLimits::default()
+        },
+    )
+    .await;
+    let version: String = sqlx::query_scalar("SHOW server_version_num")
+        .fetch_one(bounded.pool())
+        .await
+        .unwrap();
+    let backstop: Result<String, _> = sqlx::query_scalar("SHOW transaction_timeout")
+        .fetch_one(bounded.pool())
+        .await;
+    let f = fixture(&owner, Op::Accept).await;
+    let before = counts(&owner, &f.g).await;
+    let hook = PauseHook::slow_statement_checked(HookPoint::BeforeCommit, each, 6);
+    let mut handle = tokio::spawn(run(
+        bounded.clone().with_workflow_pause_hook(hook.clone()),
+        &f,
+        Op::Accept,
+        "per-stmt",
+    ));
+    reached_or_failed(&hook, &mut handle).await;
+    let started = Instant::now();
+    let result = handle.await.unwrap();
+    let took = started.elapsed();
+    println!(
+        "server {version}: transaction_timeout {}; six {each:?} statements under a {bound:?} bound stopped after {took:?}: {result:?}",
+        backstop.as_deref().unwrap_or("absent")
+    );
+    assert!(
+        matches!(&result, Err(LedgerError::DependencyTimeout(m)) if m.contains("exceeded its bound") && m.contains("before an injected slow statement")),
+        "the production deadline check refuses the next statement: {result:?}"
+    );
+    // At most two statements started (the second before 300 ms); the third was refused. The
+    // overshoot past the deadline is one statement tail (≤ 250 ms), never 6 × 250 ms.
+    assert!(
+        took >= each && took < bound + each + Duration::from_millis(250),
+        "one in-flight statement tail at most: {took:?}"
+    );
+    assert_eq!(delta(&before, &counts(&owner, &f.g).await), BTreeMap::new());
+    assert_eq!(
+        idempotency_rows(&owner, &f.g, "accept", "per-stmt").await,
+        0
+    );
+    let retried = run(bounded.clone(), &f, Op::Accept, "per-stmt")
+        .await
+        .unwrap();
+    assert!(!retried.replayed);
+    verify_clean(&owner).await;
+}
+
 /// ACCEPTED (M2, ADR-0026 §4). An error from `COMMIT` itself whose class is a lost connection
 /// is reported as `CommitOutcomeUnknown` (never as a rollback): the transaction, paused just
 /// before `COMMIT`, has its backend terminated from another session; `COMMIT` then fails on

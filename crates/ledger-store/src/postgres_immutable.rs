@@ -8,9 +8,10 @@
 //! therefore means "identical, already published" or an explicit error — never a silent
 //! success over foreign bytes or a foreign graph binding.
 
+use crate::lifecycle::Statements;
 use crate::{db_error, decode_commit_object, reject_commit_bytes_as_content, validate_patch_bytes};
 use ledger_core::{AnyCommit, CommitId, ContentId, GraphId, ImmutableStore, LedgerError};
-use sqlx::{PgConnection, PgPool, Row, postgres::PgPoolOptions};
+use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use std::str::FromStr;
 
 /// Bounds of one retrieval window (Plan 0012). Reconstruction and ancestry walks fetch
@@ -97,7 +98,7 @@ impl FetchedObject {
 /// detoasting the objects it does not return. The caller continues from the first
 /// unserved id. At most `max_objects` ids may be requested.
 pub(crate) async fn fetch_objects_window(
-    conn: &mut PgConnection,
+    conn: &mut dyn Statements,
     ids: &[ContentId],
     windows: RetrievalWindows,
 ) -> Result<Vec<FetchedObject>, LedgerError> {
@@ -127,7 +128,7 @@ pub(crate) async fn fetch_objects_window(
     )
     .bind(&requested)
     .bind(i64::try_from(windows.bytes).unwrap_or(i64::MAX))
-    .fetch_all(&mut *conn)
+    .fetch_all(conn.stmt("the objects window")?)
     .await
     .map_err(db_error)?;
     let mut served: Vec<(i64, String, Option<Vec<u8>>)> = rows
@@ -212,7 +213,7 @@ impl ChainRow {
 /// order ([`ChainRow::expect`]), verifies each object, and must confirm from the decoded
 /// bytes that `parents[0]` equals `next_hint` before following it.
 pub(crate) async fn fetch_first_parent_window(
-    conn: &mut PgConnection,
+    conn: &mut dyn Statements,
     anchor: &CommitId,
     max_rows: usize,
     windows: RetrievalWindows,
@@ -242,7 +243,7 @@ pub(crate) async fn fetch_first_parent_window(
     .bind(anchor.to_string())
     .bind(i64::try_from(max_rows).unwrap_or(i64::MAX))
     .bind(i64::try_from(windows.bytes).unwrap_or(i64::MAX))
-    .fetch_all(&mut *conn)
+    .fetch_all(conn.stmt("the chain window")?)
     .await
     .map_err(db_error)?;
     let mut served: Vec<RawChainRow> = rows
@@ -304,7 +305,7 @@ pub struct PostgresImmutableStore {
 /// other stored bytes are `ObjectCollision`. Immutable bytes are never overwritten. Works
 /// inside or outside a transaction (`&mut *tx` or a pool connection).
 pub(crate) async fn publish_object(
-    conn: &mut PgConnection,
+    conn: &mut dyn Statements,
     id: &ContentId,
     bytes: &[u8],
 ) -> Result<(), LedgerError> {
@@ -317,12 +318,12 @@ pub(crate) async fn publish_object(
     )
     .bind(&id_s)
     .bind(bytes)
-    .execute(&mut *conn)
+    .execute(conn.stmt("the immutable_objects insert")?)
     .await
     .map_err(db_error)?;
     let row = sqlx::query("SELECT bytes FROM immutable_objects WHERE id = $1")
         .bind(&id_s)
-        .fetch_one(&mut *conn)
+        .fetch_one(conn.stmt("the immutable_objects lookup")?)
         .await
         .map_err(db_error)?;
     let stored: Vec<u8> = row.try_get("bytes").map_err(db_error)?;
@@ -502,7 +503,7 @@ impl PostgresImmutableStore {
     /// [`Self::validate_patch_of`] (or hold the patch bytes verified) first.
     pub(crate) async fn publish_commit_in(
         &self,
-        tx: &mut PgConnection,
+        tx: &mut dyn Statements,
         commit: &AnyCommit,
     ) -> Result<CommitId, LedgerError> {
         let graph_id = self.graph_for(commit)?;
@@ -513,7 +514,7 @@ impl PostgresImmutableStore {
         for parent in commit.parents() {
             let row = sqlx::query("SELECT graph_id FROM commit_index WHERE id = $1")
                 .bind(parent.to_string())
-                .fetch_optional(&mut *tx)
+                .fetch_optional(tx.stmt("the commit_index lookup")?)
                 .await
                 .map_err(db_error)?;
             let Some(row) = row else {
@@ -532,7 +533,7 @@ impl PostgresImmutableStore {
         // as an untyped error if the patch row is somehow absent here.
         let patch_present = sqlx::query("SELECT 1 FROM immutable_objects WHERE id = $1")
             .bind(commit.patch().to_string())
-            .fetch_optional(&mut *tx)
+            .fetch_optional(tx.stmt("the immutable_objects lookup")?)
             .await
             .map_err(db_error)?;
         if patch_present.is_none() {
@@ -540,7 +541,7 @@ impl PostgresImmutableStore {
         }
         let graph_row = sqlx::query("SELECT status FROM graphs WHERE graph_id = $1")
             .bind(graph_id.as_str())
-            .fetch_optional(&mut *tx)
+            .fetch_optional(tx.stmt("the graphs lookup")?)
             .await
             .map_err(db_error)?;
         let Some(graph_row) = graph_row else {
@@ -570,7 +571,7 @@ impl PostgresImmutableStore {
         .bind(i16::from(commit.version()))
         .bind(commit.patch().to_string())
         .bind(parent_count)
-        .execute(&mut *tx)
+        .execute(tx.stmt("the commit_index insert")?)
         .await
         .map_err(db_error)?;
         for (position, parent) in commit.parents().iter().enumerate() {
@@ -583,7 +584,7 @@ impl PostgresImmutableStore {
             .bind(&id_s)
             .bind(position)
             .bind(parent.to_string())
-            .execute(&mut *tx)
+            .execute(tx.stmt("the commit_parents insert")?)
             .await
             .map_err(db_error)?;
         }
@@ -594,7 +595,7 @@ impl PostgresImmutableStore {
             "SELECT graph_id, version, patch_id, parent_count FROM commit_index WHERE id = $1",
         )
         .bind(&id_s)
-        .fetch_one(&mut *tx)
+        .fetch_one(tx.stmt("the commit_index lookup")?)
         .await
         .map_err(db_error)?;
         IndexRow::from_row(&row)?.check_against(
@@ -604,7 +605,7 @@ impl PostgresImmutableStore {
                 requested_graph: &graph_id,
             },
         )?;
-        let parents = fetch_parent_rows(&mut *tx, &id_s).await?;
+        let parents = fetch_parent_rows(tx.stmt("the commit_parents lookup")?, &id_s).await?;
         check_parent_rows(&parents, commit, &id.0)?;
         Ok(id)
     }
@@ -757,10 +758,10 @@ impl ImmutableStore for PostgresImmutableStore {
         self.validate_patch_of(commit).await?;
         let mut tx = self.pool.begin().await.map_err(db_error)?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
-            .execute(&mut *tx)
+            .execute(tx.stmt("the isolation level")?)
             .await
             .map_err(db_error)?;
-        let id = self.publish_commit_in(&mut tx, commit).await?;
+        let id = self.publish_commit_in(&mut *tx, commit).await?;
         tx.commit().await.map_err(db_error)?;
         Ok(id)
     }

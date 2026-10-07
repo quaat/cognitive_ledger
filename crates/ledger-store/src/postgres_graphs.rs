@@ -3,6 +3,7 @@
 //! surface belong to later phases; this module only guarantees the schema's invariants
 //! (global `graph_id` uniqueness, immutable tenant binding, many graphs per KB).
 
+use crate::lifecycle::Statements;
 use crate::{db_error, storage};
 use ledger_core::{GraphId, LedgerError, TenantId};
 use sqlx::{PgPool, Row};
@@ -111,7 +112,7 @@ impl PgGraphs {
              WHERE graph_id = $1",
         )
         .bind(graph_id.as_str())
-        .fetch_optional(&mut *conn)
+        .fetch_optional(conn.stmt("the graphs lookup")?)
         .await
         .map_err(db_error)?;
         let Some(row) = row else {

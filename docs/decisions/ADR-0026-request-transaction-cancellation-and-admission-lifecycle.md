@@ -107,11 +107,18 @@ validator_timeout + statement_timeout  ≤  request_timeout     (when a validato
 **The transaction bound, honestly.** Every workflow transaction (`begin_scoped`) carries a
 deadline `T = min(begin + transaction_bound, request deadline)` (`begin` is after the pool
 acquire, so the bound never includes the wait for a connection; the cap means **no `COMMIT` is
-ever sent after the request deadline**). Before every statement of the transaction — the lock
-and lookup phases, each publication, each row insert, each reconstruction window, the
-idempotency result — and before *sending* `COMMIT`, the deadline is checked; at or past `T` the
-transaction is rolled back and the request fails with `DependencyTimeout` (`DEPENDENCY_TIMEOUT`,
-retry by key). That check alone is not a hard bound — a statement started at `T − ε` runs on.
+ever sent after the request deadline**). Before **every** statement of the transaction and before
+*sending* `COMMIT`, the deadline is checked; at or past `T` the transaction is rolled back and
+the request fails with `DependencyTimeout` (`DEPENDENCY_TIMEOUT`, retry by key). The check is
+structural, not a convention: a bounded transaction does not dereference to a connection, and
+the only way to run SQL on it is the checked accessor `Statements::stmt(phase)`, which every
+helper the transaction calls — lookups, locks, publications, index writes, reconstruction
+windows, idempotency rows — obtains immediately before each statement (PR #17 review P1: a
+helper that ran several statements behind one outer check could keep starting statements past
+the deadline on PostgreSQL 15, which has no backstop). The same accessor on a pooled
+request-path connection refuses to start a statement after the request deadline. Only
+`test-hooks` builds have an unchecked accessor, for the injected statements that simulate a
+check-skipping bug in the PostgreSQL 17 backstop test. That check alone is not a hard bound — a statement started at `T − ε` runs on.
 The declared bound, the same on both supported servers, is:
 
 ```text
@@ -363,7 +370,19 @@ tracked operation). The M3 `db_work` permit attaches to exactly this operation l
 `expensive` and `validations` permits already do in M2 (owned permits moved into the task). A
 request-side connection acquisition inside the operation never waits beyond the request's
 remaining budget (`min(pool_acquire_timeout, remaining)`), and an acquisition attempted after
-the budget is spent fails at once (`DependencyUnavailable`, nothing done): an operation whose
+the budget is spent fails at once (`DependencyUnavailable`, nothing done). **Transaction
+start-up is cancellation-safe** (PR #17 review P1): the acquisition is the only database step
+raced against a client-side timer; a budget that ends between the acquisition and `BEGIN`
+returns the clean connection without beginning anything; `BEGIN` itself is awaited in a task
+of its own that is never dropped — in sqlx 0.8.6 the client-side transaction depth is
+incremented only after `BEGIN`'s `ReadyForQuery`, so a begin future dropped in that window
+would return to the pool a connection PostgreSQL still considers inside a transaction, which
+the next borrower would unknowingly reuse. If the awaiting future is ever dropped, the begin
+task still completes and drops its transaction there (queueing `ROLLBACK`), so the pool never
+receives a connection with an open transaction the client does not know about; a `BEGIN` that
+cannot complete is an error and its connection is not reused. Regression tests:
+`pg_lifecycle::a_request_budget_that_ends_before_begin_…` and
+`a_caller_dropped_during_begin_never_returns_an_open_transaction_to_the_pool`. Concretely: an operation whose
 client has already received `REQUEST_TIMEOUT` therefore stops at its next connection
 acquisition — typically before its transaction began — and the retry by key executes afresh;
 an operation already inside a transaction runs to its bound and commits or rolls back on its

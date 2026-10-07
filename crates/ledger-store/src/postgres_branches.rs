@@ -4,13 +4,14 @@
 //! complete-actor scope and advisory lock as the workflow; `ref_events` stays the only
 //! authority for head movement, `branch_events` records the lifecycle.
 
+use crate::lifecycle::Statements;
 use crate::postgres_workflow::{
     Operation, StoredResult, validate_branch, validate_reason, validate_scope_fn,
 };
 use crate::{RequestScope, WorkflowRepository, db_error};
 use ledger_core::{CommitId, GraphId, LedgerError, TenantId};
 use ledger_dag::{DagError, ParentProvider, TraversalLimits, WindowKind};
-use sqlx::{PgConnection, Row};
+use sqlx::Row;
 use std::collections::BTreeMap;
 use tokio::sync::Mutex;
 
@@ -117,7 +118,7 @@ const REACH_PAIRS_PER_COMMIT: usize = 4;
 /// returns each with the same contiguity-checked parent list [`Self::parents`] would. A
 /// window of 1 is the Phase-4/5 walk, one commit per two statements, kept as the reference.
 pub(crate) struct GraphParents<'c> {
-    pub(crate) conn: Mutex<&'c mut PgConnection>,
+    pub(crate) conn: Mutex<&'c mut dyn Statements>,
     pub(crate) graph: GraphId,
     /// Commits per ancestry window (`RetrievalWindows::ancestry`).
     pub(crate) window: usize,
@@ -154,7 +155,7 @@ impl ParentProvider for GraphParents<'_> {
         )
         .bind(commit.to_string())
         .bind(self.graph.as_str())
-        .fetch_optional(&mut **conn)
+        .fetch_optional(conn.stmt("the commit_index lookup")?)
         .await
         .map_err(db_error)?;
         let Some(parent_count) = indexed else {
@@ -164,7 +165,7 @@ impl ParentProvider for GraphParents<'_> {
             "SELECT position, parent_id FROM commit_parents WHERE commit_id = $1 ORDER BY position",
         )
         .bind(commit.to_string())
-        .fetch_all(&mut **conn)
+        .fetch_all(conn.stmt("the commit_parents lookup")?)
         .await
         .map_err(db_error)?;
         let rows: Vec<(i16, String)> = rows
@@ -242,7 +243,7 @@ impl ParentProvider for GraphParents<'_> {
         .bind(i64::try_from(max).unwrap_or(i64::MAX))
         .bind(first_parent_only)
         .bind(i64::try_from(max.saturating_mul(REACH_PAIRS_PER_COMMIT)).unwrap_or(i64::MAX))
-        .fetch_all(&mut **conn)
+        .fetch_all(conn.stmt("the ancestry window")?)
         .await
         .map_err(db_error)?;
         drop(conn);
@@ -349,7 +350,7 @@ impl WorkflowRepository {
     /// Lock a branch row (`FOR SHARE` for workflow steps, `FOR UPDATE` for lifecycle
     /// changes). Callers lock the ref first where they lock both (ADR-0022 lock order).
     pub(crate) async fn lock_branch(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         graph: &GraphId,
         branch: &str,
         exclusive: bool,
@@ -364,7 +365,7 @@ impl WorkflowRepository {
         let row = sqlx::query(sql)
             .bind(graph.as_str())
             .bind(branch)
-            .fetch_optional(&mut *conn)
+            .fetch_optional(conn.stmt("the branch lock")?)
             .await
             .map_err(db_error)?;
         row.map(|r| {
@@ -382,7 +383,7 @@ impl WorkflowRepository {
     /// Record `main`'s branch row and its `genesis` lifecycle event inside the genesis
     /// acceptance transaction (only `main` is born by genesis, ADR-0022).
     pub(crate) async fn record_genesis_branch(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         scope: &RequestScope,
         branch: &str,
         head: &CommitId,
@@ -395,7 +396,7 @@ impl WorkflowRepository {
         .bind(scope.graph.as_str())
         .bind(branch)
         .bind(scope.principal.tenant_id.as_str())
-        .execute(&mut *conn)
+        .execute(conn.stmt("the branches insert")?)
         .await
         .map_err(db_error)?;
         Self::insert_branch_event(
@@ -407,7 +408,7 @@ impl WorkflowRepository {
 
     #[allow(clippy::too_many_arguments)]
     async fn insert_branch_event(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         scope: &RequestScope,
         branch: &str,
         lifecycle_version: i64,
@@ -441,14 +442,14 @@ impl WorkflowRepository {
         .bind(actor.on_behalf_of.as_ref().map(|p| p.as_str().to_owned()))
         .bind(reason)
         .bind(scope.correlation_id.as_deref())
-        .fetch_one(&mut *conn)
+        .fetch_one(conn.stmt("the branch_events lookup")?)
         .await
         .map_err(db_error)?;
         event_from_row(&row)
     }
 
     async fn record_branch_result(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         scope: &RequestScope,
         operation: Operation,
         result_kind: &str,
@@ -478,14 +479,14 @@ impl WorkflowRepository {
         .bind(event.head.to_string())
         .bind(event.ref_version)
         .bind(event.event_id)
-        .execute(&mut *conn)
+        .execute(conn.stmt("the idempotency insert")?)
         .await
         .map_err(db_error)?;
         Ok(())
     }
 
     async fn replay_branch(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         stored: StoredResult,
         scope: &RequestScope,
         result_kind: &str,
@@ -504,7 +505,7 @@ impl WorkflowRepository {
         ))
         .bind(event_id)
         .bind(scope.graph.as_str())
-        .fetch_one(&mut *conn)
+        .fetch_one(conn.stmt("the branch_events lookup")?)
         .await
         .map_err(db_error)?;
         Ok(BranchOutcome {
@@ -533,7 +534,7 @@ impl WorkflowRepository {
         .bind(scope.graph.as_str())
         .bind(&request.source)
         .bind(scope.principal.tenant_id.as_str())
-        .fetch_optional(&mut *conn)
+        .fetch_optional(conn.stmt("the refs lookup")?)
         .await
         .map_err(db_error)?;
         let Some(row) = row else {
@@ -551,14 +552,14 @@ impl WorkflowRepository {
             sqlx::query_scalar("SELECT 1 FROM commit_index WHERE id = $1 AND graph_id = $2")
                 .bind(commit.to_string())
                 .bind(scope.graph.as_str())
-                .fetch_optional(&mut *conn)
+                .fetch_optional(conn.stmt("the commit_index lookup")?)
                 .await
                 .map_err(db_error)?;
         if known.is_none() {
             return Ok((head, version, false));
         }
         let provider = GraphParents {
-            conn: Mutex::new(&mut *conn),
+            conn: Mutex::new(&mut conn as &mut dyn Statements),
             graph: scope.graph.clone(),
             window: self.windows.ancestry,
         };
@@ -587,7 +588,7 @@ impl WorkflowRepository {
     /// audited ref events: exactly one event per version in `from+1..=to`, chained, the first
     /// leaving `head_then`. Raw (import) moves write no events, so they fail this.
     async fn moved_by_audited_fast_forwards(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         graph: &GraphId,
         branch: &str,
         head_then: &CommitId,
@@ -611,7 +612,7 @@ impl WorkflowRepository {
         .bind(from)
         .bind(to)
         .bind(head_then.to_string())
-        .fetch_one(&mut *conn)
+        .fetch_one(conn.stmt("the ref_events lookup")?)
         .await
         .map_err(db_error)?;
         Ok(chained)
@@ -657,8 +658,14 @@ impl WorkflowRepository {
                     .await,
             ),
         };
-        let mut tx =
-            Self::begin_scoped(&self.pool, &self.session, scope, Operation::BranchCreate).await?;
+        let mut tx = Self::begin_scoped(
+            &self.pool,
+            &self.session,
+            scope,
+            Operation::BranchCreate,
+            self.begin_hook(),
+        )
+        .await?;
         if let Some(stored) = Self::stored_result(&mut tx, scope, Operation::BranchCreate).await? {
             return Self::replay_branch(&mut tx, stored, scope, "branch_created").await;
         }
@@ -673,7 +680,7 @@ impl WorkflowRepository {
         )
         .bind(scope.graph.as_str())
         .bind(&request.source)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.stmt("the refs lookup")?)
         .await
         .map_err(db_error)?;
         let source = Self::lock_branch(&mut tx, &scope.graph, &request.source, false).await?;
@@ -733,7 +740,7 @@ impl WorkflowRepository {
         .bind(&request.name)
         .bind(point.to_string())
         .bind(request.policy.protected)
-        .execute(&mut *tx)
+        .execute(tx.stmt("the refs insert")?)
         .await
         .map_err(db_error)?;
         if inserted.rows_affected() != 1 {
@@ -754,7 +761,7 @@ impl WorkflowRepository {
         .bind(actor.principal_type.as_str())
         .bind(actor.on_behalf_of.as_ref().map(|p| p.as_str().to_owned()))
         .bind(scope.correlation_id.as_deref())
-        .execute(&mut *tx)
+        .execute(tx.stmt("the ref_events insert")?)
         .await
         .map_err(db_error)?;
         tx.check_deadline("the branch row")?;
@@ -770,7 +777,7 @@ impl WorkflowRepository {
         .bind(point.to_string())
         .bind(request.policy.require_validation)
         .bind(request.policy.require_distinct_reviewer)
-        .execute(&mut *tx)
+        .execute(tx.stmt("the branches insert")?)
         .await
         .map_err(db_error)?;
         tx.check_deadline("the branch event")?;
@@ -855,7 +862,14 @@ impl WorkflowRepository {
             Operation::BranchDelete => "branch_deleted",
             _ => "branch_restored",
         };
-        let mut tx = Self::begin_scoped(&self.pool, &self.session, scope, operation).await?;
+        let mut tx = Self::begin_scoped(
+            &self.pool,
+            &self.session,
+            scope,
+            operation,
+            self.begin_hook(),
+        )
+        .await?;
         if let Some(stored) = Self::stored_result(&mut tx, scope, operation).await? {
             return Self::replay_branch(&mut tx, stored, scope, result_kind).await;
         }
@@ -877,7 +891,7 @@ impl WorkflowRepository {
         )
         .bind(scope.graph.as_str())
         .bind(&request.name)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.stmt("the branches lookup")?)
         .await
         .map_err(db_error)?;
         let Some(row) = row else {
@@ -894,7 +908,7 @@ impl WorkflowRepository {
             sqlx::query("SELECT head, version FROM refs WHERE graph_id = $1 AND branch = $2")
                 .bind(scope.graph.as_str())
                 .bind(&request.name)
-                .fetch_one(&mut *tx)
+                .fetch_one(tx.stmt("the refs lookup")?)
                 .await
                 .map_err(db_error)?;
         let head: CommitId = head_row
@@ -910,7 +924,7 @@ impl WorkflowRepository {
         .bind(scope.graph.as_str())
         .bind(&request.name)
         .bind(to)
-        .execute(&mut *tx)
+        .execute(tx.stmt("the branches update")?)
         .await
         .map_err(db_error)?;
         tx.check_deadline("the branch event")?;
@@ -955,7 +969,7 @@ impl WorkflowRepository {
         let owner: Option<String> =
             sqlx::query_scalar("SELECT tenant_id FROM graphs WHERE graph_id = $1")
                 .bind(graph.as_str())
-                .fetch_optional(&mut *conn)
+                .fetch_optional(conn.stmt("the graphs lookup")?)
                 .await
                 .map_err(db_error)?;
         if owner.as_deref() != Some(tenant.as_str()) {
@@ -979,7 +993,7 @@ impl WorkflowRepository {
         ))
         .bind(graph.as_str())
         .bind(name)
-        .fetch_optional(&mut *conn)
+        .fetch_optional(conn.stmt("the branches lookup")?)
         .await
         .map_err(db_error)?;
         row.map(|r| info_from_row(&r)).transpose()
@@ -999,7 +1013,7 @@ impl WorkflowRepository {
         ))
         .bind(graph.as_str())
         .bind(limit.clamp(1, 10_000))
-        .fetch_all(&mut *conn)
+        .fetch_all(conn.stmt("the branches lookup")?)
         .await
         .map_err(db_error)?;
         rows.iter().map(info_from_row).collect()
@@ -1025,7 +1039,7 @@ impl WorkflowRepository {
         .bind(graph.as_str())
         .bind(name)
         .bind(limit)
-        .fetch_all(&mut *conn)
+        .fetch_all(conn.stmt("the branch_events lookup")?)
         .await
         .map_err(db_error)?;
         if events.is_empty() {
@@ -1039,7 +1053,7 @@ impl WorkflowRepository {
         .bind(graph.as_str())
         .bind(name)
         .bind(limit)
-        .fetch_all(&mut *conn)
+        .fetch_all(conn.stmt("the ref_events lookup")?)
         .await
         .map_err(db_error)?;
         let movements = movements
@@ -1085,7 +1099,7 @@ impl WorkflowRepository {
         self.readable_graph(tenant, graph).await?;
         let mut conn = crate::lifecycle::acquire(&self.pool, self.session.acquire_timeout).await?;
         let provider = GraphParents {
-            conn: Mutex::new(&mut *conn),
+            conn: Mutex::new(&mut conn as &mut dyn Statements),
             graph: graph.clone(),
             window: self.windows.ancestry,
         };
@@ -1120,7 +1134,7 @@ impl WorkflowRepository {
         self.readable_graph(tenant, graph).await?;
         let mut conn = crate::lifecycle::acquire(&self.pool, self.session.acquire_timeout).await?;
         let provider = GraphParents {
-            conn: Mutex::new(&mut *conn),
+            conn: Mutex::new(&mut conn as &mut dyn Statements),
             graph: graph.clone(),
             window: self.windows.ancestry,
         };

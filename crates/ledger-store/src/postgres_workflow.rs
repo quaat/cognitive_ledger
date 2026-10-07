@@ -23,6 +23,7 @@
 //! atomicity is verified, production protected semantic acceptance (Phase 2) is not
 //! enabled, and no validation record is ever fabricated.
 
+use crate::lifecycle::Statements;
 use crate::postgres_immutable::{
     RetrievalWindows, fetch_first_parent_window, fetch_objects_window,
 };
@@ -33,7 +34,7 @@ use ledger_core::{
 };
 use ledger_rdf::{DeltaPolicy, Patch, effective_delta};
 use ledger_validation_protocol::{SemanticEnvironmentId, ValidationId};
-use sqlx::{PgConnection, PgPool, Row, postgres::PgPoolOptions};
+use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use std::collections::BTreeSet;
 use time::OffsetDateTime;
 
@@ -436,7 +437,7 @@ impl PostgresLedgerStore {
         let mut conn = crate::lifecycle::acquire(&self.pool, self.session.acquire_timeout).await?;
         let row = sqlx::query("SELECT graph_id FROM commit_index WHERE id = $1")
             .bind(commit.to_string())
-            .fetch_optional(&mut *conn)
+            .fetch_optional(conn.stmt("the commit_index lookup")?)
             .await
             .map_err(db_error)?;
         row.map(|row| {
@@ -456,7 +457,7 @@ impl PostgresLedgerStore {
         let row = sqlx::query("SELECT head, version FROM refs WHERE graph_id = $1 AND branch = $2")
             .bind(graph.as_str())
             .bind(branch)
-            .fetch_optional(&mut *conn)
+            .fetch_optional(conn.stmt("the refs lookup")?)
             .await
             .map_err(db_error)?;
         row.map(|row| {
@@ -746,10 +747,10 @@ impl WorkflowRepository {
     pub(crate) async fn hook_at(
         &self,
         point: crate::test_hooks::HookPoint,
-        conn: &mut PgConnection,
+        tx: &mut crate::lifecycle::BoundedTx,
     ) -> Result<(), LedgerError> {
         match &self.pause {
-            Some(hook) => hook.at(point, Some(conn)).await,
+            Some(hook) => hook.at(point, Some(tx)).await,
             None => Ok(()),
         }
     }
@@ -775,7 +776,26 @@ impl WorkflowRepository {
         scope: &RequestScope,
         operation: Operation,
     ) -> Result<crate::lifecycle::BoundedTx, LedgerError> {
-        Self::begin_scoped(&self.pool, &self.session, scope, operation).await
+        Self::begin_scoped(
+            &self.pool,
+            &self.session,
+            scope,
+            operation,
+            self.begin_hook(),
+        )
+        .await
+    }
+
+    /// This repository's pause hook as the transaction start-up hook (test-hooks builds).
+    pub(crate) fn begin_hook(&self) -> crate::lifecycle::BeginHook<'_> {
+        #[cfg(feature = "test-hooks")]
+        {
+            self.pause.as_ref()
+        }
+        #[cfg(not(feature = "test-hooks"))]
+        {
+            None
+        }
     }
 
     /// Open a bounded workflow transaction (ADR-0026 §2: the bound starts once the
@@ -785,10 +805,11 @@ impl WorkflowRepository {
         session: &DbSessionLimits,
         scope: &RequestScope,
         operation: Operation,
+        hook: crate::lifecycle::BeginHook<'_>,
     ) -> Result<crate::lifecycle::BoundedTx, LedgerError> {
-        let mut tx = crate::lifecycle::begin(pool, session).await?;
+        let mut tx = crate::lifecycle::begin(pool, session, hook).await?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
-            .execute(&mut *tx)
+            .execute(tx.stmt("the isolation level")?)
             .await
             .map_err(db_error)?;
         // The complete actor is part of the scope: two contexts sharing a principal id but
@@ -810,14 +831,14 @@ impl WorkflowRepository {
         );
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(crate::lock_key(&format!("idempotency:{lock_key}")))
-            .execute(&mut *tx)
+            .execute(tx.stmt("the advisory lock")?)
             .await
             .map_err(db_error)?;
         Ok(tx)
     }
 
     pub(crate) async fn stored_result(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         scope: &RequestScope,
         operation: Operation,
     ) -> Result<Option<StoredResult>, LedgerError> {
@@ -842,7 +863,7 @@ impl WorkflowRepository {
         .bind(scope.graph.as_str())
         .bind(operation.as_str())
         .bind(&scope.idempotency_key)
-        .fetch_optional(&mut *conn)
+        .fetch_optional(conn.stmt("the idempotency lookup")?)
         .await
         .map_err(db_error)?;
         row.map(|row| {
@@ -864,7 +885,7 @@ impl WorkflowRepository {
     /// key, so a conflict here is an invariant violation rather than a race.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn record_result(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         scope: &RequestScope,
         operation: Operation,
         result_kind: &str,
@@ -900,7 +921,7 @@ impl WorkflowRepository {
                 .map(|p| p.as_str().to_owned()),
         )
         .bind(result_validation_id.map(ToString::to_string))
-        .execute(&mut *conn)
+        .execute(conn.stmt("the idempotency insert")?)
         .await
         .map_err(db_error)?;
         Ok(())
@@ -920,12 +941,12 @@ impl WorkflowRepository {
     /// exclusive counterpart for every status change, so no transition can interleave with
     /// a workflow transaction that checked the status.
     async fn lock_graph_status_shared(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         graph: &GraphId,
     ) -> Result<(), LedgerError> {
         sqlx::query("SELECT pg_advisory_xact_lock_shared($1)")
             .bind(crate::lock_key(&format!("graph-status:{}", graph.as_str())))
-            .execute(&mut *conn)
+            .execute(conn.stmt("the advisory lock")?)
             .await
             .map_err(db_error)?;
         Ok(())
@@ -935,12 +956,12 @@ impl WorkflowRepository {
     /// (accept, reject, supersede), so two deciders serialize and the second sees the
     /// first's decision instead of racing the unique indexes.
     async fn lock_proposal_decision(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         proposal_id: i64,
     ) -> Result<(), LedgerError> {
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(crate::lock_key(&format!("proposal-decision:{proposal_id}")))
-            .execute(&mut *conn)
+            .execute(conn.stmt("the advisory lock")?)
             .await
             .map_err(db_error)?;
         Ok(())
@@ -950,7 +971,7 @@ impl WorkflowRepository {
     /// reported identically as `UnknownGraph`, so nothing about other tenants leaks), and
     /// be `active` for normal workflow operations.
     pub(crate) async fn graph_must_be_active(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         scope: &RequestScope,
     ) -> Result<(), LedgerError> {
         // Shared advisory lock on the graph's status (ADR-0016): the runtime identity has
@@ -960,7 +981,7 @@ impl WorkflowRepository {
         Self::lock_graph_status_shared(conn, &scope.graph).await?;
         let row = sqlx::query("SELECT tenant_id, status FROM graphs WHERE graph_id = $1")
             .bind(scope.graph.as_str())
-            .fetch_optional(&mut *conn)
+            .fetch_optional(conn.stmt("the graphs lookup")?)
             .await
             .map_err(db_error)?;
         let Some(row) = row else {
@@ -984,7 +1005,7 @@ impl WorkflowRepository {
     /// never went through `prepare` (and therefore through effective-delta reduction) is
     /// not a workflow candidate.
     async fn proposal_for(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         candidate: &CommitId,
     ) -> Result<Option<ProposalBinding>, LedgerError> {
         let row = sqlx::query(
@@ -992,7 +1013,7 @@ impl WorkflowRepository {
              WHERE candidate_commit = $1",
         )
         .bind(candidate.to_string())
-        .fetch_optional(&mut *conn)
+        .fetch_optional(conn.stmt("the proposals lookup")?)
         .await
         .map_err(db_error)?;
         row.map(|row| {
@@ -1009,7 +1030,7 @@ impl WorkflowRepository {
     /// The candidate must be an indexed commit of the caller's graph with a proposal bound
     /// to exactly this ref and expected head, and carry no terminal decision yet.
     pub(crate) async fn bound_undecided_proposal(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         scope: &RequestScope,
         branch: &str,
         expected_head: Option<&CommitId>,
@@ -1018,7 +1039,7 @@ impl WorkflowRepository {
         let indexed_graph: Option<String> =
             sqlx::query("SELECT graph_id FROM commit_index WHERE id = $1")
                 .bind(candidate.to_string())
-                .fetch_optional(&mut *conn)
+                .fetch_optional(conn.stmt("the commit_index lookup")?)
                 .await
                 .map_err(db_error)?
                 .map(|row| row.try_get("graph_id").map_err(db_error))
@@ -1048,7 +1069,7 @@ impl WorkflowRepository {
         let decided =
             sqlx::query("SELECT decision FROM decisions WHERE candidate_commit = $1 LIMIT 1")
                 .bind(candidate.to_string())
-                .fetch_optional(&mut *conn)
+                .fetch_optional(conn.stmt("the decisions lookup")?)
                 .await
                 .map_err(db_error)?;
         if let Some(row) = decided {
@@ -1071,7 +1092,7 @@ impl WorkflowRepository {
 
     /// Read the current head and version of a ref, optionally locking the row.
     pub(crate) async fn read_ref(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         graph: &GraphId,
         branch: &str,
         lock: bool,
@@ -1084,7 +1105,7 @@ impl WorkflowRepository {
         let row = sqlx::query(sql)
             .bind(graph.as_str())
             .bind(branch)
-            .fetch_optional(&mut *conn)
+            .fetch_optional(conn.stmt("the ref lookup")?)
             .await
             .map_err(db_error)?;
         row.map(|row| {
@@ -1103,7 +1124,7 @@ impl WorkflowRepository {
     /// another. Bytes are digest-verified exactly as `PostgresImmutableStore` does.
     /// Retrieval is windowed with the production windows (Plan 0012).
     pub(crate) async fn state_at_on(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         head: &CommitId,
         limits: &crate::ReconstructionLimits,
     ) -> Result<Reconstructed, LedgerError> {
@@ -1132,22 +1153,10 @@ impl WorkflowRepository {
     /// window never asks for more commits than the limit allows; the cycle set is carried
     /// across windows.
     pub(crate) async fn state_at_on_windowed(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         head: &CommitId,
         limits: &crate::ReconstructionLimits,
         windows: RetrievalWindows,
-    ) -> Result<Reconstructed, LedgerError> {
-        Self::state_at_on_windowed_until(conn, head, limits, windows, None).await
-    }
-
-    /// `state_at_on_windowed` inside a bounded transaction: the deadline is checked before
-    /// every window statement (ADR-0026 §2), so the tail past the deadline is one window.
-    pub(crate) async fn state_at_on_windowed_until(
-        conn: &mut PgConnection,
-        head: &CommitId,
-        limits: &crate::ReconstructionLimits,
-        windows: RetrievalWindows,
-        deadline: Option<std::time::Instant>,
     ) -> Result<Reconstructed, LedgerError> {
         fn cycle(id: &CommitId) -> LedgerError {
             LedgerError::CorruptObject {
@@ -1175,7 +1184,6 @@ impl WorkflowRepository {
                 return Err(depth_exceeded(limits));
             }
             let max_rows = windows.objects.min(limits.max_depth - seen.len());
-            crate::lifecycle::check_window_deadline(deadline)?;
             let rows = fetch_first_parent_window(conn, &anchor, max_rows, windows).await?;
             // The commit each row must be: the anchor, then whatever the previous row's
             // bytes named as parent 0. The index never chooses it.
@@ -1251,17 +1259,17 @@ impl WorkflowRepository {
     /// the differential tests of the windowed path; `test-hooks` builds only.
     #[cfg(feature = "test-hooks")]
     pub(crate) async fn state_at_on_scalar(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         head: &CommitId,
         limits: &crate::ReconstructionLimits,
     ) -> Result<Reconstructed, LedgerError> {
         async fn object(
-            conn: &mut PgConnection,
+            conn: &mut dyn Statements,
             id: &ContentId,
         ) -> Result<Option<Vec<u8>>, LedgerError> {
             let row = sqlx::query("SELECT bytes FROM immutable_objects WHERE id = $1")
                 .bind(id.to_string())
-                .fetch_optional(&mut *conn)
+                .fetch_optional(conn.stmt("the immutable_objects lookup")?)
                 .await
                 .map_err(db_error)?;
             let Some(row) = row else {
@@ -1365,15 +1373,7 @@ impl WorkflowRepository {
         tx.check_deadline("the base-state reconstruction")?;
         let base = match &request.expected_head {
             Some(head) => {
-                let deadline = Some(tx.deadline());
-                Self::state_at_on_windowed_until(
-                    &mut tx,
-                    head,
-                    &self.limits,
-                    self.windows,
-                    deadline,
-                )
-                .await?
+                Self::state_at_on_windowed(&mut tx, head, &self.limits, self.windows).await?
             }
             None => Reconstructed::default(),
         };
@@ -1471,7 +1471,7 @@ impl WorkflowRepository {
         .bind(effective_id.to_string())
         .bind(candidate_id.to_string())
         .bind(scope.correlation_id.as_deref())
-        .fetch_one(&mut *tx)
+        .fetch_one(tx.stmt("the proposals insert")?)
         .await
         .map_err(|e| match &e {
             // Identical content, actor and microsecond: the same candidate id already has a
@@ -1516,7 +1516,7 @@ impl WorkflowRepository {
     }
 
     async fn replay_prepared(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         stored: StoredResult,
         scope: &RequestScope,
     ) -> Result<Prepared, LedgerError> {
@@ -1538,7 +1538,7 @@ impl WorkflowRepository {
             "SELECT requested_patch_id, effective_patch_id FROM proposals WHERE proposal_id = $1",
         )
         .bind(proposal_id)
-        .fetch_one(&mut *conn)
+        .fetch_one(conn.stmt("the proposals lookup")?)
         .await
         .map_err(db_error)?;
         let requested: String = row.try_get("requested_patch_id").map_err(db_error)?;
@@ -1555,14 +1555,14 @@ impl WorkflowRepository {
     /// `require_distinct_reviewer` (ADR-0022): the proposer's and the acceptor's accountable
     /// parties ({principal, delegator}) must not share a member.
     pub(crate) async fn require_distinct_parties(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         proposal_id: i64,
         scope: &RequestScope,
     ) -> Result<(), LedgerError> {
         let proposer =
             sqlx::query("SELECT principal_id, on_behalf_of FROM proposals WHERE proposal_id = $1")
                 .bind(proposal_id)
-                .fetch_one(&mut *conn)
+                .fetch_one(conn.stmt("the proposals lookup")?)
                 .await
                 .map_err(db_error)?;
         // Distinct accountable parties (ADR-0022): the proposer's {principal, delegator}
@@ -1602,7 +1602,7 @@ impl WorkflowRepository {
     /// (on the hashed bytes) before any write. `Required` must be refused by the caller.
     pub(crate) async fn cite_validation(
         &self,
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         scope: &RequestScope,
         candidate: &CommitId,
         validation: &ValidationPolicy,
@@ -1721,7 +1721,7 @@ impl WorkflowRepository {
         // Lineage from the verified index.
         let candidate_row = sqlx::query("SELECT parent_count FROM commit_index WHERE id = $1")
             .bind(request.candidate.to_string())
-            .fetch_one(&mut *tx)
+            .fetch_one(tx.stmt("the commit_index lookup")?)
             .await
             .map_err(db_error)?;
         let parent_count: i16 = candidate_row.try_get("parent_count").map_err(db_error)?;
@@ -1729,7 +1729,7 @@ impl WorkflowRepository {
             "SELECT parent_id FROM commit_parents WHERE commit_id = $1 AND position = 0",
         )
         .bind(request.candidate.to_string())
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.stmt("the commit_parents lookup")?)
         .await
         .map_err(db_error)?
         .map(|row| row.try_get("parent_id").map_err(db_error))
@@ -1777,7 +1777,7 @@ impl WorkflowRepository {
                 .bind(scope.graph.as_str())
                 .bind(&request.branch)
                 .bind(request.candidate.to_string())
-                .execute(&mut *tx)
+                .execute(tx.stmt("the refs insert")?)
                 .await
                 .map_err(db_error)?;
                 if inserted.rows_affected() != 1 {
@@ -1802,7 +1802,7 @@ impl WorkflowRepository {
                 .bind(&request.branch)
                 .bind(request.candidate.to_string())
                 .bind(head.to_string())
-                .execute(&mut *tx)
+                .execute(tx.stmt("the refs update")?)
                 .await
                 .map_err(db_error)?;
                 if updated.rows_affected() != 1 {
@@ -1836,7 +1836,7 @@ impl WorkflowRepository {
         .bind(actor.on_behalf_of.as_ref().map(|p| p.as_str().to_owned()))
         .bind(request.reason.as_deref())
         .bind(scope.correlation_id.as_deref())
-        .fetch_one(&mut *tx)
+        .fetch_one(tx.stmt("the ref_events insert")?)
         .await
         .map_err(db_error)?;
         let ref_event_id: i64 = event_row.try_get("event_id").map_err(db_error)?;
@@ -1867,7 +1867,7 @@ impl WorkflowRepository {
         .bind(ref_event_id)
         .bind(scope.correlation_id.as_deref())
         .bind(&validation_ids)
-        .fetch_one(&mut *tx)
+        .fetch_one(tx.stmt("the decisions insert")?)
         .await
         .map_err(|e| map_decision_insert(e, &request.candidate))?;
         let decision_id: i64 = decision_row.try_get("decision_id").map_err(db_error)?;
@@ -1894,7 +1894,7 @@ impl WorkflowRepository {
         .bind(request.candidate.to_string())
         .bind(new_version)
         .bind(ref_event_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(tx.stmt("the projection_outbox insert")?)
         .await
         .map_err(db_error)?;
         let outbox_id: i64 = outbox_row.try_get("outbox_id").map_err(db_error)?;
@@ -1934,7 +1934,7 @@ impl WorkflowRepository {
     }
 
     async fn replay_accepted(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         stored: StoredResult,
         scope: &RequestScope,
     ) -> Result<Accepted, LedgerError> {
@@ -1960,7 +1960,7 @@ impl WorkflowRepository {
              JOIN projection_outbox o ON o.ref_event_id = d.ref_event_id WHERE d.decision_id = $1",
         )
         .bind(decision_id)
-        .fetch_one(&mut *conn)
+        .fetch_one(conn.stmt("the decisions lookup")?)
         .await
         .map_err(db_error)?;
         Ok(Accepted {
@@ -2055,7 +2055,7 @@ impl WorkflowRepository {
         .bind(&request.reason)
         .bind(scope.correlation_id.as_deref())
         .bind(&validation_ids)
-        .fetch_one(&mut *tx)
+        .fetch_one(tx.stmt("the decisions insert")?)
         .await
         .map_err(|e| map_decision_insert(e, &request.candidate))?;
         let decision_id: i64 = decision_row.try_get("decision_id").map_err(db_error)?;
@@ -2102,7 +2102,7 @@ impl WorkflowRepository {
     /// The enforced decision ↔ validation relation (ADR-0019): PostgreSQL's composite
     /// foreign keys prove both sides name the same graph and candidate.
     pub(crate) async fn link_decision_validation(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         decision_id: i64,
         scope: &RequestScope,
         candidate: &CommitId,
@@ -2116,7 +2116,7 @@ impl WorkflowRepository {
         .bind(validation_id.to_string())
         .bind(scope.graph.as_str())
         .bind(candidate.to_string())
-        .execute(&mut *conn)
+        .execute(conn.stmt("the decision_validations insert")?)
         .await
         .map_err(db_error)?;
         Ok(())
@@ -2152,15 +2152,15 @@ impl WorkflowRepository {
         correlation_id: Option<&str>,
     ) -> Result<i64, LedgerError> {
         validate_reason(Some(reason))?;
-        let mut tx = crate::lifecycle::begin(&self.pool, &self.session).await?;
+        let mut tx = crate::lifecycle::begin(&self.pool, &self.session, self.begin_hook()).await?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
-            .execute(&mut *tx)
+            .execute(tx.stmt("the isolation level")?)
             .await
             .map_err(db_error)?;
         Self::lock_graph_status_shared(&mut tx, graph).await?;
         let owner = sqlx::query("SELECT tenant_id, status FROM graphs WHERE graph_id = $1")
             .bind(graph.as_str())
-            .fetch_optional(&mut *tx)
+            .fetch_optional(tx.stmt("the graphs lookup")?)
             .await
             .map_err(db_error)?;
         let Some(owner) = owner else {
@@ -2182,7 +2182,7 @@ impl WorkflowRepository {
         let owned = sqlx::query("SELECT 1 FROM proposals WHERE proposal_id = $1 AND graph_id = $2")
             .bind(proposal_id)
             .bind(graph.as_str())
-            .fetch_optional(&mut *tx)
+            .fetch_optional(tx.stmt("the proposals lookup")?)
             .await
             .map_err(db_error)?;
         if owned.is_none() {
@@ -2200,7 +2200,7 @@ impl WorkflowRepository {
         )
         .bind(proposal_id)
         .bind(graph.as_str())
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.stmt("the proposals lookup")?)
         .await
         .map_err(db_error)?;
         let Some(row) = row else {
@@ -2216,7 +2216,7 @@ impl WorkflowRepository {
         let decided =
             sqlx::query("SELECT decision FROM decisions WHERE candidate_commit = $1 LIMIT 1")
                 .bind(&candidate)
-                .fetch_optional(&mut *tx)
+                .fetch_optional(tx.stmt("the decisions lookup")?)
                 .await
                 .map_err(db_error)?;
         if let Some(row) = decided {
@@ -2246,7 +2246,7 @@ impl WorkflowRepository {
         .bind(actor.on_behalf_of.as_ref().map(|p| p.as_str().to_owned()))
         .bind(reason)
         .bind(correlation_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(tx.stmt("the decisions insert")?)
         .await
         .map_err(|e| map_decision_insert(e, &candidate_id))?;
         let decision_id: i64 = decision_row.try_get("decision_id").map_err(db_error)?;

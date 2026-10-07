@@ -16,6 +16,7 @@
 //!   decision, the outbox row and the idempotency result.
 
 use crate::db_error;
+use crate::lifecycle::Statements;
 use crate::postgres_branches::GraphParents;
 #[cfg(feature = "test-hooks")]
 use crate::postgres_workflow::FailPoint;
@@ -30,7 +31,7 @@ use ledger_merge::{
     three_way_reported,
 };
 use ledger_rdf::{Quad, diff};
-use sqlx::{PgConnection, Row};
+use sqlx::Row;
 use std::collections::BTreeSet;
 use tokio::sync::Mutex;
 
@@ -236,7 +237,7 @@ fn dag_error(e: ledger_dag::DagError<LedgerError>) -> LedgerError {
 impl WorkflowRepository {
     /// Read a branch's head and status without locks; `BranchNotFound` if absent.
     async fn branch_head(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         graph: &GraphId,
         branch: &str,
     ) -> Result<(CommitId, String), LedgerError> {
@@ -246,7 +247,7 @@ impl WorkflowRepository {
         )
         .bind(graph.as_str())
         .bind(branch)
-        .fetch_optional(&mut *conn)
+        .fetch_optional(conn.stmt("the refs lookup")?)
         .await
         .map_err(db_error)?;
         let Some(row) = row else {
@@ -302,7 +303,7 @@ impl WorkflowRepository {
         }
         let analysis = {
             let provider = GraphParents {
-                conn: Mutex::new(&mut *conn),
+                conn: Mutex::new(&mut conn as &mut dyn Statements),
                 graph: graph.clone(),
                 window: self.windows.ancestry,
             };
@@ -448,7 +449,7 @@ impl WorkflowRepository {
     }
 
     async fn replay_merge_proposed(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         stored: StoredResult,
         scope: &RequestScope,
     ) -> Result<MergeProposed, LedgerError> {
@@ -484,7 +485,7 @@ impl WorkflowRepository {
     }
 
     async fn load_merge_row(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         graph: &GraphId,
         proposal_id: i64,
     ) -> Result<Option<MergeRow>, LedgerError> {
@@ -493,7 +494,7 @@ impl WorkflowRepository {
         ))
         .bind(proposal_id)
         .bind(graph.as_str())
-        .fetch_optional(&mut *conn)
+        .fetch_optional(conn.stmt("the merge_proposals lookup")?)
         .await
         .map_err(db_error)?;
         row.as_ref().map(merge_row).transpose()
@@ -680,7 +681,7 @@ impl WorkflowRepository {
         .bind(patch_id.to_string())
         .bind(candidate_id.to_string())
         .bind(scope.correlation_id.as_deref())
-        .fetch_one(&mut *tx)
+        .fetch_one(tx.stmt("the proposals insert")?)
         .await
         .map_err(|e| match &e {
             sqlx::Error::Database(d) if d.is_unique_violation() => LedgerError::MergeStale(
@@ -719,7 +720,7 @@ impl WorkflowRepository {
         .bind(digest.to_string())
         .bind(&request.preview_token)
         .bind(&source_parties)
-        .execute(&mut *tx)
+        .execute(tx.stmt("the merge_proposals insert")?)
         .await
         .map_err(|e| match &e {
             sqlx::Error::Database(d) if d.is_unique_violation() => LedgerError::MergeStale(
@@ -764,11 +765,18 @@ impl WorkflowRepository {
         scope: &RequestScope,
         operation: Operation,
     ) -> Result<crate::lifecycle::BoundedTx, LedgerError> {
-        Self::begin_scoped(&self.pool, &self.session, scope, operation).await
+        Self::begin_scoped(
+            &self.pool,
+            &self.session,
+            scope,
+            operation,
+            self.begin_hook(),
+        )
+        .await
     }
 
     async fn replay_merge_applied(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         stored: StoredResult,
         scope: &RequestScope,
     ) -> Result<MergeApplied, LedgerError> {
@@ -786,7 +794,7 @@ impl WorkflowRepository {
              JOIN projection_outbox o ON o.ref_event_id = d.ref_event_id WHERE d.decision_id = $1",
         )
         .bind(decision_id)
-        .fetch_one(&mut *conn)
+        .fetch_one(conn.stmt("the decisions lookup")?)
         .await
         .map_err(db_error)?;
         Ok(MergeApplied {
@@ -807,7 +815,7 @@ impl WorkflowRepository {
 
     /// Lock a ref row `FOR UPDATE` (target) or `FOR SHARE` (source); head and version.
     async fn lock_ref(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         graph: &GraphId,
         branch: &str,
         exclusive: bool,
@@ -820,7 +828,7 @@ impl WorkflowRepository {
         let row = sqlx::query(sql)
             .bind(graph.as_str())
             .bind(branch)
-            .fetch_optional(&mut *conn)
+            .fetch_optional(conn.stmt("the ref lock")?)
             .await
             .map_err(db_error)?;
         row.map(|r| {
@@ -904,7 +912,7 @@ impl WorkflowRepository {
             "SELECT decision_id, decision FROM decisions WHERE candidate_commit = $1",
         )
         .bind(row.candidate.to_string())
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.stmt("the decisions lookup")?)
         .await
         .map_err(db_error)?;
         if let Some((decision_id, decision)) = decided {
@@ -980,7 +988,7 @@ impl WorkflowRepository {
         .bind(&row.target_branch)
         .bind(row.candidate.to_string())
         .bind(target_head.to_string())
-        .execute(&mut *tx)
+        .execute(tx.stmt("the refs update")?)
         .await
         .map_err(db_error)?;
         if updated.rows_affected() != 1 {
@@ -1009,7 +1017,7 @@ impl WorkflowRepository {
         .bind(actor.on_behalf_of.as_ref().map(|p| p.as_str().to_owned()))
         .bind(request.reason.as_deref())
         .bind(scope.correlation_id.as_deref())
-        .fetch_one(&mut *tx)
+        .fetch_one(tx.stmt("the ref_events insert")?)
         .await
         .map_err(db_error)?;
         #[cfg(feature = "test-hooks")]
@@ -1033,7 +1041,7 @@ impl WorkflowRepository {
         .bind(&validation_ids)
         .bind(ref_event_id)
         .bind(scope.correlation_id.as_deref())
-        .fetch_one(&mut *tx)
+        .fetch_one(tx.stmt("the decisions insert")?)
         .await
         .map_err(db_error)?;
         if let Some(cited) = &cited {
@@ -1058,7 +1066,7 @@ impl WorkflowRepository {
         .bind(row.candidate.to_string())
         .bind(new_version)
         .bind(ref_event_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(tx.stmt("the projection_outbox insert")?)
         .await
         .map_err(db_error)?;
         #[cfg(feature = "test-hooks")]
@@ -1099,7 +1107,7 @@ impl WorkflowRepository {
 /// The proposers (and principals acted for) of the given commits, sorted and distinct: the
 /// `source_parties` of a merge row. `verify` recomputes it with the same query.
 pub(crate) async fn source_parties_on(
-    conn: &mut sqlx::PgConnection,
+    conn: &mut dyn Statements,
     graph: &GraphId,
     commits: &[String],
 ) -> Result<Vec<String>, LedgerError> {
@@ -1112,7 +1120,7 @@ pub(crate) async fn source_parties_on(
     )
     .bind(graph.as_str())
     .bind(commits)
-    .fetch_all(conn)
+    .fetch_all(conn.stmt("the proposals lookup")?)
     .await
     .map_err(db_error)
 }

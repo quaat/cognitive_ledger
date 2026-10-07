@@ -94,3 +94,22 @@ Suite: 20 passed on 17.2 (9.9 s) and 20 passed on 15.19 (10.1 s); `future_` run 
 | `ledger-api` unit tests (27, incl. the envelope-by-class, COMMIT mapping and lifecycle units) | passed | — |
 
 The Plan 0013 Evidence table records the integration, fault and fast gates with their revisions.
+
+## Hosted GitHub Actions
+`48e323b` (the PR #17 head the hosted Codex review examined): every stable check green —
+benchmark-ci, container, dependency-review, docker, fast, fuzz (aggregate; sanitizer jobs
+`address` and `none`), supply-chain (Actions runs 37656694982, 37656694984, 37656694986,
+37656695032, 37656695042). That run precedes the post-review P1 fixes; the corrected head's run
+is recorded below.
+
+## Post-review fixes (hosted Codex review of `48e323b`; fix revision `FIX_SHA`)
+
+| test | class | 17.2 | 15.19 | measured |
+|---|---|---|---|---|
+| `a_request_budget_that_ends_before_begin_returns_the_connection_without_a_transaction` | ACCEPTED (new; the `BeforeBegin` hook did not exist, so no red run against the pre-fix code) | pass | pass | the budget ends while the operation holds the acquired connection: `DependencyUnavailable` "before the transaction began"; the backend is `idle` with `xact_start IS NULL`, zero locks, nothing written, key unused; the retry begins and commits on the **same backend pid** |
+| `a_caller_dropped_during_begin_never_returns_an_open_transaction_to_the_pool` | ACCEPTED (new) | pass | pass | the caller's task is aborted while `BEGIN; SELECT pg_sleep(0.8)` is in flight; the begin task completes and rolls back; the backend returns `idle` (never `idle in transaction`), zero locks; the retry commits on the same pid. **Red** against the pre-fix shape (begin awaited inline): the test timed out after 30 s waiting for the connection to leave the transaction — the backend stayed `idle in transaction` after the drop (17.2) |
+| `statements_cannot_keep_starting_after_the_transaction_deadline_without_a_backstop` | ACCEPTED (new; PostgreSQL 15 is the target) | pass | pass | six real 250 ms statements through the production accessor under a 300 ms bound stop at the first that would start past the deadline: **501.7 ms** (17.2) / **501.1 ms** (15.19) from the first statement — the deadline plus one tail, never 1.5 s; 17.2 reports `transaction_timeout 2300ms` (never reached), 15.19 `absent`. **Red** with the accessor's check removed: all six statements ran, 1.504 s, caught only by the pre-`COMMIT` check ("1514 ms elapsed before COMMIT", 17.2) |
+
+Suite after the fixes: `pg_lifecycle` 21 tests — see the Plan 0013 Evidence table for the full
+re-run on both versions and the other suites.
+

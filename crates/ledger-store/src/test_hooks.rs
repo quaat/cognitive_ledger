@@ -24,6 +24,11 @@ use tokio::sync::Notify;
 /// Where a request can be paused.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HookPoint {
+    /// `lifecycle::begin`: the pooled connection is acquired, `BEGIN` has not been sent
+    /// (Plan 0013 M2 review: a request budget that ends here must return the clean
+    /// connection without beginning anything). Installed process-wide with
+    /// `lifecycle::set_pause_before_begin`, not per repository.
+    BeforeBegin,
     /// `merge_propose`: after the first stored-result lookup found nothing, before the
     /// preview is recomputed.
     ProposeAfterReplayCheck,
@@ -50,7 +55,18 @@ pub enum HookPoint {
 #[derive(Clone, Copy, Debug)]
 enum Action {
     Pause,
-    SlowStatement { each: Duration, count: u32 },
+    SlowStatement {
+        each: Duration,
+        count: u32,
+        /// Through the checked accessor (a real statement) or the raw connection (a simulated
+        /// check-skipping bug).
+        checked: bool,
+    },
+    /// At [`HookPoint::BeforeBegin`]: signal arrival, then make this repository's `BEGIN` run
+    /// `each` on the server (`BEGIN; SELECT pg_sleep(..)` as one simple-query statement).
+    SlowBegin {
+        each: Duration,
+    },
 }
 
 /// A pause (or injected slow statement) at one [`HookPoint`].
@@ -79,9 +95,54 @@ impl PauseHook {
     pub fn slow_statement(point: HookPoint, each: Duration, count: u32) -> Self {
         Self {
             point,
-            action: Action::SlowStatement { each, count },
+            action: Action::SlowStatement {
+                each,
+                count,
+                checked: false,
+            },
             reached: Arc::new(Notify::new()),
             resume: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Like [`Self::slow_statement`], but each injected statement goes through the bounded
+    /// transaction's checked accessor (`Statements::stmt`), exactly as a real statement of the
+    /// ledger would: the production deadline check runs before each one, so the sequence stops
+    /// at the first statement that would start past the deadline. [`Self::slow_statement`]
+    /// bypasses the check on purpose (it simulates a check-skipping bug for the PostgreSQL 17
+    /// backstop test).
+    pub fn slow_statement_checked(point: HookPoint, each: Duration, count: u32) -> Self {
+        Self {
+            point,
+            action: Action::SlowStatement {
+                each,
+                count,
+                checked: true,
+            },
+            reached: Arc::new(Notify::new()),
+            resume: Arc::new(Notify::new()),
+        }
+    }
+
+    /// At [`HookPoint::BeforeBegin`]: the connection is acquired and `BEGIN` itself takes
+    /// `each` on the server — the window in which a dropped begin future would leave the
+    /// pool a connection inside a transaction (Plan 0013 M2 review).
+    pub fn slow_begin(each: Duration) -> Self {
+        Self {
+            point: HookPoint::BeforeBegin,
+            action: Action::SlowBegin { each },
+            reached: Arc::new(Notify::new()),
+            resume: Arc::new(Notify::new()),
+        }
+    }
+
+    /// The `BEGIN` statement a [`Self::slow_begin`] hook asks for; `None` for every other hook.
+    pub(crate) fn slow_begin_statement(&self) -> Option<std::borrow::Cow<'static, str>> {
+        match self.action {
+            Action::SlowBegin { each } if self.point == HookPoint::BeforeBegin => Some(
+                std::borrow::Cow::Owned(format!("BEGIN; SELECT pg_sleep({})", each.as_secs_f64())),
+            ),
+            _ => None,
         }
     }
 
@@ -100,28 +161,42 @@ impl PauseHook {
     pub(crate) async fn at(
         &self,
         point: HookPoint,
-        conn: Option<&mut sqlx::PgConnection>,
+        tx: Option<&mut crate::lifecycle::BoundedTx>,
     ) -> Result<(), ledger_core::LedgerError> {
         if point != self.point {
             return Ok(());
         }
         self.reached.notify_one();
-        match (self.action, conn) {
+        match (self.action, tx) {
             (Action::Pause, _) => {
                 self.resume.notified().await;
                 Ok(())
             }
-            (Action::SlowStatement { each, count }, Some(conn)) => {
+            (
+                Action::SlowStatement {
+                    each,
+                    count,
+                    checked,
+                },
+                Some(tx),
+            ) => {
+                use crate::lifecycle::Statements;
                 for _ in 0..count {
+                    let conn = if checked {
+                        tx.stmt("an injected slow statement")?
+                    } else {
+                        tx.raw()
+                    };
                     sqlx::query("SELECT pg_sleep($1)")
                         .bind(each.as_secs_f64())
-                        .execute(&mut *conn)
+                        .execute(conn)
                         .await
                         .map_err(crate::db_error)?;
                 }
                 Ok(())
             }
             (Action::SlowStatement { .. }, None) => Ok(()),
+            (Action::SlowBegin { .. }, _) => Ok(()),
         }
     }
 }
