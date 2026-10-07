@@ -31,8 +31,15 @@ pub enum HookPoint {
     /// (kept for the Plan 0009 races; [`HookPoint::BeforeCommit`] fires there too).
     ProposeBeforeCommit,
     /// Every workflow transaction (prepare, accept, reject, merge propose, merge apply,
-    /// branch create / delete / restore): every row written, the idempotency result
-    /// inserted, the idempotency and graph-status locks held, just before `COMMIT` is sent.
+    /// branch create / delete / restore, validation record): the idempotency lock is held,
+    /// the stored-result lookup found nothing, and no other statement has run yet (Plan 0013
+    /// M2: pausing here past the transaction bound exercises the first mid-transaction
+    /// deadline check).
+    AfterReplayCheck,
+    /// Every workflow transaction (prepare, accept, reject, merge propose, merge apply,
+    /// branch create / delete / restore, validation record): every row written, the
+    /// idempotency result inserted, the idempotency and graph-status locks held, just before
+    /// `COMMIT` is sent.
     BeforeCommit,
     /// The same transactions: `COMMIT` has returned successfully and the connection is being
     /// returned to the pool (asynchronously), but the result has not been built or returned yet. A request dropped

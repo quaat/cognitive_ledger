@@ -60,11 +60,23 @@ pub struct GraphRecord {
 #[derive(Clone, Debug)]
 pub struct PgGraphs {
     pool: PgPool,
+    /// How long a request-path lookup may wait for a connection (bounded further by the
+    /// request budget, ADR-0026 §8).
+    acquire_timeout: std::time::Duration,
 }
 
 impl PgGraphs {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            acquire_timeout: crate::DbSessionLimits::default().acquire_timeout,
+        }
+    }
+
+    /// Lifecycle limits for request-path lookups (ADR-0026).
+    pub fn with_session_limits(mut self, session: crate::DbSessionLimits) -> Self {
+        self.acquire_timeout = session.acquire_timeout;
+        self
     }
 
     /// Insert a graph. A `graph_id` that already exists — under any tenant — is
@@ -91,12 +103,15 @@ impl PgGraphs {
     }
 
     pub async fn get(&self, graph_id: &GraphId) -> Result<Option<GraphRecord>, LedgerError> {
+        // The first pooled query of every authenticated route (`authorized_graph`): waited for
+        // within the request budget like every other request-path acquisition.
+        let mut conn = crate::lifecycle::acquire(&self.pool, self.acquire_timeout).await?;
         let row = sqlx::query(
             "SELECT graph_id, tenant_id, knowledge_base_id, purpose, status FROM graphs \
              WHERE graph_id = $1",
         )
         .bind(graph_id.as_str())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(db_error)?;
         let Some(row) = row else {

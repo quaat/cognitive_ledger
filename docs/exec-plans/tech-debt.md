@@ -249,19 +249,24 @@ file:line evidence and the milestone that fixes each):
   connection until PostgreSQL finishes; `ROLLBACK` is queued behind it), `statement_timeout`
   equals `request_timeout`, `idle_in_transaction_session_timeout` exceeds it, and no
   transaction-level bound exists — measured in M1 ([evidence](../quality/evidence/plan-0013-m1-lifecycle-2026-10-07.md)).
-  M2 per ADR-0026 (proposed): timeout-only cancellation; **active cancellation stays open**
+  **Done in M2 per ADR-0026 (accepted)**: validated hierarchy, bounded transactions capped by the
+  request deadline, tracked detached operations, `REQUEST_TIMEOUT`; timeout-only cancellation —
+  **active cancellation stays open**
   because `pg_cancel_backend(pid)` can hit the next borrower of the pooled session
   (demonstrated); it needs connection fencing first, and the backend-reuse race test is its gate.
 - `accept`, `reject`, `merge_apply` and branch writes take no admission permit; 12 + 4 slots
   equal the 16-connection pool; prepare holds a slot while waiting for a connection — measured
   in M1 (reads and `/ready` starve 10 s behind three blocked accepts). M3 per ADR-0026 §5
   (the `db_work` permit before the first pooled query, held by the detached operation).
-- M1 review residuals (P2/P3): the validation record transaction has no `BeforeCommit`/
-  `AfterCommit` hook and no drop test (same `begin_scoped`/`record_result` shape as the eight
-  hooked paths; needs the validation fixtures) — before M2 acceptance; `mark_superseded` has
-  none either (F8 scope); an identical in-flight `immutable_objects` insert from another tenant
-  waits on the unique index and could surface as `DEPENDENCY_TIMEOUT` once `lock_timeout` is
-  5 s — M2 classifies that wait.
+- ~~M1 review residuals~~ **Closed in M2**: the validation record transaction has the
+  `AfterReplayCheck`/`BeforeCommit`/`AfterCommit` hooks and its drop/one-connection tests
+  (`pg_lifecycle` `Op::Validate`); the identical-object wait is characterized and documented
+  as a retryable `DEPENDENCY_TIMEOUT` under `lock_timeout` (stress/fault content never
+  collides, so their gates are unchanged). Still open: `mark_superseded` has no pause hooks
+  (F8 scope; it is bounded and its COMMIT error is `CommitOutcomeUnknown` like the rest).
+- M2 residuals (P3): the projector validates no lifecycle hierarchy for its own pool and its
+  `number()` accepts 0 (F9, M3); detached-operation counts are visible only in the drain log
+  (metrics are Phase 7B); the edge grace of 1 s before admission is a constant.
 - `mark_superseded` has no idempotency key (a retry after a lost response gets
   `LineageMismatch`); the projector's `number()` accepts 0, its DB session limits are not
   configurable and its worker count is not checked against its 8-connection pool;

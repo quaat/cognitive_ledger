@@ -117,6 +117,7 @@
        "RESOURCE_LIMIT",
        "DEPENDENCY_UNAVAILABLE",
        "DEPENDENCY_TIMEOUT",
+       "REQUEST_TIMEOUT",
        "INTERNAL",
        "BRANCH_NOT_FOUND",
        "BRANCH_EXISTS",
@@ -1255,7 +1256,7 @@
   },
   "responses": {
    "Error": {
-    "description": "Error envelope. 503 is DEPENDENCY_UNAVAILABLE (database, key source or schema not usable), DEPENDENCY_TIMEOUT (a database statement or lock wait exceeded its limit; the transaction was rolled back) or RESOURCE_LIMIT (HTTP time or concurrency limit); all three mean the outcome is unknown: retry with the same Idempotency-Key. 500 is INTERNAL with a generic message; the detail is logged under correlation_id.",
+    "description": "Error envelope. 503 codes (ADR-0026): RESOURCE_LIMIT is an admission refusal (nothing was done; retry later); REQUEST_TIMEOUT is the HTTP time limit (a read wrote nothing; an idempotent write has an unknown outcome: retry with the same Idempotency-Key, which replays a committed result or executes afresh); DEPENDENCY_TIMEOUT is a database statement, lock wait or transaction bound exceeded before COMMIT (rolled back; retry with the same key); DEPENDENCY_UNAVAILABLE is a database that is not usable, a connection not obtained within the request budget, or the server draining (retry; writes with the same key). An error raised by COMMIT itself is reported with the outcome-unknown guidance under DEPENDENCY_TIMEOUT or DEPENDENCY_UNAVAILABLE by class, never as a rollback. The message of a key-less read never tells it to retry with a key. 500 is INTERNAL with a generic message; the detail is logged under correlation_id.",
     "content": {
      "application/json": {
       "schema": {

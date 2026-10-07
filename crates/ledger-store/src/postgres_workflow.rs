@@ -171,6 +171,9 @@ pub struct WorkflowRepository {
     /// The validation service this deployment trusts (ADR-0019). Independent of whether a
     /// validator endpoint is configured; without it, validated acceptance fails closed.
     trust: Option<ValidationTrustPolicy>,
+    /// Lifecycle limits (ADR-0026): the transaction bound and the acquire timeout every
+    /// request-path acquisition and workflow transaction of this repository observes.
+    pub(crate) session: DbSessionLimits,
 }
 
 /// Which validation service's records may satisfy validated acceptance (ADR-0019). This is
@@ -215,51 +218,85 @@ pub struct PostgresLedgerStore {
     graphs: PgGraphs,
     workflows: WorkflowRepository,
     validations: ValidationRepository,
+    session: DbSessionLimits,
     /// Expression fingerprints of every CHECK and partial-index predicate validated at
     /// start-up (deparse and probe); readiness refuses if any stored expression changed since.
     fingerprints: Option<std::collections::BTreeMap<String, String>>,
 }
 
-/// Session limits the runtime identity sets on every connection (ADR-0016): a statement,
-/// a lock wait or an idle transaction that exceeds them is cancelled by PostgreSQL and
-/// surfaces as a retryable `DependencyTimeout`/`DependencyUnavailable`, so a stuck
-/// request can never pin a connection or a lock indefinitely.
+/// Session and lifecycle limits of the runtime pool (ADR-0016, ADR-0026 §2): a statement,
+/// a lock wait or an idle transaction that exceeds the PostgreSQL limits is cancelled by the
+/// server and surfaces as a retryable `DependencyTimeout`/`DependencyUnavailable`; the
+/// transaction bound is the ledger's own application deadline on every workflow transaction;
+/// the acquire timeout bounds the wait for a pooled connection (and a request never waits
+/// past its own remaining budget, `lifecycle`). The hierarchy between these and the API's
+/// request timeout is validated at server start-up (`ledger_api::lifecycle`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DbSessionLimits {
     pub statement_timeout: std::time::Duration,
     pub lock_timeout: std::time::Duration,
     pub idle_in_transaction_timeout: std::time::Duration,
     pub max_connections: u32,
+    /// The application deadline of a workflow transaction, measured from the moment its
+    /// connection was obtained; checked before each statement phase and before `COMMIT`.
+    /// On PostgreSQL 17 `transaction_timeout` is additionally set to
+    /// `transaction_bound + statement_timeout` as a session-terminating backstop.
+    pub transaction_bound: std::time::Duration,
+    /// How long a pooled acquisition may wait (sqlx `acquire_timeout`).
+    pub acquire_timeout: std::time::Duration,
 }
 
 impl Default for DbSessionLimits {
     fn default() -> Self {
         Self {
-            statement_timeout: std::time::Duration::from_secs(30),
-            lock_timeout: std::time::Duration::from_secs(10),
-            idle_in_transaction_timeout: std::time::Duration::from_secs(60),
+            statement_timeout: std::time::Duration::from_secs(10),
+            lock_timeout: std::time::Duration::from_secs(5),
+            idle_in_transaction_timeout: std::time::Duration::from_secs(30),
             max_connections: 16,
+            transaction_bound: std::time::Duration::from_secs(20),
+            acquire_timeout: std::time::Duration::from_secs(5),
         }
     }
 }
 
+/// The server version from which `transaction_timeout` exists (PostgreSQL 17.0).
+const TRANSACTION_TIMEOUT_MIN_SERVER_VERSION: u32 = 170000;
+
 impl DbSessionLimits {
-    pub(crate) fn pool_options(self) -> PgPoolOptions {
+    /// The PostgreSQL 17 backstop: the declared bound (`transaction_bound + one statement
+    /// tail`). Never the primary mechanism (it terminates the session, SQLSTATE 25P04).
+    pub fn transaction_timeout_backstop(&self) -> std::time::Duration {
+        self.transaction_bound + self.statement_timeout
+    }
+
+    /// Pool options applying these limits: the session `SET`s at connect (plus the PostgreSQL
+    /// 17 backstop when the server supports it) and the acquire timeout. Public so tests and
+    /// tooling build pools exactly as the server does.
+    pub fn pool_options(self) -> PgPoolOptions {
         // Zero would disable a limit; the smallest effective value is one millisecond.
         let statement = self.statement_timeout.as_millis().max(1);
         let lock = self.lock_timeout.as_millis().max(1);
         let idle = self.idle_in_transaction_timeout.as_millis().max(1);
+        let backstop = self.transaction_timeout_backstop().as_millis().max(1);
         PgPoolOptions::new()
             .max_connections(self.max_connections)
-            .acquire_timeout(std::time::Duration::from_secs(10))
+            .acquire_timeout(self.acquire_timeout)
             .after_connect(move |conn, _meta| {
                 Box::pin(async move {
                     // Simple-protocol multi-statement (SET cannot be parameterised).
                     use sqlx::Executor;
-                    let sql = format!(
+                    let mut sql = format!(
                         "SET statement_timeout = '{statement}ms'; SET lock_timeout = '{lock}ms'; \
                          SET idle_in_transaction_session_timeout = '{idle}ms'"
                     );
+                    // PostgreSQL 15 has no `transaction_timeout` (42704); it is set only where
+                    // the server reports a version that has it.
+                    if conn
+                        .server_version_num()
+                        .is_some_and(|v| v >= TRANSACTION_TIMEOUT_MIN_SERVER_VERSION)
+                    {
+                        sql.push_str(&format!("; SET transaction_timeout = '{backstop}ms'"));
+                    }
                     conn.execute(sql.as_str()).await?;
                     Ok(())
                 })
@@ -291,7 +328,7 @@ impl PostgresLedgerStore {
         let report = crate::schema::verify(&pool).await?;
         crate::schema::verify_runtime_identity(&pool).await?;
         crate::schema::verify_definitions_at_startup(&pool).await?;
-        let mut store = Self::from_pool_migrated(pool, v1_binding);
+        let mut store = Self::from_pool_migrated(pool, v1_binding).with_session_limits(limits);
         store.fingerprints = Some(report.fingerprints);
         Ok(store)
     }
@@ -320,6 +357,7 @@ impl PostgresLedgerStore {
             validations: ValidationRepository::new(pool.clone()),
             immutable,
             pool,
+            session: DbSessionLimits::default(),
             fingerprints: None,
         }
     }
@@ -330,6 +368,22 @@ impl PostgresLedgerStore {
         self.workflows = self.workflows.with_limits(limits);
         self.validations = self.validations.with_limits(limits);
         self
+    }
+
+    /// The lifecycle limits (transaction bound, acquire timeout) every workflow and
+    /// validation transaction of this store observes (ADR-0026 §2). `connect_with` sets
+    /// them from the pool's limits; `from_pool_migrated` starts from the defaults.
+    pub fn with_session_limits(mut self, limits: DbSessionLimits) -> Self {
+        self.session = limits;
+        self.workflows = self.workflows.with_session_limits(limits);
+        self.validations = self.validations.with_session_limits(limits);
+        self.graphs = self.graphs.with_session_limits(limits);
+        self
+    }
+
+    /// The lifecycle limits in force.
+    pub fn session_limits(&self) -> DbSessionLimits {
+        self.session
     }
 
     /// Bind validated acceptance to records of the trusted validation service.
@@ -350,7 +404,8 @@ impl PostgresLedgerStore {
     /// point (feature `test-hooks` only): the request-lifecycle tests of Plan 0013.
     #[cfg(feature = "test-hooks")]
     pub fn with_workflow_pause_hook(mut self, hook: crate::test_hooks::PauseHook) -> Self {
-        self.workflows = self.workflows.with_pause_hook(hook);
+        self.workflows = self.workflows.with_pause_hook(hook.clone());
+        self.validations = self.validations.with_pause_hook(hook);
         self
     }
 
@@ -378,9 +433,10 @@ impl PostgresLedgerStore {
     /// The graph an indexed commit belongs to, or `None` when the id is not an indexed
     /// commit. Public reads use this to enforce graph membership before reconstructing.
     pub async fn commit_graph(&self, commit: &CommitId) -> Result<Option<GraphId>, LedgerError> {
+        let mut conn = crate::lifecycle::acquire(&self.pool, self.session.acquire_timeout).await?;
         let row = sqlx::query("SELECT graph_id FROM commit_index WHERE id = $1")
             .bind(commit.to_string())
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *conn)
             .await
             .map_err(db_error)?;
         row.map(|row| {
@@ -396,10 +452,11 @@ impl PostgresLedgerStore {
         graph: &GraphId,
         branch: &str,
     ) -> Result<Option<(CommitId, i64)>, LedgerError> {
+        let mut conn = crate::lifecycle::acquire(&self.pool, self.session.acquire_timeout).await?;
         let row = sqlx::query("SELECT head, version FROM refs WHERE graph_id = $1 AND branch = $2")
             .bind(graph.as_str())
             .bind(branch)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *conn)
             .await
             .map_err(db_error)?;
         row.map(|row| {
@@ -571,7 +628,19 @@ impl WorkflowRepository {
             limits: crate::ReconstructionLimits::DEVELOPMENT,
             windows: RetrievalWindows::DEFAULT,
             trust: None,
+            session: DbSessionLimits::default(),
         }
+    }
+
+    /// Lifecycle limits for this repository's acquisitions and transactions (ADR-0026).
+    pub fn with_session_limits(mut self, session: DbSessionLimits) -> Self {
+        self.session = session;
+        self
+    }
+
+    /// The lifecycle limits in force.
+    pub fn session_limits(&self) -> DbSessionLimits {
+        self.session
     }
 
     /// Shrink (or widen) the retrieval windows so tests exercise window boundaries cheaply
@@ -613,7 +682,7 @@ impl WorkflowRepository {
         head: &CommitId,
         limits: &crate::ReconstructionLimits,
     ) -> Result<BTreeSet<ledger_rdf::Quad>, LedgerError> {
-        let mut conn = self.pool.acquire().await.map_err(db_error)?;
+        let mut conn = crate::lifecycle::acquire(&self.pool, self.session.acquire_timeout).await?;
         Ok(
             Self::state_at_on_windowed(&mut conn, head, limits, self.windows)
                 .await?
@@ -629,7 +698,7 @@ impl WorkflowRepository {
         head: &CommitId,
         limits: &crate::ReconstructionLimits,
     ) -> Result<(BTreeSet<ledger_rdf::Quad>, usize, usize), LedgerError> {
-        let mut conn = self.pool.acquire().await.map_err(db_error)?;
+        let mut conn = crate::lifecycle::acquire(&self.pool, self.session.acquire_timeout).await?;
         let r = Self::state_at_on_windowed(&mut conn, head, limits, self.windows).await?;
         Ok((r.state, r.bytes, r.depth))
     }
@@ -643,7 +712,7 @@ impl WorkflowRepository {
         head: &CommitId,
         limits: &crate::ReconstructionLimits,
     ) -> Result<(BTreeSet<ledger_rdf::Quad>, usize, usize), LedgerError> {
-        let mut conn = self.pool.acquire().await.map_err(db_error)?;
+        let mut conn = crate::lifecycle::acquire(&self.pool, self.session.acquire_timeout).await?;
         let r = Self::state_at_on_scalar(&mut conn, head, limits).await?;
         Ok((r.state, r.bytes, r.depth))
     }
@@ -705,16 +774,19 @@ impl WorkflowRepository {
         &self,
         scope: &RequestScope,
         operation: Operation,
-    ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, LedgerError> {
-        Self::begin_scoped(&self.pool, scope, operation).await
+    ) -> Result<crate::lifecycle::BoundedTx, LedgerError> {
+        Self::begin_scoped(&self.pool, &self.session, scope, operation).await
     }
 
+    /// Open a bounded workflow transaction (ADR-0026 §2: the bound starts once the
+    /// connection is obtained; the idempotency advisory lock wait counts against it).
     pub(crate) async fn begin_scoped(
         pool: &PgPool,
+        session: &DbSessionLimits,
         scope: &RequestScope,
         operation: Operation,
-    ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, LedgerError> {
-        let mut tx = pool.begin().await.map_err(db_error)?;
+    ) -> Result<crate::lifecycle::BoundedTx, LedgerError> {
+        let mut tx = crate::lifecycle::begin(pool, session).await?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
             .execute(&mut *tx)
             .await
@@ -1065,6 +1137,18 @@ impl WorkflowRepository {
         limits: &crate::ReconstructionLimits,
         windows: RetrievalWindows,
     ) -> Result<Reconstructed, LedgerError> {
+        Self::state_at_on_windowed_until(conn, head, limits, windows, None).await
+    }
+
+    /// `state_at_on_windowed` inside a bounded transaction: the deadline is checked before
+    /// every window statement (ADR-0026 §2), so the tail past the deadline is one window.
+    pub(crate) async fn state_at_on_windowed_until(
+        conn: &mut PgConnection,
+        head: &CommitId,
+        limits: &crate::ReconstructionLimits,
+        windows: RetrievalWindows,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Reconstructed, LedgerError> {
         fn cycle(id: &CommitId) -> LedgerError {
             LedgerError::CorruptObject {
                 id: id.0.clone(),
@@ -1091,6 +1175,7 @@ impl WorkflowRepository {
                 return Err(depth_exceeded(limits));
             }
             let max_rows = windows.objects.min(limits.max_depth - seen.len());
+            crate::lifecycle::check_window_deadline(deadline)?;
             let rows = fetch_first_parent_window(conn, &anchor, max_rows, windows).await?;
             // The commit each row must be: the anchor, then whatever the previous row's
             // bytes named as parent 0. The index never chooses it.
@@ -1246,6 +1331,10 @@ impl WorkflowRepository {
         }
         #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterIdempotencyCheck)?;
+        #[cfg(feature = "test-hooks")]
+        self.hook_at(crate::test_hooks::HookPoint::AfterReplayCheck, &mut tx)
+            .await?;
+        tx.check_deadline("the graph and branch locks")?;
         Self::graph_must_be_active(&mut tx, scope).await?;
         // The branch must exist and be active (ADR-0022); held `FOR SHARE` until commit so a
         // concurrent delete serializes with this prepare. Only `main` may be proposed onto
@@ -1273,9 +1362,18 @@ impl WorkflowRepository {
             });
         }
         // Base state is immutable content, read on this transaction's connection.
+        tx.check_deadline("the base-state reconstruction")?;
         let base = match &request.expected_head {
             Some(head) => {
-                Self::state_at_on_windowed(&mut tx, head, &self.limits, self.windows).await?
+                let deadline = Some(tx.deadline());
+                Self::state_at_on_windowed_until(
+                    &mut tx,
+                    head,
+                    &self.limits,
+                    self.windows,
+                    deadline,
+                )
+                .await?
             }
             None => Reconstructed::default(),
         };
@@ -1322,12 +1420,14 @@ impl WorkflowRepository {
         // candidate commits to (ADR-0008).
         let requested_id = request.requested.id();
         let effective_id = effective.id();
+        tx.check_deadline("the requested-patch publication")?;
         crate::postgres_immutable::publish_object(
             &mut tx,
             &requested_id.0,
             &request.requested.canonical_bytes(),
         )
         .await?;
+        tx.check_deadline("the effective-patch publication")?;
         crate::postgres_immutable::publish_object(
             &mut tx,
             &effective_id.0,
@@ -1347,11 +1447,13 @@ impl WorkflowRepository {
             message: request.message.clone(),
         });
         // The effective patch is a canonical `Patch` by construction.
+        tx.check_deadline("the candidate publication")?;
         let candidate_id = self
             .immutable
             .publish_commit_in(&mut tx, &candidate)
             .await?;
         let actor = scope.principal.actor();
+        tx.check_deadline("the proposal row")?;
         let row = sqlx::query(
             "INSERT INTO proposals (graph_id, branch, tenant_id, principal_id, principal_type, \
              on_behalf_of, expected_head, requested_patch_id, effective_patch_id, candidate_commit, \
@@ -1382,6 +1484,7 @@ impl WorkflowRepository {
         let proposal_id: i64 = row.try_get("proposal_id").map_err(db_error)?;
         #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterDecision)?;
+        tx.check_deadline("the idempotency result")?;
         Self::record_result(
             &mut tx,
             scope,
@@ -1399,7 +1502,7 @@ impl WorkflowRepository {
         #[cfg(feature = "test-hooks")]
         self.hook_at(crate::test_hooks::HookPoint::BeforeCommit, &mut tx)
             .await?;
-        tx.commit().await.map_err(db_error)?;
+        tx.commit().await?;
         #[cfg(feature = "test-hooks")]
         self.pause_at(crate::test_hooks::HookPoint::AfterCommit)
             .await;
@@ -1563,6 +1666,10 @@ impl WorkflowRepository {
         }
         #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterIdempotencyCheck)?;
+        #[cfg(feature = "test-hooks")]
+        self.hook_at(crate::test_hooks::HookPoint::AfterReplayCheck, &mut tx)
+            .await?;
+        tx.check_deadline("the graph, ref and branch locks")?;
         Self::graph_must_be_active(&mut tx, scope).await?;
 
         // Lock the ref row (if it exists) so competing advances serialize on it, then the
@@ -1658,6 +1765,7 @@ impl WorkflowRepository {
         };
         #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterLineageValidation)?;
+        tx.check_deadline("the ref movement")?;
 
         // Ref movement with version bump.
         let (old_version, new_version) = match &current {
@@ -1709,6 +1817,7 @@ impl WorkflowRepository {
         self.fail_at(FailPoint::AfterRefUpdate)?;
 
         let actor = scope.principal.actor();
+        tx.check_deadline("the ref event")?;
         let event_row = sqlx::query(
             "INSERT INTO ref_events (graph_id, branch, old_head, new_head, old_version, new_version, \
              operation, tenant_id, principal_id, principal_type, on_behalf_of, reason, correlation_id) \
@@ -1738,6 +1847,7 @@ impl WorkflowRepository {
         }
         #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterRefEvent)?;
+        tx.check_deadline("the decision")?;
 
         let decision_row = sqlx::query(
             "INSERT INTO decisions (proposal_id, graph_id, branch, candidate_commit, decision, \
@@ -1773,6 +1883,7 @@ impl WorkflowRepository {
         }
         #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterDecision)?;
+        tx.check_deadline("the outbox row")?;
 
         let outbox_row = sqlx::query(
             "INSERT INTO projection_outbox (graph_id, branch, commit_id, ref_version, event_kind, ref_event_id) \
@@ -1789,6 +1900,7 @@ impl WorkflowRepository {
         let outbox_id: i64 = outbox_row.try_get("outbox_id").map_err(db_error)?;
         #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterOutbox)?;
+        tx.check_deadline("the idempotency result")?;
 
         Self::record_result(
             &mut tx,
@@ -1807,7 +1919,7 @@ impl WorkflowRepository {
         #[cfg(feature = "test-hooks")]
         self.hook_at(crate::test_hooks::HookPoint::BeforeCommit, &mut tx)
             .await?;
-        tx.commit().await.map_err(db_error)?;
+        tx.commit().await?;
         #[cfg(feature = "test-hooks")]
         self.pause_at(crate::test_hooks::HookPoint::AfterCommit)
             .await;
@@ -1876,6 +1988,10 @@ impl WorkflowRepository {
         }
         #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterIdempotencyCheck)?;
+        #[cfg(feature = "test-hooks")]
+        self.hook_at(crate::test_hooks::HookPoint::AfterReplayCheck, &mut tx)
+            .await?;
+        tx.check_deadline("the graph lock")?;
         Self::graph_must_be_active(&mut tx, scope).await?;
         // Rejection does not depend on the current head, only on the proposal's own
         // binding to this ref.
@@ -1922,6 +2038,7 @@ impl WorkflowRepository {
         let validation_ids: Vec<String> =
             cited.iter().map(|c| c.validation_id.to_string()).collect();
         let actor = scope.principal.actor();
+        tx.check_deadline("the decision")?;
         let decision_row = sqlx::query(
             "INSERT INTO decisions (proposal_id, graph_id, branch, candidate_commit, decision, \
              tenant_id, principal_id, principal_type, on_behalf_of, reason, validation_ids, correlation_id) \
@@ -1954,6 +2071,7 @@ impl WorkflowRepository {
         }
         #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterDecision)?;
+        tx.check_deadline("the idempotency result")?;
         Self::record_result(
             &mut tx,
             scope,
@@ -1971,7 +2089,7 @@ impl WorkflowRepository {
         #[cfg(feature = "test-hooks")]
         self.hook_at(crate::test_hooks::HookPoint::BeforeCommit, &mut tx)
             .await?;
-        tx.commit().await.map_err(db_error)?;
+        tx.commit().await?;
         #[cfg(feature = "test-hooks")]
         self.pause_at(crate::test_hooks::HookPoint::AfterCommit)
             .await;
@@ -2034,7 +2152,7 @@ impl WorkflowRepository {
         correlation_id: Option<&str>,
     ) -> Result<i64, LedgerError> {
         validate_reason(Some(reason))?;
-        let mut tx = self.pool.begin().await.map_err(db_error)?;
+        let mut tx = crate::lifecycle::begin(&self.pool, &self.session).await?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
             .execute(&mut *tx)
             .await
@@ -2132,7 +2250,7 @@ impl WorkflowRepository {
         .await
         .map_err(|e| map_decision_insert(e, &candidate_id))?;
         let decision_id: i64 = decision_row.try_get("decision_id").map_err(db_error)?;
-        tx.commit().await.map_err(db_error)?;
+        tx.commit().await?;
         Ok(decision_id)
     }
 }

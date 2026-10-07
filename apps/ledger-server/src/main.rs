@@ -18,10 +18,12 @@ use std::{
 };
 use tracing::{info, warn};
 
-/// How long open connections may drain after a shutdown signal before the process exits
-/// anyway. An unfinished publication transaction is rolled back by PostgreSQL, so exiting
-/// never leaves partial state.
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default drain deadline after a shutdown signal (`LEDGER_DRAIN_TIMEOUT_MS`, ADR-0026 §8):
+/// open HTTP connections and detached database operations get this long before the process
+/// exits anyway. It is validated to cover the longest detached operation. Exiting at the
+/// deadline never proves anything about an in-flight `COMMIT`: PostgreSQL ends the abandoned
+/// session's transaction by its own rules, and a retry by idempotency key resolves the outcome.
+const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(40);
 
 /// The only value of `LEDGER_UNVALIDATED_ACCEPTANCE` that enables acceptance without
 /// semantic validation. Deliberately long and self-describing so it cannot be set by
@@ -319,7 +321,7 @@ fn db_session_limits() -> Result<DbSessionLimits, String> {
         }
         Ok(Duration::from_millis(value as u64))
     };
-    Ok(DbSessionLimits {
+    let limits = DbSessionLimits {
         statement_timeout: ms("LEDGER_DB_STATEMENT_TIMEOUT_MS", d.statement_timeout)?,
         lock_timeout: ms("LEDGER_DB_LOCK_TIMEOUT_MS", d.lock_timeout)?,
         idle_in_transaction_timeout: ms(
@@ -331,7 +333,26 @@ fn db_session_limits() -> Result<DbSessionLimits, String> {
             d.max_connections as usize,
         )?)
         .map_err(|_| "LEDGER_DB_MAX_CONNECTIONS is too large".to_owned())?,
-    })
+        transaction_bound: ms("LEDGER_DB_TRANSACTION_TIMEOUT_MS", d.transaction_bound)?,
+        acquire_timeout: ms("LEDGER_DB_ACQUIRE_TIMEOUT_MS", d.acquire_timeout)?,
+    };
+    // The PostgreSQL 17 backstop is the sum of two settings; it must fit the 32-bit setting too.
+    if limits.transaction_timeout_backstop().as_millis() > i32::MAX as u128 {
+        return Err(format!(
+            "LEDGER_DB_TRANSACTION_TIMEOUT_MS + LEDGER_DB_STATEMENT_TIMEOUT_MS must be at most {} ms \
+             (the PostgreSQL 17 transaction_timeout backstop)",
+            i32::MAX
+        ));
+    }
+    Ok(limits)
+}
+
+/// `LEDGER_DRAIN_TIMEOUT_MS`: the graceful-shutdown deadline (ADR-0026 §8).
+fn drain_deadline() -> Result<Duration, String> {
+    Ok(Duration::from_millis(env_usize(
+        "LEDGER_DRAIN_TIMEOUT_MS",
+        DEFAULT_DRAIN_TIMEOUT.as_millis() as usize,
+    )? as u64))
 }
 
 fn limits() -> Result<ApiLimits, String> {
@@ -499,11 +520,6 @@ fn validation_service(
         }
         None => None,
     };
-    if limits.validator_timeout >= limits.request_timeout {
-        return Err(
-            "LEDGER_LIMIT_VALIDATOR_SECONDS must be below LEDGER_LIMIT_REQUEST_SECONDS".into(),
-        );
-    }
     let client = ledger_api::validator::HttpValidationClient::new(
         ledger_api::validator::HttpValidatorConfig {
             endpoint: url,
@@ -539,6 +555,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend_choice = env_optional("LEDGER_IMMUTABLE_BACKEND")?;
     let backend = select_backend(database_url.as_deref(), backend_choice.as_deref())?;
     let limits = limits()?;
+    let drain = drain_deadline()?;
+    // The database-bearing router hands its detached-operation tracker to the shutdown path.
+    let mut detached_state: Option<AppState> = None;
 
     let app = match backend {
         Backend::FilesystemOnly => {
@@ -579,10 +598,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // published by this process (ADR-0010 policy `Reject`), and no route reaches the
             // raw ref primitive or `Ledger::commit`. The connection is verify-only: the
             // runtime identity never migrates and refuses a schema at any other level.
-            let store =
-                PostgresLedgerStore::connect_with(url, V1Binding::Reject, db_session_limits()?)
-                    .await
-                    .map_err(|e| format!("startup refused: {e}"))?;
+            let session = db_session_limits()?;
+            // The ADR-0026 §2 hierarchy, validated before any connection is opened: an
+            // inconsistent deployment refuses to start with the violated relation named.
+            let validator_configured = env_optional("LEDGER_VALIDATOR_URL")?.is_some();
+            ledger_api::lifecycle::validate_lifecycle(
+                &session,
+                &limits,
+                drain,
+                validator_configured,
+            )
+            .map_err(|e| format!("startup refused: {e}"))?;
+            info!(
+                lock_ms = session.lock_timeout.as_millis() as u64,
+                statement_ms = session.statement_timeout.as_millis() as u64,
+                transaction_ms = session.transaction_bound.as_millis() as u64,
+                acquire_ms = session.acquire_timeout.as_millis() as u64,
+                idle_in_transaction_ms = session.idle_in_transaction_timeout.as_millis() as u64,
+                request_ms = limits.request_timeout.as_millis() as u64,
+                validator_ms = limits.validator_timeout.as_millis() as u64,
+                drain_ms = drain.as_millis() as u64,
+                "request/transaction lifecycle limits validated (ADR-0026)"
+            );
+            let store = PostgresLedgerStore::connect_with(url, V1Binding::Reject, session)
+                .await
+                .map_err(|e| format!("startup refused: {e}"))?;
             info!(
                 auth = %authenticator.describe(),
                 "shared PostgreSQL topology: refs, objects and workflow in one database; v1 \
@@ -614,6 +654,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                      validations answer VALIDATOR_UNAVAILABLE"
                 ),
             }
+            detached_state = Some(state.clone());
             ledger_api::router(state)
         }
     };
@@ -637,15 +678,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let server = axum::serve(listener, app).with_graceful_shutdown(async move {
         let _ = drain_rx.wait_for(|signalled| *signalled).await;
     });
-    let deadline = async move {
+    // ADR-0026 §8: on the signal, stop accepting (axum), close the tracker to new detached
+    // operations, then give open connections AND tracked detached operations the drain
+    // deadline together. Exiting at the deadline proves nothing about an in-flight COMMIT.
+    let detached = detached_state.clone();
+    let drained = async move {
         let _ = deadline_rx.wait_for(|signalled| *signalled).await;
-        tokio::time::sleep(DRAIN_TIMEOUT).await;
+        if let Some(state) = &detached {
+            state.begin_shutdown();
+        }
+        tokio::time::sleep(drain).await;
+    };
+    let server_and_detached = async {
+        server.await?;
+        if let Some(state) = &detached_state {
+            state.detached().wait_idle().await;
+        }
+        Ok::<(), std::io::Error>(())
     };
     tokio::select! {
-        result = server => result?,
-        () = deadline => warn!(
-            timeout_secs = DRAIN_TIMEOUT.as_secs(),
-            "drain deadline reached with connections still open; exiting"
+        result = server_and_detached => result?,
+        () = drained => warn!(
+            drain_ms = drain.as_millis() as u64,
+            detached_operations = detached_state.as_ref().map_or(0, |s| s.detached().active()),
+            "drain deadline reached with work still open; exiting (a database transaction that \
+             was mid-COMMIT has an unknown outcome until its key is retried)"
         ),
     }
     Ok(())

@@ -298,10 +298,12 @@ pub fn sqlstate_is_unavailable(code: &str) -> bool {
 /// SQLSTATEs after which the transaction was rolled back and the request is retryable:
 /// 57014 `query_canceled` (statement_timeout) and 55P03 `lock_not_available`
 /// (lock_timeout) from the session limits ADR-0016 sets, plus 40001
-/// `serialization_failure` and 40P01 `deadlock_detected`.
+/// `serialization_failure` and 40P01 `deadlock_detected`, and 25P04 `transaction_timeout`
+/// (PostgreSQL 17's session-terminating backstop, ADR-0026 §2: the transaction is gone; the
+/// pool reconnects; retry by key).
 #[cfg(feature = "postgres")]
 pub fn sqlstate_is_timeout(code: &str) -> bool {
-    matches!(code, "57014" | "55P03" | "40001" | "40P01")
+    matches!(code, "57014" | "55P03" | "40001" | "40P01" | "25P04")
 }
 
 /// Advisory-lock key derivation shared with migration 0009's `ledger_lock_key`: the first
@@ -582,6 +584,8 @@ pub use postgres_immutable::{PostgresImmutableStore, RetrievalWindows, V1Binding
 mod postgres_graphs;
 #[cfg(feature = "postgres")]
 pub use postgres_graphs::{GraphRecord, GraphStatus, NewGraph, PgGraphs};
+#[cfg(feature = "postgres")]
+pub mod lifecycle;
 #[cfg(feature = "postgres")]
 mod postgres_workflow;
 /// Deterministic fault injection (Plan 0013 F5): test builds only, like the pause points.

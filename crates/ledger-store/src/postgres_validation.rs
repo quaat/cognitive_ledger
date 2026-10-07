@@ -108,8 +108,12 @@ pub struct ValidatorOutcome {
 pub struct ValidationRepository {
     pool: PgPool,
     limits: crate::ReconstructionLimits,
+    /// Lifecycle limits (ADR-0026): transaction bound and acquire timeout.
+    session: crate::DbSessionLimits,
     #[cfg(feature = "test-hooks")]
     failpoint: Option<FailPoint>,
+    #[cfg(feature = "test-hooks")]
+    pause: Option<crate::test_hooks::PauseHook>,
 }
 
 fn now() -> Result<LedgerTimestamp, LedgerError> {
@@ -121,14 +125,50 @@ impl ValidationRepository {
         Self {
             pool,
             limits: crate::ReconstructionLimits::DEVELOPMENT,
+            session: crate::DbSessionLimits::default(),
             #[cfg(feature = "test-hooks")]
             failpoint: None,
+            #[cfg(feature = "test-hooks")]
+            pause: None,
         }
     }
 
     pub fn with_limits(mut self, limits: crate::ReconstructionLimits) -> Self {
         self.limits = limits;
         self
+    }
+
+    /// Lifecycle limits for this repository's acquisitions and transactions (ADR-0026).
+    pub fn with_session_limits(mut self, session: crate::DbSessionLimits) -> Self {
+        self.session = session;
+        self
+    }
+
+    /// Pause (or inject a slow statement into) the record transaction at the hook's point
+    /// (feature `test-hooks` only).
+    #[cfg(feature = "test-hooks")]
+    pub fn with_pause_hook(mut self, hook: crate::test_hooks::PauseHook) -> Self {
+        self.pause = Some(hook);
+        self
+    }
+
+    #[cfg(feature = "test-hooks")]
+    async fn pause_at(&self, point: crate::test_hooks::HookPoint) {
+        if let Some(hook) = &self.pause {
+            let _ = hook.at(point, None).await;
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    async fn hook_at(
+        &self,
+        point: crate::test_hooks::HookPoint,
+        conn: &mut sqlx::PgConnection,
+    ) -> Result<(), LedgerError> {
+        match &self.pause {
+            Some(hook) => hook.at(point, Some(conn)).await,
+            None => Ok(()),
+        }
     }
 
     /// Abort `record`'s transaction at `point` (tests only): `AfterLineageValidation` after
@@ -167,7 +207,7 @@ impl ValidationRepository {
     ) -> Result<Option<RecordedValidation>, LedgerError> {
         let scope = &request.scope;
         WorkflowRepository::validate_scope(scope)?;
-        let mut conn = self.pool.acquire().await.map_err(db_error)?;
+        let mut conn = crate::lifecycle::acquire(&self.pool, self.session.acquire_timeout).await?;
         match WorkflowRepository::stored_result(&mut conn, scope, Operation::Validate).await? {
             Some(stored) => Ok(Some(Self::replay(&mut conn, stored, scope).await?)),
             None => Ok(None),
@@ -184,7 +224,7 @@ impl ValidationRepository {
         let scope = &request.scope;
         WorkflowRepository::validate_scope(scope)?;
         request.requested.validate()?;
-        let mut tx = self.pool.begin().await.map_err(db_error)?;
+        let mut tx = crate::lifecycle::begin(&self.pool, &self.session).await?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
             .execute(&mut *tx)
             .await
@@ -193,9 +233,10 @@ impl ValidationRepository {
             WorkflowRepository::stored_result(&mut tx, scope, Operation::Validate).await?
         {
             let replayed = Self::replay(&mut tx, stored, scope).await?;
-            tx.rollback().await.map_err(db_error)?;
+            tx.rollback().await?;
             return Ok(ValidationBegin::Replayed(Box::new(replayed)));
         }
+        tx.check_deadline("the graph lock")?;
         WorkflowRepository::graph_must_be_active(&mut tx, scope).await?;
         Self::candidate_is_prepared_here(&mut tx, &scope.graph, &request.candidate).await?;
         let knowledge_base_id: Option<String> =
@@ -204,9 +245,17 @@ impl ValidationRepository {
                 .fetch_one(&mut *tx)
                 .await
                 .map_err(db_error)?;
-        let reconstructed =
-            WorkflowRepository::state_at_on(&mut tx, &request.candidate, limits).await?;
-        tx.rollback().await.map_err(db_error)?;
+        tx.check_deadline("the candidate-state reconstruction")?;
+        let deadline = Some(tx.deadline());
+        let reconstructed = WorkflowRepository::state_at_on_windowed_until(
+            &mut tx,
+            &request.candidate,
+            limits,
+            crate::RetrievalWindows::DEFAULT,
+            deadline,
+        )
+        .await?;
+        tx.rollback().await?;
         let digest = state_digest(&reconstructed.state);
         Ok(ValidationBegin::Fresh(ValidationTicket {
             graph: scope.graph.clone(),
@@ -262,22 +311,29 @@ impl ValidationRepository {
         let validation_id = record.id()?;
 
         let mut tx =
-            WorkflowRepository::begin_scoped(&self.pool, scope, Operation::Validate).await?;
+            WorkflowRepository::begin_scoped(&self.pool, &self.session, scope, Operation::Validate)
+                .await?;
         if let Some(stored) =
             WorkflowRepository::stored_result(&mut tx, scope, Operation::Validate).await?
         {
             let replayed = Self::replay(&mut tx, stored, scope).await?;
-            tx.rollback().await.map_err(db_error)?;
+            tx.rollback().await?;
             return Ok(replayed);
         }
+        #[cfg(feature = "test-hooks")]
+        self.hook_at(crate::test_hooks::HookPoint::AfterReplayCheck, &mut tx)
+            .await?;
+        tx.check_deadline("the graph lock and the context insert")?;
         WorkflowRepository::graph_must_be_active(&mut tx, scope).await?;
         Self::candidate_is_prepared_here(&mut tx, &scope.graph, &ticket.candidate).await?;
         Self::insert_context(&mut tx, scope, &context_bytes, &context_id).await?;
         #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterLineageValidation)?;
+        tx.check_deadline("the validation record")?;
         Self::insert_record(&mut tx, scope, &record_bytes, &validation_id).await?;
         #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterDecision)?;
+        tx.check_deadline("the idempotency result")?;
         WorkflowRepository::record_result(
             &mut tx,
             scope,
@@ -292,7 +348,13 @@ impl ValidationRepository {
         .await?;
         #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::BeforeCommit)?;
-        tx.commit().await.map_err(db_error)?;
+        #[cfg(feature = "test-hooks")]
+        self.hook_at(crate::test_hooks::HookPoint::BeforeCommit, &mut tx)
+            .await?;
+        tx.commit().await?;
+        #[cfg(feature = "test-hooks")]
+        self.pause_at(crate::test_hooks::HookPoint::AfterCommit)
+            .await;
         Ok(RecordedValidation {
             validation_id,
             context_id,
@@ -310,7 +372,7 @@ impl ValidationRepository {
         graph: &GraphId,
         validation_id: &ValidationId,
     ) -> Result<Option<(ValidationRecord, SemanticExecutionContext)>, LedgerError> {
-        let mut conn = self.pool.acquire().await.map_err(db_error)?;
+        let mut conn = crate::lifecycle::acquire(&self.pool, self.session.acquire_timeout).await?;
         Self::load_on(&mut conn, tenant, graph, validation_id).await
     }
 
@@ -329,7 +391,7 @@ impl ValidationRepository {
         .bind(graph.as_str())
         .bind(tenant.as_str())
         .bind(candidate.to_string())
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *crate::lifecycle::acquire(&self.pool, self.session.acquire_timeout).await?)
         .await
         .map_err(db_error)?;
         rows.iter()

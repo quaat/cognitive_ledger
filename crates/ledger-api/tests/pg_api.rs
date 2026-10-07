@@ -83,6 +83,8 @@ struct Harness {
     /// Owner-identity store for provisioning and raw assertions.
     owner: PostgresLedgerStore,
     app: Router,
+    /// The served state: its detached-operation tracker is what shutdown waits for.
+    state: AppState,
 }
 
 /// Owner migrates and grants once; the served store connects as a least-privilege runtime
@@ -212,8 +214,14 @@ async fn harness_in_hooked(
     if let Some(hook) = hook {
         store = store.with_workflow_pause_hook(hook);
     }
-    let app = ledger_api::router(AppState::new(store.clone(), auth, limits, acceptance));
-    Harness { store, owner, app }
+    let state = AppState::new(store.clone(), auth, limits, acceptance);
+    let app = ledger_api::router(state.clone());
+    Harness {
+        store,
+        owner,
+        app,
+        state,
+    }
 }
 
 async fn harness(acceptance: AcceptancePolicy, limits: ApiLimits) -> Harness {
@@ -318,7 +326,10 @@ fn prepare_body(expected_head: Option<&str>, quads: &[(&str, &str)], message: &s
     })
 }
 
-const LEAKS: [&str; 17] = [
+const LEAKS: [&str; 20] = [
+    "COMMIT_OUTCOME_UNKNOWN",
+    "bound of",
+    "time budget",
     "canceling statement",
     "pg_sleep",
     "pool timed out",
@@ -2118,8 +2129,9 @@ async fn call_app(app: Router, method: &str, path: &str, bearer: Option<&str>) -
 #[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
 async fn edge_timeout_slow_loris_and_body_boundary_are_bounded() {
     // Edge timeout under a slow database: the database waits longer than the request is
-    // allowed to take, so the edge answers RESOURCE_LIMIT and the client is never left
-    // hanging (the store's own timeout is 10 s here, longer than the edge's 1 s).
+    // allowed to take, so the edge answers REQUEST_TIMEOUT (read guidance) and the client is
+    // never left hanging (the store's lock wait is 10 s here, longer than the edge's 1 s); the
+    // detached read ends on its own once the lock is gone.
     let limits = ApiLimits {
         body_bytes: 600,
         request_timeout: Duration::from_secs(1),
@@ -2151,9 +2163,13 @@ async fn edge_timeout_slow_loris_and_body_boundary_are_bounded() {
         .unwrap();
     let started = std::time::Instant::now();
     let r = h.call("GET", &state_path, Some(&t), None, None).await;
-    assert_error(&r, StatusCode::SERVICE_UNAVAILABLE, "RESOURCE_LIMIT");
+    // ADR-0026 §4 (M2): a read's time limit is REQUEST_TIMEOUT with read guidance.
+    assert_error(&r, StatusCode::SERVICE_UNAVAILABLE, "REQUEST_TIMEOUT");
+    let message = r.1["message"].as_str().unwrap();
     assert!(
-        r.1["message"].as_str().unwrap().contains("time limit"),
+        message.contains("time limit")
+            && message.contains("nothing was written")
+            && !message.contains("idempotency"),
         "{r:?}"
     );
     assert!(
@@ -2171,8 +2187,8 @@ async fn edge_timeout_slow_loris_and_body_boundary_are_bounded() {
     .await;
 
     // Slow-loris body: one byte every 100 ms, never finishing. The edge timeout covers body
-    // reading, so the request ends with RESOURCE_LIMIT after ~1 s instead of holding a
-    // connection open indefinitely.
+    // reading, so the request ends with REQUEST_TIMEOUT after ~2 s (deadline + grace) instead
+    // of holding a connection open indefinitely.
     let proposals = format!("/v1/graphs/{g}/proposals");
     let drip = futures_util::stream::unfold(0u32, |i| async move {
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2191,10 +2207,17 @@ async fn edge_timeout_slow_loris_and_body_boundary_are_bounded() {
         .unwrap();
     let started = std::time::Instant::now();
     let r = h.raw(request).await;
-    assert_error(&r, StatusCode::SERVICE_UNAVAILABLE, "RESOURCE_LIMIT");
+    // Before any database work the edge answers at request_timeout + its 1 s grace; the
+    // class comes from the Idempotency-Key header (a write: outcome unknown, same key).
+    assert_error(&r, StatusCode::SERVICE_UNAVAILABLE, "REQUEST_TIMEOUT");
     assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "slow-loris cut at {:?}",
+        r.1["message"].as_str().unwrap().contains("idempotency key"),
+        "{r:?}"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(1900)
+            && started.elapsed() < Duration::from_secs(5),
+        "slow-loris cut at request_timeout + the 1 s edge grace: {:?}",
         started.elapsed()
     );
 
@@ -2317,21 +2340,24 @@ fn p7a_spawn(
     })
 }
 
-/// CHARACTERIZATION (F3, F4). With every pooled connection held elsewhere, a cheap read,
-/// readiness, a prepare and an accept all wait the hard-coded 10 s pool acquire timeout and
-/// then answer 503 `DEPENDENCY_UNAVAILABLE`; the read's message tells a key-less caller to
-/// retry with an idempotency key. Nothing is written; once a connection is free everything
-/// answers normally. (ADR-0026 bounds the wait by the request deadline and gives reads their
-/// own guidance; M2 changes the envelope, M3 the headroom.)
+/// ACCEPTED (M2, ADR-0026 §2/§4; the M1 characterization measured the hard-coded 10 s acquire
+/// timeout and a key-less read told to retry with a key). With every pooled connection held
+/// elsewhere, a cheap read, readiness, a prepare and an accept all wait the configured
+/// `acquire_timeout` (here 2 s; never the request budget) and answer 503
+/// `DEPENDENCY_UNAVAILABLE` with class guidance: the read and readiness are told nothing was
+/// written and never to use a key, the writes to retry with the same key. Nothing is written;
+/// once a connection is free everything answers normally. (Reserved headroom is M3.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
-async fn p7a_pool_exhaustion_waits_the_acquire_timeout_then_fails_every_request_class_alike() {
+async fn p7a_pool_exhaustion_fails_every_class_after_the_acquire_timeout_with_class_guidance() {
     let limits = ApiLimits {
         request_timeout: Duration::from_secs(30),
         ..ApiLimits::default()
     };
+    let acquire = Duration::from_secs(2);
     let session = DbSessionLimits {
         max_connections: 2,
+        acquire_timeout: acquire,
         ..DbSessionLimits::default()
     };
     let h = harness_full(dev(), limits, p7a_auth(), session).await;
@@ -2380,19 +2406,25 @@ async fn p7a_pool_exhaustion_waits_the_acquire_timeout_then_fails_every_request_
         assert_error(r, StatusCode::SERVICE_UNAVAILABLE, "DEPENDENCY_UNAVAILABLE");
         println!("{what}: {} {:?}", r.0, r.1["message"]);
     }
-    // The key-less read is told to retry "with the same idempotency key" (F4).
+    for r in [&read, &ready] {
+        assert!(
+            !r.1["message"].as_str().unwrap().contains("idempotency"),
+            "a key-less request is never told to retry with a key: {r:?}"
+        );
+    }
+    for r in [&prepare, &accept] {
+        assert!(
+            r.1["message"].as_str().unwrap().contains("idempotency key"),
+            "{r:?}"
+        );
+    }
     assert!(
-        read.1["message"]
-            .as_str()
-            .unwrap()
-            .contains("idempotency key"),
-        "{read:?}"
+        waited >= acquire - Duration::from_millis(100) && waited < acquire + Duration::from_secs(4),
+        "the configured acquire timeout governs the wait: {waited:?}"
     );
-    assert!(
-        waited >= Duration::from_secs(9) && waited < Duration::from_secs(20),
-        "the hard-coded pool acquire timeout (10 s) governs the wait: {waited:?}"
+    println!(
+        "pool exhaustion: all four classes failed after {waited:?} (acquire_timeout {acquire:?})"
     );
-    println!("pool exhaustion: all four classes failed after {waited:?}");
     assert_eq!(
         h.count("idempotency", &g).await,
         3,
@@ -2428,9 +2460,15 @@ fn p7a_saturation_session(max_connections: u32, lock_timeout: Duration) -> DbSes
         max_connections,
         lock_timeout,
         statement_timeout: Duration::from_secs(60),
+        // The pool wait the starving read measures; explicit so the assertion names it.
+        acquire_timeout: P7A_SATURATION_ACQUIRE,
+        // The blocked accepts resume after the probes (≈ 2 × acquire): inside the bound.
+        transaction_bound: Duration::from_secs(60),
         ..DbSessionLimits::default()
     }
 }
+
+const P7A_SATURATION_ACQUIRE: Duration = Duration::from_secs(3);
 
 /// An owner transaction holding `main`'s ref row `FOR UPDATE`: every accept blocks on its
 /// `SELECT … FOR UPDATE` inside PostgreSQL, while plain reads of the row (the refs route)
@@ -2445,12 +2483,13 @@ async fn p7a_hold_main(h: &Harness, g: &GraphId) -> sqlx::Transaction<'static, s
     blocker
 }
 
-/// CHARACTERIZATION (F3). Accept takes no admission permit, so three accepts blocked inside
-/// PostgreSQL (on `main`'s row lock) occupy a three-connection pool entirely; the next cheap
-/// read (which the row lock does not block) and readiness probe find no connection, wait the
-/// 10 s acquire timeout and fail 503 `DEPENDENCY_UNAVAILABLE` — there is no reserved headroom
-/// for cheap traffic. Once the blocker is gone, exactly one accept lands and the other two
-/// are `HEAD_CHANGED`.
+/// CHARACTERIZATION (F3; M3 changes it). Accept takes no admission permit, so three accepts
+/// blocked inside PostgreSQL (on `main`'s row lock) occupy a three-connection pool entirely;
+/// the next cheap read (which the row lock does not block) and readiness probe find no
+/// connection, wait the configured acquire timeout (M1 measured the hard-coded 10 s) and fail
+/// 503 `DEPENDENCY_UNAVAILABLE` with read guidance — there is no reserved headroom for cheap
+/// traffic. Once the blocker is gone, exactly one accept lands and the other two are
+/// `HEAD_CHANGED`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
 async fn p7a_heavy_writes_without_admission_take_every_connection_and_cheap_reads_starve() {
@@ -2526,8 +2565,13 @@ async fn p7a_heavy_writes_without_admission_take_every_connection_and_cheap_read
         "DEPENDENCY_UNAVAILABLE",
     );
     assert!(
-        read_waited >= Duration::from_secs(9) && read_waited < Duration::from_secs(20),
-        "the read starved for the pool acquire timeout: {read_waited:?}"
+        !read.1["message"].as_str().unwrap().contains("idempotency"),
+        "read guidance never names a key: {read:?}"
+    );
+    assert!(
+        read_waited >= P7A_SATURATION_ACQUIRE - Duration::from_millis(100)
+            && read_waited < P7A_SATURATION_ACQUIRE + Duration::from_secs(5),
+        "the read starved for the configured acquire timeout: {read_waited:?}"
     );
     blocker.rollback().await.unwrap();
     let mut statuses = Vec::new();
@@ -2552,17 +2596,18 @@ async fn p7a_heavy_writes_without_admission_take_every_connection_and_cheap_read
 
 /// FUTURE ACCEPTANCE (Plan 0013 M3, ADR-0026 §5 admission model). Pool N = 3, reserved cheap
 /// headroom 2, so one DB-work permit (`expensive` and `validations` are 1 each, as the start-up
-/// invariants require for N = 3). Sequence, order-sensitive by construction:
+/// invariants require for N = 3). Sequence:
 /// 1. one accept is admitted and blocks inside PostgreSQL on `main`'s row lock;
-/// 2. `graphs` is then locked exclusively, so *any* pooled query touching it would block;
-/// 3. three more heavy requests of different classes (accept, prepare, state read) must be
-///    refused at once with 503 `RESOURCE_LIMIT` — before `authorized_graph`, hence without
-///    touching `graphs`; a permit taken after the graph lookup would block here instead;
-/// 4. with `graphs` released and the first accept still blocked, the cheap read and `/ready`
-///    answer 200 promptly on the reserved connections;
-/// 5. with the row lock released, the admitted accept lands; nothing else was written.
-/// Today accept takes no permit and the followers block on `graphs` until `lock_timeout`
-/// (6 s here) → `DEPENDENCY_TIMEOUT`, so this fails.
+/// 2. three more heavy requests of different classes (accept, prepare, state read) must be
+///    refused at once with 503 `RESOURCE_LIMIT` — before `authorized_graph`, hence without a
+///    pooled connection: while they are answered, the only runtime session doing anything is
+///    the admitted accept (the permit precedes the first pooled query; a permit taken after
+///    the graph lookup would show their sessions);
+/// 3. the cheap read and `/ready` answer 200 promptly on the reserved connections while the
+///    admitted accept is still blocked;
+/// 4. with the row lock released, the admitted accept lands; nothing else was written.
+/// Today accept takes no permit and the followers take connections and block on the row lock
+/// until `lock_timeout` (6 s here) → `DEPENDENCY_TIMEOUT`, so this fails (M2 re-verified: red).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "FUTURE ACCEPTANCE (Plan 0013 M3): requires PostgreSQL and the admission model"]
 async fn future_p7a_reserved_headroom_keeps_reads_and_readiness_answering_while_heavy_writes_saturate()
@@ -2603,13 +2648,7 @@ async fn future_p7a_reserved_headroom_keeps_reads_and_readiness_answering_while_
         "the admitted accept blocked inside PostgreSQL",
     )
     .await;
-    // 2. graphs locked: anything that looks a graph up now blocks
-    let mut graphs_lock = h.owner.pool().begin().await.unwrap();
-    sqlx::query("LOCK TABLE graphs IN ACCESS EXCLUSIVE MODE")
-        .execute(&mut *graphs_lock)
-        .await
-        .unwrap();
-    // 3. followers of three heavy classes: refused by admission, never reaching the pool
+    // 2. followers of three heavy classes: refused by admission, never reaching the pool
     let started = std::time::Instant::now();
     let followers = [
         p7a_spawn(
@@ -2650,8 +2689,12 @@ async fn future_p7a_reserved_headroom_keeps_reads_and_readiness_answering_while_
         refused_in < Duration::from_millis(1500),
         "admission refuses without touching the database: {refused_in:?}"
     );
-    graphs_lock.rollback().await.unwrap();
-    // 4. cheap traffic answers on the reserved headroom while the heavy one is still blocked
+    assert_eq!(
+        runtime_sessions_active(&h.owner).await,
+        1,
+        "only the admitted accept ever occupied a runtime session"
+    );
+    // 3. cheap traffic answers on the reserved headroom while the heavy one is still blocked
     assert!(runtime_sessions_waiting(&h.owner).await >= 1);
     let started = std::time::Instant::now();
     let read = h
@@ -2668,7 +2711,7 @@ async fn future_p7a_reserved_headroom_keeps_reads_and_readiness_answering_while_
     assert_eq!(read.0, StatusCode::OK, "{read:?}");
     assert_eq!(ready.0, StatusCode::OK, "{ready:?}");
     assert!(cheap_took < Duration::from_secs(2), "{cheap_took:?}");
-    // 5. the admitted accept lands once the row lock is gone
+    // 4. the admitted accept lands once the row lock is gone
     blocker.rollback().await.unwrap();
     let r = admitted.await.unwrap();
     assert_eq!(r.0, StatusCode::OK, "{r:?}");
@@ -2677,6 +2720,18 @@ async fn future_p7a_reserved_headroom_keeps_reads_and_readiness_answering_while_
         written_before + 1,
         "only the admitted accept wrote"
     );
+}
+
+/// Runtime-identity sessions currently executing or waiting inside PostgreSQL.
+async fn runtime_sessions_active(owner: &PostgresLedgerStore) -> i64 {
+    sqlx::query(
+        "SELECT count(*) AS n FROM pg_stat_activity \
+         WHERE usename = 'ledger_rt_api' AND datname = current_database() AND state = 'active'",
+    )
+    .fetch_one(owner.pool())
+    .await
+    .unwrap()
+    .get::<i64, _>("n")
 }
 
 /// PRESERVATION (premise of the Plan 0013 admission model, HTTP level). Every heavy route
@@ -2876,9 +2931,10 @@ async fn p7a_after_commit_harness() -> (Harness, ledger_store::test_hooks::Pause
 }
 
 /// Genesis prepare over the after-COMMIT harness (resumed explicitly), then an accept that
-/// pauses after its COMMIT and is dropped by the 1 s edge timeout. Returns the candidate, the
-/// accept's path and the timeout reply. The accept is only sent once it has provably reached
-/// COMMIT (`hook.reached()`), so a slow runner cannot turn this into a pre-COMMIT drop.
+/// pauses after its COMMIT while the 1 s edge timeout answers for it. Returns the candidate,
+/// the accept's path and the timeout reply. The accept's reply is awaited only after it has
+/// provably reached the after-COMMIT hook, so a slow runner cannot turn this into a
+/// pre-COMMIT timeout.
 async fn p7a_lost_accept(
     h: &Harness,
     hook: &ledger_store::test_hooks::PauseHook,
@@ -2923,39 +2979,44 @@ async fn p7a_lost_accept(
     (candidate, accept_path, reply, started.elapsed())
 }
 
-/// CHARACTERIZATION (F4). An accept whose COMMIT succeeded but whose handler is dropped by
-/// the edge timeout before responding is reported today as 503 `RESOURCE_LIMIT` "request
-/// exceeded the configured time limit" — indistinguishable from an admission refusal where
-/// nothing happened, and without any replay guidance — although the write is durable: the
-/// same-key retry replays it. (M2 / ADR-0026 outcome model changes the envelope; the
-/// durability and replay here are PRESERVATION and must not change.)
+/// ACCEPTED (M2, ADR-0026 §4 Design A; was `future_p7a_an_edge_timeout_after_commit_reports_…`,
+/// red before M2: 503 `RESOURCE_LIMIT` "request exceeded the configured time limit" with no
+/// guidance). An accept whose COMMIT succeeded but whose edge deadline passes before the
+/// response is built answers 503 `REQUEST_TIMEOUT`: the outcome is unknown and the same key
+/// replays it. The operation is not dropped: it stays registered in the server's tracker
+/// while paused and deregisters when it ends; the write is durable and the retry replays it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
-async fn p7a_an_edge_timeout_after_commit_is_reported_today_like_an_admission_refusal() {
+async fn p7a_an_edge_timeout_after_commit_reports_the_outcome_as_unknown_and_the_key_replays() {
     let (h, hook) = p7a_after_commit_harness().await;
     let g = h.graph("tenant-a").await;
     let t = token("tenant-a", "actor", &ALL);
     let (candidate, accept_path, r, took) = p7a_lost_accept(&h, &hook, &g, &t, "eto").await;
-    assert_error(&r, StatusCode::SERVICE_UNAVAILABLE, "RESOURCE_LIMIT");
+    assert_error(&r, StatusCode::SERVICE_UNAVAILABLE, "REQUEST_TIMEOUT");
+    let message = r.1["message"].as_str().unwrap();
     assert!(
-        r.1["message"].as_str().unwrap().contains("time limit"),
+        message.contains("unknown") && message.contains("idempotency key"),
         "{r:?}"
-    );
-    assert!(
-        !r.1["message"].as_str().unwrap().contains("idempotency"),
-        "today: no replay guidance: {r:?}"
     );
     assert!(
         took >= Duration::from_millis(900) && took < Duration::from_secs(5),
         "{took:?}"
     );
-    println!(
-        "edge timeout after COMMIT answered {} {:?} after {took:?}",
-        r.0, r.1["code"]
+    // Detached, not dropped: still registered while it waits at the after-COMMIT pause.
+    assert_eq!(
+        h.state.detached().active(),
+        1,
+        "the timed-out operation is still owned"
     );
     // Durable regardless of the lost response.
     assert_eq!(h.count("ref_events", &g).await, 1);
     assert_eq!(h.count("idempotency", &g).await, 2);
+    hook.resume();
+    wait_until(
+        async || h.state.detached().active() == 0,
+        "the detached operation to end",
+    )
+    .await;
     // The retry replays (a replay commits no write, so it never reaches the after-COMMIT hook).
     let r = h
         .call(
@@ -2969,40 +3030,284 @@ async fn p7a_an_edge_timeout_after_commit_is_reported_today_like_an_admission_re
     assert_eq!(r.0, StatusCode::OK, "{r:?}");
     assert_eq!(r.1["replayed"], true, "{r:?}");
     assert_eq!(r.1["head"], candidate, "{r:?}");
-    println!(
-        "retry after the lost response: {} replayed={}",
-        r.0, r.1["replayed"]
-    );
+    println!("edge timeout after COMMIT: 503 REQUEST_TIMEOUT after {took:?}; retry replayed");
 }
 
-/// FUTURE ACCEPTANCE (Plan 0013 M2, ADR-0026 outcome model, Design A). The same scenario must
-/// answer with the request-timeout envelope for an idempotent write whose execution began:
-/// 503 `REQUEST_TIMEOUT`, a message saying the outcome is unknown and that the same
-/// idempotency key replays it, and the retry replays the durable result. Today the code is
-/// `RESOURCE_LIMIT` and the message carries no guidance, so this fails.
+/// ACCEPTED (M2, ADR-0026 §2/§8). A client that times out while its write is *inside* its
+/// transaction (a 2 s statement under a 1 s request timeout) gets `REQUEST_TIMEOUT`; the
+/// operation is not dropped — it stays registered and its statement runs on — but its
+/// transaction deadline was capped by the request deadline, so the check before `COMMIT`
+/// rolls it back: no `COMMIT` is ever sent after the request deadline, nothing is durable,
+/// and the same key executes afresh on a replica.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "FUTURE ACCEPTANCE (Plan 0013 M2): requires PostgreSQL and the outcome-classified timeout envelope"]
-async fn future_p7a_an_edge_timeout_after_commit_reports_the_outcome_as_unknown_and_the_key_replays()
- {
-    let (h, hook) = p7a_after_commit_harness().await;
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn p7a_a_client_timing_out_mid_transaction_never_gets_a_late_commit() {
+    use ledger_store::test_hooks::{HookPoint, PauseHook};
+    // The fixture (genesis, prepare) runs on a plain replica; the hooked replica runs the accept.
+    let plain = harness_full(
+        dev(),
+        ApiLimits::default(),
+        p7a_auth(),
+        DbSessionLimits::default(),
+    )
+    .await;
+    let g = plain.graph("tenant-a").await;
+    let t = token("tenant-a", "actor", &ALL);
+    let head = commit(&plain, &g, &t, "<urn:a> <urn:p> \"1\" .").await;
+    let (expected, candidate) =
+        p7a_prepare(&plain, &g, &t, "<urn:a> <urn:p> \"2\" .", "mid-prep").await;
+    assert_eq!(expected.as_deref(), Some(head.as_str()));
+    let hook = PauseHook::slow_statement(HookPoint::BeforeCommit, Duration::from_secs(2), 1);
+    let hooked = harness_in_hooked(
+        &database_url(),
+        dev(),
+        ApiLimits {
+            request_timeout: Duration::from_secs(1),
+            ..ApiLimits::default()
+        },
+        p7a_auth(),
+        DbSessionLimits::default(),
+        Some(hook.clone()),
+    )
+    .await;
+    let accept_path = format!("/v1/graphs/{g}/proposals/{candidate}/accept");
+    let started = std::time::Instant::now();
+    let r = hooked
+        .call(
+            "POST",
+            &accept_path,
+            Some(&t),
+            Some("mid-accept"),
+            Some(p7a_accept_body(&expected)),
+        )
+        .await;
+    let took = started.elapsed();
+    assert_error(&r, StatusCode::SERVICE_UNAVAILABLE, "REQUEST_TIMEOUT");
+    assert!(
+        r.1["message"].as_str().unwrap().contains("idempotency key"),
+        "{r:?}"
+    );
+    assert!(
+        took >= Duration::from_millis(900) && took < Duration::from_secs(2),
+        "{took:?}"
+    );
+    // Still owned while its statement runs on.
+    assert_eq!(hooked.state.detached().active(), 1);
+    wait_until(
+        async || hooked.state.detached().active() == 0,
+        "the detached transaction to end at its pre-COMMIT check",
+    )
+    .await;
+    assert_eq!(
+        plain.count("ref_events", &g).await,
+        1,
+        "no late COMMIT: the accept rolled back"
+    );
+    assert_eq!(
+        plain.count("idempotency", &g).await,
+        3,
+        "commit (2) + prepare; no accept row"
+    );
+    let r = plain
+        .call(
+            "POST",
+            &accept_path,
+            Some(&t),
+            Some("mid-accept"),
+            Some(p7a_accept_body(&expected)),
+        )
+        .await;
+    assert_eq!(r.0, StatusCode::OK, "{r:?}");
+    assert_eq!(r.1["replayed"], false, "the retry executes afresh: {r:?}");
+    assert_eq!(plain.count("ref_events", &g).await, 2);
+}
+
+/// ACCEPTED (M2, ADR-0026 §8: the ownership boundary starts at the graph lookup). A request
+/// whose very first pooled query — `authorized_graph` — is blocked past the HTTP deadline:
+/// the client gets `REQUEST_TIMEOUT` at the deadline (read guidance for the read, same-key
+/// guidance for the write), but the operation stays registered, still waiting on `graphs`
+/// inside PostgreSQL, until it reaches its own bounded end; nothing is dropped mid-statement.
+/// Once the lock is gone the write's operation ends at its next connection acquisition — its
+/// request budget is spent, so the transaction never begins and nothing is written (ADR-0026
+/// §8) — and the retry by key executes afresh. (M3 attaches the `db_work` permit to exactly
+/// this operation lifetime.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn p7a_a_request_timing_out_at_its_graph_lookup_keeps_its_operation_registered_until_it_ends()
+{
+    let limits = ApiLimits {
+        request_timeout: Duration::from_secs(1),
+        ..ApiLimits::default()
+    };
+    let session = DbSessionLimits {
+        lock_timeout: Duration::from_secs(20),
+        statement_timeout: Duration::from_secs(25),
+        transaction_bound: Duration::from_secs(28),
+        ..DbSessionLimits::default()
+    };
+    let url = fresh_database("api_p7a_own").await;
+    let h = harness_in(&url, dev(), limits, p7a_auth(), session).await;
     let g = h.graph("tenant-a").await;
     let t = token("tenant-a", "actor", &ALL);
-    let (_, accept_path, r, _) = p7a_lost_accept(&h, &hook, &g, &t, "fto").await;
-    assert_error(&r, StatusCode::SERVICE_UNAVAILABLE, "REQUEST_TIMEOUT");
-    let message = r.1["message"].as_str().unwrap();
+    commit(&h, &g, &t, "<urn:a> <urn:p> \"1\" .").await;
+    let (expected, candidate) =
+        p7a_prepare(&h, &g, &t, "<urn:a> <urn:p> \"2\" .", "own-prep").await;
+    assert_eq!(h.state.detached().active(), 0);
+    // Every graph lookup now blocks inside PostgreSQL.
+    let mut graphs_lock = h.owner.pool().begin().await.unwrap();
+    sqlx::query("LOCK TABLE graphs IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *graphs_lock)
+        .await
+        .unwrap();
+    let refs = format!("/v1/graphs/{g}/refs?name=main");
+    let accept_path = format!("/v1/graphs/{g}/proposals/{candidate}/accept");
+    let started = std::time::Instant::now();
+    let (read, write) = tokio::join!(
+        h.call("GET", &refs, Some(&t), None, None),
+        h.call(
+            "POST",
+            &accept_path,
+            Some(&t),
+            Some("own-accept"),
+            Some(p7a_accept_body(&expected)),
+        ),
+    );
+    let took = started.elapsed();
+    assert_error(&read, StatusCode::SERVICE_UNAVAILABLE, "REQUEST_TIMEOUT");
     assert!(
-        message.contains("unknown") && message.contains("idempotency key"),
-        "{r:?}"
+        !read.1["message"].as_str().unwrap().contains("idempotency"),
+        "{read:?}"
+    );
+    assert_error(&write, StatusCode::SERVICE_UNAVAILABLE, "REQUEST_TIMEOUT");
+    assert!(
+        write.1["message"]
+            .as_str()
+            .unwrap()
+            .contains("idempotency key"),
+        "{write:?}"
+    );
+    assert!(
+        took >= Duration::from_millis(900) && took < Duration::from_secs(4),
+        "{took:?}"
+    );
+    // Both operations are still owned and still waiting on the lock inside PostgreSQL.
+    assert_eq!(
+        h.state.detached().active(),
+        2,
+        "timed-out operations stay registered"
+    );
+    assert!(runtime_sessions_waiting(&h.owner).await >= 2);
+    graphs_lock.rollback().await.unwrap();
+    wait_until(
+        async || h.state.detached().active() == 0,
+        "both detached operations to reach their end",
+    )
+    .await;
+    // The write's operation stopped at its transaction acquisition (budget spent): the graph
+    // lookup finished, nothing was written, and the key is unused.
+    assert_eq!(
+        h.count("ref_events", &g).await,
+        1,
+        "the budget-spent accept wrote nothing"
+    );
+    assert_eq!(
+        h.count("idempotency", &g).await,
+        3,
+        "commit (2) + prepare; no accept row"
     );
     let r = h
         .call(
             "POST",
             &accept_path,
             Some(&t),
-            Some("fto-accept"),
+            Some("own-accept"),
+            Some(p7a_accept_body(&expected)),
+        )
+        .await;
+    assert_eq!(r.0, StatusCode::OK, "{r:?}");
+    assert_eq!(r.1["replayed"], false, "the retry executes afresh: {r:?}");
+    assert_eq!(r.1["head"], candidate, "{r:?}");
+    assert_eq!(h.count("ref_events", &g).await, 2);
+}
+
+/// ACCEPTED (M2, ADR-0026 §8 shutdown semantics). An idempotent write times out at the edge
+/// (the client has its `REQUEST_TIMEOUT`) while its operation is paused after COMMIT;
+/// shutdown begins: the tracker is closed (a new database-bearing request is refused with
+/// `DEPENDENCY_UNAVAILABLE`, nothing done), `wait_idle` does not resolve while the operation
+/// runs, and resolves — inside the drain window — once it ends. The database holds the write,
+/// and the same key replays it on another replica (a fresh state over the same database).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn p7a_graceful_shutdown_waits_for_a_detached_write_and_the_key_replays_on_another_replica() {
+    let (h, hook) = p7a_after_commit_harness().await;
+    let g = h.graph("tenant-a").await;
+    let t = token("tenant-a", "actor", &ALL);
+    let (candidate, accept_path, r, _) = p7a_lost_accept(&h, &hook, &g, &t, "sd").await;
+    assert_error(&r, StatusCode::SERVICE_UNAVAILABLE, "REQUEST_TIMEOUT");
+    assert_eq!(h.state.detached().active(), 1);
+    // Shutdown steps 3–4: stop accepting (the server's job) and close the tracker.
+    h.state.begin_shutdown();
+    assert!(h.state.detached().is_closed());
+    let refused = h
+        .call(
+            "GET",
+            &format!("/v1/graphs/{g}/refs?name=main"),
+            Some(&t),
+            None,
+            None,
+        )
+        .await;
+    assert_error(
+        &refused,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "DEPENDENCY_UNAVAILABLE",
+    );
+    assert!(
+        refused.1["message"]
+            .as_str()
+            .unwrap()
+            .contains("shutting down"),
+        "{refused:?}"
+    );
+    // Step 5: the drain waits for the detached operation; it does not resolve early.
+    let drain = Duration::from_secs(10);
+    let early =
+        tokio::time::timeout(Duration::from_millis(300), h.state.detached().wait_idle()).await;
+    assert!(
+        early.is_err(),
+        "the drain must wait for the detached operation"
+    );
+    hook.resume();
+    let drained_in = std::time::Instant::now();
+    tokio::time::timeout(drain, h.state.detached().wait_idle())
+        .await
+        .expect("the detached operation ended inside the drain window");
+    println!(
+        "drain completed {:?} after the operation was released",
+        drained_in.elapsed()
+    );
+    assert_eq!(h.state.detached().active(), 0);
+    // Step 6/7: the database state is what the committed transaction left.
+    assert_eq!(h.count("ref_events", &g).await, 1);
+    assert_eq!(h.count("idempotency", &g).await, 2);
+    // Another replica over the same database resolves the outcome by key: replayed.
+    let replica = harness_full(
+        dev(),
+        ApiLimits::default(),
+        p7a_auth(),
+        DbSessionLimits::default(),
+    )
+    .await;
+    let r = replica
+        .call(
+            "POST",
+            &accept_path,
+            Some(&t),
+            Some("sd-accept"),
             Some(p7a_accept_body(&None)),
         )
         .await;
     assert_eq!(r.0, StatusCode::OK, "{r:?}");
     assert_eq!(r.1["replayed"], true, "{r:?}");
+    assert_eq!(r.1["head"], candidate, "{r:?}");
 }

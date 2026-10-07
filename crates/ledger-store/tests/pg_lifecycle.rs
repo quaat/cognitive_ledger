@@ -24,11 +24,16 @@ use ledger_core::{
 use ledger_rdf::{Operation, OperationKind, Patch, Quad};
 use ledger_store::{
     AcceptRequest, ApplyMergeRequest, BranchLifecycleRequest, BranchPolicy, CreateBranchRequest,
-    GraphStatus, MergeSpec, MergeStrategy, NewGraph, PostgresLedgerStore, PrepareRequest,
-    ProposeMergeRequest, RejectRequest, RequestScope, TraversalLimits, V1Binding, ValidationPolicy,
+    DbSessionLimits, GraphStatus, MergeSpec, MergeStrategy, NewGraph, PostgresLedgerStore,
+    PrepareRequest, ProposeMergeRequest, RejectRequest, RequestScope, TraversalLimits, V1Binding,
+    ValidateRequest, ValidationBegin, ValidationPolicy, ValidatorOutcome,
     test_hooks::{HookPoint, PauseHook},
 };
-use sqlx::{Connection, Row, postgres::PgPoolOptions};
+use ledger_validation_protocol::{
+    BaseKb, Ontology, RequestedContext, SemanticExecutionContext, ShapeSet, ValidationOutcome,
+    ValidatorIdentity,
+};
+use sqlx::{Connection, Row};
 use std::{
     collections::BTreeMap,
     future::Future,
@@ -67,47 +72,48 @@ async fn store() -> PostgresLedgerStore {
         .unwrap()
 }
 
-/// A store over its own small pool with explicit session limits (the shape the runtime
-/// identity uses; here the owner, so no runtime-role setup is needed), named for the
-/// catalog views. The shared database must already be migrated (`store()`).
+/// A store over its own small pool built exactly as the server builds it
+/// (`DbSessionLimits::pool_options`: session `SET`s, the PostgreSQL 17 backstop, the acquire
+/// timeout) and carrying the same lifecycle limits (transaction bound) — here under the owner
+/// identity, so no runtime-role setup is needed — named for the catalog views. The shared
+/// database must already be migrated (`store()`).
+async fn store_with_limits(name: &str, limits: DbSessionLimits) -> PostgresLedgerStore {
+    let pool = limits
+        .pool_options()
+        .connect(&named_url(name))
+        .await
+        .unwrap();
+    PostgresLedgerStore::from_pool_migrated(pool, V1Binding::Reject).with_session_limits(limits)
+}
+
+/// The M1 shape: `max_connections`, `statement_timeout`, `lock_timeout`; everything else at
+/// the production defaults (transaction bound 20 s, acquire 5 s, idle 30 s).
 async fn store_with(
     name: &str,
     max_connections: u32,
     statement_timeout: Duration,
     lock_timeout: Duration,
 ) -> PostgresLedgerStore {
-    let statement = statement_timeout.as_millis().max(1);
-    let lock = lock_timeout.as_millis().max(1);
-    let pool = PgPoolOptions::new()
-        .max_connections(max_connections)
-        .acquire_timeout(Duration::from_secs(10))
-        .after_connect(move |conn, _| {
-            Box::pin(async move {
-                use sqlx::Executor;
-                conn.execute(
-                    format!(
-                        "SET statement_timeout = '{statement}ms'; SET lock_timeout = '{lock}ms'; \
-                         SET idle_in_transaction_session_timeout = '60000ms'"
-                    )
-                    .as_str(),
-                )
-                .await?;
-                Ok(())
-            })
-        })
-        .connect(&named_url(name))
-        .await
-        .unwrap();
-    PostgresLedgerStore::from_pool_migrated(pool, V1Binding::Reject)
+    store_with_limits(
+        name,
+        DbSessionLimits {
+            max_connections,
+            statement_timeout,
+            lock_timeout,
+            ..DbSessionLimits::default()
+        },
+    )
+    .await
 }
 
-/// A named store with the default session limits (statement 30 s, lock 10 s).
+/// A named store with the default session limits.
 async fn named_store(name: &str, max_connections: u32) -> PostgresLedgerStore {
-    store_with(
+    store_with_limits(
         name,
-        max_connections,
-        Duration::from_secs(30),
-        Duration::from_secs(10),
+        DbSessionLimits {
+            max_connections,
+            ..DbSessionLimits::default()
+        },
     )
     .await
 }
@@ -263,7 +269,9 @@ async fn branch(store: &PostgresLedgerStore, g: &GraphId, name: &str) {
 
 /// Every graph-scoped table a workflow write can touch (`immutable_objects` is content-
 /// addressed and shared, so it is not counted per graph).
-const TABLES: [&str; 11] = [
+const TABLES: [&str; 13] = [
+    "semantic_execution_contexts",
+    "validation_records",
     "proposals",
     "merge_proposals",
     "decisions",
@@ -406,14 +414,14 @@ const C: &str = "<urn:c> <urn:p> \"1\" .";
 
 // ---- every write path, uniformly --------------------------------------------------------
 
-/// The eight idempotent workflow write paths. Not here: the validation record transaction
-/// (same `begin_scoped`/`record_result` shape; its drop test is listed in Plan 0013 as a
-/// prerequisite of M2 acceptance), `mark_superseded` (no key, F8) and the raw bootstrap CAS.
+/// The nine idempotent workflow write paths, the validation record (begin + record; M2 closed
+/// the M1 gap) included. Not here: `mark_superseded` (no key, F8) and the raw bootstrap CAS.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Op {
     Prepare,
     Accept,
     Reject,
+    Validate,
     BranchCreate,
     BranchDelete,
     BranchRestore,
@@ -421,10 +429,11 @@ enum Op {
     MergeApply,
 }
 
-const OPS: [Op; 8] = [
+const OPS: [Op; 9] = [
     Op::Prepare,
     Op::Accept,
     Op::Reject,
+    Op::Validate,
     Op::BranchCreate,
     Op::BranchDelete,
     Op::BranchRestore,
@@ -438,6 +447,7 @@ impl Op {
             Op::Prepare => "prepare",
             Op::Accept => "accept",
             Op::Reject => "reject",
+            Op::Validate => "validate",
             Op::BranchCreate => "branch_create",
             Op::BranchDelete => "branch_delete",
             Op::BranchRestore => "branch_restore",
@@ -471,7 +481,7 @@ async fn fixture(store: &PostgresLedgerStore, op: Op) -> Fixture {
     };
     match op {
         Op::Prepare | Op::BranchCreate => {}
-        Op::Accept | Op::Reject => {
+        Op::Accept | Op::Reject | Op::Validate => {
             let p = store
                 .workflows()
                 .prepare(&prepare_req(
@@ -551,8 +561,10 @@ struct Outcome {
 
 type OpFuture = Pin<Box<dyn Future<Output = Result<Outcome, LedgerError>> + Send>>;
 
-/// Run `op` with `key` through `repo` (which may carry a hook) against `f`.
-fn run(repo: ledger_store::WorkflowRepository, f: &Fixture, op: Op, key: &str) -> OpFuture {
+/// Run `op` with `key` through `store` (whose repositories may carry a hook) against `f`.
+fn run(store: PostgresLedgerStore, f: &Fixture, op: Op, key: &str) -> OpFuture {
+    let repo = store.workflows().clone();
+    let validations = store.validations().clone();
     let g = f.g.clone();
     let head = f.head.clone();
     let candidate = f.candidate.clone();
@@ -586,6 +598,33 @@ fn run(repo: ledger_store::WorkflowRepository, f: &Fixture, op: Op, key: &str) -
                         "decision:{} event:{} outbox:{} version:{} head:{}",
                         r.decision_id, r.ref_event_id, r.outbox_id, r.ref_version, r.head
                     ),
+                }
+            }
+            Op::Validate => {
+                let request = validate_req(&g, candidate.as_ref().unwrap(), &key);
+                let ticket = match validations.begin(&request).await? {
+                    ValidationBegin::Replayed(recorded) => {
+                        return Ok(Outcome {
+                            replayed: true,
+                            ids: format!("validation:{}", recorded.validation_id),
+                        });
+                    }
+                    ValidationBegin::Fresh(ticket) => ticket,
+                };
+                let r = validations
+                    .record(
+                        &request,
+                        &ticket,
+                        conforming(context_for(
+                            &g,
+                            candidate.as_ref().unwrap(),
+                            ticket.state_digest(),
+                        )),
+                    )
+                    .await?;
+                Outcome {
+                    replayed: r.replayed,
+                    ids: format!("validation:{}", r.validation_id),
                 }
             }
             Op::Reject => {
@@ -674,9 +713,27 @@ fn run(repo: ledger_store::WorkflowRepository, f: &Fixture, op: Op, key: &str) -
     })
 }
 
-/// The identity the *database* holds for the newest result of `op` on `f.g`, as the `ids`
-/// fragment a replay must contain.
-async fn durable_id_fragment(store: &PostgresLedgerStore, f: &Fixture, op: Op) -> String {
+/// The identity the *database* holds for the newest result of `op` on `f.g` (for the
+/// validation: the result the idempotency row of `key` names), as the `ids` fragment a replay
+/// must contain.
+async fn durable_id_fragment(
+    store: &PostgresLedgerStore,
+    f: &Fixture,
+    op: Op,
+    key: &str,
+) -> String {
+    if op == Op::Validate {
+        let id: String = sqlx::query_scalar(
+            "SELECT result_validation_id FROM idempotency WHERE graph_id = $1 AND operation = 'validate' \
+             AND idempotency_key = $2",
+        )
+        .bind(f.g.as_str())
+        .bind(key)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        return format!("validation:{id}");
+    }
     let (sql, label) = match op {
         Op::Prepare | Op::MergePropose => (
             "SELECT max(proposal_id) FROM proposals WHERE graph_id = $1",
@@ -690,6 +747,7 @@ async fn durable_id_fragment(store: &PostgresLedgerStore, f: &Fixture, op: Op) -
             "SELECT max(event_id) FROM branch_events WHERE graph_id = $1",
             "event",
         ),
+        Op::Validate => unreachable!(),
     };
     let id: i64 = sqlx::query_scalar(sql)
         .bind(f.g.as_str())
@@ -699,18 +757,80 @@ async fn durable_id_fragment(store: &PostgresLedgerStore, f: &Fixture, op: Op) -
     format!("{label}:{id}")
 }
 
-/// Start `op` on a repository carrying `hook`, wait until it reaches the hook, and abandon it
-/// (the task is aborted: the future, its transaction and its pooled connection are dropped
-/// exactly as an edge-timeout drop of a handler future does).
-async fn abandon_at(
-    repo: &ledger_store::WorkflowRepository,
-    f: &Fixture,
-    op: Op,
-    key: &str,
-    hook: PauseHook,
+/// Validation fixtures (the shape `pg_validation` uses): a request whose digest covers the
+/// candidate and hints, a context naming the ticket's state digest, a conforming outcome.
+fn validate_req(g: &GraphId, candidate: &CommitId, key: &str) -> ValidateRequest {
+    let hints = RequestedContext::default();
+    let mut digest = format!("validate:{candidate}:").into_bytes();
+    hints.encode_into(&mut digest).unwrap();
+    ValidateRequest {
+        scope: RequestScope {
+            principal: actor("validator-caller"),
+            graph: g.clone(),
+            idempotency_key: key.to_owned(),
+            request_digest: ContentId::for_bytes(&digest),
+            correlation_id: None,
+        },
+        candidate: candidate.clone(),
+        requested: hints,
+    }
+}
+
+fn context_for(g: &GraphId, candidate: &CommitId, state: &ContentId) -> SemanticExecutionContext {
+    SemanticExecutionContext {
+        graph_id: g.clone(),
+        candidate_commit: candidate.clone(),
+        candidate_state_digest: state.clone(),
+        base_kb: BaseKb {
+            kb_id: "urn:exodus:kb:lc".into(),
+            revision: "kbrev-1".into(),
+        },
+        ontology: Some(Ontology {
+            id: "urn:sculpin:ontology:core".into(),
+            version: "O1".into(),
+        }),
+        shapes: ShapeSet {
+            id: "urn:sculpin:shapes:core".into(),
+            version: "S1".into(),
+        },
+        reasoning: None,
+        sources_revision: None,
+        virtual_contexts: vec![],
+        validator: ValidatorIdentity {
+            service_id: "urn:sculpin:validator".into(),
+            service_version: "1.0".into(),
+            configuration_version: "c1".into(),
+        },
+    }
+}
+
+fn conforming(context: SemanticExecutionContext) -> ValidatorOutcome {
+    ValidatorOutcome {
+        context,
+        outcome: ValidationOutcome::conforms(),
+        report_digest: ContentId::for_bytes(b"report-ok"),
+        report_reference: None,
+    }
+}
+
+/// Wait until the operation reaches its hook — or fail at once if it ended first (a bound that
+/// fired early, a refused acquisition), instead of hanging on a hook that is never reached.
+async fn reached_or_failed<T: std::fmt::Debug>(
+    hook: &PauseHook,
+    handle: &mut tokio::task::JoinHandle<Result<T, LedgerError>>,
 ) {
-    let repo = repo.clone().with_pause_hook(hook.clone());
-    let handle = tokio::spawn(run(repo, f, op, key));
+    tokio::select! {
+        () = hook.reached() => {}
+        r = handle => panic!("the operation ended before reaching the hook: {r:?}"),
+    }
+}
+
+/// Start `op` on a store whose repositories carry `hook`, wait until it reaches the hook, and
+/// abandon it (the task is aborted: the future, its transaction and its pooled connection are
+/// dropped exactly as the pre-M2 edge dropped a handler future).
+async fn abandon_at(store: &PostgresLedgerStore, f: &Fixture, op: Op, key: &str, hook: PauseHook) {
+    let hooked = store.clone().with_workflow_pause_hook(hook.clone());
+    let handle = tokio::spawn(run(hooked, f, op, key));
     hook.reached().await;
     handle.abort();
     let joined = handle.await;
@@ -725,7 +845,8 @@ async fn abandon_at(
 /// partial row in any graph-scoped table, every lock its session held is released (observed in
 /// `pg_locks`, timed), the session is idle, and the same-key retry runs fresh — never a
 /// replay — producing exactly the rows a clean run produces (ADR-0013: results, not
-/// reservations; a rolled-back attempt leaves the key unused). The eight workflow write paths.
+/// reservations; a rolled-back attempt leaves the key unused). The nine workflow write paths,
+/// the validation record included (M2 closed that M1 gap).
 #[tokio::test]
 #[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
 async fn a_write_dropped_before_commit_rolls_back_leaves_the_key_unused_and_the_retry_runs_fresh() {
@@ -738,9 +859,7 @@ async fn a_write_dropped_before_commit_rolls_back_leaves_the_key_unused_and_the_
         // Reference: the rows one clean execution produces.
         let clean = fixture(&store, op).await;
         let before = counts(&store, &clean.g).await;
-        let reference = run(store.workflows().clone(), &clean, op, "clean")
-            .await
-            .unwrap();
+        let reference = run(store.clone(), &clean, op, "clean").await.unwrap();
         assert!(!reference.replayed, "{op:?}");
         let expected = delta(&before, &counts(&store, &clean.g).await);
         assert!(
@@ -752,7 +871,7 @@ async fn a_write_dropped_before_commit_rolls_back_leaves_the_key_unused_and_the_
         let f = fixture(&store, op).await;
         let before = counts(&store, &f.g).await;
         abandon_at(
-            named.workflows(),
+            &named,
             &f,
             op,
             "dropped",
@@ -786,9 +905,7 @@ async fn a_write_dropped_before_commit_rolls_back_leaves_the_key_unused_and_the_
         );
         // The retry runs afresh and writes exactly one clean execution's rows.
         let retry_started = Instant::now();
-        let retried = run(store.workflows().clone(), &f, op, "dropped")
-            .await
-            .unwrap();
+        let retried = run(store.clone(), &f, op, "dropped").await.unwrap();
         let retry_took = retry_started.elapsed();
         assert!(
             !retried.replayed,
@@ -806,9 +923,7 @@ async fn a_write_dropped_before_commit_rolls_back_leaves_the_key_unused_and_the_
             "{op:?}"
         );
         // A second retry replays the retry's result, not anything of the dropped attempt.
-        let replay = run(store.workflows().clone(), &f, op, "dropped")
-            .await
-            .unwrap();
+        let replay = run(store.clone(), &f, op, "dropped").await.unwrap();
         assert_eq!(
             replay,
             Outcome {
@@ -835,7 +950,8 @@ async fn a_write_dropped_before_commit_rolls_back_leaves_the_key_unused_and_the_
 /// durable result: every row is there, the session is idle (`pg_stat_activity`), the
 /// invariants hold, and the same-key retry replays exactly the identities the database holds
 /// without writing anything. COMMIT is the durable-outcome boundary; the HTTP acknowledgement
-/// that may be lost is downstream of it. The eight workflow write paths.
+/// that may be lost is downstream of it. The nine workflow write paths, the validation record
+/// included.
 #[tokio::test]
 #[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
 async fn a_write_dropped_after_commit_is_durable_and_the_retry_replays_exactly() {
@@ -845,15 +961,13 @@ async fn a_write_dropped_after_commit_is_durable_and_the_retry_replays_exactly()
     for op in OPS {
         let clean = fixture(&store, op).await;
         let before = counts(&store, &clean.g).await;
-        run(store.workflows().clone(), &clean, op, "clean")
-            .await
-            .unwrap();
+        run(store.clone(), &clean, op, "clean").await.unwrap();
         let expected = delta(&before, &counts(&store, &clean.g).await);
 
         let f = fixture(&store, op).await;
         let before = counts(&store, &f.g).await;
         abandon_at(
-            named.workflows(),
+            &named,
             &f,
             op,
             "lost",
@@ -880,10 +994,8 @@ async fn a_write_dropped_after_commit_is_durable_and_the_retry_replays_exactly()
             1,
             "{op:?}"
         );
-        let durable = durable_id_fragment(&store, &f, op).await;
-        let replay = run(store.workflows().clone(), &f, op, "lost")
-            .await
-            .unwrap();
+        let durable = durable_id_fragment(&store, &f, op, "lost").await;
+        let replay = run(store.clone(), &f, op, "lost").await.unwrap();
         assert!(
             replay.replayed,
             "{op:?}: the retry must replay the committed result"
@@ -897,9 +1009,7 @@ async fn a_write_dropped_after_commit_is_durable_and_the_retry_replays_exactly()
             after_drop,
             "{op:?}: a replay writes nothing"
         );
-        let again = run(store.workflows().clone(), &f, op, "lost")
-            .await
-            .unwrap();
+        let again = run(store.clone(), &f, op, "lost").await.unwrap();
         assert_eq!(again, replay, "{op:?}: replays are stable");
     }
     verify_clean(&store).await;
@@ -911,9 +1021,8 @@ async fn a_write_dropped_after_commit_is_durable_and_the_retry_replays_exactly()
 /// reconstructions), the public state read (membership lookup, then reconstruction) and the
 /// first-parent history walk: no path ever needs two connections at once, so one admitted
 /// operation occupies at most one connection (the DB-work permit of ADR-0026 bounds
-/// connections one-to-one). Plan 0012 proved prepare / preview / propose / apply this way.
-/// Not covered here: the validation begin/record pair (needs the validation fixtures;
-/// Plan 0013 lists it before M2 acceptance).
+/// connections one-to-one). Plan 0012 proved prepare / preview / propose / apply this way;
+/// M2 added the validation begin/record pair (`Op::Validate`).
 #[tokio::test]
 #[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
 async fn every_heavy_store_path_completes_on_a_one_connection_pool() {
@@ -921,7 +1030,7 @@ async fn every_heavy_store_path_completes_on_a_one_connection_pool() {
     let one = named_store(&unique("lc-one"), 1).await;
     for op in OPS {
         let f = fixture(&owner, op).await;
-        let r = run(one.workflows().clone(), &f, op, "one").await.unwrap();
+        let r = run(one.clone(), &f, op, "one").await.unwrap();
         assert!(!r.replayed, "{op:?}");
     }
     let f = fixture(&owner, Op::MergePropose).await;
@@ -998,8 +1107,8 @@ async fn an_abandoned_active_statement_pins_its_connection_until_postgres_ends_i
         let f = fixture(&owner, Op::Accept).await;
         let before = counts(&owner, &f.g).await;
         let hook = PauseHook::slow_statement(HookPoint::BeforeCommit, sleep, 1);
-        let repo = one.workflows().clone().with_pause_hook(hook.clone());
-        let handle = tokio::spawn(run(repo, &f, Op::Accept, "pinned"));
+        let hooked = one.clone().with_workflow_pause_hook(hook.clone());
+        let handle = tokio::spawn(run(hooked, &f, Op::Accept, "pinned"));
         hook.reached().await;
         let statement_sent = Instant::now();
         // The statement is observably in flight server-side; then abandon the request exactly
@@ -1064,9 +1173,7 @@ async fn an_abandoned_active_statement_pins_its_connection_until_postgres_ends_i
             "the session idle without locks",
         )
         .await;
-        let retried = run(one.workflows().clone(), &f, Op::Accept, "pinned")
-            .await
-            .unwrap();
+        let retried = run(one.clone(), &f, Op::Accept, "pinned").await.unwrap();
         assert!(!retried.replayed, "{label}");
         report.push(format!(
             "{label}: statement_timeout {statement_timeout:?}, sleep {sleep:?}: active seen after {seen:?}; connection released {held_from_send:?} after the statement was sent ({held_after_drop:?} after the drop) — client-observed, one sample"
@@ -1185,12 +1292,11 @@ async fn wait_until_acquired(
     }
 }
 
-/// CHARACTERIZATION (ADR-0026 §2 input). PostgreSQL 17's `transaction_timeout` **terminates
-/// the session** (FATAL, SQLSTATE 25P04) rather than cancelling the statement: the pooled
-/// connection is gone and the pool reconnects; today the error is not classified as retryable
-/// (it surfaces as `Storage` or, if the socket closes first, as `DependencyUnavailable`). On
-/// PostgreSQL 15 the setting does not exist (42704). Both facts are asserted, so the test is
-/// meaningful on either server.
+/// ACCEPTED (M2; M1 characterization: the error then classified `Storage`). PostgreSQL 17's
+/// `transaction_timeout` **terminates the session** (FATAL, SQLSTATE 25P04) rather than
+/// cancelling the statement: the pooled connection is gone and the pool reconnects; since M2
+/// the error is retryable (`DependencyTimeout`, ADR-0026 §2). On PostgreSQL 15 the setting does
+/// not exist (42704). Both facts are asserted, so the test is meaningful on either server.
 #[tokio::test]
 #[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
 async fn pg17_transaction_timeout_terminates_the_session_and_pg15_lacks_it() {
@@ -1239,11 +1345,8 @@ async fn pg17_transaction_timeout_terminates_the_session_and_pg15_lacks_it() {
     };
     let classified = ledger_store::classify_db_error(err);
     assert!(
-        matches!(
-            classified,
-            LedgerError::Storage(_) | LedgerError::DependencyUnavailable(_)
-        ),
-        "today's classification of a transaction_timeout termination: {classified:?}"
+        matches!(classified, LedgerError::DependencyTimeout(_)),
+        "25P04 is retryable since M2 (ADR-0026 §2): {classified:?}"
     );
     // The session is terminated: the next statement on this connection fails, and the pool
     // reconnects with a new backend.
@@ -1287,7 +1390,7 @@ async fn a_statement_timeout_inside_an_accept_is_a_dependency_timeout_and_the_re
     let hook = PauseHook::slow_statement(HookPoint::BeforeCommit, Duration::from_secs(3), 1);
     let started = Instant::now();
     let err = run(
-        short.workflows().clone().with_pause_hook(hook),
+        short.clone().with_workflow_pause_hook(hook),
         &f,
         Op::Accept,
         "st",
@@ -1305,9 +1408,7 @@ async fn a_statement_timeout_inside_an_accept_is_a_dependency_timeout_and_the_re
     );
     assert_eq!(delta(&before, &counts(&owner, &f.g).await), BTreeMap::new());
     assert_eq!(idempotency_rows(&owner, &f.g, "accept", "st").await, 0);
-    let retried = run(short.workflows().clone(), &f, Op::Accept, "st")
-        .await
-        .unwrap();
+    let retried = run(short.clone(), &f, Op::Accept, "st").await.unwrap();
     assert!(!retried.replayed);
     verify_clean(&owner).await;
 }
@@ -1336,9 +1437,7 @@ async fn a_lock_timeout_on_the_ref_row_during_accept_is_a_dependency_timeout_and
         .await
         .unwrap();
     let started = Instant::now();
-    let err = run(short.workflows().clone(), &f, Op::Accept, "lt")
-        .await
-        .unwrap_err();
+    let err = run(short.clone(), &f, Op::Accept, "lt").await.unwrap_err();
     let took = started.elapsed();
     assert!(matches!(err, LedgerError::DependencyTimeout(_)), "{err:?}");
     assert!(
@@ -1348,9 +1447,7 @@ async fn a_lock_timeout_on_the_ref_row_during_accept_is_a_dependency_timeout_and
     assert_eq!(idempotency_rows(&owner, &f.g, "accept", "lt").await, 0);
     assert_eq!(delta(&before, &counts(&owner, &f.g).await), BTreeMap::new());
     holder.rollback().await.unwrap();
-    let retried = run(short.workflows().clone(), &f, Op::Accept, "lt")
-        .await
-        .unwrap();
+    let retried = run(short.clone(), &f, Op::Accept, "lt").await.unwrap();
     assert!(!retried.replayed);
     verify_clean(&owner).await;
 }
@@ -1690,49 +1787,55 @@ async fn concurrent_same_key_merge_applies_execute_once_and_replay() {
     verify_clean(&store).await;
 }
 
-// ---- transaction bound (M2) ------------------------------------------------------------------
+// ---- transaction bound (ADR-0026 §2; M2) -------------------------------------------------------
 
-/// FUTURE ACCEPTANCE (Plan 0013 M2, ADR-0026 §2: no late commit). An accept whose in-transaction
-/// work is three statements of 400 ms each — every one well inside `statement_timeout` (1 s) —
-/// exceeds a 500 ms transaction bound. Today no bound exists: the transaction commits after
-/// ≈ 1.2 s and this test fails (the red evidence recorded in Plan 0013). The contract: the
-/// check before *sending* `COMMIT` sees the bound exceeded and rolls back with
-/// `DependencyTimeout`, key unused, no later than the injected work plus a round trip (the
-/// injected statements are one uninterruptible unit, so this test exercises the pre-COMMIT
-/// check; the per-statement check is M2's own unit test, and the statement tail is proven by
-/// `a_statement_timeout_inside_an_accept_…`). When M2 lands, the bound becomes a
-/// `DbSessionLimits` setting and this test sets it instead of the constant.
+/// ACCEPTED (M2; was `future_a_transaction_exceeding_its_bound_does_not_commit_late`, red before
+/// M2: committed after 1.221 s / 1.214 s past a 500 ms bound). An accept whose in-transaction
+/// work is three statements of 700 ms each — every one inside `statement_timeout` (2 s) —
+/// exceeds a 1.5 s transaction bound: the check before *sending* `COMMIT` sees the bound
+/// exceeded and rolls back with `DependencyTimeout`, key unused, no later than the injected
+/// work plus a round trip (the injected statements are one uninterruptible unit, so this
+/// exercises the pre-COMMIT check; the per-phase check is `…after_the_replay_check…` below, and
+/// the statement tail is bounded by `statement_timeout`, `a_statement_timeout_inside_an_accept_…`).
 #[tokio::test]
-#[ignore = "FUTURE ACCEPTANCE (Plan 0013 M2): requires PostgreSQL and the transaction bound"]
-async fn future_a_transaction_exceeding_its_bound_does_not_commit_late() {
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn a_transaction_exceeding_its_bound_does_not_commit_late() {
     let owner = store().await;
-    let bound = Duration::from_millis(500);
-    let injected = Duration::from_millis(400) * 3;
-    let short = store_with(
+    let bound = Duration::from_millis(1500);
+    let injected = Duration::from_millis(700) * 3;
+    // Mechanism-level settings (statement_timeout > transaction_bound would be refused by the
+    // server's start-up validation): the point is the pre-COMMIT check, not a valid deployment.
+    let short = store_with_limits(
         &unique("lc-tx"),
-        2,
-        Duration::from_secs(1),
-        Duration::from_secs(10),
+        DbSessionLimits {
+            max_connections: 2,
+            statement_timeout: Duration::from_secs(2),
+            lock_timeout: Duration::from_secs(1),
+            transaction_bound: bound,
+            ..DbSessionLimits::default()
+        },
     )
     .await;
     let f = fixture(&owner, Op::Accept).await;
     let before = counts(&owner, &f.g).await;
-    let hook = PauseHook::slow_statement(HookPoint::BeforeCommit, Duration::from_millis(400), 3);
-    let started = Instant::now();
-    let result = run(
-        short.workflows().clone().with_pause_hook(hook),
+    let hook = PauseHook::slow_statement(HookPoint::BeforeCommit, Duration::from_millis(700), 3);
+    let mut handle = tokio::spawn(run(
+        short.clone().with_workflow_pause_hook(hook.clone()),
         &f,
         Op::Accept,
         "tx-bound",
-    )
-    .await;
+    ));
+    reached_or_failed(&hook, &mut handle).await;
+    // Measured from the hook (the injected statements start here), not from the request.
+    let started = Instant::now();
+    let result = handle.await.unwrap();
     let took = started.elapsed();
     assert!(
-        matches!(result, Err(LedgerError::DependencyTimeout(_))),
+        matches!(&result, Err(LedgerError::DependencyTimeout(m)) if m.contains("exceeded its bound") && m.contains("before COMMIT")),
         "a transaction past its {bound:?} bound must not commit; got {result:?} after {took:?}"
     );
     assert!(
-        took <= injected + Duration::from_millis(300),
+        took <= injected + Duration::from_millis(400),
         "rolled back at the pre-COMMIT check: {took:?}"
     );
     assert_eq!(delta(&before, &counts(&owner, &f.g).await), BTreeMap::new());
@@ -1740,37 +1843,46 @@ async fn future_a_transaction_exceeding_its_bound_does_not_commit_late() {
         idempotency_rows(&owner, &f.g, "accept", "tx-bound").await,
         0
     );
-    let retried = run(short.workflows().clone(), &f, Op::Accept, "tx-bound")
+    let retried = run(short.clone(), &f, Op::Accept, "tx-bound")
         .await
         .unwrap();
     assert!(!retried.replayed);
+    verify_clean(&owner).await;
 }
 
-/// FUTURE ACCEPTANCE (Plan 0013 M2, ADR-0026 §2: the pre-COMMIT check with real statements
-/// only). An accept paused just before `COMMIT` (every row written, no injected statement) for
-/// longer than its 500 ms bound must, when it resumes, roll back with `DependencyTimeout` and
-/// leave the key unused; today it commits (red). The wall-clock wait *is* the scenario here.
+/// ACCEPTED (M2; was `future_a_transaction_paused_past_its_bound_rolls_back_before_commit`, red
+/// before M2: committed). An accept paused just before `COMMIT` (every row written, no injected
+/// statement) for longer than its 500 ms bound rolls back with `DependencyTimeout` when it
+/// resumes and leaves the key unused. The wall-clock wait *is* the scenario here.
 #[tokio::test]
-#[ignore = "FUTURE ACCEPTANCE (Plan 0013 M2): requires PostgreSQL and the transaction bound"]
-async fn future_a_transaction_paused_past_its_bound_rolls_back_before_commit() {
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn a_transaction_paused_past_its_bound_rolls_back_before_commit() {
     let owner = store().await;
     let bound = Duration::from_millis(500);
-    let named = named_store(&unique("lc-txp"), 2).await;
+    let named = store_with_limits(
+        &unique("lc-txp"),
+        DbSessionLimits {
+            max_connections: 2,
+            transaction_bound: bound,
+            ..DbSessionLimits::default()
+        },
+    )
+    .await;
     let f = fixture(&owner, Op::Accept).await;
     let before = counts(&owner, &f.g).await;
     let hook = PauseHook::new(HookPoint::BeforeCommit);
-    let handle = tokio::spawn(run(
-        named.workflows().clone().with_pause_hook(hook.clone()),
+    let mut handle = tokio::spawn(run(
+        named.clone().with_workflow_pause_hook(hook.clone()),
         &f,
         Op::Accept,
         "tx-paused",
     ));
-    hook.reached().await;
+    reached_or_failed(&hook, &mut handle).await;
     tokio::time::sleep(bound + Duration::from_millis(300)).await;
     hook.resume();
     let result = handle.await.unwrap();
     assert!(
-        matches!(result, Err(LedgerError::DependencyTimeout(_))),
+        matches!(&result, Err(LedgerError::DependencyTimeout(m)) if m.contains("before COMMIT")),
         "a transaction resumed past its {bound:?} bound must not commit; got {result:?}"
     );
     assert_eq!(delta(&before, &counts(&owner, &f.g).await), BTreeMap::new());
@@ -1778,8 +1890,368 @@ async fn future_a_transaction_paused_past_its_bound_rolls_back_before_commit() {
         idempotency_rows(&owner, &f.g, "accept", "tx-paused").await,
         0
     );
-    let retried = run(named.workflows().clone(), &f, Op::Accept, "tx-paused")
+    let retried = run(named.clone(), &f, Op::Accept, "tx-paused")
         .await
         .unwrap();
     assert!(!retried.replayed);
+}
+
+/// ACCEPTED (M2). The deadline is checked before the statement phases, not only before
+/// `COMMIT`: every write path paused right after its replay lookup (idempotency lock held,
+/// nothing else run) for longer than its bound rolls back at the first phase check with
+/// `DependencyTimeout` naming the phase, writes nothing, and the retry runs fresh.
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn a_transaction_paused_past_its_bound_after_the_replay_check_rolls_back_at_the_first_phase()
+{
+    let owner = store().await;
+    let bound = Duration::from_millis(300);
+    let named = store_with_limits(
+        &unique("lc-txr"),
+        DbSessionLimits {
+            max_connections: 4,
+            transaction_bound: bound,
+            ..DbSessionLimits::default()
+        },
+    )
+    .await;
+    for op in OPS {
+        let f = fixture(&owner, op).await;
+        let before = counts(&owner, &f.g).await;
+        let hook = PauseHook::new(HookPoint::AfterReplayCheck);
+        let mut handle = tokio::spawn(run(
+            named.clone().with_workflow_pause_hook(hook.clone()),
+            &f,
+            op,
+            "phase",
+        ));
+        reached_or_failed(&hook, &mut handle).await;
+        tokio::time::sleep(bound + Duration::from_millis(200)).await;
+        hook.resume();
+        let result = handle.await.unwrap();
+        // The very first phase check of each path, by its name in the error.
+        let first_phase = match op {
+            Op::Prepare | Op::BranchDelete | Op::BranchRestore | Op::MergePropose => {
+                "before the graph and branch locks"
+            }
+            Op::Accept | Op::BranchCreate | Op::MergeApply => {
+                "before the graph, ref and branch locks"
+            }
+            Op::Reject => "before the graph lock;",
+            Op::Validate => "before the graph lock and the context insert",
+        };
+        assert!(
+            matches!(&result, Err(LedgerError::DependencyTimeout(m)) if m.contains("exceeded its bound") && m.contains(first_phase)),
+            "{op:?}: the first phase check ({first_phase}) must roll back; got {result:?}"
+        );
+        assert_eq!(
+            delta(&before, &counts(&owner, &f.g).await),
+            BTreeMap::new(),
+            "{op:?}"
+        );
+        assert_eq!(
+            idempotency_rows(&owner, &f.g, op.operation(), "phase").await,
+            0,
+            "{op:?}"
+        );
+        let retried = run(named.clone(), &f, op, "phase").await.unwrap();
+        assert!(!retried.replayed, "{op:?}");
+    }
+    verify_clean(&owner).await;
+}
+
+/// ACCEPTED (M2, ADR-0026 §2). PostgreSQL 17's `transaction_timeout` backstop through the
+/// production pool: `DbSessionLimits::pool_options` sets it to `transaction_bound +
+/// statement_timeout` on a 17 server and not at all on 15. Two injected statements of 1.5 s
+/// (each inside `statement_timeout` = 2 s) under a 300 ms bound: on 17 the backstop (2.3 s)
+/// terminates the session before the pre-COMMIT check could run (3 s) — SQLSTATE 25P04,
+/// classified `DependencyTimeout`, the backend replaced and the pool serving again (the
+/// reconnect cost is measured); on 15 the pre-COMMIT check ends the transaction at ≈ 3 s. On
+/// both: nothing durable, key unused, retry fresh. The backstop is a backstop: the ledger's
+/// own check is what normally fires (the tests above).
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn the_pg17_transaction_timeout_backstop_fires_only_past_the_bound_plus_one_statement() {
+    let owner = store().await;
+    let app = unique("lc-backstop");
+    let limits = DbSessionLimits {
+        max_connections: 1,
+        statement_timeout: Duration::from_secs(2),
+        lock_timeout: Duration::from_millis(500),
+        transaction_bound: Duration::from_millis(300),
+        ..DbSessionLimits::default()
+    };
+    let bounded = store_with_limits(&app, limits).await;
+    let version: String = sqlx::query_scalar("SHOW server_version_num")
+        .fetch_one(bounded.pool())
+        .await
+        .unwrap();
+    let pg17 = version.parse::<i64>().unwrap() >= 170000;
+    let setting: String = sqlx::query_scalar("SHOW transaction_timeout")
+        .fetch_one(bounded.pool())
+        .await
+        .map(|s: String| s)
+        .unwrap_or_else(|_| "absent".into());
+    if pg17 {
+        assert_eq!(setting, "2300ms", "backstop = bound + statement_timeout");
+    } else {
+        assert_eq!(
+            setting, "absent",
+            "PostgreSQL 15 has no transaction_timeout"
+        );
+    }
+    let pid_before: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(bounded.pool())
+        .await
+        .unwrap();
+    let f = fixture(&owner, Op::Accept).await;
+    let before = counts(&owner, &f.g).await;
+    // The injected two-statement loop deliberately skips the ledger's own per-statement checks
+    // (a simulated check-skipping bug): only then does the backstop have anything to end.
+    // Mechanism-level settings (statement > bound) that start-up validation would refuse.
+    let hook = PauseHook::slow_statement(HookPoint::BeforeCommit, Duration::from_millis(1500), 2);
+    let mut handle = tokio::spawn(run(
+        bounded.clone().with_workflow_pause_hook(hook.clone()),
+        &f,
+        Op::Accept,
+        "backstop",
+    ));
+    reached_or_failed(&hook, &mut handle).await;
+    let started = Instant::now();
+    let result = handle.await.unwrap();
+    let took = started.elapsed();
+    let message = match &result {
+        Err(LedgerError::DependencyTimeout(m)) => m.clone(),
+        other => panic!("expected DependencyTimeout, got {other:?} after {took:?}"),
+    };
+    if pg17 {
+        assert!(
+            message.contains("transaction timeout") || message.contains("25P04"),
+            "the backstop terminated the session: {message}"
+        );
+        assert!(
+            took >= Duration::from_millis(2200) && took < Duration::from_millis(3300),
+            "fired at ≈ 2.3 s after the statements began: {took:?}"
+        );
+    } else {
+        assert!(message.contains("exceeded its bound"), "{message}");
+        assert!(
+            took >= Duration::from_millis(2900) && took < Duration::from_millis(4000),
+            "the pre-COMMIT check at ≈ 3 s after the statements began: {took:?}"
+        );
+    }
+    assert_eq!(delta(&before, &counts(&owner, &f.g).await), BTreeMap::new());
+    assert_eq!(
+        idempotency_rows(&owner, &f.g, "accept", "backstop").await,
+        0
+    );
+    // The pool serves again; on 17 the terminated backend was replaced (reconnect cost).
+    let reconnect_started = Instant::now();
+    let pid_after: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(bounded.pool())
+        .await
+        .unwrap();
+    let reconnect = reconnect_started.elapsed();
+    if pg17 {
+        assert_ne!(
+            pid_after, pid_before,
+            "a new backend replaced the terminated one"
+        );
+    }
+    let retried = run(bounded.clone(), &f, Op::Accept, "backstop")
+        .await
+        .unwrap();
+    assert!(!retried.replayed);
+    println!(
+        "server {version}: transaction_timeout setting {setting}; bound exceeded after {took:?} ({}); next acquire + statement {reconnect:?}",
+        if pg17 {
+            "25P04 backstop"
+        } else {
+            "pre-COMMIT check"
+        }
+    );
+}
+
+/// ACCEPTED (M2, ADR-0026 §3). A connection idle in the pool for longer than the transaction
+/// bound is borrowed normally afterwards: none of the session timeouts is armed outside a
+/// statement or an open transaction, and no transaction-local state leaks to the next
+/// borrower (the backend pid is unchanged on both servers; a full accept runs on it).
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn a_connection_idle_in_the_pool_longer_than_the_bound_is_borrowed_normally() {
+    let owner = store().await;
+    // Every timer short enough that the idle wait exceeds all of them: bound 300 ms, PostgreSQL
+    // 17 backstop = bound + statement = 500 ms, idle-in-transaction 400 ms.
+    let one = store_with_limits(
+        &unique("lc-idle"),
+        DbSessionLimits {
+            max_connections: 1,
+            statement_timeout: Duration::from_millis(200),
+            lock_timeout: Duration::from_millis(100),
+            idle_in_transaction_timeout: Duration::from_millis(400),
+            transaction_bound: Duration::from_millis(300),
+            ..DbSessionLimits::default()
+        },
+    )
+    .await;
+    let identity = || async {
+        let row = sqlx::query(
+            "SELECT pg_backend_pid() AS pid, current_setting('statement_timeout') AS st, \
+             current_setting('lock_timeout') AS lt, \
+             current_setting('idle_in_transaction_session_timeout') AS it, \
+             (SELECT backend_start::text FROM pg_stat_activity WHERE pid = pg_backend_pid()) AS started",
+        )
+        .fetch_one(one.pool())
+        .await
+        .unwrap();
+        (
+            row.get::<i32, _>("pid"),
+            row.get::<String, _>("st"),
+            row.get::<String, _>("lt"),
+            row.get::<String, _>("it"),
+            row.get::<String, _>("started"),
+        )
+    };
+    let before = identity().await;
+    assert_eq!(
+        (&before.1[..], &before.2[..], &before.3[..]),
+        ("200ms", "100ms", "400ms")
+    );
+    // The idle wait is the scenario: longer than the bound, the backstop and the idle timeout.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let after = identity().await;
+    assert_eq!(
+        after, before,
+        "the same backend, started at the same time, with the same session settings"
+    );
+    // It serves a whole accept (several statements and a COMMIT inside a bounded transaction).
+    let f = fixture(&owner, Op::Accept).await;
+    let r = run(one.clone(), &f, Op::Accept, "idle").await.unwrap();
+    assert!(!r.replayed);
+    assert_eq!(identity().await, before);
+}
+
+/// ACCEPTED (M2, ADR-0026 §4). An error from `COMMIT` itself whose class is a lost connection
+/// is reported as `CommitOutcomeUnknown` (never as a rollback): the transaction, paused just
+/// before `COMMIT`, has its backend terminated from another session; `COMMIT` then fails on
+/// the dead connection. Here the server did roll back (the session is gone), so nothing is
+/// durable, the key is unused, and the retry by key runs fresh — which is exactly what the
+/// "outcome unknown; retry with the same key" guidance resolves to.
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn a_commit_on_a_terminated_connection_is_outcome_unknown_and_the_retry_runs_fresh() {
+    let owner = store().await;
+    let app = unique("lc-commit");
+    let one = named_store(&app, 1).await;
+    let f = fixture(&owner, Op::Accept).await;
+    let before = counts(&owner, &f.g).await;
+    let hook = PauseHook::new(HookPoint::BeforeCommit);
+    let mut handle = tokio::spawn(run(
+        one.clone().with_workflow_pause_hook(hook.clone()),
+        &f,
+        Op::Accept,
+        "commit-lost",
+    ));
+    reached_or_failed(&hook, &mut handle).await;
+    let paused: Vec<Session> = sessions(&owner, &app)
+        .await
+        .into_iter()
+        .filter(|s| s.state == "idle in transaction")
+        .collect();
+    assert_eq!(
+        paused.len(),
+        1,
+        "exactly one transaction is paused before COMMIT: {paused:?}"
+    );
+    let terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
+        .bind(paused[0].pid)
+        .fetch_one(owner.pool())
+        .await
+        .unwrap();
+    assert!(terminated);
+    hook.resume();
+    let result = handle.await.unwrap();
+    match &result {
+        Err(LedgerError::CommitOutcomeUnknown(inner)) => assert!(
+            matches!(
+                **inner,
+                LedgerError::DependencyUnavailable(_) | LedgerError::DependencyTimeout(_)
+            ),
+            "{inner:?}"
+        ),
+        other => panic!("COMMIT on a terminated connection must be outcome unknown, got {other:?}"),
+    }
+    assert_eq!(delta(&before, &counts(&owner, &f.g).await), BTreeMap::new());
+    assert_eq!(
+        idempotency_rows(&owner, &f.g, "accept", "commit-lost").await,
+        0
+    );
+    let retried = run(one.clone(), &f, Op::Accept, "commit-lost")
+        .await
+        .unwrap();
+    assert!(
+        !retried.replayed,
+        "the key was unused: the retry executes afresh"
+    );
+    verify_clean(&owner).await;
+}
+
+/// CHARACTERIZATION (Plan 0013 M1 review residual, documented contract). `immutable_objects` is
+/// content-addressed and shared by every graph and tenant. Two prepares of byte-identical
+/// patches (here two graphs; two tenants behave identically) race on the same object row:
+/// the second insert waits for the first transaction to end, and under the shortened
+/// `lock_timeout` that wait can legitimately surface as `DEPENDENCY_TIMEOUT` (55P03) — a
+/// retryable outcome, not a fault: once the first transaction commits the retry succeeds
+/// (`ON CONFLICT DO NOTHING`) and writes its own graph's rows. The stress and fault
+/// workloads never produce identical content, so the gate's `DEPENDENCY_TIMEOUT` policy stays.
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn an_identical_object_published_by_an_uncommitted_transaction_makes_the_second_prepare_wait()
+{
+    let owner = store().await;
+    let short = store_with(
+        &unique("lc-obj"),
+        2,
+        Duration::from_secs(10),
+        Duration::from_millis(300),
+    )
+    .await;
+    let a = fixture(&owner, Op::Prepare).await;
+    let b = fixture(&owner, Op::Prepare).await;
+    let before_b = counts(&owner, &b.g).await;
+    // Content no earlier test has published (objects are global): the same quad in both
+    // graphs gives byte-identical requested and effective patches, hence one object row.
+    let quad = format!("<urn:shared:{}> <urn:p> \"1\" .", unique("o"));
+    let req_a = prepare_req(&a.g, "main", a.head.clone(), "obj-a", &[&quad]);
+    let req_b = prepare_req(&b.g, "main", b.head.clone(), "obj-b", &[&quad]);
+    // A publishes the patch/candidate objects and pauses before COMMIT.
+    let hook = PauseHook::new(HookPoint::BeforeCommit);
+    let held = tokio::spawn({
+        let hooked = owner.clone().with_workflow_pause_hook(hook.clone());
+        async move { hooked.workflows().prepare(&req_a).await }
+    });
+    hook.reached().await;
+    // B prepares the identical content in another graph.
+    let started = Instant::now();
+    let err = short.workflows().prepare(&req_b).await.unwrap_err();
+    let took = started.elapsed();
+    assert!(matches!(err, LedgerError::DependencyTimeout(_)), "{err:?}");
+    assert!(
+        took >= Duration::from_millis(250) && took < Duration::from_secs(3),
+        "B waited for A's uncommitted object insert until lock_timeout: {took:?}"
+    );
+    assert_eq!(
+        delta(&before_b, &counts(&owner, &b.g).await),
+        BTreeMap::new()
+    );
+    hook.resume();
+    held.await.unwrap().unwrap();
+    // A committed; B's retry finds the shared object and writes its own rows.
+    let retried = short.workflows().prepare(&req_b).await.unwrap();
+    assert!(!retried.replayed);
+    assert!(delta(&before_b, &counts(&owner, &b.g).await).contains_key("proposals"));
+    verify_clean(&owner).await;
+    println!(
+        "shared-object wait surfaced as DEPENDENCY_TIMEOUT after {took:?}; the retry succeeded"
+    );
 }

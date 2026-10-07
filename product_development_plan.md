@@ -1798,8 +1798,10 @@ performance regression envelope
 > plan; acceptance tests come before any behaviour change, and the timeout/cancellation/
 > admission model needs an ADR before implementation. M1 (2026-10-07) measured the current
 > behaviour on PostgreSQL 17 and 15, added the deterministic lifecycle suites with red
-> `future_*` acceptance tests, fixed F5/F6, and ADR-0026 is drafted for owner review; M2/M3
-> start only after that review. Checkpoints are not started (§24).
+> `future_*` acceptance tests, fixed F5/F6; ADR-0026 was accepted and M2 (validated timeout
+> hierarchy, bounded transactions, tracked detached database operations, `REQUEST_TIMEOUT`,
+> drained shutdown) is complete with evidence on PostgreSQL 17 and 15; M3 (admission) and M4
+> (qualification) are next. Checkpoints are not started (§24).
 
 Deliver:
 

@@ -523,7 +523,7 @@ impl WorkflowRepository {
         commit: &CommitId,
         limits: TraversalLimits,
     ) -> Result<(CommitId, i64, bool), LedgerError> {
-        let mut conn = self.pool.acquire().await.map_err(db_error)?;
+        let mut conn = crate::lifecycle::acquire(&self.pool, self.session.acquire_timeout).await?;
         // Only an active graph of the caller's tenant is walked (nothing is read for, or
         // spent on, another tenant's graph); the transaction reports the precise error.
         let row = sqlx::query(
@@ -638,7 +638,8 @@ impl WorkflowRepository {
         // held; the connection is released before walking) — the scoped transaction below
         // checks again under the idempotency lock, for a request completed meanwhile.
         if request.from_commit.is_some() {
-            let mut conn = self.pool.acquire().await.map_err(db_error)?;
+            let mut conn =
+                crate::lifecycle::acquire(&self.pool, self.session.acquire_timeout).await?;
             if let Some(stored) =
                 Self::stored_result(&mut conn, scope, Operation::BranchCreate).await?
             {
@@ -656,10 +657,15 @@ impl WorkflowRepository {
                     .await,
             ),
         };
-        let mut tx = Self::begin_scoped(&self.pool, scope, Operation::BranchCreate).await?;
+        let mut tx =
+            Self::begin_scoped(&self.pool, &self.session, scope, Operation::BranchCreate).await?;
         if let Some(stored) = Self::stored_result(&mut tx, scope, Operation::BranchCreate).await? {
             return Self::replay_branch(&mut tx, stored, scope, "branch_created").await;
         }
+        #[cfg(feature = "test-hooks")]
+        self.hook_at(crate::test_hooks::HookPoint::AfterReplayCheck, &mut tx)
+            .await?;
+        tx.check_deadline("the graph, ref and branch locks")?;
         Self::graph_must_be_active(&mut tx, scope).await?;
         // Lock order: ref, then branch (as accept does).
         let source_ref = sqlx::query(
@@ -718,6 +724,7 @@ impl WorkflowRepository {
                 None => return Err(LedgerError::BranchPointUnreachable),
             },
         };
+        tx.check_deadline("the branch creation rows")?;
         let inserted = sqlx::query(
             "INSERT INTO refs (graph_id, branch, head, version, protected) VALUES ($1, $2, $3, 1, $4) \
              ON CONFLICT (graph_id, branch) DO NOTHING",
@@ -733,6 +740,7 @@ impl WorkflowRepository {
             return Err(LedgerError::BranchExists(request.name.clone()));
         }
         let actor = scope.principal.actor();
+        tx.check_deadline("the ref event")?;
         sqlx::query(
             "INSERT INTO ref_events (graph_id, branch, old_head, new_head, old_version, new_version, \
              operation, tenant_id, principal_id, principal_type, on_behalf_of, reason, correlation_id) \
@@ -749,6 +757,7 @@ impl WorkflowRepository {
         .execute(&mut *tx)
         .await
         .map_err(db_error)?;
+        tx.check_deadline("the branch row")?;
         sqlx::query(
             "INSERT INTO branches (graph_id, branch, tenant_id, status, lifecycle_version, origin, \
              source_branch, source_commit, require_validation, require_distinct_reviewer) \
@@ -764,6 +773,7 @@ impl WorkflowRepository {
         .execute(&mut *tx)
         .await
         .map_err(db_error)?;
+        tx.check_deadline("the branch event")?;
         let event = Self::insert_branch_event(
             &mut tx,
             scope,
@@ -777,6 +787,7 @@ impl WorkflowRepository {
             None,
         )
         .await?;
+        tx.check_deadline("the idempotency result")?;
         Self::record_branch_result(
             &mut tx,
             scope,
@@ -788,7 +799,7 @@ impl WorkflowRepository {
         #[cfg(feature = "test-hooks")]
         self.hook_at(crate::test_hooks::HookPoint::BeforeCommit, &mut tx)
             .await?;
-        tx.commit().await.map_err(db_error)?;
+        tx.commit().await?;
         #[cfg(feature = "test-hooks")]
         self.pause_at(crate::test_hooks::HookPoint::AfterCommit)
             .await;
@@ -844,10 +855,14 @@ impl WorkflowRepository {
             Operation::BranchDelete => "branch_deleted",
             _ => "branch_restored",
         };
-        let mut tx = Self::begin_scoped(&self.pool, scope, operation).await?;
+        let mut tx = Self::begin_scoped(&self.pool, &self.session, scope, operation).await?;
         if let Some(stored) = Self::stored_result(&mut tx, scope, operation).await? {
             return Self::replay_branch(&mut tx, stored, scope, result_kind).await;
         }
+        #[cfg(feature = "test-hooks")]
+        self.hook_at(crate::test_hooks::HookPoint::AfterReplayCheck, &mut tx)
+            .await?;
+        tx.check_deadline("the graph and branch locks")?;
         Self::graph_must_be_active(&mut tx, scope).await?;
         if request.name == "main" {
             return Err(LedgerError::BranchPolicyViolation(
@@ -887,6 +902,7 @@ impl WorkflowRepository {
             .map_err(db_error)?
             .parse()?;
         let version: i64 = head_row.try_get("version").map_err(db_error)?;
+        tx.check_deadline("the lifecycle change rows")?;
         sqlx::query(
             "UPDATE branches SET status = $3, lifecycle_version = lifecycle_version + 1, \
              updated_at = now() WHERE graph_id = $1 AND branch = $2",
@@ -897,6 +913,7 @@ impl WorkflowRepository {
         .execute(&mut *tx)
         .await
         .map_err(db_error)?;
+        tx.check_deadline("the branch event")?;
         let event = Self::insert_branch_event(
             &mut tx,
             scope,
@@ -910,11 +927,12 @@ impl WorkflowRepository {
             request.reason.as_deref(),
         )
         .await?;
+        tx.check_deadline("the idempotency result")?;
         Self::record_branch_result(&mut tx, scope, operation, result_kind, &event).await?;
         #[cfg(feature = "test-hooks")]
         self.hook_at(crate::test_hooks::HookPoint::BeforeCommit, &mut tx)
             .await?;
-        tx.commit().await.map_err(db_error)?;
+        tx.commit().await?;
         #[cfg(feature = "test-hooks")]
         self.pause_at(crate::test_hooks::HookPoint::AfterCommit)
             .await;
@@ -925,16 +943,19 @@ impl WorkflowRepository {
     }
 
     /// The graph must belong to the reading tenant (foreign and missing graphs are
-    /// indistinguishable).
+    /// indistinguishable). Takes and releases its own pooled connection: callers acquire
+    /// theirs *after* this check, never around it (a nested acquisition starves a small pool —
+    /// `p7a_every_heavy_route_completes_on_a_one_connection_pool` pins this).
     pub(crate) async fn readable_graph(
         &self,
         tenant: &TenantId,
         graph: &GraphId,
     ) -> Result<(), LedgerError> {
+        let mut conn = crate::lifecycle::acquire(&self.pool, self.session.acquire_timeout).await?;
         let owner: Option<String> =
             sqlx::query_scalar("SELECT tenant_id FROM graphs WHERE graph_id = $1")
                 .bind(graph.as_str())
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *conn)
                 .await
                 .map_err(db_error)?;
         if owner.as_deref() != Some(tenant.as_str()) {
@@ -952,12 +973,13 @@ impl WorkflowRepository {
     ) -> Result<Option<BranchInfo>, LedgerError> {
         validate_branch(name)?;
         self.readable_graph(tenant, graph).await?;
+        let mut conn = crate::lifecycle::acquire(&self.pool, self.session.acquire_timeout).await?;
         let row = sqlx::query(&format!(
             "{BRANCH_INFO_SELECT} WHERE b.graph_id = $1 AND b.branch = $2"
         ))
         .bind(graph.as_str())
         .bind(name)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *conn)
         .await
         .map_err(db_error)?;
         row.map(|r| info_from_row(&r)).transpose()
@@ -971,12 +993,13 @@ impl WorkflowRepository {
         limit: i64,
     ) -> Result<Vec<BranchInfo>, LedgerError> {
         self.readable_graph(tenant, graph).await?;
+        let mut conn = crate::lifecycle::acquire(&self.pool, self.session.acquire_timeout).await?;
         let rows = sqlx::query(&format!(
             "{BRANCH_INFO_SELECT} WHERE b.graph_id = $1 ORDER BY b.branch LIMIT $2"
         ))
         .bind(graph.as_str())
         .bind(limit.clamp(1, 10_000))
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *conn)
         .await
         .map_err(db_error)?;
         rows.iter().map(info_from_row).collect()
@@ -993,6 +1016,7 @@ impl WorkflowRepository {
     ) -> Result<Option<(Vec<BranchEvent>, Vec<RefMovement>)>, LedgerError> {
         validate_branch(name)?;
         self.readable_graph(tenant, graph).await?;
+        let mut conn = crate::lifecycle::acquire(&self.pool, self.session.acquire_timeout).await?;
         let limit = limit.clamp(1, 10_000);
         let events = sqlx::query(&format!(
             "SELECT * FROM (SELECT {BRANCH_EVENT_COLUMNS}, lifecycle_version AS lv FROM branch_events \
@@ -1001,7 +1025,7 @@ impl WorkflowRepository {
         .bind(graph.as_str())
         .bind(name)
         .bind(limit)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *conn)
         .await
         .map_err(db_error)?;
         if events.is_empty() {
@@ -1015,7 +1039,7 @@ impl WorkflowRepository {
         .bind(graph.as_str())
         .bind(name)
         .bind(limit)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *conn)
         .await
         .map_err(db_error)?;
         let movements = movements
@@ -1059,7 +1083,7 @@ impl WorkflowRepository {
         limits: TraversalLimits,
     ) -> Result<usize, LedgerError> {
         self.readable_graph(tenant, graph).await?;
-        let mut conn = self.pool.acquire().await.map_err(db_error)?;
+        let mut conn = crate::lifecycle::acquire(&self.pool, self.session.acquire_timeout).await?;
         let provider = GraphParents {
             conn: Mutex::new(&mut *conn),
             graph: graph.clone(),
@@ -1094,7 +1118,7 @@ impl WorkflowRepository {
         limits: TraversalLimits,
     ) -> Result<Vec<CommitId>, LedgerError> {
         self.readable_graph(tenant, graph).await?;
-        let mut conn = self.pool.acquire().await.map_err(db_error)?;
+        let mut conn = crate::lifecycle::acquire(&self.pool, self.session.acquire_timeout).await?;
         let provider = GraphParents {
             conn: Mutex::new(&mut *conn),
             graph: graph.clone(),
