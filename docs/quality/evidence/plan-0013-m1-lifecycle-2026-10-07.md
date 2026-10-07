@@ -1,8 +1,13 @@
 # Plan 0013 M1 — request-lifecycle characterization (2026-10-07)
 
-Measured on the unchanged production code of `d27e7f8` (the M1 change adds only
-`test-hooks` code, tests, the F5/F6 fixes, two start-up refusals of a `test-hooks` build and
-documentation) against two throwaway containers on this workstation: PostgreSQL 17.2
+Measured against the request lifecycle of `d27e7f8`, which M1 leaves unchanged (no
+timeout, admission, transaction or cancellation behaviour differs). M1 is not a
+documentation-only change: it adds `test-hooks` code and tests, the F5/F6 harness fixes, the
+start-up refusal of a `test-hooks` build in the three binaries, and one production-visible
+error-classification fix — **F11**: a sqlx `Error::Protocol` raised while PostgreSQL is in
+crash recovery is now a retryable `DEPENDENCY_UNAVAILABLE` (HTTP 503) instead of `INTERNAL`
+(HTTP 500); see the fault-run section at the end. The containers are two throwaway
+PostgreSQL servers on this workstation: PostgreSQL 17.2
 (`postgres:17.2-bookworm`, `127.0.0.1:55433`) and PostgreSQL 15.19 (`postgres:15-bookworm`,
 `127.0.0.1:55434`), both with a 1 GiB `/dev/shm`. The final figures below are from the runs
 after the five independent reviews, at code revision `647be51`. Commands:
