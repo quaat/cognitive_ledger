@@ -281,7 +281,7 @@ Revisions:
 - **Docs head** `93a7f90` and the final PR head add only docs and evidence:
   `git diff --stat e353b6c..<final head>` touches `docs/` only.
 - **Hosted CI** for `pull_request` runs on GitHub's test-merge commit, not on the branch
-  head. For the code head that is `f88ec80` (merge of `e353b6c` into `646b029`). The final
+  head. For the code head that is `c4abd3d` (merge of `e353b6c` into `646b029`). The final
   head's runs are listed in the PR description.
 
 | Gate | Revision | Result |
@@ -299,8 +299,8 @@ Revisions:
 | Benchmark `bear` | `93a7f90` | bear-b-ci 185 assertions, 0 failed; `VERIFY OK` |
 | Reconstruction characterization, official run 1 | clean worktree `4eb4d28` (`official=yes`) | `RECON PASS`, 144 points, 186 exact checks, 0 failures; `VERIFY OK`; 69 min |
 | Reconstruction characterization, official run 2 | clean worktree `e353b6c` (`official=yes`; quiet healthchecks, settled database) | `RECON PASS`, 144 points, 186 exact checks, 0 failures; `VERIFY OK`; API calls = store + 2 in every window |
-| Hosted CI, test-merge `f88ec80` (code head `e353b6c`) | ci-fast 37552533912, ci-integration 37552533888, ci-security 37552533866, ci-fuzz 37552533864, ci-benchmark 37552533925 | all success: fast; docker; container, dependency-review, supply-chain; fuzz-sanitizer (none), fuzz-sanitizer (address), aggregate `fuzz`; benchmark-ci |
-| Hosted `benchmark-ci` envelope (`f88ec80`) | run 37552533925 | job 4m55s (harness build 23 s, cached sources verified, fetch+prepare 14 s, stack 190 s, **benchmark run 32 s**: synthetic 1,115 + BEAR 185 assertions, 0 failed; `VERIFY OK`) |
+| Hosted CI, test-merge `c4abd3d` (code head `e353b6c`) | ci-fast 37552533912, ci-integration 37552533888, ci-security 37552533866, ci-fuzz 37552533864, ci-benchmark 37552533925 | all success: fast; docker; container, dependency-review, supply-chain; fuzz-sanitizer (none), fuzz-sanitizer (address), aggregate `fuzz`; benchmark-ci |
+| Hosted `benchmark-ci` envelope (`c4abd3d`) | run 37552533925 | job 4m55s (harness build 23 s, cached sources verified, fetch+prepare 14 s, stack 190 s, **benchmark run 32 s**: synthetic 1,115 + BEAR 185 assertions, 0 failed; `VERIFY OK`) |
 | Hosted `benchmark-ci` envelope, earlier heads | `097f517` / `4eb4d28` | 5m36s (first download of the sources, 33 s; run 44 s) / 7m36s (cold rust cache: harness build 141 s; run 40 s) |
 | Backup/restore | — | not applicable: no production, storage or migration code changed in this PR (`git diff 646b029.. -- crates apps/ledger-server apps/ledger-projector migrations` touches only three test files) |
 
