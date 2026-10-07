@@ -51,6 +51,6 @@ See [Plan 0009](../exec-plans/completed/0009-phase5-diff-and-merge.md).
 - [ADR-0024: Diff, merge base, structural conflicts, merge preview and stale-safe apply](ADR-0024-diff-merge-base-conflicts-preview-and-apply.md)
 
 ## Phase 6C batched retrieval (P6)
-See [Plan 0012](../exec-plans/active/0012-phase6c-batched-retrieval.md) (moved to `completed/` at closure).
+See [Plan 0012](../exec-plans/completed/0012-phase6c-batched-retrieval.md).
 
 - [ADR-0025: A derived-index claim that contradicts verified immutable bytes is storage corruption](ADR-0025-derived-index-contradiction-is-corruption.md)
