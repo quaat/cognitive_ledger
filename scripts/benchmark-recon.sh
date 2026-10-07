@@ -48,7 +48,9 @@ else OFFICIAL="no (tracked_changes=${DIRTY}, untracked_files=${UNTRACKED})"; fi
 export LEDGER_BENCH_OFFICIAL="${OFFICIAL}"
 # With tracked changes, which ones: a hash of the diff (the count alone does not identify them).
 DIFF_SHA=$(git diff HEAD | sha256sum | cut -d' ' -f1)
-INPUTS=$(cat Dockerfile compose.yaml benchmark/compose.instrumented.yaml Cargo.lock | sha256sum | cut -d' ' -f1)
+INPUTS=$(cat Dockerfile compose.yaml benchmark/compose.instrumented.yaml Cargo.lock deploy/postgres-init/* | sha256sum | cut -d' ' -f1)
+# The host → container path of the store measurement: Docker's userland proxy, if running.
+USERLAND_PROXY=$(pgrep -c -x docker-proxy || true)
 # The server's reconstruction depth limit (compose override, else the server default).
 DEPTH_LIMIT=$("${COMPOSE[@]}" config | sed -n 's/.*LEDGER_LIMIT_RECONSTRUCTION_DEPTH: *"\{0,1\}\([0-9]*\).*/\1/p' | head -1)
 DEPTH_LIMIT=${DEPTH_LIMIT:-10000}
@@ -60,7 +62,8 @@ set +e
   ${SERVER_CG:+--server-cgroup "${SERVER_CG}"} ${PG_CG:+--postgres-cgroup "${PG_CG}"} \
   --meta "build_rev=${REV}" --meta "tracked_changes=${DIRTY}" --meta "untracked_files=${UNTRACKED}" \
   --meta "tracked_diff_sha256=${DIFF_SHA}" \
-  --meta "inputs_sha256(Dockerfile,compose.yaml,benchmark/compose.instrumented.yaml,Cargo.lock)=${INPUTS}" \
+  --meta "inputs_sha256(Dockerfile,compose.yaml,benchmark/compose.instrumented.yaml,Cargo.lock,deploy/postgres-init)=${INPUTS}" \
+  --meta "docker_userland_proxy_processes=${USERLAND_PROXY}" \
   --meta "rustc=$(rustc --version)" --meta "server_toolchain=$(grep -m1 '^FROM' Dockerfile)" \
   --meta "docker=$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo unknown)" \
   --meta "compose=$(docker compose version --short 2>/dev/null || echo unknown)" \

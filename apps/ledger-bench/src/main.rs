@@ -581,7 +581,8 @@ async fn recon_command(mut argv: impl Iterator<Item = String>) -> ExitCode {
         format!("{:.0}", started.elapsed().as_secs_f64()),
     );
     let env = environment(&cfg.replica, "see the meta postgres entry");
-    r.environment = BTreeMap::from([
+    // Extend, never replace: the run records its own entries (e.g. the settle step).
+    r.environment.extend(BTreeMap::from([
         ("os".into(), env.os),
         ("kernel".into(), env.kernel),
         ("cpu".into(), format!("{} × {}", env.cpus, env.cpu_model)),
@@ -605,7 +606,7 @@ async fn recon_command(mut argv: impl Iterator<Item = String>) -> ExitCode {
                 recon::FIRST_AFTER_RESTART
             ),
         ),
-    ]);
+    ]));
     let write = || -> Result<(), String> {
         std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
         std::fs::write(

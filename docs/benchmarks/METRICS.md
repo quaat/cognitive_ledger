@@ -111,6 +111,35 @@ the oracle digest of that commit's state. Equal cardinality is not enough.
   shared buffers are not untouched.
 - The OS page cache is never dropped, so no OS-cold condition is claimed.
 
+**Before measuring:**
+- the database is settled after the concurrent write build with `VACUUM (ANALYZE)` and then
+  `CHECKPOINT`;
+- the instrumented override slows the containers' healthchecks to once a day after
+  start-up, so no probe statement (`ledger-admin probe /ready` runs `schema::verify` as the
+  runtime role) lands in a measurement window.
+
+**Percentiles:** p95 is reported from n ≥ 20, where it is the second-largest of 20. p99 is
+reported only from n ≥ 100, because below that the nearest-rank p99 is the maximum.
+
+**What these figures cannot support:**
+- **API minus store is not the cost of HTTP and JSON.** `store_reconstruct` runs in the
+  benchmark process on the host and reaches PostgreSQL through the published port. That path
+  goes through Docker's port mapping, and the result records whether the userland proxy was
+  running. The server reaches PostgreSQL over the container network instead. The benchmark
+  process's own CPU is not measured.
+- **`fold_cpu` is a lower bound.** It hashes each object once on cache-hot memory, while
+  production hashes commits and patches twice and checks limits per patch.
+- **No per-part latency breakdown.** Container CPU is whole-container. Server plus
+  PostgreSQL CPU can exceed latency, because both sides work around each round trip, so it
+  cannot be split into parts of the latency.
+- **PostgreSQL CPU does not transfer.** It is measured with `pg_stat_statements.track=all`
+  and `track_io_timing`, which production does not run.
+- **Absolute latency does not transfer.** The per-round-trip cost is specific to the host and
+  container topology. The scaling shape transfers: round trips per ancestor and linear
+  growth.
+- **Memory is not a peak.** It is `memory.current` after the batch and includes page cache.
+  Kernel 5.10 has no `memory.peak`, so the memory of individual parts is not measured.
+
 Results record that PostgreSQL ran the benchmark-only instrumentation configuration. A
 result is official only from a clean checkout (`official=yes`: no tracked changes and no
 untracked files). `recon.md` marks every other run **NON-OFFICIAL**.

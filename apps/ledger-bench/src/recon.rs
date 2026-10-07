@@ -65,6 +65,28 @@
 //!   are not untouched (the catalog and statistics pages are already loaded).
 //!
 //! An OS-page-cache-cold condition is never claimed: the host cache is not dropped.
+//!
+//! **Before measuring**, the database is settled after the concurrent write build
+//! (`VACUUM (ANALYZE)`, then `CHECKPOINT`). The instrumented override slows the containers'
+//! healthchecks to once a day after start-up, so no probe statement lands in a window.
+//!
+//! **What the figures cannot support** (Plan 0011 review):
+//! - `persisted` / `store_reconstruct` runs in this process on the host and reaches
+//!   PostgreSQL through the published port (Docker's port mapping, possibly its userland
+//!   proxy), while the server reaches it over the container network. API minus store is
+//!   therefore *not* the cost of HTTP and JSON; the benchmark process's own CPU is not
+//!   measured.
+//! - `algorithm` / `fold_cpu` hashes each object once on cache-hot memory, while production
+//!   hashes commits and patches twice and checks limits per patch. It is a lower bound on the
+//!   fold's compute, not that cost itself.
+//! - Container CPU is whole-container and includes work both sides do around each round
+//!   trip. Server plus PostgreSQL CPU can exceed latency, so it cannot be split into a
+//!   per-part latency breakdown.
+//! - PostgreSQL CPU is measured with `pg_stat_statements.track=all` and `track_io_timing`,
+//!   which production does not run; absolute per-statement CPU does not transfer.
+//! - Absolute per-round-trip cost is specific to this host and container topology. The
+//!   scaling shape (round trips per ancestor, linear growth) transfers; absolute latency
+//!   does not.
 
 use crate::{result::stats, workload::oracle_digest};
 use ledger_core::{AnyCommit, CommitId, ContentId, GraphId, TenantId};
@@ -196,8 +218,9 @@ pub struct ReconPoint {
     pub cache: String,
     pub n: usize,
     pub p50_ms: f64,
-    /// Only with at least 20 samples.
+    /// Only with at least 20 samples (nearest rank: with n = 20 it is the second-largest).
     pub p95_ms: Option<f64>,
+    /// Only with at least 100 samples (below that the nearest-rank p99 is the maximum).
     pub p99_ms: Option<f64>,
     pub mean_ms: f64,
     pub max_ms: f64,
@@ -669,7 +692,8 @@ fn point(
         n: s.count,
         p50_ms: s.p50_ms,
         p95_ms: tail.then_some(s.p95_ms),
-        p99_ms: tail.then_some(s.p99_ms),
+        // With fewer than 100 samples the nearest-rank p99 is the maximum: not reported.
+        p99_ms: (s.count >= 100).then_some(s.p99_ms),
         mean_ms: s.mean_ms,
         max_ms: s.max_ms,
         response_bytes,
@@ -804,6 +828,20 @@ async fn run_inner(cfg: &ReconConfig, result: &mut ReconResult) -> Result<(), St
     result.build_ms.insert(
         "all histories (concurrent)".into(),
         started.elapsed().as_millis(),
+    );
+    // Settle the database after the concurrent write build, so measurement does not start
+    // in the middle of autovacuum or a checkpoint: VACUUM (ANALYZE), then CHECKPOINT.
+    let settle = Instant::now();
+    for sql in ["VACUUM (ANALYZE)", "CHECKPOINT"] {
+        let outcome = sqlx::query(sql).execute(&owner).await;
+        result.environment.insert(
+            format!("settle: {sql}"),
+            outcome.map_or_else(|e| format!("failed: {e}"), |_| "done".into()),
+        );
+    }
+    result.build_ms.insert(
+        "settle (vacuum analyze, checkpoint)".into(),
+        settle.elapsed().as_millis(),
     );
 
     let check = |result: &mut ReconResult, family: &str, ok: bool, detail: String| {
@@ -1137,6 +1175,23 @@ async fn run_inner(cfg: &ReconConfig, result: &mut ReconResult) -> Result<(), St
                     let mut wrong = 0;
                     for _ in 0..cfg.cold_reps {
                         restart_database(cfg, &client).await?;
+                        // The store path gets a fresh one-connection pool, connected before
+                        // the window: the timed reconstruction is the first ledger operation,
+                        // never a pool reconnection (the API server's own pool reconnects as
+                        // in production).
+                        let cold_store = if category == "api" {
+                            None
+                        } else {
+                            let pool = sqlx::postgres::PgPoolOptions::new()
+                                .max_connections(1)
+                                .connect(&cfg.owner_database_url)
+                                .await
+                                .map_err(|e| e.to_string())?;
+                            Some(PostgresLedgerStore::from_pool_migrated(
+                                pool,
+                                V1Binding::Reject,
+                            ))
+                        };
                         let w = open_window(cfg, &owner, rt, role).await;
                         let t = Instant::now();
                         let got = if category == "api" {
@@ -1145,7 +1200,9 @@ async fn run_inner(cfg: &ReconConfig, result: &mut ReconResult) -> Result<(), St
                                 .await?;
                             Err(v)
                         } else {
-                            Ok(store
+                            Ok(cold_store
+                                .as_ref()
+                                .expect("store path")
                                 .workflows()
                                 .reconstruct(&id, &limits)
                                 .await
@@ -1259,7 +1316,7 @@ pub fn markdown(r: &ReconResult) -> String {
     }
     let _ = writeln!(
         out,
-        "Generated from `recon.json` ({}); the JSON is authoritative. p95/p99 only for n ≥ 20. PostgreSQL figures are per operation, from `pg_stat_statements` (8 KiB buffer counts, not physical disk bytes). CPU is cgroup `cpu.stat` per operation of the whole container, read immediately around the measured operations (statistics queries outside); memory is `memory.current` after the batch (page cache included). `{}`: PostgreSQL restarted, then readiness and statistics queries, then the measured first ledger reconstruction; OS page cache not dropped.\n",
+        "Generated from `recon.json` ({}); the JSON is authoritative. p95 only for n ≥ 20 (the second-largest of 20), p99 only for n ≥ 100. PostgreSQL figures are per operation, from `pg_stat_statements` (8 KiB buffer counts, not physical disk bytes). CPU is cgroup `cpu.stat` per operation of the whole container, read immediately around the measured operations (statistics queries outside); memory is `memory.current` after the batch (page cache included). `{}`: PostgreSQL restarted, then readiness and statistics queries, then the measured first ledger reconstruction; OS page cache not dropped.\n",
         r.schema, FIRST_AFTER_RESTART
     );
     let _ = writeln!(out, "| | |\n|---|---|");

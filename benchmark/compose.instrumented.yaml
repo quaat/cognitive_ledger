@@ -3,8 +3,22 @@
 # production-shaped defaults: pg_stat_statements is preloaded, I/O timing is tracked, and
 # the extension is created in its own `bench_stats` schema (outside the ledger's `public`
 # schema) by the script. Results produced under it record that the configuration differs.
+#
+# Healthchecks: the production-shaped 5 s probes (`ledger-admin probe /ready` runs
+# `schema::verify` as the runtime role) would land inside measurement windows and be
+# attributed to the measured operations. Here they probe every second only during the start
+# period (so `compose up --wait` still waits for healthy), then once a day.
 services:
+  ledger:
+    healthcheck:
+      start_period: 60s
+      start_interval: 1s
+      interval: 24h
   postgres:
+    healthcheck:
+      start_period: 60s
+      start_interval: 1s
+      interval: 24h
     command:
       - postgres
       - -c
