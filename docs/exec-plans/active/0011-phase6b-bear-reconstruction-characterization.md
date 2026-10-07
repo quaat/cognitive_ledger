@@ -153,6 +153,19 @@ Every item of the Phase-6B gate in the task holds, the recommendation is written
    reconstruction, not the first database operation. The OS page cache is warm, and no
    OS-cold claim is made.
 7. **The pg_graphs_migration hang: cause unknown, the fix is defensive** (tech-debt entry).
+8. **IC ⊆ TB is enforced for all 89 versions** (option A of the PR-#13 review), not only
+   for the window; it costs about 10 s of release `prepare`.
+9. **Required fuzz status:** the matrix job is `fuzz-sanitizer`, and a stable aggregate
+   `fuzz` job (`if: always()`, succeeds only when every sanitizer job succeeded) is the
+   required check (option A). `check-doc-consistency.py` models matrix expansion and
+   self-tests the rule on fixtures.
+10. **Official reconstruction evidence comes only from a clean checkout** of a recorded
+    revision, with the default sweep (`official=yes`, set by `benchmark-recon.sh`, never by
+    an argument). Both official runs were made from detached worktrees.
+11. **Owner decision pending:** the unmodified public BEAR source archives are kept in a
+    GitHub Actions cache entry that pull requests (including forks) can restore. This is
+    recorded in the manifest's `redistribution` field and in `DATASETS.md`, for the owner to
+    accept or reject.
 
 ## Discoveries
 - **BEAR-B lineage.** Encoding facts:
@@ -170,5 +183,95 @@ Every item of the Phase-6B gate in the task holds, the recommendation is written
 - **Stale documentation found by review:**
   - `deployment.md` contradicted ADR-0017 on PITR;
   - tech-debt claimed that zero DB timeouts were accepted, but the server rejects them.
+
+## Recommendation (primary question)
+
+**A. Batch ancestor and object retrieval first.** This choice comes from the measurements,
+not from architectural preference. Two official runs (clean worktrees `4eb4d28` and
+`e353b6c`), 144 points each, are in [run 1](../../quality/evidence/benchmarks/2026-10-07-phase6b-recon-official/recon.json)
+and [run 2](../../quality/evidence/benchmarks/2026-10-07-phase6b-recon-official-run2/recon.json).
+The run-2 windows are free of healthcheck statements: API calls equal store calls + 2 at
+every point. Slopes are least-squares fits over depths 100–5,000; "run 1 / run 2" ranges
+span S = 1, 1,000 and 10,000.
+
+| Quantity | Run 1 | Run 2 |
+|---|---|---|
+| API state-read latency per ancestry level | 189–225 µs | 206–213 µs |
+| PostgreSQL statements per ancestry level (state read, store, prepare) | 2.00 | 2.00 |
+| PostgreSQL execution time ÷ end-to-end latency, depth 5,000 | 14–15 % | 14–15 % |
+| Execution time per ancestry level | 28–32 µs | ≈ 30 µs |
+| Prefetched fold CPU per level (lower bound) | 10.3–11.0 µs | 10.3–11.0 µs |
+| Prefetched fold ÷ API latency, depth 5,000 | 4.6–7.7 % | 4.9–7.6 % |
+| API state read p50, depth 5,000 (S = 1 / 1k / 10k) | 1,129 / 956 / 1,022 ms | 1,063 / 1,058 / 1,049 ms |
+| State size at depth 1 (S = 1 / 1k / 10k) | 1.1 / 3.9 / 34 ms | 0.9 / 10.5 / 30 ms |
+| Merge ancestry walk (contained preview), per level | 324–331 µs, 4 statements | 328–334 µs, 4 statements |
+| Divergent merge preview, per level | 947–972 µs, 10 statements | same |
+| Divergent − contained at depth 5,000 | 2.8–3.4 × one state read | 2.9–3.0 × |
+| Ancestry share of a divergent preview | 33–34 % | 35 % |
+| After a database restart vs warm, depth 5,000 | within noise (n = 3); ≈ 1,200 block reads, 13–15 ms read time | same |
+
+**Reading:**
+- **Statements grow exactly linearly.** Reconstruction issues two PostgreSQL statements per
+  ancestor (`state_at_on`: one for the commit object, one for the patch). The merge
+  ancestry walk issues two per commit per side.
+- **Neither query execution nor the fold explains the per-level cost.** Execution is about
+  30 µs per level and the fold about 10 µs (a lower bound), while latency is about 200 µs
+  per level. The remaining ≈ 85 % is per-statement round-trip overhead: protocol, driver,
+  scheduling and network, on both the server and PostgreSQL sides. The container CPU
+  figures (server ≈ 120 µs/level, PostgreSQL ≈ 130 µs/level) agree, but they are
+  whole-container and not a latency breakdown.
+- **The fold is not the problem.** Optimizing the fold alone could save at most about 5 % at
+  depth.
+- **State size matters only at shallow depth.** At depth 1 it costs up to ≈ 30 ms (fold
+  ≈ 24 ms and JSON at 10,000 quads). At depth 5,000 it has no systematic effect.
+- **Storage I/O is not the cost here.** A post-restart read adds ≈ 1,200 block reads
+  (13–15 ms in total) and is otherwise within noise of warm. The OS page cache was not
+  dropped.
+- **A merge preview is about one third ancestry walk and two thirds three reconstructions.**
+  Both are the same per-statement pattern, so batching addresses both.
+- **What transfers:** the scaling shape (statements per ancestor, linearity) transfers to
+  other deployments. The absolute per-round-trip cost (≈ 100 µs on this host's container
+  network) does not. Over a real network or with TLS, round trips are expected to cost
+  more, which strengthens the case for batching.
+
+**What batching must preserve** (Phase-6C inputs):
+- **Same states and same identities.** Reconstructed states, state digests, commit and patch
+  bytes, reconstruction limits, v1/v2 readability, merge reconstruction behaviour and the
+  error taxonomy all stay unchanged.
+- **Every fetched object is still verified.** Its SHA-256 is checked against its id, and it
+  is decoded by the production canonical decoders.
+- **Indexes are only hints.** The first-parent chain can be discovered with a bounded
+  recursive query over `commit_parents`, but each decoded commit's `parents[0]` must equal
+  the next id in that chain, and any mismatch is corruption.
+- **Memory stays bounded.** Fetches happen in windows of k ancestors, never as one
+  load-everything query.
+- **Ancestry walks are batched too**, both the merge-base and the contained-check walks.
+
+**Not supported yet:**
+- **Checkpoints.** The linear cost that remains after batching (fold ≥ 10–11 µs per level,
+  plus batched transfer and verification) has not been measured.
+- **A reconstruction cache.** It was never measured.
+- **Fold micro-optimization.** The fold is ≤ 8 % of the cost.
+- **PostgreSQL tuning.** Execution is ≈ 15 % and warm block reads are 0.
+
+**CHECKPOINT-ADR-READY: NO.** The missing evidence:
+- the per-level residual of reconstruction and merge after batching, measured with the same
+  `recon` profile;
+- a target depth and latency budget for production histories. Today `max_depth` is 10,000
+  and doubles as the write ceiling: see the production-qualification matrix.
+
+Checkpoints become justified if the post-batching residual is still material at the target
+depth. A rough projection from the fold lower bound puts it at ≥ 0.1 s at depth 10,000 and
+≥ 1 s at 100,000, but this is a hypothesis until it is measured.
+
+## Reviews (independent, bounded sub-agents)
+| Review | Result | Resolution |
+|---|---|---|
+| BEAR / temporal RDF + oracle independence | no P0/P1 | Every timed recon result is now verified exactly. API timing includes decoding. The oracle's ledger dependencies are labelled, and the "independent" wording is gone. The invalid-line count and the IC-1 double count are fixed. Accepted: meaning-changing canonicalization without a collision is undetected (labelled). |
+| Benchmark architecture + CI reliability | no P0/P1; P2 `official` overridable | `official` is set only by the script, and custom arguments make a run non-official. The cache key covers the source section, with a verified fallback. The per-attempt fetch timeout is 300 s, and fetch exits with 4. Empty lists and `clean` flag order are fixed. Aggregate detection is tightened. Accepted: a single source host (P2, recorded); tokio deadlines do not bound blocking hangs (tech-debt). |
+| Archive / hostile input + licensing | P1: ledger error bodies could put BEAR statements into uploaded results | Fixed: replies are reduced to code + hash, and parse errors and TB tokens are never quoted. Also: pinned-size regular-file reads, `.part` written with `create_new`, artifact size cap, tar buffers dropped, an unverified LGPL claim removed, a modification notice in the report, and the CI-cache distribution recorded for the owner. |
+| Production-qualification gaps | no P0; missing P1 (write ceiling at depth 10,000) | The matrix was re-verified at `795028e` and corrected. New rows: write ceiling (P1), limits pairing, Sculpin `invocation_id` deduplication (P1), runtime write authority, per-release qualification (P1). |
+| Performance + PostgreSQL measurement methodology | no P0; P1: healthcheck statements inside windows; store path is not "same fold without HTTP"; CPU is not a breakdown; absolute numbers are topology-specific | Healthchecks are quiet after start-up in the instrumented override (run 2 is clean: API = store + 2 everywhere). The database is settled before measuring. p99 only from n ≥ 100. Post-restart store reads use a fresh pool. The limits are documented in `METRICS.md` and `recon.rs`. The recommendation rests on shape and ratios, not absolute latency. |
+| Bottleneck inference without the preferred answer | — | Independently concluded: about two round trips per ancestor dominate (execution ≈ 14 %, fold ≈ 5 %), so make the ancestry walk set-based first. Checkpoints, caches, fold work and PostgreSQL tuning are not yet supported. |
 
 ## Evidence
