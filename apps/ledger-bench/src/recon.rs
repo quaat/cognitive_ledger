@@ -155,6 +155,18 @@ impl ReconConfig {
         if self.reps == 0 || self.preview_reps == 0 {
             return Err("--reps and --preview-reps must be at least 1".into());
         }
+        // The base state is built in chunks of `BULK` quads, and every chunk is one ancestry
+        // level: depth d holds the complete state only once (d + 1) * BULK >= S. A smaller
+        // depth would be measured against a partial state and mislabelled with S.
+        let min_depth = self.depths.iter().copied().min().unwrap_or(0);
+        if let Some(s) = self.states.iter().find(|s| **s > (min_depth + 1) * BULK) {
+            return Err(format!(
+                "state size {s} is complete only from depth {} ({} commits of {BULK} quads), \
+                 but depth {min_depth} was requested",
+                s.div_ceil(BULK) - 1,
+                s.div_ceil(BULK)
+            ));
+        }
         // The divergent merge preview reconstructs one commit beyond the measured depth, and
         // the store path runs under ReconstructionLimits::DEVELOPMENT.
         let limit = self
@@ -831,13 +843,17 @@ async fn run_inner(cfg: &ReconConfig, result: &mut ReconResult) -> Result<(), St
     );
     // Settle the database after the concurrent write build, so measurement does not start
     // in the middle of autovacuum or a checkpoint: VACUUM (ANALYZE), then CHECKPOINT.
+    // A settle failure aborts the run: measuring an unsettled database would violate the
+    // stated precondition of every figure below, so no result may be emitted as `pass`.
     let settle = Instant::now();
     for sql in ["VACUUM (ANALYZE)", "CHECKPOINT"] {
-        let outcome = sqlx::query(sql).execute(&owner).await;
-        result.environment.insert(
-            format!("settle: {sql}"),
-            outcome.map_or_else(|e| format!("failed: {e}"), |_| "done".into()),
-        );
+        sqlx::query(sql)
+            .execute(&owner)
+            .await
+            .map_err(|e| format!("settle `{sql}` failed, the database is not quiesced: {e}"))?;
+        result
+            .environment
+            .insert(format!("settle: {sql}"), "done".into());
     }
     result.build_ms.insert(
         "settle (vacuum analyze, checkpoint)".into(),
@@ -1484,6 +1500,14 @@ mod tests {
             (|c| c.depths = vec![], "empty"),
             (|c| c.states = vec![1, 0], "contain 0"),
             (|c| c.states = vec![2_000_000], "exceeds"),
+            (
+                |c| {
+                    c.states = vec![10_001];
+                    c.depths = vec![1, 100];
+                    c.cold_depths = vec![];
+                },
+                "complete only from depth 2",
+            ),
             (|c| c.reps = 0, "at least 1"),
             (|c| c.preview_reps = 0, "at least 1"),
             (|c| c.cold_reps = 0, "--cold-reps"),
