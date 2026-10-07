@@ -562,7 +562,7 @@ pub mod schema;
 #[cfg(feature = "postgres")]
 pub mod verify;
 #[cfg(feature = "postgres")]
-pub use postgres_immutable::{PostgresImmutableStore, V1Binding};
+pub use postgres_immutable::{PostgresImmutableStore, RetrievalWindows, V1Binding};
 #[cfg(feature = "postgres")]
 mod postgres_graphs;
 #[cfg(feature = "postgres")]

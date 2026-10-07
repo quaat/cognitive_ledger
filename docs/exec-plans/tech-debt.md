@@ -173,6 +173,29 @@
   and is not counted; the ledger-dag and ledger-merge property suites against independent
   reference models replace it internally.
 
+## Phase 6C (Plan 0012) residuals and accepted risk
+- `Ledger::state_at_bounded` (the reconstruction over the `ImmutableStore` trait, used by
+  the filesystem backend and the fs→pg migration) stays scalar: one `get_commit` and one
+  `get_content` per ancestor. It is not a PostgreSQL hot path; through
+  `PostgresImmutableStore` it would still cost two statements per ancestor.
+- The index/bytes rule of windowed reconstruction: a `commit_parents` position-0 row that
+  contradicts the decoded commit is `CorruptObject`, where the scalar walk silently followed
+  the bytes (Plan 0012 Decision 1). Such a database is already reported corrupt by
+  `ledger-admin verify`; a silent index (no row) is followed from the bytes as before.
+- The retrieval windows (256 objects / 8 MiB / 256 commits) are crate-internal constants
+  with a `test-hooks` setter, not operator configuration. Revisit only with a measured
+  reason (Plan 0012 M4 records the per-window cost); a configuration surface would need the
+  limits-pairing discussion of the production-qualification matrix.
+- The statement-count tests (`pg_retrieval`) count sqlx's `sqlx::query` tracing events on
+  the test thread. They pin the formula `2 × ceil(depth / window)` exactly and will need
+  adjusting if sqlx changes its per-statement logging, or if a path gains a constant
+  statement (the tests subtract measured constants where they exist).
+- `pg_least_privilege` fails when its tests run in parallel against one database on this
+  workstation (five tests, all passing with `--test-threads=1`); `scripts/test-integration.sh`
+  runs the suite with cargo's default parallelism. Observed 2026-10-07 before and after the
+  Plan 0012 change; not caused by it. Investigate whether the suite's role/grant mutations
+  need serializing.
+
 ## Later-phase work and accepted residual risk (does not block Phase 2 or the P1.5 gate)
 
 - Design a stable skolemization/import protocol and hostile-input limits around the standards N-Quads parser.

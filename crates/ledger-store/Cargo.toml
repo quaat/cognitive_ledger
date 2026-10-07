@@ -31,6 +31,10 @@ test-hooks = []
 # Self dev-dependency: the test targets (and only they) build the library with `test-hooks`.
 ledger-store = { path = ".", features = ["test-hooks"] }
 tempfile.workspace = true
+# Statement counting in the retrieval tests (sqlx reports every executed statement as a
+# `sqlx::query` event); neither is a dependency of the library.
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

@@ -14,10 +14,18 @@
 //!   merge (equal / source contained / fast-forward / divergent, ADR-0023).
 //!
 //! Every traversal is iterative (no recursion, so 100k-deep linear history cannot overflow
-//! the stack), keeps a visited set (each distinct commit is fetched from the provider at most
-//! once per call, so duplicate ancestry paths such as diamonds do not multiply work), is
-//! bounded by [`TraversalLimits`] and fails closed on corruption: a missing parent is
+//! the stack), keeps a visited set (each distinct commit is entered at most once per call, so
+//! duplicate ancestry paths such as diamonds do not multiply work), is bounded by
+//! [`TraversalLimits`] and fails closed on corruption: a missing parent is
 //! [`DagError::UnknownCommit`] and a cycle presented by the provider is [`DagError::Cycle`].
+//!
+//! Retrieval is windowed (Plan 0012): a walk asks the provider for a bounded
+//! [`ParentProvider::ancestry_window`] around the commit it needs and keeps the other
+//! entries of the reply for later, so a provider backed by a database answers a deep linear
+//! history in `ceil(n / window)` round trips instead of `n`. The window is a retrieval hint
+//! only: visit limits count commits the walk enters, every answer is still derived from the
+//! parents the provider returned for exactly that commit, and a provider that cannot batch
+//! keeps the default window of one commit.
 //!
 //! Out of scope: three-way state merge (`ledger-merge`) and anything that reads RDF.
 //!
@@ -28,22 +36,56 @@ use std::time::Instant;
 
 use ledger_core::CommitId;
 
+/// Which parent edges a retrieval window follows from its anchor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WindowKind {
+    /// Every parent (the commits an ancestry walk will need).
+    Ancestry,
+    /// Position 0 only (the commits a first-parent history will need).
+    FirstParent,
+}
+
 /// Supplies a commit's parents (in commit order; position 0 = first parent).
 /// `Ok(None)` = the commit is unknown to this provider (e.g. not in the graph).
 #[async_trait::async_trait]
 pub trait ParentProvider: Send + Sync {
     type Error: std::error::Error + Send + Sync + 'static;
     async fn parents(&self, commit: &CommitId) -> Result<Option<Vec<CommitId>>, Self::Error>;
+
+    /// A retrieval window: the parents of up to `max` (≥ 1) commits reachable from `start`
+    /// through the edges `kind` names, `start` among them when it is known. Only commits
+    /// the provider knows are returned (an unknown `start` yields an empty window), each
+    /// at most once, with exactly the parents [`Self::parents`] would return for it. The
+    /// walk treats the extra entries purely as prefetched answers; it never infers
+    /// reachability from a commit's presence in a window.
+    ///
+    /// The default returns `start` alone, which makes every existing provider a window of
+    /// one. Batching providers override it with a bounded, set-based fetch.
+    async fn ancestry_window(
+        &self,
+        start: &CommitId,
+        max: usize,
+        kind: WindowKind,
+    ) -> Result<Vec<(CommitId, Vec<CommitId>)>, Self::Error> {
+        let _ = (max, kind);
+        Ok(self
+            .parents(start)
+            .await?
+            .map(|parents| vec![(start.clone(), parents)])
+            .unwrap_or_default())
+    }
 }
 
 /// Bounds on a single traversal call.
 #[derive(Clone, Copy, Debug)]
 pub struct TraversalLimits {
-    /// Maximum number of distinct commits a traversal may visit (fetch from the provider).
-    /// Visiting one more is [`DagError::VisitLimit`].
+    /// Maximum number of distinct commits a traversal may visit (enter; rows a provider
+    /// prefetched into a window but the walk never entered do not count). Visiting one more
+    /// is [`DagError::VisitLimit`].
     pub max_visited: usize,
-    /// Wall-clock deadline, checked before and after every provider call. A deadline that is
-    /// already at or before "now" fails the traversal with [`DagError::Deadline`].
+    /// Wall-clock deadline, checked before and after every provider call and before every
+    /// commit served from a prefetched window. A deadline that is already at or before
+    /// "now" fails the traversal with [`DagError::Deadline`].
     pub deadline: Option<Instant>,
 }
 
@@ -89,11 +131,18 @@ enum Colour {
     Black,
 }
 
-/// Shared traversal state: the visited set (with DFS colours), the limits and the provider.
+/// Shared traversal state: the visited set (with DFS colours), the limits, the provider and
+/// the parents prefetched by retrieval windows but not entered yet.
 struct Walk<'a, P: ParentProvider + ?Sized> {
     provider: &'a P,
     limits: TraversalLimits,
+    kind: WindowKind,
     colour: HashMap<CommitId, Colour>,
+    /// Parents returned by a window for commits the walk has not entered. An entry is
+    /// removed when its commit is entered, and the map never holds more than
+    /// `max_visited` entries, so memory stays bounded by the visit limit even when the
+    /// provider's windows are wide.
+    prefetched: HashMap<CommitId, Vec<CommitId>>,
     /// When set, every fetched commit's parents are recorded ([`ancestry`]).
     record: Option<HashMap<CommitId, Vec<CommitId>>>,
 }
@@ -106,11 +155,13 @@ enum DfsOutcome {
 }
 
 impl<'a, P: ParentProvider + ?Sized> Walk<'a, P> {
-    fn new(provider: &'a P, limits: TraversalLimits) -> Self {
+    fn new(provider: &'a P, limits: TraversalLimits, kind: WindowKind) -> Self {
         Self {
             provider,
             limits,
+            kind,
             colour: HashMap::new(),
+            prefetched: HashMap::new(),
             record: None,
         }
     }
@@ -123,20 +174,41 @@ impl<'a, P: ParentProvider + ?Sized> Walk<'a, P> {
     }
 
     /// Fetches the parents of a commit that has not been visited yet, charging it against
-    /// the visit limit and checking the deadline around the provider call.
+    /// the visit limit and checking the deadline around the provider call. A commit already
+    /// prefetched by an earlier window is served from memory; otherwise the provider is
+    /// asked for a window anchored at the commit, bounded by the remaining visit budget,
+    /// and the window's other entries are kept for later.
     async fn load(&mut self, id: &CommitId) -> Result<Vec<CommitId>, DagError<P::Error>> {
         let visited = self.colour.len();
         if visited >= self.limits.max_visited {
             return Err(DagError::VisitLimit { visited });
         }
         self.check_deadline()?;
-        let parents = self
-            .provider
-            .parents(id)
-            .await
-            .map_err(DagError::Provider)?;
-        self.check_deadline()?;
-        let parents = parents.ok_or_else(|| DagError::UnknownCommit(id.clone()))?;
+        let parents = match self.prefetched.remove(id) {
+            Some(parents) => parents,
+            None => {
+                // `visited < max_visited`, so the budget is at least one.
+                let max = self.limits.max_visited - visited;
+                let window = self
+                    .provider
+                    .ancestry_window(id, max, self.kind)
+                    .await
+                    .map_err(DagError::Provider)?;
+                self.check_deadline()?;
+                let mut found = None;
+                for (commit, parents) in window {
+                    if &commit == id {
+                        // The anchor's own answer; a duplicate entry for it is ignored.
+                        found.get_or_insert(parents);
+                    } else if !self.colour.contains_key(&commit)
+                        && self.prefetched.len() < self.limits.max_visited
+                    {
+                        self.prefetched.entry(commit).or_insert(parents);
+                    }
+                }
+                found.ok_or_else(|| DagError::UnknownCommit(id.clone()))?
+            }
+        };
         if let Some(record) = &mut self.record {
             record.insert(id.clone(), parents.clone());
         }
@@ -211,7 +283,7 @@ pub async fn is_ancestor<P: ParentProvider + ?Sized>(
     descendant: &CommitId,
     limits: TraversalLimits,
 ) -> Result<bool, DagError<P::Error>> {
-    let mut walk = Walk::new(provider, limits);
+    let mut walk = Walk::new(provider, limits, WindowKind::Ancestry);
     let outcome = walk.dfs(descendant, |id| id == ancestor).await?;
     Ok(matches!(outcome, DfsOutcome::Hit))
 }
@@ -234,7 +306,7 @@ pub async fn first_parent_history<P: ParentProvider + ?Sized>(
     if max == 0 {
         return Ok(history);
     }
-    let mut walk = Walk::new(provider, limits);
+    let mut walk = Walk::new(provider, limits, WindowKind::FirstParent);
     let mut current = head.clone();
     loop {
         let parents = walk.load(&current).await?;
@@ -267,7 +339,7 @@ pub async fn ancestors<P: ParentProvider + ?Sized>(
     head: &CommitId,
     limits: TraversalLimits,
 ) -> Result<Vec<CommitId>, DagError<P::Error>> {
-    let mut walk = Walk::new(provider, limits);
+    let mut walk = Walk::new(provider, limits, WindowKind::Ancestry);
     let mut order = Vec::new();
     walk.dfs(head, |id| {
         order.push(id.clone());
@@ -307,7 +379,7 @@ pub async fn ancestry<P: ParentProvider + ?Sized>(
     head: &CommitId,
     limits: TraversalLimits,
 ) -> Result<Ancestry, DagError<P::Error>> {
-    let mut walk = Walk::new(provider, limits);
+    let mut walk = Walk::new(provider, limits, WindowKind::Ancestry);
     walk.record = Some(HashMap::new());
     walk.dfs(head, |_| false).await?;
     Ok(Ancestry {
@@ -463,14 +535,38 @@ pub async fn analyze_with_ancestries<P: ParentProvider + ?Sized>(
 
 /// An in-memory, `HashMap`-backed [`ParentProvider`] for tests (including other crates'
 /// unit tests). It accepts any graph, including malformed ones (missing parents, cycles).
-#[derive(Clone, Debug, Default)]
+/// Its retrieval window is one commit unless [`MemoryDag::with_window`] widens it.
+#[derive(Clone, Debug)]
 pub struct MemoryDag {
     parents: HashMap<CommitId, Vec<CommitId>>,
+    window: usize,
+}
+
+impl Default for MemoryDag {
+    fn default() -> Self {
+        Self {
+            parents: HashMap::new(),
+            window: 1,
+        }
+    }
 }
 
 impl MemoryDag {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Answer [`ParentProvider::ancestry_window`] with up to `window` (≥ 1) commits found by
+    /// a breadth-first walk from the anchor (tests of windowed traversal).
+    #[must_use]
+    pub fn with_window(mut self, window: usize) -> Self {
+        self.window = window.max(1);
+        self
+    }
+
+    /// The retrieval window this provider answers with.
+    pub fn window(&self) -> usize {
+        self.window
     }
 
     /// Builder form of [`MemoryDag::insert`].
@@ -508,6 +604,41 @@ impl ParentProvider for MemoryDag {
     type Error = std::convert::Infallible;
     async fn parents(&self, commit: &CommitId) -> Result<Option<Vec<CommitId>>, Self::Error> {
         Ok(self.parents.get(commit).cloned())
+    }
+
+    /// Breadth-first from `start` over the edges `kind` names, at most `min(window, max)`
+    /// known commits; unknown parents are skipped (a later anchored window reports them).
+    async fn ancestry_window(
+        &self,
+        start: &CommitId,
+        max: usize,
+        kind: WindowKind,
+    ) -> Result<Vec<(CommitId, Vec<CommitId>)>, Self::Error> {
+        let max = self.window.min(max).max(1);
+        let mut out: Vec<(CommitId, Vec<CommitId>)> = Vec::new();
+        let mut queued: HashSet<CommitId> = HashSet::new();
+        let mut queue = std::collections::VecDeque::new();
+        if self.parents.contains_key(start) {
+            queued.insert(start.clone());
+            queue.push_back(start.clone());
+        }
+        while let Some(id) = queue.pop_front() {
+            if out.len() >= max {
+                break;
+            }
+            let parents = self.parents[&id].clone();
+            let follow: &[CommitId] = match kind {
+                WindowKind::Ancestry => &parents,
+                WindowKind::FirstParent => &parents[..parents.len().min(1)],
+            };
+            for parent in follow {
+                if self.parents.contains_key(parent) && queued.insert(parent.clone()) {
+                    queue.push_back(parent.clone());
+                }
+            }
+            out.push((id, parents));
+        }
+        Ok(out)
     }
 }
 

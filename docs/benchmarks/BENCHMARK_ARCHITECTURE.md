@@ -10,7 +10,7 @@ must keep.
 | concern | production path | what a benchmark can reach |
 |---|---|---|
 | Immutable commits and patches | `ledger-core` (`CommitV2`, `AnyCommit`, `PatchId`); `ledger-store` `PostgresImmutableStore` (`immutable_objects`, `commit_index`, `commit_parents`) | written only through prepare/accept or merge propose; read through `ImmutableStore::get_commit` (hash re-verified). The public API has no commit endpoint |
-| Reconstruction | `WorkflowRepository::state_at_on`: walks the parent-0 chain from the head to genesis, fetching and re-hashing each commit and patch object (one row read each), then folds the patches; bounded by `ReconstructionLimits` | `GET …/commits/{c}/state` (and implicitly every prepare, which reconstructs the parent) |
+| Reconstruction | `WorkflowRepository::state_at_on`: walks the parent-0 chain from the head to genesis, fetching and re-hashing each commit and patch object (one row read each at the time of this assessment; windowed since Plan 0012, see §1a), then folds the patches; bounded by `ReconstructionLimits` | `GET …/commits/{c}/state` (and implicitly every prepare, which reconstructs the parent) |
 | DAG traversal | `ledger-dag`: `first_parent_history`, `is_ancestor`, `analyze_with_ancestries` (merge base, ahead/behind; bounded visits and deadline) | `GET …/branches/log` (first-parent history), merge preview (base, ahead/behind) |
 | Branches | `postgres_branches.rs`, migration 0012 (`branches`, `branch_events`) | `POST/GET …/branches*` |
 | Merges | `ledger-merge` (`structural-slot/v1`, the preview token), `postgres_merge.rs` (preview, propose, apply), migration 0013 | `POST …/merges/{preview,propose,apply}` |
@@ -34,12 +34,23 @@ Findings that shape the design:
    ledger-materialized states. Parents and provenance are checked through the production
    `ImmutableStore::get_commit`, under the owner identity. Both categories are labelled.
 3. **Reconstruction cost is per parent-0 ancestor** (two object reads and two re-hashes
-   each). Shallow-versus-deep and growing-versus-constant state are the axes that matter,
-   so the synthetic dataset includes both.
+   each at the time of this assessment). Shallow-versus-deep and growing-versus-constant
+   state are the axes that matter, so the synthetic dataset includes both.
 4. **`ledger-stress` is a concurrency and fault tool.** It has no dataset lifecycle,
    oracle or result schema. Extending its 4,000-line binary would mix the two concerns, so
    the benchmark harness is a separate application. It duplicates about 40 lines of
    token minting and percentile code instead of coupling the two tools.
+
+### 1a. Status after Plan 0012 (Phase 6C, batched retrieval)
+The Plan 0011 characterization measured two PostgreSQL statements per reconstructed
+ancestor and two per visited commit per ancestry side, with the per-statement round trip
+dominating latency. Plan 0012 made retrieval windowed: `state_at_on` issues
+`2 × ceil(depth / 256)` statements (one chain window joined to the commit bytes, one patch
+window), and `GraphParents` answers an ancestry walk in `ceil(visited / 256)` statements
+per side. The benchmark harness did not change: the `recon` profile's `pg.calls` column is
+the deterministic gate for this scaling (statement count per operation), and the
+correctness oracle is unchanged. The fold, the limits and the production decoders are
+the same code; `fold_cpu` remains a lower bound of the non-I/O work.
 
 ## 2. Subsystem boundary
 

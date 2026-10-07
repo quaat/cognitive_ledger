@@ -9,8 +9,9 @@ use crate::postgres_workflow::{
 };
 use crate::{RequestScope, WorkflowRepository, db_error};
 use ledger_core::{CommitId, GraphId, LedgerError, TenantId};
-use ledger_dag::{DagError, ParentProvider, TraversalLimits};
+use ledger_dag::{DagError, ParentProvider, TraversalLimits, WindowKind};
 use sqlx::{PgConnection, Row};
+use std::collections::BTreeMap;
 use tokio::sync::Mutex;
 
 /// Branch policy v1 (immutable at creation). Only tightens the deployment floor.
@@ -102,9 +103,37 @@ pub struct RefMovement {
 /// Commit parents of one graph, read on one connection (immutable rows; a commit not indexed
 /// under the graph is unknown — foreign commits never resolve). Fails closed on a parent list
 /// that disagrees with the indexed `parent_count` (corruption, never "fewer parents").
+///
+/// Retrieval is windowed (Plan 0012 M3): [`ParentProvider::ancestry_window`] discovers up
+/// to `window` commits around an anchor with one bounded, graph-scoped recursive query and
+/// returns each with the same contiguity-checked parent list [`Self::parents`] would. A
+/// window of 1 is the Phase-4/5 walk, one commit per two statements, kept as the reference.
 pub(crate) struct GraphParents<'c> {
     pub(crate) conn: Mutex<&'c mut PgConnection>,
     pub(crate) graph: GraphId,
+    /// Commits per ancestry window (`RetrievalWindows::ancestry`).
+    pub(crate) window: usize,
+}
+
+/// The parent list of one commit from its indexed rows, or the corruption error when the
+/// rows are not exactly positions `0..parent_count`.
+fn parents_from_rows(
+    commit: &CommitId,
+    parent_count: i16,
+    rows: &[(i16, String)],
+) -> Result<Vec<CommitId>, LedgerError> {
+    let contiguous = rows.len() == usize::try_from(parent_count).unwrap_or(usize::MAX)
+        && rows
+            .iter()
+            .enumerate()
+            .all(|(i, (position, _))| usize::try_from(*position) == Ok(i));
+    if !contiguous {
+        return Err(LedgerError::CorruptObject {
+            id: commit.0.clone(),
+            reason: format!("commit_parents rows disagree with parent_count {parent_count}"),
+        });
+    }
+    rows.iter().map(|(_, parent)| parent.parse()).collect()
 }
 
 #[async_trait::async_trait]
@@ -130,25 +159,95 @@ impl ParentProvider for GraphParents<'_> {
         .fetch_all(&mut **conn)
         .await
         .map_err(db_error)?;
-        let contiguous = rows.len() == usize::try_from(parent_count).unwrap_or(usize::MAX)
-            && rows.iter().enumerate().all(|(i, r)| {
-                r.try_get::<i16, _>("position")
-                    .is_ok_and(|p| usize::try_from(p) == Ok(i))
-            });
-        if !contiguous {
-            return Err(LedgerError::CorruptObject {
-                id: commit.0.clone(),
-                reason: format!("commit_parents rows disagree with parent_count {parent_count}"),
-            });
-        }
-        rows.iter()
+        let rows: Vec<(i16, String)> = rows
+            .iter()
             .map(|r| {
-                r.try_get::<String, _>("parent_id")
-                    .map_err(db_error)?
-                    .parse()
+                Ok((
+                    r.try_get("position").map_err(db_error)?,
+                    r.try_get("parent_id").map_err(db_error)?,
+                ))
             })
-            .collect::<Result<Vec<_>, _>>()
-            .map(Some)
+            .collect::<Result<_, LedgerError>>()?;
+        parents_from_rows(commit, parent_count, &rows).map(Some)
+    }
+
+    /// One statement: a bounded recursive discovery from `start` over `commit_parents`
+    /// (every position, or position 0 only), following parents only through commits
+    /// indexed under this graph, nearest first, at most `min(window, max)` commits; then
+    /// each discovered commit's `parent_count` and parent rows. The anchor is included
+    /// only if it is indexed under the graph (an unknown or foreign anchor yields an empty
+    /// window and no work). Row order is not trusted: rows are grouped by commit and each
+    /// group is checked for contiguity exactly as [`Self::parents`] does.
+    async fn ancestry_window(
+        &self,
+        start: &CommitId,
+        max: usize,
+        kind: WindowKind,
+    ) -> Result<Vec<(CommitId, Vec<CommitId>)>, LedgerError> {
+        let max = self.window.min(max).max(1);
+        if max == 1 {
+            return Ok(self
+                .parents(start)
+                .await?
+                .map(|parents| vec![(start.clone(), parents)])
+                .unwrap_or_default());
+        }
+        let first_parent_only = matches!(kind, WindowKind::FirstParent);
+        let mut conn = self.conn.lock().await;
+        let rows = sqlx::query(
+            "WITH RECURSIVE reach(id, depth) AS ( \
+                 SELECT a.id, 0::bigint FROM commit_index a WHERE a.id = $1 AND a.graph_id = $2 \
+                 UNION \
+                 SELECT p.parent_id, r.depth + 1 \
+                 FROM reach r \
+                 JOIN commit_parents p ON p.commit_id = r.id AND (NOT $5 OR p.position = 0) \
+                 JOIN commit_index ci ON ci.id = p.parent_id AND ci.graph_id = $2 \
+                 WHERE r.depth + 1 < $3 \
+             ), nearest AS ( \
+                 SELECT DISTINCT ON (id) id, depth FROM reach ORDER BY id, depth \
+             ), w AS ( \
+                 SELECT id FROM nearest ORDER BY depth, id LIMIT $4 \
+             ) \
+             SELECT c.id, c.parent_count, p.position, p.parent_id \
+             FROM w JOIN commit_index c ON c.id = w.id AND c.graph_id = $2 \
+             LEFT JOIN commit_parents p ON p.commit_id = c.id \
+             ORDER BY c.id, p.position",
+        )
+        .bind(start.to_string())
+        .bind(self.graph.as_str())
+        .bind(i64::try_from(max).unwrap_or(i64::MAX))
+        .bind(i64::try_from(max).unwrap_or(i64::MAX))
+        .bind(first_parent_only)
+        .fetch_all(&mut **conn)
+        .await
+        .map_err(db_error)?;
+        drop(conn);
+        let mut groups: BTreeMap<String, (i16, Vec<(i16, String)>)> = BTreeMap::new();
+        for row in &rows {
+            let id: String = row.try_get("id").map_err(db_error)?;
+            let parent_count: i16 = row.try_get("parent_count").map_err(db_error)?;
+            let position: Option<i16> = row.try_get("position").map_err(db_error)?;
+            let parent: Option<String> = row.try_get("parent_id").map_err(db_error)?;
+            let group = groups
+                .entry(id)
+                .or_insert_with(|| (parent_count, Vec::new()));
+            if let (Some(position), Some(parent)) = (position, parent) {
+                group.1.push((position, parent));
+            }
+        }
+        if groups.len() > max {
+            return Err(LedgerError::Storage(
+                "ancestry window returned more commits than requested".into(),
+            ));
+        }
+        let mut out = Vec::with_capacity(groups.len());
+        for (id, (parent_count, mut parents)) in groups {
+            let commit: CommitId = id.parse()?;
+            parents.sort_by_key(|(position, _)| *position);
+            let parents = parents_from_rows(&commit, parent_count, &parents)?;
+            out.push((commit, parents));
+        }
+        Ok(out)
     }
 }
 
@@ -429,6 +528,7 @@ impl WorkflowRepository {
         let provider = GraphParents {
             conn: Mutex::new(&mut *conn),
             graph: scope.graph.clone(),
+            window: self.windows.ancestry,
         };
         match ledger_dag::is_ancestor(&provider, commit, &head, limits).await {
             Ok(reachable) => Ok((head, version, reachable)),
@@ -917,6 +1017,7 @@ impl WorkflowRepository {
         let provider = GraphParents {
             conn: Mutex::new(&mut *conn),
             graph: graph.clone(),
+            window: self.windows.ancestry,
         };
         ledger_dag::first_parent_history(&provider, head, max, limits)
             .await

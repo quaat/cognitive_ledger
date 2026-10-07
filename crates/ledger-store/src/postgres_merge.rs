@@ -302,6 +302,7 @@ impl WorkflowRepository {
             let provider = GraphParents {
                 conn: Mutex::new(&mut *conn),
                 graph: graph.clone(),
+                window: self.windows.ancestry,
             };
             ledger_dag::analyze_with_ancestries(&provider, &target_head, &source_head, limits)
                 .await
@@ -379,9 +380,10 @@ impl WorkflowRepository {
             }
         };
         preview.merge_base = Some(base.clone());
-        let base_state = Self::state_at_on(&mut conn, &base, &self.limits).await?;
-        let target = Self::state_at_on(&mut conn, &target_head, &self.limits).await?;
-        let source = Self::state_at_on(&mut conn, &source_head, &self.limits).await?;
+        let w = self.windows;
+        let base_state = Self::state_at_on_windowed(&mut conn, &base, &self.limits, w).await?;
+        let target = Self::state_at_on_windowed(&mut conn, &target_head, &self.limits, w).await?;
+        let source = Self::state_at_on_windowed(&mut conn, &source_head, &self.limits, w).await?;
         drop(conn);
         preview.target_delta = summary(&base_state.state, &target.state);
         preview.source_delta = summary(&base_state.state, &source.state);
