@@ -55,6 +55,13 @@ for what each operation isolates.
   git worktree add --detach target/recon-tree <revision>
   target/recon-tree/scripts/benchmark-recon.sh
   ```
+  For a before/after comparison (Plan 0012): one detached worktree per revision, the runs
+  one after the other (the compose project name and the host ports are fixed), nothing
+  else running on the host during either run, and every output file of both runs
+  (`recon.json`, `recon.md`, `verify.log`, `run.log`) archived under
+  `docs/quality/evidence/benchmarks/`. Compare slopes and statement counts on the same
+  host only; the result files record no host load, so a quiet host is a procedure, not a
+  recorded fact.
 
 The script:
 1. builds `ledger-bench` (release);

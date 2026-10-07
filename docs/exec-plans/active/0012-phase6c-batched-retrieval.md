@@ -205,7 +205,7 @@ equal / source-contained / fast-forward / divergent from the two recorded ancest
 | path | per-ancestor / per-visited-commit statements | constant statements around them |
 |---|---|---|
 | `GET …/commits/{c}/state` | 2 per ancestor | auth/tenant, `commit_graph` membership (≈ 2) |
-| `prepare` | 2 per ancestor of the expected head | idempotency lock/lookup, graph status, branch `FOR SHARE`, ref read, object publication ×3, index rows, verification, proposal, result (≈ 15) |
+| `prepare` | 2 per ancestor of the expected head | idempotency lock/lookup, graph status, branch `FOR SHARE`, ref read, object publication ×3, index rows, verification, proposal, result (26 observed in M4) |
 | merge preview, contained/equal | 2 per visited commit per side | `readable_graph`, two `branch_head` reads |
 | merge preview, divergent | 2 per visited commit per side + 3 × (2 per ancestor) | the same + nothing else |
 | branch log (`first_parent_history`) | 2 per entry | branch read |
@@ -237,14 +237,32 @@ window statements and the three scalar statements. Warm cache, all buffers share
 | ancestry window, K = 256, all parents | 256 | 7.5 ms | 1,878 | recursive union with two index-only probes per step (`commit_parents_distinct`, `commit_index_graph_commit`); `DISTINCT ON` + sort + `LIMIT`; final join by `commit_parents_pkey` |
 | scalar `SELECT bytes … WHERE id = $1` | 1 | ≈ 0.02–0.08 ms | 3 | primary-key probe |
 
+Second diagnostic run (after the review fixes; 15,000-commit constant-state history, 30,000
+objects, plus a 3,000-commit Fibonacci DAG in which every commit after the second has two
+parents and is reachable at many depths):
+
+| statement | rows out | execution | plan |
+|---|---:|---:|---|
+| chain window, K = 256 | 256 | 2.9 ms | recursive union 257 rows, index probes as above |
+| object window, 256 patches, 30,000-object table | 256 | 1.24 ms | `unnest` → **nested loop with `immutable_objects_pkey` probes** (the sequential scan of the small-table run is gone; the planner risk the review raised does not materialize at this size) |
+| ancestry window, linear, K = 256, cap 1,024 | 256 | 5.4 ms | recursion 256 rows; two index-only probes per step |
+| ancestry window, linear first-parent, K = 256 | 256 | 6.1 ms | same, position-0 edges only |
+| ancestry window, linear, K = 1,024, cap 4,096 | 1,024 | 38.8 ms | linear in K |
+| ancestry window, Fibonacci DAG, K = 256, cap 1,024 | 87 commits (174 rows) | 13.8 ms | the recursion produced **exactly 1,024 `(id, depth)` pairs and stopped** (44 levels, 22 rows per level on average), yielding 87 distinct commits for the window |
+| ancestry window, Fibonacci DAG, K = 64, cap 256 | 64 | 3.6 ms | 256 pairs, cap reached |
+| scalar primary-key reads | 1 | 0.011–0.016 ms | index probes |
+
 Reading: a window's execution is linear in K at ≈ 8 µs per ancestor for the chain
 (Plan 0011 measured ≈ 30 µs of execution plus ≈ 170 µs of round trip per ancestor on the
 scalar path), so even the PostgreSQL-side work falls; a K = 256 window costs 2 ms of
 execution and one round trip. The ancestry window costs ≈ 29 µs per commit of execution
 (the recursive union with `UNION` deduplication and the `DISTINCT ON`), still one round
 trip per 256 commits instead of two per commit. No sequential scan appears on the
-recursive paths; the one on `immutable_objects` is the small-table planner choice and is
-re-checked in M4 on the benchmark database (≈ 30,000 objects).
+recursive paths; the one on `immutable_objects` in the first run was the small-table
+planner choice and is gone at 30,000 objects (second run). On the one merge-heavy DAG
+measured the pair cap bounded the statement at ≈ 14 ms at the price of fewer distinct
+commits per window (87 of 256); that the cap bounds every shape is a construction
+argument (at most 1,024 recursion rows per statement), not a measurement across shapes.
 
 ## Design (M1–M3)
 
@@ -306,9 +324,10 @@ ancestry walk, merge-heavy DAG: between window_calls(N, 256) and N statements pe
                                 (a window holds fewer distinct commits when the recursion
                                 reaches commits at several depths and stops at the pair
                                 cap); each statement bounded as above
-contained preview, depth d:     2 × window_calls(d, 256) + 3 constants, linear (was 4 × d + 3)
-divergent preview, depth d:     2 × window_calls(d, 256) + 3 × 2 × ceil(d / 256) + 3
-                                (was 10 × d + 3)
+contained preview, depth d:     2 × window_calls(d, 256) + constants, linear (was 4 × d + constants)
+divergent preview, depth d:     2 × window_calls(d, 256) + 3 × 2 × ceil(d / 256) + constants
+                                (was 10 × d + constants); the constants observed in M4 are 4
+                                for a preview and 26 for prepare
 first-parent history, n:        window_calls(n, 256), never a window beyond the n wanted
                                 (was 2 × n)
 ```
@@ -374,6 +393,116 @@ damage is reported (a damaged prefetched commit is left out and fails when asked
 an anchor). The `parents` method stays as it is (window = 1 reproduces today's behaviour
 exactly; the differential tests use it as the reference).
 
+
+## M4 — characterization (before/after, same host, clean worktrees)
+
+Two official `recon` runs (`scripts/benchmark-recon.sh`, default sweep, `official=yes`, no
+tracked or untracked changes) from detached worktrees on the same workstation (16 cores,
+31 GiB, Docker 29.8.1, PostgreSQL 17.2 with the benchmark-only instrumentation override,
+same Dockerfile, compose files, PostgreSQL image digest and toolchain; the build-input
+hash differs only by the two `ledger-store` dev-dependency edges in `Cargo.lock`):
+**before** at `d05113d` (the Phase-6B head; production code identical to `main`) and
+**after** at `7408a3e` (the Phase-6C code head), run one after the other. Both: `RECON
+PASS`, 144 points, 186 exact oracle checks, 0 failures, `VERIFY OK`. Evidence:
+[before](../../quality/evidence/benchmarks/2026-10-07-phase6c-recon-before/recon.md),
+[after](../../quality/evidence/benchmarks/2026-10-07-phase6c-recon-after/recon.md) (the
+JSON files are authoritative; `verify.log` and `run.log` are archived beside them). The
+before run's history-build phase (not its measurement phase) overlapped a compile and
+test job; the result files cannot show host load, and `fold_cpu` (identical code in both
+runs) deviates only sporadically at single points in both runs, so no systematic
+slowdown of either measurement phase is visible. This host differs from the Plan 0011
+workstation (CPU, kernel, Docker); like-for-like on the API state read it is 1.8–2.3×
+faster per level (97–105 µs here versus 189–225 µs there), so only same-host
+before/after comparisons are made below. In this profile "depth d" is the history index
+with genesis at 0: a reconstruction at depth d reads d + 1 commits, and the preview
+branches sit at d + 1 and d + 2 commits.
+
+Slopes are least-squares fits over depths 100–5,000; "calls" are `pg_stat_statements`
+statements per operation.
+
+| S quads | operation | p50 µs per level, before → after | PG statements per level | PG execution µs per level | depth 5,000 p50 ms | depth 5,000 statements | depth 1 p50 ms |
+|---:|---|---|---|---|---|---|---|
+| 1 | API state read | 105 → 24 | 2.00 → 0.008 | 15.4 → 13.7 | 523 → 121 | 10,004 → 42 | 0.46 → 0.53 |
+| 1,000 | API state read | 97 → 26 | 2.00 → 0.008 | 13.7 → 15.0 | 492 → 132 | 10,004 → 42 | 2.32 → 2.37 |
+| 10,000 | API state read | 98 → 27 | 2.00 → 0.008 | 14.3 → 15.7 | 506 → 148 | 10,004 → 42 | 18.2 → 17.6 |
+| 1 | store reconstruction (`persisted`) | 131 → 25 | 2.00 → 0.008 | 14.2 → 14.3 | 657 → 124 | 10,002 → 40 | 0.28 → 0.47 |
+| 1 | prepare | 91 → 26 | 2.00 → 0.008 | 13.2 → 14.1 | 457 → 131 | 10,028 → 66 | 2.52 → 2.36 |
+| 1 | contained merge preview (ancestry walk only) | 173 → 40 | 4.00 → 0.008 | 28.9 → 34.8 | 867 → 202 | 20,010 → 52 | 0.90 → 1.52 |
+| 1 | divergent merge preview (walk + 3 reconstructions) | 459 → 116 | 10.00 → 0.031 | 69.1 → 80.7 | 2,307 → 579 | 50,022 → 172 | 1.96 → 1.88 |
+| 1 | API state read after a database restart | 94 → 26 | 2.00 → 0.008 | 14.7 → 15.3 | 478 → 135 | 10,004 → 42 | — |
+
+**Statement-count gate (deterministic): passed.** Statements no longer grow at 2 per
+ancestor. With n = d + 1 commits in a reconstruction, the observed counts at every
+measured depth (1, 10, 100, 500, 1,000, 2,500, 5,000) are exactly these closed forms
+(before → after):
+- state read: `2n + 2` → `2 + 2 × ceil(n / 256)` (4 at depths 1–100, 10 at 1,000, 42 at
+  5,000); the store path without the API's two constants: `2n` → `2 × ceil(n / 256)`;
+- prepare: `2n + 26` → `26 + 2 × ceil(n / 256)` (28, 34, 66);
+- contained preview (walks of d + 1 and d + 2 commits): `4d + 10` →
+  `4 + window_calls(d + 1, 256) + window_calls(d + 2, 256)` (8 at depth 1, 20 at 1,000,
+  52 at 5,000; the walks ramp 1, 4, 16, 64, then 256);
+- divergent preview: `10d + 22` → `4 + 2 × window_calls(d + 2, 256) + 2 × ceil((d + 1) /
+  256) + 4 × ceil((d + 2) / 256)` (14, 44, 172).
+The counts are identical across the three state sizes. At depth 5,000 that is 238× fewer
+statements for a state read, 385× for the contained walk and 291× for the divergent
+preview. (The pre-implementation estimate of the constants in "Expected statement
+complexity" and the census was low: prepare carries 26, a preview 4.)
+
+**Latency (observed, not gated; one official run per revision, n = 20 per point, n = 10
+for previews, n = 3 after a restart):** the per-level cost of a state read fell 3.6–4.3×
+(4.3× at S = 1, 3.7× at 1,000, 3.6× at 10,000; 3.6× after a database restart); the store
+path 5.2×, prepare 3.5×, the contained walk 4.3×, the divergent preview 4.0×. The
+remaining per-level cost of a state read is ≈ 24–27 µs, of which ≈ 14–16 µs is
+PostgreSQL execution (measured; about the same per ancestor as before — the windows do
+the scalar statements' work with 12 buffer hits per level instead of 8); the other
+≈ 10–11 µs per level is **unattributed** (the harness has no per-part latency breakdown;
+the server container's CPU slope of 11–13 µs per level is consistent with it, and the
+prefetched fold's 5.4–5.6 µs per level in the after run is a lower bound because
+production hashes twice and checks limits per patch). PostgreSQL execution is now the
+majority of a deep read (51–57 % at depth 5,000 across the state sizes, mean execution
+over p50 latency) where it was 14–15 %: the round-trip share is gone. (The history-build
+phase was faster too, but that figure mixes the code change with host load and is not
+reported as a result.)
+
+**Shallow histories (reported, not hidden; observed once per revision):** at depth 1
+(two commits) a state read costs 0.53 ms instead of 0.46 ms p50 (p95 0.70 vs 0.62; 4
+statements instead of 6), the store path 0.47 instead of 0.28 ms (p95 0.53 vs 0.37; 2
+windows instead of 4 primary-key reads), and the contained preview 1.52 instead of
+0.90 ms (means 1.7 vs 1.0 at all three state sizes; 4 window statements instead of 10
+primary-key reads). PostgreSQL execution grows by only 0.03–0.06 ms per operation in
+those cases, so most of the difference is unattributed by this profile (the windows are
+heavier statements; planning time is not instrumented). From depth 10 on every path is
+faster (state read 0.64 vs 1.40 ms, contained preview 1.75 vs 2.37 ms), and the 1,000- and
+10,000-quad states show the same pattern within noise. The difference does not grow with
+depth; under `METRICS.md`'s regression policy a single run cannot classify a +0.07 ms
+depth-1 difference as a regression, so it is recorded as an observation.
+
+**Not covered by this profile:** the `recon` histories are linear, so the merge-heavy
+shape (where a window holds fewer distinct commits) and the 8 MiB byte cut (never
+triggered by these small patches) are covered only by the M0 diagnostic `EXPLAIN` on one
+3,000-commit Fibonacci DAG, the `pg_retrieval` Fibonacci statement-bound test and the
+byte-cut equivalence tests, not by latency measurements on the production stack. The
+per-statement bound on other DAG shapes is a construction argument from the pair cap,
+measured on that one DAG.
+
+**Residual cost and the checkpoint question.** After batching, a reconstruction costs
+≈ 25 µs per ancestor plus the state-size cost at the head (≈ 17 ms at 10,000 quads for
+JSON encoding and the final fold, unchanged). Extrapolated (not measured) to the
+development `max_depth` of 10,000 that is ≈ 0.25–0.3 s per state read or prepare, ≈ 0.4 s
+for a contained merge preview and ≈ 1.2 s for a divergent one (116–127 µs per level);
+at a hypothetical 100,000 a read would be ≈ 2.5 s. These absolute figures belong to this
+host and the instrumented configuration. No product target depth or latency/operational
+budget has been declared, and the write ceiling at `max_depth` remains
+(production-qualification matrix).
+
+**CHECKPOINT-ADR-READY: NO.** The post-batching residual is measured (above), but the
+second requirement — a declared target history depth and latency budget against which it
+is too expensive — is still absent, and the plan does not invent one. If a target of the
+order of 10,000 commits with a sub-second budget for state reads and prepares is
+declared, the extrapolated residual meets it without checkpoints (a divergent merge
+preview at that depth would not); a target of 100,000 or more, or a budget of a few tens
+of milliseconds at depth, would reopen the question with these numbers as its input.
+
 ## Work
 - [x] M0: plan, algorithms, census, bounds, complexity (this document); query plans
 - [x] M1: `fetch_objects_window` (+ `fetch_first_parent_window`), covered by the PG
@@ -385,9 +514,9 @@ exactly; the differential tests use it as the reference).
       ownership tests, criss-cross/two-parent tests, statement-count tests
 - [ ] Gates: check-fast, PG 17 + PG 15 suites, integration, upgrade, benchmark ci/bear,
       verify, fuzz, supply chain, container, hosted CI
-- [ ] M4: before/after `recon` on this host from clean worktrees; residual estimate;
+- [x] M4: before/after `recon` on this host from clean worktrees; residual estimate;
       checkpoint decision
-- [ ] Independent reviews (8), P0/P1 resolved
+- [x] Independent reviews (8), P0/P1 resolved
 - [ ] Docs reconciled; completion report
 
 ## Decisions
@@ -421,8 +550,9 @@ exactly; the differential tests use it as the reference).
 6. **The ancestry recursion is capped at 4 (id, depth) pairs per requested commit.** On a
    merge-heavy DAG the recursion reaches one commit at many depths; without the cap a
    single statement's work was bounded only by the depth bound (review finding, four
-   reviewers). With it a statement is at most 1,024 steps on any shape, and a window may
-   hold fewer distinct commits (more statements, each bounded).
+   reviewers). With it a statement is at most 1,024 recursion rows by construction
+   (measured on one Fibonacci DAG), and a window may hold fewer distinct commits (more
+   statements, each bounded).
 7. **Only the anchor's damage is reported by a window.** A damaged prefetched commit is
    left out, so bounded histories and early-exit reachability checks that never reach it
    answer as the unwindowed walk did (review finding).
@@ -465,6 +595,18 @@ verify`; fuzz; `check-supply-chain.sh`; container/security; hosted CI on the PR 
 result; official `recon` from a clean worktree at the final revision, plus the same at the
 base revision on the same host.
 
+## Reviews (independent, bounded sub-agents; all P0/P1 findings resolved)
+| Review | Result | Resolution |
+|---|---|---|
+| Storage / corruption invariants | no P0; P1: chain-window index strings were parsed before the bytes that name them (a malformed `parent_id` became `InvalidContentId` ahead of the scalar `NotFound`); P1 (shared with the DAG review): windows failed on damaged commits the walk never needed; P2: zero test window looped, an over-long reply could panic, matrix gaps | Rows are consumed as the commit the previous bytes named and index strings compared as text; anchor-only errors; `checked()` on entry and in the setter; `.get()` instead of indexing; matrix extended (unknown envelope version, malformed mid-chain, four precedence cases, malformed index id, contradicted hint at the limit, duplicate patch ids, v1 damage, byte cuts at ±1). Decision 1's precedence consequence and the upgrade note recorded. |
+| DAG / merge semantic equivalence | no P0; P1: a damaged prefetched commit beyond a bounded history or an early hit failed the call | Only the anchor's damage is reported; first-parent windows capped at the entries still wanted; tests for both (PG and in-memory). Every listed semantic marked preserved afterwards. |
+| PostgreSQL query and resource bounds | P1: the ancestry recursion's work was bounded by depth, not by the window (merge-heavy DAGs); P1: the "one object ≤ 2 MiB" bound was false (merge patches, imports); P1/P2: evidence and doc claims ahead of measurement; P2: planner risk on the object window, shallow `is_ancestor` regression, deadline overshoot | Recursion capped at 4 pairs per requested commit (measured on a Fibonacci DAG: exactly 1,024 rows); the walk ramps 1/4/16/64/256; the object bound reworded; planner re-checked at 30,000 objects (primary key used); merge-heavy and shallow cases labelled as diagnostic/observed; deadline overshoot documented. |
+| Concurrency / transactions | no P0/P1; P2: zero window loop (test-hooks only), one-connection test did not walk the DAG, Decision 1 upgrade consequence | Fixed; the one-connection test now walks, previews, proposes and applies; `deployment.md` carries the upgrade note. Verdict per path: prepare, reads, branch creation, preview, propose, apply, concurrent ref movement unchanged. |
+| Security / tenant isolation | no P0; P1: the same unbounded recursion work (client-triggerable through preview and branch creation) | Same fix. SQL construction, graph scoping, entry points, error hygiene, test-only exclusion and privileges all pass. |
+| Test completeness | P1: `pg_retrieval` was not in `test-integration.sh`; P1: the statement-count arithmetic no longer matched after the history cap; P1: precedence untested, previews never compared with the scalar reconstruction; P2: merge-heavy branch missing, genesis-cycle case not a cycle, carve-outs, throwaway databases never dropped | Wired into the script; counts recomputed along the ramp on a dedicated connection with statement summaries; four precedence cases; every preview input through the scalar reference; 10-round merge-heavy branch with pinned classes; cycle reasons pinned; databases dropped with `FORCE`. |
+| Architecture / documentation consistency | P1: "`ledger-admin verify` reports the disagreement" was false; P1: "no error changed" contradicted Decision 1; P1: "the index is never an authority" overstated for DAG walks; P2: stale formulas, constant names, "crate-internal", evidence revisions, unmeasured claims | All corrected (`verify_commit_index` is the re-derivation; tech-debt asks for it in `ledger-admin verify`); boundaries, dependency direction and the no-migration/no-API claims confirmed. |
+| Benchmark methodology (M4) | gate and conclusion supported; P1: preview formulas off by the harness's depth index, "4× everywhere" overstated (3.5–5×), build-time comparison contaminated, "≈ 10 µs server" and the depth-1 bound not measured; P2: labels (inputs hash, 0.031, 51–57 %, fold caveat, cross-host factor, "any shape", byte cut, linear-only) | All corrected in the plan, baselines, qualification matrix, roadmap note, METRICS, BENCHMARK_ARCHITECTURE; `verify.log`/`run.log` archived; before/after protocol added to RUNNING_BENCHMARKS. |
+
 ## Evidence
 Revisions: `e9a8681` is the first implementation checkpoint; the review-driven fixes
 (anchor-only window errors, first-parent window cap, lazy chain-row checks, recursion
@@ -480,6 +622,8 @@ pair cap, window ramp, zero-window guards) and the reworked tests are the next c
 | `check-fast` (fmt, clippy `-D warnings` incl. test targets, workspace tests, architecture, doc links, doc consistency, goldens) | `e9a8681` | pass (re-run on the final head recorded below) |
 | `check-supply-chain.sh` (cargo audit with the one documented exception re-proven, cargo deny advisories/licenses/bans/sources, CycloneDX SBOMs) | review fixes (lockfile: two dev-dependency edges) | pass |
 | M0 query plans | `e9a8681` | see the M0 table |
+| Official `recon`, before (clean worktree `d05113d`, `official=yes`) | `d05113d` | `RECON PASS`, 144 points, 186 exact checks, 0 failures; `VERIFY OK` (wall 38 min including the history build, which overlapped a compile job; not a result) |
+| Official `recon`, after (clean worktree `7408a3e`, `official=yes`) | `7408a3e` | `RECON PASS`, 144 points, 186 exact checks, 0 failures; `VERIFY OK` (wall 12 min); statement counts per the closed forms in M4 at every depth |
 
 ## Deferred work
 - `Ledger::state_at_bounded` over the trait (filesystem backend) stays scalar.

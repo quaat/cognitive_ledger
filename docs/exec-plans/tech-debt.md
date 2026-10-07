@@ -202,11 +202,13 @@
   the test thread. They pin the formula `2 × ceil(depth / window)` exactly and will need
   adjusting if sqlx changes its per-statement logging, or if a path gains a constant
   statement (the tests subtract measured constants where they exist).
-- `pg_least_privilege` fails when its tests run in parallel against one database on this
-  workstation (five tests, all passing with `--test-threads=1`); `scripts/test-integration.sh`
-  runs the suite with cargo's default parallelism. Observed 2026-10-07 before and after the
-  Plan 0012 change; not caused by it. Investigate whether the suite's role/grant mutations
-  need serializing.
+- `pg_least_privilege` fails when its tests run with cargo's default parallelism (one
+  thread per core, 16 here) against one database: PostgreSQL answers "sorry, too many
+  clients already" and pools time out, because the suite's tests each open several pools.
+  All 19 pass with `--test-threads=1`, and `scripts/test-integration.sh` passes with
+  `RUST_TEST_THREADS=4`. Observed 2026-10-07 before and after the Plan 0012 change; not
+  caused by it; hosted runners have fewer cores. Bound the suite's parallelism in the
+  script, or its pools, rather than relying on the runner.
 
 ## Later-phase work and accepted residual risk (does not block Phase 2 or the P1.5 gate)
 

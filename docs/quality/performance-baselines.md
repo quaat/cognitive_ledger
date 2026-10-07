@@ -87,12 +87,48 @@ noise.
 **Reading:** depth dominates through per-statement round trips, two per ancestor, not
 through query execution, the fold or storage I/O. The recommended first Phase-6
 intervention is **batched ancestor and object retrieval** (Plan 0011 "Recommendation").
-Checkpoints are deferred until the residual cost after batching has been measured.
+Checkpoints are deferred until the residual cost after batching has been measured — done
+in Plan 0012, next section.
 
 The absolute per-level cost belongs to this host and container topology. The scaling
 shape transfers to other setups; see `docs/benchmarks/METRICS.md` for what the figures
 cannot support. The `scripts/bench.sh` figures above (≈ 0.19–0.20 ms per ancestor) agree
 with this run.
+
+## 2026-10-07 windowed retrieval (Plan 0012, Phase 6C): before/after on one host
+
+Two official `recon` runs from clean worktrees on one workstation (16 cores, 31 GiB,
+PostgreSQL 17.2 with the benchmark-only instrumentation): the Phase-6B head `d05113d`
+([before](evidence/benchmarks/2026-10-07-phase6c-recon-before/recon.md)) and the Phase-6C
+code head `7408a3e` ([after](evidence/benchmarks/2026-10-07-phase6c-recon-after/recon.md)).
+Both pass every exact oracle check. This host is about twice as fast per round trip as the
+Plan 0011 workstation, so the table compares before and after on this host only.
+
+| measure (S = 1 quad; the 1,000- and 10,000-quad states agree within noise) | before | after |
+|---|---|---|
+| API state read, p50 per ancestry level (fit over depths 100–5,000) | 105 µs | 24 µs |
+| PostgreSQL statements per level (state read / prepare / contained walk / divergent preview) | 2.00 / 2.00 / 4.00 / 10.00 | 0.008 / 0.008 / 0.008 / 0.031 |
+| Statements at depth 5,000 (state read / prepare / contained / divergent) | 10,004 / 10,028 / 20,010 / 50,022 | 42 / 66 / 52 / 172 |
+| API state read p50 at depth 5,000 | 523 ms | 121 ms |
+| prepare p50 at depth 5,000 | 457 ms | 131 ms |
+| contained merge preview p50 at depth 5,000 | 867 ms | 202 ms |
+| divergent merge preview p50 at depth 5,000 | 2,307 ms | 579 ms |
+| state read after a database restart, depth 5,000 | 478 ms | 135 ms |
+| PostgreSQL execution ÷ latency at depth 5,000 (state read; 51–57 % across state sizes) | 15 % | 56 % |
+| API state read p50 at depth 1 | 0.46 ms | 0.53 ms |
+
+**Reading:** the statement count now scales with 256-object windows (`2 × ceil(n / 256)`
+for a reconstruction of n commits, `4 + ceil((n − 85) / 256)` per ancestry side for
+n > 85), and latency per level fell 3.5–5× (state reads 3.6–4.3×, prepare 3.5×, the store
+path 5.2×, previews 4.0–4.3×). What remains per ancestor is ≈ 14–16 µs of PostgreSQL
+execution (measured) and ≈ 10–11 µs that this profile does not attribute (the fold's
+lower bound is 5.4–5.6 µs); the round-trip share is gone. Depth 1 is ≈ 0.07 ms slower
+(observed once; heavier window statements instead of primary-key reads); every depth
+from 10 on is faster. These histories are linear and never trigger the 8 MiB byte cut;
+merge-heavy shapes were not measured for latency (Plan 0012 M0/M4). At the development
+`max_depth` of 10,000 a read or prepare extrapolates to ≈ 0.25–0.3 s and a divergent merge
+preview to ≈ 1.2 s. Checkpoints remain unjustified until a target depth and budget exist
+(Plan 0012 M4: `CHECKPOINT-ADR-READY: NO`).
 
 ## Checkpoint policy proposal (input to Phase 4/5; no implementation in Plan 0005)
 

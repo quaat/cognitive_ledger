@@ -1747,6 +1747,21 @@ Only implement optimizations justified by measurements.
 > checkpoint, cache or change index is built in 6A. The checkpoint ADR and the deliverables
 > below follow from those measurements, together with the reduced BEAR-B dataset (M3 of
 > the benchmark plan).
+>
+> **Phase 6B (Plan 0011, 2026-10-07)** characterized reconstruction on BEAR-B and
+> constant-state histories: two PostgreSQL statements per ancestor dominated, and the
+> recommendation was to batch retrieval before anything else (`CHECKPOINT-ADR-READY: NO`).
+> **Phase 6C (Plan 0012)** delivered that: windowed retrieval of commits, patches and
+> parent edges (256 objects / 8 MiB per statement, the index a hint the verified bytes
+> must confirm), `2 × ceil(depth / 256)` statements per reconstruction instead of
+> `2 × depth`, and a 3.5–4.3× lower per-ancestor cost on the same host (linear
+> histories), with every identity,
+> limit, error (one documented exception on corrupt indexes) and transaction boundary
+> unchanged and no migration. The residual is ≈ 25 µs per ancestor (≈ 0.3 s at the
+> 10,000 ceiling); checkpoints stay unjustified until a target depth and budget are
+> declared (`CHECKPOINT-ADR-READY: NO`). The deliverables below that remain — checkpoints
+> and their verification, a reconstruction cache, streaming export, the change index,
+> history lookup APIs, orphan cleanup — are not started.
 
 Gate:
 
