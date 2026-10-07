@@ -252,9 +252,17 @@ fn storage(e: impl std::fmt::Display) -> LedgerError {
 #[cfg(feature = "postgres")]
 pub(crate) fn db_error(e: sqlx::Error) -> LedgerError {
     match &e {
+        // `Protocol`: the driver could not complete a wire exchange. In the request path this
+        // is what a connection attempt during PostgreSQL crash recovery or shutdown produces
+        // (the server answers the start-up handshake with an ErrorResponse — 57P03 "the
+        // database system is in recovery mode" — and sqlx 0.8 reports "Postgres protocol
+        // error (reading Authentication)" instead of the SQLSTATE); the connection is
+        // discarded either way and the request is retryable. Plan 0013 M1 fault run:
+        // 165 × 500 INTERNAL across two PostgreSQL kills before this classification.
         sqlx::Error::PoolTimedOut
         | sqlx::Error::PoolClosed
         | sqlx::Error::Io(_)
+        | sqlx::Error::Protocol(_)
         | sqlx::Error::WorkerCrashed => LedgerError::DependencyUnavailable(e.to_string()),
         sqlx::Error::Database(d) if d.code().is_some_and(|code| sqlstate_is_unavailable(&code)) => {
             LedgerError::DependencyUnavailable(e.to_string())
@@ -264,6 +272,13 @@ pub(crate) fn db_error(e: sqlx::Error) -> LedgerError {
         }
         _ => LedgerError::Storage(e.to_string()),
     }
+}
+
+/// The production classification of a driver error, exposed for the mapping-boundary tests
+/// of Plan 0013 M1 (`test-hooks` builds only): exactly what every store surface applies.
+#[cfg(all(feature = "postgres", feature = "test-hooks"))]
+pub fn classify_db_error(e: sqlx::Error) -> LedgerError {
+    db_error(e)
 }
 
 /// SQLSTATEs PostgreSQL returns while it is shutting down, restarting, failing over or
@@ -569,9 +584,12 @@ mod postgres_graphs;
 pub use postgres_graphs::{GraphRecord, GraphStatus, NewGraph, PgGraphs};
 #[cfg(feature = "postgres")]
 mod postgres_workflow;
+/// Deterministic fault injection (Plan 0013 F5): test builds only, like the pause points.
+#[cfg(all(feature = "postgres", feature = "test-hooks"))]
+pub use postgres_workflow::FailPoint;
 #[cfg(feature = "postgres")]
 pub use postgres_workflow::{
-    AcceptRequest, Accepted, DbSessionLimits, FailPoint, MAX_BRANCH_BYTES, MAX_CORRELATION_BYTES,
+    AcceptRequest, Accepted, DbSessionLimits, MAX_BRANCH_BYTES, MAX_CORRELATION_BYTES,
     MAX_IDEMPOTENCY_KEY_BYTES, MAX_REASON_BYTES, PostgresLedgerStore, PrepareRequest, Prepared,
     RejectRequest, Rejected, RequestScope, ValidationPolicy, ValidationTrustPolicy,
     WorkflowRepository,

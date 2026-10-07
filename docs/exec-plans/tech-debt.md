@@ -6,7 +6,7 @@
 - Admission control (Plan 0005 reviews): `accept` takes no expensive-operation slot (only `prepare` and state reads do), so an accept-heavy burst can occupy the whole 16-connection pool beside the 12 expensive slots; and when the edge timeout fires the handler future is dropped and its slot released while the PostgreSQL statement keeps running until `lock_timeout`/`statement_timeout`, so repeated edge timeouts can pin pool connections beyond `max_concurrent_expensive`. Both are bounded by the session limits (ADR-0016) and observed as `503 DEPENDENCY_*`, not as corruption; decide on a shared admission budget for accept and on cancelling the statement (`pg_cancel_backend` or a cancellation-aware driver call) when the request is abandoned.
 - Restore semantics (Plan 0005 slice 8): a restore forks history — versions after the snapshot are reissued for different commits, acknowledged writes vanish, projections may be ahead. These questions (PITR/WAL archiving, writer fencing, publishing the restore point and rebuilding projections, forbidding new versions until reconciled) were open before ADR-0017. ADR-0017 decides: PITR/WAL archiving required in production, writer fencing, declared restore point, projection reconciliation, version reissue semantics; the deployment must provide the PITR configuration evidence.
 - Migration 0009 aborts on a corrupt `immutable_objects` row with a raw `23514` naming no ids (the README convention is guards that name rows); the runbook says to run `verify` first. Add a pre-check guard that lists offending ids, and document the `ACCESS EXCLUSIVE` hashing window. Also: a graph moved from `importing` to `active` after raw ref moves has no `ref_events` for them and fails the verifier's version-equals-events check permanently — activation needs an audited path (Phase 4 admin flow).
-- Fault injection (Plan 0005 slice 4): the lost-response-after-COMMIT case is deterministic only in the `FailPoint` unit test; at the HTTP level random SIGKILLs hit the sub-millisecond COMMIT-to-response window by chance (0–3 observations per run). A `fault-injection` cargo feature that aborts the process right after the workflow transaction commits — compiled only into a separate qualification image, never into the runtime image — would make it deterministic.
+- Fault injection (Plan 0005 slice 4): the lost-response-after-COMMIT case is proven deterministically in-process since Plan 0013 M1 (a `test-hooks` pause after `COMMIT` on every write path, `pg_lifecycle`, and over a live router with the edge timeout, `pg_api` `p7a_*`); at the HTTP level under `scripts/fault.sh` random SIGKILLs still hit the sub-millisecond COMMIT-to-response window only by chance (0–3 observations per run). A `fault-injection` cargo feature that aborts the *process* right after the workflow transaction commits — compiled only into a separate qualification image, never into the runtime image — would make the process-kill variant deterministic too.
 
 - Repository governance (observed 2026-10-06): the GitHub `main` branch has no branch protection or ruleset. Before a production release, enable a ruleset requiring a pull request, the required CI checks (benchmark-ci, container, dependency-review, docker, fast, fuzz, supply-chain), a review, and no direct pushes to `main`. `benchmark-ci` (workflow `ci-benchmark`) is the Phase-6A correctness gate (the dataset manifests, the oracle assertions and `ledger-admin verify`); its timings never gate. `scripts/check-doc-consistency.py` keeps this list equal to the jobs of the PR-gating workflows (rulesets match check-run names, i.e. job names, not workflow file names). A matrix job reports one check per combination, for example `fuzz-sanitizer (none)` and `fuzz-sanitizer (address)`, so the stable `fuzz` aggregate job (`if: always()`, succeeds only if every sanitizer job succeeded) is the one to require. Not changed automatically (repository policy is the owner's).
 
@@ -233,9 +233,47 @@
   fewer tests at once. Set `shm_size` on the compose PostgreSQL (or document the host
   requirement) before relying on local full-parallel runs.
 
+## Phase 7A (Plan 0013) M0 findings awaiting their milestone
+Recorded 2026-10-07 from the read-only inventory in
+[Plan 0013](active/0013-phase7a-resource-governance.md) (findings F1–F10 there carry the
+file:line evidence and the milestone that fixes each):
+- ~~`FailPoint` is compiled into release builds~~ **Fixed in M1**: `FailPoint`, every fail
+  point, the pause hooks and the projector's crash windows exist only under the `test-hooks`
+  feature; `scripts/check-architecture.py` proves the apps' build graphs never enable it and
+  that the symbols are absent without it (compile probe).
+- ~~The fault gate accepts `DEPENDENCY_TIMEOUT`~~ **Fixed in M1**: `fault_unexpected` fails the
+  fault run on it (mode-specific; the pair-verdict helper is unchanged); the merge crash tests
+  assert the injected error; the post-COMMIT lost-response proof is deterministic in
+  `pg_lifecycle` / `pg_api` (see the Plan 0005 bullet above).
+- Abandoned statements run to completion after the edge timeout (sqlx 0.8.6 pins the
+  connection until PostgreSQL finishes; `ROLLBACK` is queued behind it), `statement_timeout`
+  equals `request_timeout`, `idle_in_transaction_session_timeout` exceeds it, and no
+  transaction-level bound exists — measured in M1 ([evidence](../quality/evidence/plan-0013-m1-lifecycle-2026-10-07.md)).
+  M2 per ADR-0026 (proposed): timeout-only cancellation; **active cancellation stays open**
+  because `pg_cancel_backend(pid)` can hit the next borrower of the pooled session
+  (demonstrated); it needs connection fencing first, and the backend-reuse race test is its gate.
+- `accept`, `reject`, `merge_apply` and branch writes take no admission permit; 12 + 4 slots
+  equal the 16-connection pool; prepare holds a slot while waiting for a connection — measured
+  in M1 (reads and `/ready` starve 10 s behind three blocked accepts). M3 per ADR-0026 §5
+  (the `db_work` permit before the first pooled query, held by the detached operation).
+- M1 review residuals (P2/P3): the validation record transaction has no `BeforeCommit`/
+  `AfterCommit` hook and no drop test (same `begin_scoped`/`record_result` shape as the eight
+  hooked paths; needs the validation fixtures) — before M2 acceptance; `mark_superseded` has
+  none either (F8 scope); an identical in-flight `immutable_objects` insert from another tenant
+  waits on the unique index and could surface as `DEPENDENCY_TIMEOUT` once `lock_timeout` is
+  5 s — M2 classifies that wait.
+- `mark_superseded` has no idempotency key (a retry after a lost response gets
+  `LineageMismatch`); the projector's `number()` accepts 0, its DB session limits are not
+  configurable and its worker count is not checked against its 8-connection pool;
+  `ledger-admin` pools set no session limits. Deferred or M3 as the plan states.
+
 ## Later-phase work and accepted residual risk (does not block Phase 2 or the P1.5 gate)
 
 - Design a stable skolemization/import protocol and hostile-input limits around the standards N-Quads parser.
+- The Phase 6 streaming export / history-lookup API now has a named consumer — replaying history for
+  predictive models (`docs/design/neural-prediction-assessment.md`, roadmap Phase 9 candidate) — but
+  stays gated by Phase 6's measured-need rule; a read-only export identity would extend ADR-0016 and
+  needs an ADR.
 - Run the live Fluree differential adapter; the reference image is already digest-pinned (see test/reference-images.lock), so only running the semantic-state adapter remains, blocked pending BUSL-1.1 license sign-off.
 - Graph import operator path (ADR-0010): register `status='importing'`, import, activate. Until it exists, migration 0004 fails closed on unowned graphs and `ledger-admin migrate-fs-to-pg` can only target `bootstrap`/`importing` graphs.
 - `WorkflowRepository::state_at_on` (transaction-connection, bounded reconstruction) and `Ledger::state_at_bounded` are two implementations of the same fold over `ReconstructionLimits`; unify when `Ledger` composes over `PostgresLedgerStore`.

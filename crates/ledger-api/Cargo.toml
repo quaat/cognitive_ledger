@@ -22,6 +22,9 @@ tracing.workspace = true
 time.workspace = true
 
 [dev-dependencies]
+# The API test targets (and only they) build the store with its test-only fault injection
+# and pause points (`FailPoint`, `PauseHook`); the server binary never does.
+ledger-store = { path = "../ledger-store", features = ["postgres", "test-hooks"] }
 futures-util = { version = "0.3", default-features = false }
 sqlx.workspace = true
 tempfile.workspace = true

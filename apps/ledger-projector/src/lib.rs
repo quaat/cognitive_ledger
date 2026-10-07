@@ -48,8 +48,9 @@ pub struct ProjectorConfig {
     pub probe_interval: Duration,
 }
 
-/// Deterministic crash windows (tests only): the step returns as if the process died, leaving
-/// the lease to expire.
+/// Deterministic crash windows (tests only; feature `test-hooks`, which no binary enables): the
+/// step returns as if the process died, leaving the lease to expire.
+#[cfg(feature = "test-hooks")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FailPoint {
     AfterClaim,
@@ -85,13 +86,25 @@ pub enum StepOutcome {
     /// worker owns the stream now.
     LeaseLost,
     /// A failpoint simulated a crash; the lease is still held until it expires.
+    #[cfg(feature = "test-hooks")]
     Crashed(FailPoint),
 }
+
+#[cfg(all(feature = "test-hooks", not(debug_assertions)))]
+compile_error!(
+    "ledger-projector's `test-hooks` feature (deterministic crash windows) is test-only and \
+     cannot be part of a release build"
+);
+
+/// Whether this build contains the test-only crash windows (`test-hooks`); the projector
+/// binary refuses to start when it does (like the server refuses `ledger_store`'s).
+pub const TEST_HOOKS_COMPILED: bool = cfg!(feature = "test-hooks");
 
 pub struct Projector<C: ProjectionClient + ?Sized> {
     repo: ProjectionRepository,
     client: Arc<C>,
     config: ProjectorConfig,
+    #[cfg(feature = "test-hooks")]
     failpoint: Option<FailPoint>,
     metrics: Arc<Metrics>,
     /// Set while the periodic transactional probe fails: no stream is claimed.
@@ -141,6 +154,7 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
             repo,
             client,
             config,
+            #[cfg(feature = "test-hooks")]
             failpoint: None,
             metrics,
             paused: Arc::new(AtomicBool::new(false)),
@@ -165,7 +179,8 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
         .to_string()
     }
 
-    /// Tests only: simulate a crash at `point` on every step.
+    /// Tests only (feature `test-hooks`): simulate a crash at `point` on every step.
+    #[cfg(feature = "test-hooks")]
     pub fn with_failpoint(mut self, point: FailPoint) -> Self {
         self.failpoint = Some(point);
         self
@@ -184,6 +199,7 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
         self.paused.load(Ordering::SeqCst)
     }
 
+    #[cfg(feature = "test-hooks")]
     fn crash(&self, point: FailPoint) -> bool {
         self.failpoint == Some(point)
     }
@@ -271,6 +287,7 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
         force: bool,
         started: Instant,
     ) -> StepOutcome {
+        #[cfg(feature = "test-hooks")]
         if self.crash(FailPoint::AfterClaim) {
             return StepOutcome::Crashed(FailPoint::AfterClaim);
         }
@@ -392,6 +409,7 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
             let _ = self.repo.release(claim).await;
             return Ok(StepOutcome::LeaseLost);
         }
+        #[cfg(feature = "test-hooks")]
         if self.crash(FailPoint::BeforeTargetRequest) {
             return Ok(StepOutcome::Crashed(FailPoint::BeforeTargetRequest));
         }
@@ -406,9 +424,11 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
         self.client
             .write(&graph, &projected, &marker, mode, &observation.terms)
             .await?;
+        #[cfg(feature = "test-hooks")]
         if self.crash(FailPoint::AfterTargetSuccess) {
             return Ok(StepOutcome::Crashed(FailPoint::AfterTargetSuccess));
         }
+        #[cfg(feature = "test-hooks")]
         if self.crash(FailPoint::BeforeMarkerVerification) {
             return Ok(StepOutcome::Crashed(FailPoint::BeforeMarkerVerification));
         }
@@ -441,6 +461,7 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
                 "the rebuilt graph does not contain the accepted state",
             ));
         }
+        #[cfg(feature = "test-hooks")]
         if self.crash(FailPoint::AfterMarkerVerification) {
             return Ok(StepOutcome::Crashed(FailPoint::AfterMarkerVerification));
         }
@@ -480,6 +501,7 @@ impl<C: ProjectionClient + ?Sized> Projector<C> {
         wrote: bool,
         rebuilt: bool,
     ) -> Result<StepOutcome, ProjectionError> {
+        #[cfg(feature = "test-hooks")]
         if self.crash(FailPoint::BeforeAcknowledge) {
             return Ok(StepOutcome::Crashed(FailPoint::BeforeAcknowledge));
         }

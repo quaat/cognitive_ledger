@@ -148,6 +148,19 @@ async fn harness_in(
     auth: SharedAuthenticator,
     session: DbSessionLimits,
 ) -> Harness {
+    harness_in_hooked(url, acceptance, limits, auth, session, None).await
+}
+
+/// `harness_in` whose served store carries a test-only pause hook (Plan 0013 M1): the
+/// request lifecycle tests pause the workflow transaction behind a live router.
+async fn harness_in_hooked(
+    url: &str,
+    acceptance: AcceptancePolicy,
+    limits: ApiLimits,
+    auth: SharedAuthenticator,
+    session: DbSessionLimits,
+    hook: Option<ledger_store::test_hooks::PauseHook>,
+) -> Harness {
     let owner = PostgresLedgerStore::connect_and_migrate(url, V1Binding::Reject)
         .await
         .unwrap();
@@ -193,9 +206,12 @@ async fn harness_in(
         let (_, host_part) = rest.rsplit_once('@').unwrap();
         format!("{scheme}://ledger_rt_api:rt-api-test-secret@{host_part}")
     };
-    let store = PostgresLedgerStore::connect_with(&runtime_url, V1Binding::Reject, session)
+    let mut store = PostgresLedgerStore::connect_with(&runtime_url, V1Binding::Reject, session)
         .await
         .expect("runtime role connects with verify-only startup");
+    if let Some(hook) = hook {
+        store = store.with_workflow_pause_hook(hook);
+    }
     let app = ledger_api::router(AppState::new(store.clone(), auth, limits, acceptance));
     Harness { store, owner, app }
 }
@@ -302,7 +318,12 @@ fn prepare_body(expected_head: Option<&str>, quads: &[(&str, &str)], message: &s
     })
 }
 
-const LEAKS: [&str; 12] = [
+const LEAKS: [&str; 17] = [
+    "canceling statement",
+    "pg_sleep",
+    "pool timed out",
+    "error returned from database",
+    "localhost",
     "sqlx",
     "SELECT",
     "INSERT",
@@ -2202,4 +2223,786 @@ async fn edge_timeout_slow_loris_and_body_boundary_are_bounded() {
     );
     // Nothing leaked from the refused attempts; the accepted one is a proposal.
     assert_eq!(h.count("proposals", &g).await, 2);
+}
+
+// =============================================================================================
+// Plan 0013 M1 — request lifecycle over HTTP (pool exhaustion, admission, timeout outcome).
+// Classification per test (PRESERVATION / CHARACTERIZATION / FUTURE ACCEPTANCE `future_`);
+// the `future_` tests are excluded from the suite run (`--skip future_`) and run once for the
+// red evidence. Prefix `p7a_` selects the suite.
+// =============================================================================================
+
+fn p7a_auth() -> SharedAuthenticator {
+    Arc::new(
+        DevHs256Authenticator::new(
+            ISSUER.into(),
+            AUDIENCE.into(),
+            SECRET,
+            ClaimsPolicy::default(),
+        )
+        .unwrap(),
+    )
+}
+
+/// Prepare one candidate onto the current head over HTTP; `(expected_head, candidate)`.
+async fn p7a_prepare(
+    h: &Harness,
+    g: &GraphId,
+    t: &str,
+    quad: &str,
+    key: &str,
+) -> (Option<String>, String) {
+    let (_, head, _) = h
+        .call(
+            "GET",
+            &format!("/v1/graphs/{g}/refs?name=main"),
+            Some(t),
+            None,
+            None,
+        )
+        .await;
+    let expected = head.get("head").and_then(Value::as_str).map(str::to_owned);
+    let r = h
+        .call(
+            "POST",
+            &format!("/v1/graphs/{g}/proposals"),
+            Some(t),
+            Some(key),
+            Some(prepare_body(expected.as_deref(), &[("add", quad)], "m")),
+        )
+        .await;
+    assert_eq!(r.0, StatusCode::CREATED, "{r:?}");
+    (expected, r.1["candidate"].as_str().unwrap().to_owned())
+}
+
+fn p7a_accept_body(expected: &Option<String>) -> Value {
+    json!({"ref": "main", "expected_head": expected, "reason": "ok"})
+}
+
+/// A request issued on a detached task (so several can be in flight at once), answered as a
+/// `Reply`.
+fn p7a_spawn(
+    h: &Harness,
+    method: &'static str,
+    path: String,
+    t: &str,
+    key: Option<String>,
+    body: Option<Value>,
+) -> tokio::task::JoinHandle<Reply> {
+    let (app, t) = (h.app.clone(), t.to_owned());
+    tokio::spawn(async move {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(&path)
+            .header(header::AUTHORIZATION, format!("Bearer {t}"));
+        if let Some(key) = key {
+            request = request.header("idempotency-key", key);
+        }
+        let request = match body {
+            Some(body) => request
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+            None => request.body(Body::empty()).unwrap(),
+        };
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let correlation = response
+            .headers()
+            .get("x-correlation-id")
+            .map(|v| v.to_str().unwrap().to_owned());
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, value, correlation)
+    })
+}
+
+/// CHARACTERIZATION (F3, F4). With every pooled connection held elsewhere, a cheap read,
+/// readiness, a prepare and an accept all wait the hard-coded 10 s pool acquire timeout and
+/// then answer 503 `DEPENDENCY_UNAVAILABLE`; the read's message tells a key-less caller to
+/// retry with an idempotency key. Nothing is written; once a connection is free everything
+/// answers normally. (ADR-0026 bounds the wait by the request deadline and gives reads their
+/// own guidance; M2 changes the envelope, M3 the headroom.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn p7a_pool_exhaustion_waits_the_acquire_timeout_then_fails_every_request_class_alike() {
+    let limits = ApiLimits {
+        request_timeout: Duration::from_secs(30),
+        ..ApiLimits::default()
+    };
+    let session = DbSessionLimits {
+        max_connections: 2,
+        ..DbSessionLimits::default()
+    };
+    let h = harness_full(dev(), limits, p7a_auth(), session).await;
+    let g = h.graph("tenant-a").await;
+    let t = token("tenant-a", "actor", &ALL);
+    let head = commit(&h, &g, &t, "<urn:a> <urn:p> \"1\" .").await;
+    let (expected, candidate) =
+        p7a_prepare(&h, &g, &t, "<urn:a> <urn:p> \"2\" .", "exh-prep").await;
+    assert_eq!(expected.as_deref(), Some(head.as_str()));
+    // Every connection of the served store is held.
+    let hold_a = h.store.pool().acquire().await.unwrap();
+    let hold_b = h.store.pool().acquire().await.unwrap();
+    let refs = format!("/v1/graphs/{g}/refs?name=main");
+    let proposals = format!("/v1/graphs/{g}/proposals");
+    let accept_path = format!("/v1/graphs/{g}/proposals/{candidate}/accept");
+    let started = std::time::Instant::now();
+    let (read, ready, prepare, accept) = tokio::join!(
+        h.call("GET", &refs, Some(&t), None, None),
+        h.call("GET", "/ready", None, None, None),
+        h.call(
+            "POST",
+            &proposals,
+            Some(&t),
+            Some("exh-prep-2"),
+            Some(prepare_body(
+                Some(&head),
+                &[("add", "<urn:a> <urn:p> \"3\" .")],
+                "m"
+            )),
+        ),
+        h.call(
+            "POST",
+            &accept_path,
+            Some(&t),
+            Some("exh-accept"),
+            Some(p7a_accept_body(&expected)),
+        ),
+    );
+    let waited = started.elapsed();
+    for (what, r) in [
+        ("read", &read),
+        ("ready", &ready),
+        ("prepare", &prepare),
+        ("accept", &accept),
+    ] {
+        assert_error(r, StatusCode::SERVICE_UNAVAILABLE, "DEPENDENCY_UNAVAILABLE");
+        println!("{what}: {} {:?}", r.0, r.1["message"]);
+    }
+    // The key-less read is told to retry "with the same idempotency key" (F4).
+    assert!(
+        read.1["message"]
+            .as_str()
+            .unwrap()
+            .contains("idempotency key"),
+        "{read:?}"
+    );
+    assert!(
+        waited >= Duration::from_secs(9) && waited < Duration::from_secs(20),
+        "the hard-coded pool acquire timeout (10 s) governs the wait: {waited:?}"
+    );
+    println!("pool exhaustion: all four classes failed after {waited:?}");
+    assert_eq!(
+        h.count("idempotency", &g).await,
+        3,
+        "nothing was written by the refused requests"
+    );
+    drop(hold_a);
+    drop(hold_b);
+    let r = h.call("GET", &refs, Some(&t), None, None).await;
+    assert_eq!(r.0, StatusCode::OK, "{r:?}");
+    let r = h.call("GET", "/ready", None, None, None).await;
+    assert_eq!(r.0, StatusCode::OK, "{r:?}");
+    let r = h
+        .call(
+            "POST",
+            &accept_path,
+            Some(&t),
+            Some("exh-accept"),
+            Some(p7a_accept_body(&expected)),
+        )
+        .await;
+    assert_eq!(r.0, StatusCode::OK, "{r:?}");
+    assert_eq!(
+        r.1["replayed"], false,
+        "the refused accept never ran: the retry executes"
+    );
+}
+
+/// Session limits for the saturation scenarios: the blocked accepts must outlive the probes
+/// (a read and a readiness check may each wait the 10 s pool timeout), so the lock wait and
+/// the statement are allowed 40 s / 60 s.
+fn p7a_saturation_session(max_connections: u32, lock_timeout: Duration) -> DbSessionLimits {
+    DbSessionLimits {
+        max_connections,
+        lock_timeout,
+        statement_timeout: Duration::from_secs(60),
+        ..DbSessionLimits::default()
+    }
+}
+
+/// An owner transaction holding `main`'s ref row `FOR UPDATE`: every accept blocks on its
+/// `SELECT … FOR UPDATE` inside PostgreSQL, while plain reads of the row (the refs route)
+/// are not blocked — only connections are.
+async fn p7a_hold_main(h: &Harness, g: &GraphId) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut blocker = h.owner.pool().begin().await.unwrap();
+    sqlx::query("SELECT head FROM refs WHERE graph_id = $1 AND branch = 'main' FOR UPDATE")
+        .bind(g.as_str())
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+    blocker
+}
+
+/// CHARACTERIZATION (F3). Accept takes no admission permit, so three accepts blocked inside
+/// PostgreSQL (on `main`'s row lock) occupy a three-connection pool entirely; the next cheap
+/// read (which the row lock does not block) and readiness probe find no connection, wait the
+/// 10 s acquire timeout and fail 503 `DEPENDENCY_UNAVAILABLE` — there is no reserved headroom
+/// for cheap traffic. Once the blocker is gone, exactly one accept lands and the other two
+/// are `HEAD_CHANGED`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn p7a_heavy_writes_without_admission_take_every_connection_and_cheap_reads_starve() {
+    let limits = ApiLimits {
+        request_timeout: Duration::from_secs(60),
+        ..ApiLimits::default()
+    };
+    let url = fresh_database("api_p7a_sat").await;
+    let h = harness_in(
+        &url,
+        dev(),
+        limits,
+        p7a_auth(),
+        p7a_saturation_session(3, Duration::from_secs(40)),
+    )
+    .await;
+    let g = h.graph("tenant-a").await;
+    let t = token("tenant-a", "actor", &ALL);
+    let head = commit(&h, &g, &t, "<urn:a> <urn:p> \"1\" .").await;
+    let mut candidates = Vec::new();
+    for i in 0..3 {
+        let (expected, c) = p7a_prepare(
+            &h,
+            &g,
+            &t,
+            &format!("<urn:a> <urn:p> \"{}\" .", i + 2),
+            &format!("sat-prep-{i}"),
+        )
+        .await;
+        assert_eq!(expected.as_deref(), Some(head.as_str()));
+        candidates.push(c);
+    }
+    let blocker = p7a_hold_main(&h, &g).await;
+    let accepts: Vec<_> = candidates
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            p7a_spawn(
+                &h,
+                "POST",
+                format!("/v1/graphs/{g}/proposals/{c}/accept"),
+                &t,
+                Some(format!("sat-accept-{i}")),
+                Some(p7a_accept_body(&Some(head.clone()))),
+            )
+        })
+        .collect();
+    wait_until(
+        async || runtime_sessions_waiting(&h.owner).await >= 3,
+        "three accepts blocked inside PostgreSQL",
+    )
+    .await;
+    let started = std::time::Instant::now();
+    let read = h
+        .call(
+            "GET",
+            &format!("/v1/graphs/{g}/refs?name=main"),
+            Some(&t),
+            None,
+            None,
+        )
+        .await;
+    let read_waited = started.elapsed();
+    let ready = h.call("GET", "/ready", None, None, None).await;
+    assert_error(
+        &read,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "DEPENDENCY_UNAVAILABLE",
+    );
+    assert_error(
+        &ready,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "DEPENDENCY_UNAVAILABLE",
+    );
+    assert!(
+        read_waited >= Duration::from_secs(9) && read_waited < Duration::from_secs(20),
+        "the read starved for the pool acquire timeout: {read_waited:?}"
+    );
+    blocker.rollback().await.unwrap();
+    let mut statuses = Vec::new();
+    for a in accepts {
+        statuses.push(a.await.unwrap().0);
+    }
+    assert_eq!(
+        statuses.iter().filter(|s| **s == StatusCode::OK).count(),
+        1,
+        "{statuses:?}"
+    );
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|s| **s == StatusCode::CONFLICT)
+            .count(),
+        2,
+        "{statuses:?}"
+    );
+    println!("saturation: read starved {read_waited:?}; accepts {statuses:?}");
+}
+
+/// FUTURE ACCEPTANCE (Plan 0013 M3, ADR-0026 §5 admission model). Pool N = 3, reserved cheap
+/// headroom 2, so one DB-work permit (`expensive` and `validations` are 1 each, as the start-up
+/// invariants require for N = 3). Sequence, order-sensitive by construction:
+/// 1. one accept is admitted and blocks inside PostgreSQL on `main`'s row lock;
+/// 2. `graphs` is then locked exclusively, so *any* pooled query touching it would block;
+/// 3. three more heavy requests of different classes (accept, prepare, state read) must be
+///    refused at once with 503 `RESOURCE_LIMIT` — before `authorized_graph`, hence without
+///    touching `graphs`; a permit taken after the graph lookup would block here instead;
+/// 4. with `graphs` released and the first accept still blocked, the cheap read and `/ready`
+///    answer 200 promptly on the reserved connections;
+/// 5. with the row lock released, the admitted accept lands; nothing else was written.
+/// Today accept takes no permit and the followers block on `graphs` until `lock_timeout`
+/// (6 s here) → `DEPENDENCY_TIMEOUT`, so this fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "FUTURE ACCEPTANCE (Plan 0013 M3): requires PostgreSQL and the admission model"]
+async fn future_p7a_reserved_headroom_keeps_reads_and_readiness_answering_while_heavy_writes_saturate()
+ {
+    let limits = ApiLimits {
+        request_timeout: Duration::from_secs(60),
+        max_concurrent_expensive: 1,
+        max_concurrent_validations: 1,
+        ..ApiLimits::default()
+    };
+    let url = fresh_database("api_p7a_headroom").await;
+    let h = harness_in(
+        &url,
+        dev(),
+        limits,
+        p7a_auth(),
+        p7a_saturation_session(3, Duration::from_secs(6)),
+    )
+    .await;
+    let g = h.graph("tenant-a").await;
+    let t = token("tenant-a", "actor", &ALL);
+    let head = commit(&h, &g, &t, "<urn:a> <urn:p> \"1\" .").await;
+    let (_, c0) = p7a_prepare(&h, &g, &t, "<urn:a> <urn:p> \"2\" .", "hr-prep-0").await;
+    let (_, c1) = p7a_prepare(&h, &g, &t, "<urn:a> <urn:p> \"3\" .", "hr-prep-1").await;
+    let written_before = h.count("idempotency", &g).await;
+    // 1. the admitted accept blocks on the row lock
+    let blocker = p7a_hold_main(&h, &g).await;
+    let admitted = p7a_spawn(
+        &h,
+        "POST",
+        format!("/v1/graphs/{g}/proposals/{c0}/accept"),
+        &t,
+        Some("hr-accept-0".into()),
+        Some(p7a_accept_body(&Some(head.clone()))),
+    );
+    wait_until(
+        async || runtime_sessions_waiting(&h.owner).await >= 1,
+        "the admitted accept blocked inside PostgreSQL",
+    )
+    .await;
+    // 2. graphs locked: anything that looks a graph up now blocks
+    let mut graphs_lock = h.owner.pool().begin().await.unwrap();
+    sqlx::query("LOCK TABLE graphs IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *graphs_lock)
+        .await
+        .unwrap();
+    // 3. followers of three heavy classes: refused by admission, never reaching the pool
+    let started = std::time::Instant::now();
+    let followers = [
+        p7a_spawn(
+            &h,
+            "POST",
+            format!("/v1/graphs/{g}/proposals/{c1}/accept"),
+            &t,
+            Some("hr-accept-1".into()),
+            Some(p7a_accept_body(&Some(head.clone()))),
+        ),
+        p7a_spawn(
+            &h,
+            "POST",
+            format!("/v1/graphs/{g}/proposals"),
+            &t,
+            Some("hr-prep-2".into()),
+            Some(prepare_body(
+                Some(&head),
+                &[("add", "<urn:a> <urn:p> \"4\" .")],
+                "m",
+            )),
+        ),
+        p7a_spawn(
+            &h,
+            "GET",
+            format!("/v1/graphs/{g}/commits/{head}/state"),
+            &t,
+            None,
+            None,
+        ),
+    ];
+    for f in followers {
+        let r = f.await.unwrap();
+        assert_error(&r, StatusCode::SERVICE_UNAVAILABLE, "RESOURCE_LIMIT");
+    }
+    let refused_in = started.elapsed();
+    assert!(
+        refused_in < Duration::from_millis(1500),
+        "admission refuses without touching the database: {refused_in:?}"
+    );
+    graphs_lock.rollback().await.unwrap();
+    // 4. cheap traffic answers on the reserved headroom while the heavy one is still blocked
+    assert!(runtime_sessions_waiting(&h.owner).await >= 1);
+    let started = std::time::Instant::now();
+    let read = h
+        .call(
+            "GET",
+            &format!("/v1/graphs/{g}/refs?name=main"),
+            Some(&t),
+            None,
+            None,
+        )
+        .await;
+    let ready = h.call("GET", "/ready", None, None, None).await;
+    let cheap_took = started.elapsed();
+    assert_eq!(read.0, StatusCode::OK, "{read:?}");
+    assert_eq!(ready.0, StatusCode::OK, "{ready:?}");
+    assert!(cheap_took < Duration::from_secs(2), "{cheap_took:?}");
+    // 5. the admitted accept lands once the row lock is gone
+    blocker.rollback().await.unwrap();
+    let r = admitted.await.unwrap();
+    assert_eq!(r.0, StatusCode::OK, "{r:?}");
+    assert_eq!(
+        h.count("idempotency", &g).await,
+        written_before + 1,
+        "only the admitted accept wrote"
+    );
+}
+
+/// PRESERVATION (premise of the Plan 0013 admission model, HTTP level). Every heavy route
+/// completes on a served store with a one-connection pool, including the handler-level steps
+/// (`authorized_graph`, membership lookups) around the store calls: prepare, accept, state
+/// read, branch creation from a historical commit, delete, restore, merge preview / propose /
+/// apply, refs, branch status, history and log. (Validations need a configured validator; the
+/// validate route's two transactions are sequential by code and are listed for M2.)
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn p7a_every_heavy_route_completes_on_a_one_connection_pool() {
+    let session = DbSessionLimits {
+        max_connections: 1,
+        ..DbSessionLimits::default()
+    };
+    let h = harness_full(dev(), ApiLimits::default(), p7a_auth(), session).await;
+    let g = h.graph("tenant-a").await;
+    let t = token("tenant-a", "actor", &ALL);
+    let admin = token(
+        "tenant-a",
+        "actor",
+        &[
+            "ledger.read",
+            "ledger.propose",
+            "ledger.review",
+            "ledger.admin",
+        ],
+    );
+    let c1 = commit(&h, &g, &t, "<urn:a> <urn:p> \"1\" .").await;
+    let c2 = commit(&h, &g, &t, "<urn:b> <urn:p> \"1\" .").await;
+    let ok = |r: &Reply, what: &str| assert!(r.0.is_success(), "{what}: {r:?}");
+    ok(
+        &h.call(
+            "GET",
+            &format!("/v1/graphs/{g}/refs?name=main"),
+            Some(&t),
+            None,
+            None,
+        )
+        .await,
+        "refs",
+    );
+    ok(
+        &h.call(
+            "GET",
+            &format!("/v1/graphs/{g}/commits/{c2}/state"),
+            Some(&t),
+            None,
+            None,
+        )
+        .await,
+        "state",
+    );
+    ok(
+        &h.call(
+            "GET",
+            &format!("/v1/graphs/{g}/branches/history?name=main&limit=10"),
+            Some(&t),
+            None,
+            None,
+        )
+        .await,
+        "history",
+    );
+    ok(
+        &h.call(
+            "GET",
+            &format!("/v1/graphs/{g}/branches/log?name=main&limit=10"),
+            Some(&t),
+            None,
+            None,
+        )
+        .await,
+        "log",
+    );
+    // Branch from the historical genesis: the reachability walk precedes the transaction.
+    let r = h
+        .call(
+            "POST",
+            &format!("/v1/graphs/{g}/branches"),
+            Some(&t),
+            Some("one-branch"),
+            Some(json!({"name": "agent/one", "source": "main", "from_commit": c1})),
+        )
+        .await;
+    assert_eq!(r.0, StatusCode::CREATED, "{r:?}");
+    ok(
+        &h.call(
+            "GET",
+            &format!("/v1/graphs/{g}/branches/status?name=agent/one"),
+            Some(&t),
+            None,
+            None,
+        )
+        .await,
+        "status",
+    );
+    // Diverge the branch, then merge it back: preview, propose, apply.
+    let body = json!({"ref": "agent/one", "expected_head": c1, "operations": [{"op": "add", "quad": "<urn:c> <urn:p> \"1\" ."}], "activity": "cognitive-correction", "message": "branch"});
+    let r = h
+        .call(
+            "POST",
+            &format!("/v1/graphs/{g}/proposals"),
+            Some(&t),
+            Some("one-bp"),
+            Some(body),
+        )
+        .await;
+    assert_eq!(r.0, StatusCode::CREATED, "{r:?}");
+    let bc = r.1["candidate"].as_str().unwrap().to_owned();
+    let r = h
+        .call(
+            "POST",
+            &format!("/v1/graphs/{g}/proposals/{bc}/accept"),
+            Some(&t),
+            Some("one-ba"),
+            Some(json!({"ref": "agent/one", "expected_head": c1, "reason": "ok"})),
+        )
+        .await;
+    assert_eq!(r.0, StatusCode::OK, "{r:?}");
+    let r = h
+        .call(
+            "POST",
+            &format!("/v1/graphs/{g}/merges/preview"),
+            Some(&t),
+            None,
+            Some(json!({"source": "agent/one", "target": "main"})),
+        )
+        .await;
+    assert_eq!(r.0, StatusCode::OK, "{r:?}");
+    let token_ = r.1["preview_token"].as_str().unwrap().to_owned();
+    let r = h
+        .call(
+            "POST",
+            &format!("/v1/graphs/{g}/merges/propose"),
+            Some(&t),
+            Some("one-mp"),
+            Some(json!({"source": "agent/one", "target": "main", "preview_token": token_, "message": "integrate"})),
+        )
+        .await;
+    assert_eq!(r.0, StatusCode::CREATED, "{r:?}");
+    let proposal_id = r.1["proposal_id"].clone();
+    let reviewer = token("tenant-a", "reviewer", &ALL);
+    let r = h
+        .call(
+            "POST",
+            &format!("/v1/graphs/{g}/merges/apply"),
+            Some(&reviewer),
+            Some("one-ma"),
+            Some(json!({"proposal_id": proposal_id, "preview_token": token_, "reason": "ok"})),
+        )
+        .await;
+    assert_eq!(r.0, StatusCode::OK, "{r:?}");
+    let r = h
+        .call(
+            "POST",
+            &format!("/v1/graphs/{g}/branches/delete"),
+            Some(&admin),
+            Some("one-bd"),
+            Some(json!({"name": "agent/one", "reason": "done"})),
+        )
+        .await;
+    assert_eq!(r.0, StatusCode::OK, "{r:?}");
+    let r = h
+        .call(
+            "POST",
+            &format!("/v1/graphs/{g}/branches/restore"),
+            Some(&admin),
+            Some("one-br"),
+            Some(json!({"name": "agent/one"})),
+        )
+        .await;
+    assert_eq!(r.0, StatusCode::OK, "{r:?}");
+    ok(&h.call("GET", "/ready", None, None, None).await, "ready");
+}
+
+/// A harness whose served store pauses every workflow transaction right after `COMMIT`
+/// (the response has not been built), with a 1 s edge timeout: the edge fires while the
+/// outcome is durable.
+async fn p7a_after_commit_harness() -> (Harness, ledger_store::test_hooks::PauseHook) {
+    use ledger_store::test_hooks::{HookPoint, PauseHook};
+    let hook = PauseHook::new(HookPoint::AfterCommit);
+    let limits = ApiLimits {
+        request_timeout: Duration::from_secs(1),
+        ..ApiLimits::default()
+    };
+    let h = harness_in_hooked(
+        &database_url(),
+        dev(),
+        limits,
+        p7a_auth(),
+        DbSessionLimits::default(),
+        Some(hook.clone()),
+    )
+    .await;
+    (h, hook)
+}
+
+/// Genesis prepare over the after-COMMIT harness (resumed explicitly), then an accept that
+/// pauses after its COMMIT and is dropped by the 1 s edge timeout. Returns the candidate, the
+/// accept's path and the timeout reply. The accept is only sent once it has provably reached
+/// COMMIT (`hook.reached()`), so a slow runner cannot turn this into a pre-COMMIT drop.
+async fn p7a_lost_accept(
+    h: &Harness,
+    hook: &ledger_store::test_hooks::PauseHook,
+    g: &GraphId,
+    t: &str,
+    prefix: &str,
+) -> (String, String, Reply, Duration) {
+    let prepare = p7a_spawn(
+        h,
+        "POST",
+        format!("/v1/graphs/{g}/proposals"),
+        t,
+        Some(format!("{prefix}-prep")),
+        Some(prepare_body(
+            None,
+            &[("add", "<urn:a> <urn:p> \"1\" .")],
+            "m",
+        )),
+    );
+    hook.reached().await;
+    hook.resume();
+    assert_eq!(prepare.await.unwrap().0, StatusCode::CREATED);
+    let candidate: String =
+        sqlx::query_scalar("SELECT candidate_commit FROM proposals WHERE graph_id = $1")
+            .bind(g.as_str())
+            .fetch_one(h.owner.pool())
+            .await
+            .unwrap();
+    let accept_path = format!("/v1/graphs/{g}/proposals/{candidate}/accept");
+    let started = std::time::Instant::now();
+    let accept = p7a_spawn(
+        h,
+        "POST",
+        accept_path.clone(),
+        t,
+        Some(format!("{prefix}-accept")),
+        Some(p7a_accept_body(&None)),
+    );
+    // COMMIT has returned; the handler now waits at the hook until the edge timeout drops it.
+    hook.reached().await;
+    let reply = accept.await.unwrap();
+    (candidate, accept_path, reply, started.elapsed())
+}
+
+/// CHARACTERIZATION (F4). An accept whose COMMIT succeeded but whose handler is dropped by
+/// the edge timeout before responding is reported today as 503 `RESOURCE_LIMIT` "request
+/// exceeded the configured time limit" — indistinguishable from an admission refusal where
+/// nothing happened, and without any replay guidance — although the write is durable: the
+/// same-key retry replays it. (M2 / ADR-0026 outcome model changes the envelope; the
+/// durability and replay here are PRESERVATION and must not change.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PostgreSQL: run via scripts/test-integration.sh with LEDGER_TEST_DATABASE_URL"]
+async fn p7a_an_edge_timeout_after_commit_is_reported_today_like_an_admission_refusal() {
+    let (h, hook) = p7a_after_commit_harness().await;
+    let g = h.graph("tenant-a").await;
+    let t = token("tenant-a", "actor", &ALL);
+    let (candidate, accept_path, r, took) = p7a_lost_accept(&h, &hook, &g, &t, "eto").await;
+    assert_error(&r, StatusCode::SERVICE_UNAVAILABLE, "RESOURCE_LIMIT");
+    assert!(
+        r.1["message"].as_str().unwrap().contains("time limit"),
+        "{r:?}"
+    );
+    assert!(
+        !r.1["message"].as_str().unwrap().contains("idempotency"),
+        "today: no replay guidance: {r:?}"
+    );
+    assert!(
+        took >= Duration::from_millis(900) && took < Duration::from_secs(5),
+        "{took:?}"
+    );
+    println!(
+        "edge timeout after COMMIT answered {} {:?} after {took:?}",
+        r.0, r.1["code"]
+    );
+    // Durable regardless of the lost response.
+    assert_eq!(h.count("ref_events", &g).await, 1);
+    assert_eq!(h.count("idempotency", &g).await, 2);
+    // The retry replays (a replay commits no write, so it never reaches the after-COMMIT hook).
+    let r = h
+        .call(
+            "POST",
+            &accept_path,
+            Some(&t),
+            Some("eto-accept"),
+            Some(p7a_accept_body(&None)),
+        )
+        .await;
+    assert_eq!(r.0, StatusCode::OK, "{r:?}");
+    assert_eq!(r.1["replayed"], true, "{r:?}");
+    assert_eq!(r.1["head"], candidate, "{r:?}");
+    println!(
+        "retry after the lost response: {} replayed={}",
+        r.0, r.1["replayed"]
+    );
+}
+
+/// FUTURE ACCEPTANCE (Plan 0013 M2, ADR-0026 outcome model, Design A). The same scenario must
+/// answer with the request-timeout envelope for an idempotent write whose execution began:
+/// 503 `REQUEST_TIMEOUT`, a message saying the outcome is unknown and that the same
+/// idempotency key replays it, and the retry replays the durable result. Today the code is
+/// `RESOURCE_LIMIT` and the message carries no guidance, so this fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "FUTURE ACCEPTANCE (Plan 0013 M2): requires PostgreSQL and the outcome-classified timeout envelope"]
+async fn future_p7a_an_edge_timeout_after_commit_reports_the_outcome_as_unknown_and_the_key_replays()
+ {
+    let (h, hook) = p7a_after_commit_harness().await;
+    let g = h.graph("tenant-a").await;
+    let t = token("tenant-a", "actor", &ALL);
+    let (_, accept_path, r, _) = p7a_lost_accept(&h, &hook, &g, &t, "fto").await;
+    assert_error(&r, StatusCode::SERVICE_UNAVAILABLE, "REQUEST_TIMEOUT");
+    let message = r.1["message"].as_str().unwrap();
+    assert!(
+        message.contains("unknown") && message.contains("idempotency key"),
+        "{r:?}"
+    );
+    let r = h
+        .call(
+            "POST",
+            &accept_path,
+            Some(&t),
+            Some("fto-accept"),
+            Some(p7a_accept_body(&None)),
+        )
+        .await;
+    assert_eq!(r.0, StatusCode::OK, "{r:?}");
+    assert_eq!(r.1["replayed"], true, "{r:?}");
 }

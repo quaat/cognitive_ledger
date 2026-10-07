@@ -1080,6 +1080,7 @@ dependencies = [
  "ledger-core",
  "ledger-projection",
  "ledger-projection-fuseki",
+ "ledger-projector",
  "ledger-rdf",
  "ledger-store",
  "reqwest",

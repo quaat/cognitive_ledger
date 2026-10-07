@@ -120,12 +120,65 @@ def feature_tree(pkg, edges):
     fail(f"cargo tree failed for {pkg}: {errors}")
 
 
-# Forced-interleaving pause points (ledger-store feature `test-hooks`) exist only in test
-# builds: no shipped or qualification binary may enable them in its normal build graph.
-HOOKS = 'ledger-store feature "test-hooks"'
-if HOOKS not in feature_tree("ledger-store", "normal,build,dev"):
-    fail("check broken: the ledger-store test graph does not show the test-hooks feature")
-for app in sorted(p.parent.name for p in root.glob("apps/*/Cargo.toml")):
-    if HOOKS in feature_tree(app, "normal,build"):
-        fail(f"{app}: its build enables ledger-store's test-hooks feature (test-only pause points)")
+# Test-only fault injection and pause points (ledger-store and ledger-projector feature
+# `test-hooks`: `FailPoint`, `PauseHook`, slow statements, crash windows) exist only in test
+# builds: no shipped or qualification binary may enable them in its normal build graph
+# (Plan 0013 F5). Two proofs: the resolved feature graph of every app, and a compile probe
+# showing the interface does not exist without the feature (and does exist with it, so the
+# probe cannot pass vacuously).
+for hooked in ("ledger-store", "ledger-projector"):
+    HOOKS = f'{hooked} feature "test-hooks"'
+    if HOOKS not in feature_tree(hooked, "normal,build,dev"):
+        fail(f"check broken: the {hooked} test graph does not show the test-hooks feature")
+    for app in sorted(p.parent.name for p in root.glob("apps/*/Cargo.toml")):
+        if HOOKS in feature_tree(app, "normal,build"):
+            fail(f"{app}: its build enables {hooked}'s test-hooks feature (test-only fault injection)")
+
+
+def probe(features, uses, expect_ok):
+    """`cargo check` a scratch crate that depends on the hooked crates with `features` and
+    names every test-only symbol in `uses`; the check must succeed iff `expect_ok`."""
+    work = root / "target" / "test-hooks-probe" / ("with" if expect_ok else "without")
+    (work / "src").mkdir(parents=True, exist_ok=True)
+    store_feats = '"postgres"' + (', "test-hooks"' if features else "")
+    proj_feats = '"test-hooks"' if features else ""
+    (work / "Cargo.toml").write_text(
+        "[package]\nname = \"test-hooks-probe\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n"
+        "[workspace]\n[dependencies]\n"
+        f"ledger-store = {{ path = \"{root / 'crates' / 'ledger-store'}\", features = [{store_feats}] }}\n"
+        f"ledger-projector = {{ path = \"{root / 'apps' / 'ledger-projector'}\", features = [{proj_feats}] }}\n")
+    (work / "src" / "lib.rs").write_text("".join(f"pub use {u} as Probe{i};\n" for i, u in enumerate(uses)))
+    # Resolve against the workspace's pinned versions (copied on every run, so a lockfile
+    # change is followed); offline first, online on a fresh runner, like `metadata()`.
+    (work / "Cargo.lock").write_bytes((root / "Cargo.lock").read_bytes())
+    env = dict(**__import__("os").environ, CARGO_TARGET_DIR=str(root / "target" / "test-hooks-probe" / "target"))
+    r = None
+    for extra in (["--offline"], []):
+        r = subprocess.run(["cargo", "check", "--quiet", *extra], cwd=work, env=env, capture_output=True, text=True)
+        # A resolution/download failure is distinguishable from the compile outcome we test for:
+        # rustc errors name `error[E`; cargo's offline failure does not.
+        if r.returncode == 0 or "error[E" in r.stderr:
+            break
+    if (r.returncode == 0) != expect_ok:
+        fail(f"test-hooks probe ({'with' if expect_ok else 'without'} the feature) {'succeeded' if r.returncode == 0 else 'failed'} unexpectedly:\n{r.stderr[-4000:]}")
+    if not expect_ok:
+        for i, u in enumerate(uses):
+            # rustc echoes the offending source line under each unresolved import; matching
+            # it pins every symbol by its full path, so same-named symbols of different crates
+            # (both `FailPoint`s) are checked apart. (The message itself may name only the
+            # unresolved module, e.g. `ledger_store::test_hooks`.)
+            if f"pub use {u} as Probe{i};" not in r.stderr or "error[E0432]" not in r.stderr:
+                fail(f"test-hooks probe: the production build did not report `{u}` as unresolved:\n{r.stderr[-4000:]}")
+
+
+TEST_ONLY = [
+    "ledger_store::FailPoint",
+    "ledger_store::test_hooks::PauseHook",
+    "ledger_store::test_hooks::HookPoint",
+    "ledger_store::classify_db_error",
+    "ledger_projector::FailPoint",
+]
+if "--no-probe" not in sys.argv:
+    probe(True, TEST_ONLY, expect_ok=True)
+    probe(False, TEST_ONLY, expect_ok=False)
 print("architecture dependency checks passed")

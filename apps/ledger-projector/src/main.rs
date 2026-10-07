@@ -436,6 +436,13 @@ async fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+    if ledger_store::TEST_HOOKS_COMPILED || ledger_projector::TEST_HOOKS_COMPILED {
+        eprintln!(
+            "ledger-projector: this build contains test-only fault injection (`test-hooks`); \
+             refusing to run"
+        );
+        return ExitCode::FAILURE;
+    }
     match real_main().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

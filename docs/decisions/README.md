@@ -54,3 +54,8 @@ See [Plan 0009](../exec-plans/completed/0009-phase5-diff-and-merge.md).
 See [Plan 0012](../exec-plans/completed/0012-phase6c-batched-retrieval.md).
 
 - [ADR-0025: A derived-index claim that contradicts verified immutable bytes is storage corruption](ADR-0025-derived-index-contradiction-is-corruption.md)
+
+## Phase 7A runtime resource governance (P7)
+See [Plan 0013](../exec-plans/active/0013-phase7a-resource-governance.md).
+
+- [ADR-0026: Request, transaction, cancellation and admission lifecycle](ADR-0026-request-transaction-cancellation-and-admission-lifecycle.md) — *proposed; owner review pending*
