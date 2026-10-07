@@ -233,6 +233,27 @@
   fewer tests at once. Set `shm_size` on the compose PostgreSQL (or document the host
   requirement) before relying on local full-parallel runs.
 
+## Phase 7A (Plan 0013) M0 findings awaiting their milestone
+Recorded 2026-10-07 from the read-only inventory in
+[Plan 0013](active/0013-phase7a-resource-governance.md) (findings F1–F10 there carry the
+file:line evidence and the milestone that fixes each):
+- `FailPoint` (`postgres_workflow.rs:638`, seven pre-COMMIT points) is compiled into release
+  builds (not behind `test-hooks`); Plan 0013 M1 gates it or proves it unreachable.
+- The fault gate's expected-failure filter accepts every `503 DEPENDENCY*`, so a
+  `DEPENDENCY_TIMEOUT` does not fail `scripts/fault.sh` although `test-strategy.md` says it
+  does; two merge crash tests assert only `is_err()`; the fault evidence calls "lost response
+  after COMMIT" deterministically proven while no fail point fires at or after COMMIT. M1.
+- Abandoned statements run to completion after the edge timeout (sqlx 0.8.6 pins the
+  connection until PostgreSQL finishes; `ROLLBACK` is queued behind it), `statement_timeout`
+  equals `request_timeout`, `idle_in_transaction_session_timeout` exceeds it, and no
+  transaction-level bound exists. M2 (ADR first).
+- `accept`, `reject`, `merge_apply` and branch writes take no admission permit; 12 + 4 slots
+  equal the 16-connection pool; prepare holds a slot while waiting for a connection. M3.
+- `mark_superseded` has no idempotency key (a retry after a lost response gets
+  `LineageMismatch`); the projector's `number()` accepts 0, its DB session limits are not
+  configurable and its worker count is not checked against its 8-connection pool;
+  `ledger-admin` pools set no session limits. Deferred or M3 as the plan states.
+
 ## Later-phase work and accepted residual risk (does not block Phase 2 or the P1.5 gate)
 
 - Design a stable skolemization/import protocol and hostile-input limits around the standards N-Quads parser.

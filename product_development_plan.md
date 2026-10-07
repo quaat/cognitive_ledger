@@ -1789,6 +1789,15 @@ performance regression envelope
 
 ## Phase 7 — Production security and resilience
 
+> **Phase 7A (Plan 0013, started 2026-10-07): runtime resource governance and PostgreSQL
+> resilience.** The first bounded slice takes the two code-owned P2 items of the
+> production-qualification matrix that share one cause — what a request may hold in the
+> database and for how long: abandoned database work after an HTTP timeout (no cancellation,
+> `statement_timeout` = request timeout, no transaction bound) and write paths without
+> admission control. M0 (inventory, concurrency/resource model, test strategy) is in the
+> plan; acceptance tests come before any behaviour change, and the timeout/cancellation/
+> admission model needs an ADR before implementation. Checkpoints are not started (§24).
+
 Deliver:
 
 ```text
