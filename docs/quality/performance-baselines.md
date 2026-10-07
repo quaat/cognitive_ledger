@@ -58,6 +58,42 @@ state read at the development `max_depth`).
 - The stress-run p99 figures (`docs/quality/evidence/stress-1000-writers-2026-09-26.md`) include
   queueing and contention and are not comparable to these single-client numbers.
 
+## 2026-10-07 reconstruction characterization (Plan 0011, `ledger-bench recon`)
+
+Two official runs were made from clean worktrees, `4eb4d28` and `e353b6c`
+([run 1](evidence/benchmarks/2026-10-07-phase6b-recon-official/recon.md),
+[run 2](evidence/benchmarks/2026-10-07-phase6b-recon-official-run2/recon.md); the JSON
+files are authoritative).
+- Setup: constant-state histories of 1, 1,000 and 10,000 quads, measured at depths 1 to
+  5,000, on the same workstation class as above.
+- PostgreSQL ran with benchmark-only instrumentation (`pg_stat_statements`,
+  `track_io_timing`).
+- Every timed result was verified exactly against the harness's oracle.
+
+Fitted over depths 100–5,000:
+
+| Measure | Value |
+|---|---|
+| API state read, latency per ancestry level | 189–225 µs |
+| PostgreSQL statements per level | 2.00 |
+| PostgreSQL execution time ÷ latency | 14–15 % |
+| Prefetched fold CPU (a lower bound) | 10–11 µs per level |
+| Merge ancestry walk | ≈ 330 µs per level, 4 statements |
+| Divergent merge preview | ≈ 960 µs per level, 10 statements |
+
+State size matters only at shallow depth. A database restart (OS page cache warm) is within
+noise.
+
+**Reading:** depth dominates through per-statement round trips, two per ancestor, not
+through query execution, the fold or storage I/O. The recommended first Phase-6
+intervention is **batched ancestor and object retrieval** (Plan 0011 "Recommendation").
+Checkpoints are deferred until the residual cost after batching has been measured.
+
+The absolute per-level cost belongs to this host and container topology. The scaling
+shape transfers to other setups; see `docs/benchmarks/METRICS.md` for what the figures
+cannot support. The `scripts/bench.sh` figures above (≈ 0.19–0.20 ms per ancestor) agree
+with this run.
+
 ## Checkpoint policy proposal (input to Phase 4/5; no implementation in Plan 0005)
 
 Reconstruction cost is proportional to history length; the cheaper remedies lower the constant

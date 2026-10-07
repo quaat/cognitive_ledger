@@ -1,6 +1,6 @@
 # Plan 0011: Phase 6B — BEAR-B, reconstruction characterization, qualification hygiene
 
-Status: **in progress** (started 2026-10-06). Branch `claude/p6b-bear-reconstruction` from
+Status: **complete** (2026-10-07; PR #13, awaiting the owner's merge). Branch `claude/p6b-bear-reconstruction` from
 `main` at `646b0291c2dcd0f50089939ab2622f02dc47d538`. That commit is the PR #12 Phase-6A merge;
 its tree is identical to the reviewed head `9f593d2`, see
 [Plan 0010](../completed/0010-phase6a-benchmark-foundation.md). No gate is reported as passed
@@ -112,9 +112,9 @@ Every item of the Phase-6B gate in the task holds, the recommendation is written
 - [x] Lifecycle commands (fetch, verify, prepare, verify, clean) with safe archive handling
 - [x] Extraction with the CB cross-check; oracle; `bear-b-ci` runs
 - [x] `recon` profile; PostgreSQL instrumentation override; cold arm; CPU and memory
-- [ ] `bear-b-ci` in `ci` if within budget
+- [x] `bear-b-ci` in `ci` if within budget (hosted `benchmark-ci` 4m55s–7m36s per job, benchmark run 32–44 s)
 - [x] Production-qualification matrix ([production-qualification.md](../../quality/production-qualification.md))
-- [ ] Reviews; gates; evidence; recommendation; stop
+- [x] Reviews; gates; evidence; recommendation; stop (no Phase-6C work on this branch)
 
 ## Decisions
 1. **The BEAR-B oracle is the TB/CB lineage, not IC** (owner review requested).
@@ -275,3 +275,32 @@ depth. A rough projection from the fold lower bound puts it at ≥ 0.1 s at dept
 | Bottleneck inference without the preferred answer | — | Independently concluded: about two round trips per ancestor dominate (execution ≈ 14 %, fold ≈ 5 %), so make the ancestry walk set-based first. Checkpoints, caches, fold work and PostgreSQL tuning are not yet supported. |
 
 ## Evidence
+
+Revisions:
+- **Code head** `e353b6c` is the last commit that changes code, scripts or CI.
+- **Docs head** `93a7f90` and the final PR head add only docs and evidence:
+  `git diff --stat e353b6c..<final head>` touches `docs/` only.
+- **Hosted CI** for `pull_request` runs on GitHub's test-merge commit, not on the branch
+  head. For the code head that is `f88ec80` (merge of `e353b6c` into `646b029`). The final
+  head's runs are listed in the PR description.
+
+| Gate | Revision | Result |
+|---|---|---|
+| `check-fast`: fmt, clippy, tests, architecture, doc links, doc consistency with matrix-aware required checks (self-tested), goldens | `e353b6c` | pass, 253 tests, 0 failed |
+| `ledger-bench` unit tests | `e353b6c` | 36 + 5 pass, 1 ignored (the slow debug-build `local` generation test; covered by `validate --profile local` in release) |
+| Supply chain (`check-supply-chain.sh`: advisories, bans, licenses, sources, SBOM) | `e353b6c` | pass |
+| PostgreSQL 17 suites (`ledger-store --features postgres`, `ledger-api`; `--ignored`) | `4eb4d28` (no crate, migration, Dockerfile, compose or lockfile change since) | 124 + 36 pass, 0 failed |
+| PostgreSQL 15 suites | `4eb4d28` (same) | 124 + 36 pass, 0 failed |
+| `pg_graphs_migration` repeated: 10 × PG17 + 10 × PG15 | `4eb4d28` (same) | 20 / 20 runs pass (160 test executions), each 2–9 s; no hang |
+| Integration (`test-integration.sh`) | `e353b6c` | `INTEGRATION OK` |
+| Upgrade 0012 → 0013 (`upgrade-p5.sh`) | `e353b6c` | `UPGRADE-P5 OK`, previous `5216bce` schema 12 → 13; clean and upgraded schemas converge (1,406 DDL/grant lines, 100 owned objects) |
+| Benchmark `ci` (`benchmark.sh ci`, local) | `93a7f90` (code = `e353b6c`), tracked changes 0 | synthetic-ledger-ci 1,115 and bear-b-ci 185 assertions, 0 failed; `VERIFY OK` |
+| Benchmark `local` | `93a7f90` | synthetic-ledger-local 4,945 assertions, 0 failed; `VERIFY OK` |
+| Benchmark `bear` | `93a7f90` | bear-b-ci 185 assertions, 0 failed; `VERIFY OK` |
+| Reconstruction characterization, official run 1 | clean worktree `4eb4d28` (`official=yes`) | `RECON PASS`, 144 points, 186 exact checks, 0 failures; `VERIFY OK`; 69 min |
+| Reconstruction characterization, official run 2 | clean worktree `e353b6c` (`official=yes`; quiet healthchecks, settled database) | `RECON PASS`, 144 points, 186 exact checks, 0 failures; `VERIFY OK`; API calls = store + 2 in every window |
+| Hosted CI, test-merge `f88ec80` (code head `e353b6c`) | ci-fast 37552533912, ci-integration 37552533888, ci-security 37552533866, ci-fuzz 37552533864, ci-benchmark 37552533925 | all success: fast; docker; container, dependency-review, supply-chain; fuzz-sanitizer (none), fuzz-sanitizer (address), aggregate `fuzz`; benchmark-ci |
+| Hosted `benchmark-ci` envelope (`f88ec80`) | run 37552533925 | job 4m55s (harness build 23 s, cached sources verified, fetch+prepare 14 s, stack 190 s, **benchmark run 32 s**: synthetic 1,115 + BEAR 185 assertions, 0 failed; `VERIFY OK`) |
+| Hosted `benchmark-ci` envelope, earlier heads | `097f517` / `4eb4d28` | 5m36s (first download of the sources, 33 s; run 44 s) / 7m36s (cold rust cache: harness build 141 s; run 40 s) |
+| Backup/restore | — | not applicable: no production, storage or migration code changed in this PR (`git diff 646b029.. -- crates apps/ledger-server apps/ledger-projector migrations` touches only three test files) |
+
