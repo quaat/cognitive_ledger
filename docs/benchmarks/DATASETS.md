@@ -8,14 +8,14 @@ recomputes the manifest and refuses to run when any field differs (see
 |---|---|---|
 | `synthetic-ledger-ci` | commit, branch and merge correctness oracle; small representative workload (PR CI) | **implemented** (Plan 0010) |
 | `synthetic-ledger-local` | the same generator with a deeper history (≈1,500 commits, parent-0 depth ≈650) for baselines | **implemented** (Plan 0010) |
-| `bear-b-ci` | temporal RDF versions: version materialization, version diff, history | plan below (M3, next) |
+| `bear-b-ci` | temporal RDF versions: version materialization, version diff, history (genuine DBpedia Live evolution) | **implemented** (Plan 0011, M3); in the `ci` profile |
 | `tkgl-smallpedia-ci` | temporal knowledge graph: snapshot reconstruction and no-leakage history access | plan below (M4) |
 | `thgl-software-ci` | heterogeneous temporal event graph: event replay and typed history | plan below (M5) |
 | Full BEAR, OGB, large TGB, Software Heritage, LDBC, GNN quality | nightly and scale programmes | out of scope for Phase 6A |
 
 ## `synthetic-ledger-ci` / `synthetic-ledger-local` (implemented)
 
-Generator: `apps/ledger-bench/src/synthetic.rs`, version `synthetic-ledger-gen/1`. It is a
+Generator: `apps/ledger-bench/src/synthetic.rs`. Its version (`GENERATOR_VERSION`) is recorded in each manifest's `generator.version`, the authoritative value. It is a
 single SplitMix64 stream from the seed in the manifest. The data is project-owned and
 generated on every run; nothing is committed except the manifest.
 
@@ -59,50 +59,161 @@ milestone.
 
 ## Extraction plans for the next CI datasets (reviewed in Plan 0010; not implemented)
 
-The rules below are common to all three:
-- **Nothing is downloaded during a benchmark run.** A separate `fetch` step downloads the
-  source into a cache and checks the pinned SHA-256 and byte size. Locally the cache is
-  `target/benchmark-cache/<dataset>/<source-sha256>/`. In CI it is a GitHub Actions cache
-  keyed by the manifest's `output_checksum`, filled by a manual or scheduled
-  `prepare-datasets` workflow; PR jobs only restore it.
+The common rules below apply to every external dataset. They describe what `bear-b-ci`
+implements (`apps/ledger-bench/src/{bear,archive}.rs`); the TGB plans further down predate
+them and must be brought in line when implemented.
+
+- **Nothing is downloaded during a benchmark run.**
+  - A separate `ledger-bench fetch <dataset>` step downloads the pinned source files into
+    `target/benchmark-cache/<dataset>/source/` (file names derived from role and URL,
+    validated) and checks the pinned SHA-256 and byte size before the file is renamed into
+    place.
+  - Transient failures (transport errors, HTTP 429/5xx) are retried twice with backoff, and
+    a stalled transfer times out after 120 s. Integrity failures are never retried.
+  - Redirects are followed only over https on the same host.
+  - In CI, `ci-benchmark` restores `target/benchmark-cache/<dataset>/source/` from a GitHub
+    Actions cache keyed by the hash of the dataset manifest. On a miss, the job's `fetch`
+    downloads the source. There is no separate prepare-datasets workflow.
+  - `fetch` and `prepare` re-hash a restored cache against the manifest; the cache key alone
+    is never trusted.
 - **The publishers provide no checksums** (verified for BEAR and TGB). The first reviewed
   download pins SHA-256 and size in the manifest, and any later mismatch fails.
-- **Extraction is a pure function of the verified source and the manifest parameters.** Its
-  output (canonical N-Quads plus a version or event index) has its own `output_checksum`.
-- **Raw downloads are deleted after extraction in CI.** Locally,
-  `scripts/benchmark.sh clean-cache` removes them (to be added with M3).
+- **Extraction is a pure function of the verified source and the extraction constants.**
+  - `ledger-bench prepare <dataset>` writes one prepared artifact to
+    `target/benchmark-cache/<dataset>/prepared/`. The manifest pins its SHA-256 and size,
+    plus the workload checksum.
+  - A run loads only that artifact and refuses it on any mismatch.
+- **Cache cleanup.** Raw downloads are kept, not deleted after extraction, in CI as well.
+  `ledger-bench clean <dataset>` removes the prepared artifact; `--all` also removes the
+  downloaded sources.
 - **No third-party data is committed** until its redistribution basis has been reviewed (per
   dataset below). Project-generated data and manifests are committed.
 - **Archive handling.**
-  - Archive entries are streamed by name.
-  - No path from an archive is ever used to write a file, so there is no path traversal
-    (zip-slip) and symlinks are ignored.
-  - Decompressed bytes are capped per dataset, at twice the manifest's expected
-    uncompressed size, so a decompression bomb fails instead of filling the disk.
-  - A restored CI cache is re-hashed against the manifest checksums before use. The cache
-    key alone is never trusted.
-- **Blank nodes** are forbidden in persistent ledger RDF. Extraction replaces each with a
-  deterministic skolem IRI (`urn:bench:skolem:<dataset>:<sha256 of the source file and node
-  label>`). It records the count; a count above zero is reported, never silent.
+  - gzip is decompressed in memory with a fixed hard output cap per stream (512 MiB). The
+    cap is a constant, not derived from the manifest. Exactly one gzip member is accepted,
+    and trailing data is refused.
+  - tar is read by a minimal ustar reader. Only regular-file entries whose names pass a
+    strict pattern are selected, with a 16 MiB per-entry cap and a 256 MiB total cap. Links,
+    directories, devices and extension records are skipped and counted. Duplicate names, bad
+    header checksums, truncation and a missing end-of-archive marker fail.
+  - Selected entries stay in memory. No path from an archive is ever used to write a file,
+    so there is no path traversal (zip-slip) and no link following.
+  - Archive content is never executed.
+- **Blank nodes** are forbidden in persistent ledger RDF. The planned rule is to replace each
+  with a deterministic skolem IRI (`urn:bench:skolem:<dataset>:<sha256 of the source file
+  and node label>`) and record the count. Skolemization is **not implemented yet**: BEAR-B
+  has no blank nodes, and `bear-b-ci` extraction fails on any blank node until the
+  skolemization is implemented and reviewed.
 - **Batching.** The public API caps a patch at 10,000 operations. A source version larger
-  than that is ingested as consecutive bulk commits, and the oracle checks state only at
+  than that is ingested as consecutive bulk commits (`bear-b-ci` uses at most 5,000
+  operations and 1.4 MB per commit), and the oracle checks state only at
   version boundaries. Limits are never raised for benchmarks.
 
-### `bear-b-ci` — BEAR-B (DBpedia Live), **next milestone (M3)**
+## `bear-b-ci` — BEAR-B (DBpedia Live), implemented (Plan 0011, M3)
 
-| item | plan |
-|---|---|
-| Source and version | BEAR-B, the 100 most volatile DBpedia Live resources, changesets of Aug–Oct 2015; archive files dated 2017-04-05. <https://aic.ai.wu.ac.at/qadlod/bear.html> |
-| Granularity | **day**: 89 versions, ~33.5k triples in version 0 growing to ~43.9k, average change 1.78% per version. Hour (1,299 versions, 489 MB compressed IC) and instant are nightly candidates |
-| Files | `BEAR_B/datasets/day/IC/alldata.IC.nt.tar.gz` (32,485,978 bytes; one N-Triples file per version) and `BEAR_B/datasets/day/CB/alldata.CB.nt.tar.gz` (1,129,879 bytes; added and deleted files per version). The file names inside the tarballs are unverified until the first reviewed download |
-| Licence | DBpedia data: CC BY-SA 3.0 and GFDL (attribution, share-alike). The BEAR page states no data licence (unverified); the BEAR code is LGPL-3.0. **Decision:** do not commit extracted triples; cache them. Attribution goes in the manifest and the report |
-| Expected sizes | ~33.6 MB download. The extracted window (12 versions × ~35–40k triples, canonical N-Quads) is ~60–80 MB uncompressed, an estimate to be replaced by measurement |
-| Extraction | **all** triples of 12 **consecutive** day versions `V_s … V_{s+11}`. No triple sampling, which would destroy the version semantics. The window rule is fixed in the extraction version: `s = 0` unless review chooses the window with the most changes; that choice is recorded either way. Each triple is normalized to the ledger's canonical N-Quads (default graph) and blank nodes are skolemized as above |
-| Temporal order and identity | version index = commit order; IRIs unchanged |
-| Ledger representation | linear `main`: `V_s` as bulk genesis commits, then one commit per version, applying CB's deletes and adds (cross-checked as `IC(V_{k+1}) − IC(V_k)` and vice versa). A mismatch between CB and IC fails extraction |
-| Production path | prepare/accept (ingest), `GET …/state` at every version (materialization), `ledger_rdf::diff` on materialized versions (`algorithm`, until a public diff exists), branch log (history) |
-| Oracle | `state(V_k) == IC(V_k)` after normalization; `diff(V_j, V_k) ==` set difference of the IC versions; the CB changes equal the per-commit diff |
-| CI budget | ~12 commits of ~40k triples: ingest is dominated by state size. Estimated < 2 min, to be measured before it joins `ci` |
+The authoritative values are the committed manifest `benchmark/datasets/bear-b-ci.json` (v2):
+pinned source files, extraction counts and the prepared artifact's SHA-256. Code:
+`apps/ledger-bench/src/bear.rs`.
+
+**Source facts, verified on the first reviewed download (2026-10-06)**, superseding the plan
+written before verification.
+- Distribution and versions:
+  - Publisher: BEAR, WU Vienna (QADLOD).
+  - Landing page <https://aic.ai.wu.ac.at/qadlod/bear.html>.
+  - Day granularity: **89 versions**, 33,502 → 43,907 triples (the publisher's statistics,
+    which match the IC files).
+  - Archives dated 2017-04-05 (HTTP Last-Modified).
+- Files used:
+
+  | role | file | bytes | contents |
+  |---|---|---:|---|
+  | full versions (IC) | `day/IC/alldata.IC.nt.tar.gz` | 32,485,978 | 89 regular entries `000001.nt.gz` … `000089.nt.gz`, each a gzipped N-Triples file |
+  | changesets (CB) | `day/CB/alldata.CB.nt.tar.gz` | 1,129,879 | 176 entries `data-added_k-(k+1).nt.gz` and `data-deleted_k-(k+1).nt.gz`, k = 1…88 |
+  | time-annotated (TB) | `day/TB/alldata.TB.nq.gz` | 1,041,716 | N-Quads; graph `<http://example.org/v0_1_…>` lists the 0-based versions containing a triple, plus 25,172 `owl:versionInfo` statements about those graphs |
+
+  There are no symlinks or directories in the archives. CBTB was inspected but is not used.
+- **No publisher checksums exist.** SHA-256 and byte size were pinned on the first reviewed
+  download and confirmed by a second, independent `fetch`. Any later mismatch fails.
+- **License.** The BEAR page states no data license (checked 2026-10-06). The data derives
+  from DBpedia (CC BY-SA 3.0 and GFDL; attribution, share-alike). BEAR's code license is not
+  relevant here (no BEAR code is used) and was not reviewed.
+  - Redistribution of a derived subset has **not** been reviewed, so nothing third-party is
+    committed. The prepared artifact lives only in the local cache.
+  - The unmodified public source archives are also kept in a GitHub Actions cache entry.
+    In a public repository, pull requests (including forks) can restore it. This is a form
+    of distribution of public, unmodified files, and **the owner must accept it explicitly**
+    (Plan 0011 Decisions). Until then it is recorded in the manifest's `redistribution`
+    field.
+  - Failure details and reports never quote BEAR statements (`stmt:<hash>` references;
+    ledger error bodies are reduced to their code and a hash).
+  - The report states the source, license, attribution and that the data was modified
+    (normalized and windowed).
+- **Blank nodes:** none. Parse failures: none. Normalization collisions: none.
+
+**Finding: BEAR-B day publishes two internally consistent but different lineages.**
+- IC file 1 plus the cumulative CB changes equals TB at **all 88 steps**: a changeset lineage.
+- The IC files after version 1 drop stale values the changesets never delete (for example
+  old `wikiPageLength` and `wikiPageModified` values). They disagree with both CB and TB:
+  - CB-deleted lacks IC's deletions, 191 of 370 for 1→2;
+  - every step carries 6–14 no-op churn triples in both CB files;
+  - by the last version IC holds 43,907 triples and TB 63,993.
+- The plan's cross-check "IC differences equal CB" therefore **fails on the published
+  data**. That is a property of the source, not of extraction.
+
+`bear-b-ci` follows the lineage where two encodings of one lineage (TB and CB) agree exactly:
+- **Oracle:** TB's per-version membership (full versions).
+- **Hard cross-checks at preparation:**
+  - TB version 0 equals IC file 1 (the shared start);
+  - at every step, CB's net change (added − deleted, deleted − added) equals TB's
+    difference;
+  - no-op churn (in both CB files) is present in both versions;
+  - split TB annotations of one triple (13 triples, 733 extra lines) have disjoint version
+    lists.
+  - IC ⊆ TB at **every** source version (all 89, `ic_subset_of_tb_versions_checked`): IC
+    only drops statements the changesets keep.
+- **IC divergence:** pinned as counts (`ic_lineage_divergence_in_window`,
+  `ic_lineage_divergence_all_versions`), not hidden. An IC-lineage dataset is possible later
+  and needs its own review.
+- TB and CB are two encodings of the selected lineage, and BEAR probably derived TB from
+  the changesets. Their agreement shows that the extraction reads both consistently. It does
+  not establish an external ground truth.
+
+**Extraction** (`bear-b-day-extract/2`, deterministic):
+- Every triple is normalized through the ledger's canonical N-Quads rules
+  (`ledger_rdf::Quad`). This is a labelled dependency of the oracle on the ledger's frozen
+  canonical form.
+- Window: the 12 consecutive versions with the most adds plus deletes, lowest start on ties.
+  The rule selects **v22..=v33** (0-based TB numbering; IC files 000023…000034):
+  - 36,645 → 41,316 triples;
+  - 9,384 adds and 4,713 deletes;
+  - 199 reappearances.
+
+  Version 0 would have been nearly static (584 adds and 226 deletes over 12 versions, no
+  reappearance).
+- All triples of every selected version are kept; nothing is sampled.
+
+**Workload:**
+- Ingest: `main` ingests v22 as bulk commits, then one version per commit. Every commit
+  holds at most 5,000 operations and 1.4 MB of quads (the API caps a request at 10,000
+  operations and 2 MiB; limits are never raised). The last commit of each version carries
+  the version label: its state must equal the source version.
+- Asserted: every commit's state; 28 diffs (11 adjacent pairs and 3 wider gaps, each in both
+  directions) against the source set differences (`algorithm` category); appear, disappear
+  and reappear history facts; parents and provenance.
+
+**Lifecycle** ([RUNNING_BENCHMARKS.md](RUNNING_BENCHMARKS.md)):
+1. `fetch` is the only networked step.
+2. `prepare` is offline extraction with the cross-checks.
+3. `validate` and `run` are offline and load only the hash-pinned artifact. A missing or
+   stale cache fails with exit 3; nothing downloads implicitly.
+
+**Archive safety:**
+- gzip output is capped;
+- a minimal ustar reader returns only regular-file entries with validated names, in memory;
+- no archive path is ever used for writing;
+- links, directories and extension records are skipped;
+- duplicates, truncation and bad header checksums fail;
+- the prepared artifact is capped and hashed.
 
 ### `tkgl-smallpedia-ci` — TGB 2.0 temporal KG (M4)
 
@@ -136,9 +247,7 @@ The rules below are common to all three:
 
 ## Recommended sequence
 
-1. **M3 `bear-b-ci`.** Integrate it unchanged first: it directly exercises version
-   materialization, version diff and history. Record pre-checkpoint reconstruction baselines
-   on it.
-2. **Checkpoint ADR.** Draft it from the synthetic and BEAR measurements ([METRICS.md](METRICS.md)).
+1. **M3 `bear-b-ci`.** Done in Plan 0011, together with the reconstruction characterization.
+2. **Checkpoint ADR.** Draft it from the Plan 0011 measurements.
 3. **`tkgl-smallpedia-ci` and `thgl-software-ci`.** Add them next. By the end of Phase 6 the
    `ci` profile should hold all four reduced datasets.

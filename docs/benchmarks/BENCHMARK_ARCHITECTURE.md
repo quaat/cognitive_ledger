@@ -1,6 +1,6 @@
 # Benchmark architecture (Phase 6A, M0)
 
-Status: accepted for Plan 0010 ([execution plan](../exec-plans/active/0010-phase6a-benchmark-foundation.md)).
+Status: accepted for Plan 0010 ([execution plan](../exec-plans/completed/0010-phase6a-benchmark-foundation.md)).
 Requirements: [INTEGRATION_PLAN.md](INTEGRATION_PLAN.md) (the supplied benchmark programme).
 This document records the M0 assessment and the boundaries every later benchmark milestone
 must keep.
@@ -65,8 +65,13 @@ docs/benchmarks/                   this documentation
   - provisioning (`PgGraphs`, the operator path);
   - persisted-state reads (`get_commit`);
   - the labelled `algorithm` category (`ledger_rdf::diff`);
-  - one labelled oracle-side protocol function (`ledger_rdf::state_digest`, frozen and
-    golden-pinned).
+  - two labelled oracle-side uses of frozen ledger code: the protocol function
+    `ledger_rdf::state_digest` (golden-pinned), and the BEAR-B extraction's normalization of
+    source triples through `ledger_rdf::Quad` (canonical N-Quads; the rewrite count is
+    pinned in the manifest). A canonicalization that changed a statement's meaning without
+    causing a collision would not be caught by the BEAR oracle. This is accepted and labelled.
+  - `recon` uses the same `ledger_rdf::state_digest` to compare merge-preview digests, and
+    `ledger_rdf::Quad` to parse its own synthetic quads.
 - The existing `benchmark/` directory is kept and evolves: it was a placeholder README.
   It now holds dataset manifests. No competing `benchmarks/` tree is created; code lives
   under `apps/`, like every other application.
@@ -118,14 +123,20 @@ schema:
 | BEAR versions | a linear chain `V0 → … → Vn`; expected state = the source version |
 | TGB temporal facts and events | time-ordered commits of rendered facts; the expected state is a deterministic replay of the source events (see [DATASETS.md](DATASETS.md)) |
 
-External datasets will add a `fetch` step (download plus checksum, outside the run) and a
-`prepare` step that reads only the verified local cache. The run never touches the network.
+External datasets (`bear-b-ci`, Plan 0011) add `fetch` (download plus pinned SHA-256 and
+size, outside the run) and `prepare` (offline extraction and cross-checks into a hash-pinned
+artifact). The run never touches the network. Manifests are
+`sculpin-ledger-bench-manifest/v2` ([REPRODUCIBILITY.md](REPRODUCIBILITY.md#manifests)).
+`ledger-bench recon` is a separate diagnostic mode outside PR CI
+([METRICS.md](METRICS.md#reconstruction-characterization)).
 
 ## 5. Profiles and execution model
 
 | profile | datasets | where | budget |
 |---|---|---|---|
-| `ci` | `synthetic-ledger-ci` (later plus `bear-b-ci`, `tkgl-smallpedia-ci`, `thgl-software-ci`) | every PR (`ci-benchmark`) | run < 5 min preferred, < 10 min hard |
+| `ci` | `synthetic-ledger-ci`, `bear-b-ci` (later plus `tkgl-smallpedia-ci`, `thgl-software-ci`) | every PR (`ci-benchmark`) | run < 5 min preferred, < 10 min hard |
+| `bear` | `bear-b-ci` | workstation | about a minute |
+| `recon` (`scripts/benchmark-recon.sh`) | constant-state depth × state-size histories | workstation | ≥ 1 h |
 | `local` | `synthetic-ledger-local` (deeper history, for baselines) | workstation | minutes |
 | `nightly` and `scale` | later milestones | dedicated | — |
 

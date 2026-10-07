@@ -8,6 +8,8 @@ publish = false
 description = "Phase-6A benchmark harness: deterministic datasets with independent correctness oracles, run against the production-shaped stack through the public API (never shipped in the runtime image)"
 
 [dependencies]
+# gzip decoding of benchmark source archives (pure-Rust miniz_oxide backend); Plan 0011.
+flate2 = "1.1"
 hex.workspace = true
 jsonwebtoken.workspace = true
 ledger-core = { path = "../../crates/ledger-core" }

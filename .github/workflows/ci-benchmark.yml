@@ -2,7 +2,8 @@ name: ci-benchmark
 # Plan 0010 (Phase 6A): the `ci` benchmark profile on every PR. Correctness assertions,
 # dataset/manifest validity and `ledger-admin verify` are gates; timings are recorded as
 # observations in the uploaded result.json (no performance threshold yet). The benchmark run
-# itself talks only to the loopback stack: images and crates are fetched before it starts.
+# itself talks only to the loopback stack: images, crates and pinned dataset sources are
+# fetched before it starts.
 on:
   pull_request:
   push:
@@ -19,6 +20,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@b4f984c1e7daae8e175614de3e73a8411a20333c # 1.89.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 (v2.9.2)
       - run: docker compose config --quiet
+      # Extracted-dataset sources (BEAR-B, ~34 MB) are cached by their pinned manifest; on a
+      # miss the script's `fetch` step downloads and verifies them (SHA-256 and size) before
+      # the stack starts. The benchmark run itself stays offline. A restored cache is
+      # re-verified by `fetch` and `prepare`, never trusted by its key.
+      # Keyed by the pinned `source` section only, so output-only manifest changes reuse the
+      # cache. An older entry may be restored as a fallback: `fetch` re-verifies every file
+      # and downloads only those that do not match their pin.
+      - name: Source cache key
+        id: sources
+        run: echo "key=benchmark-sources-$(jq -cS .source benchmark/datasets/bear-b-ci.json | sha256sum | cut -c1-32)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/benchmark-cache/bear-b-ci/source
+          key: ${{ steps.sources.outputs.key }}
+          restore-keys: benchmark-sources-
       - run: ./scripts/benchmark.sh ci
       - if: ${{ !cancelled() }}
         run: cat target/benchmark/*-ci/report.md >>"$GITHUB_STEP_SUMMARY" || true

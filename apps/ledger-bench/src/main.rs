@@ -11,13 +11,27 @@
 //!                  [--allow-non-loopback]
 //! ledger-bench report <result.json>              (re-render the report from the JSON)
 //! ledger-bench annotate <result.json> key=value... (record script-side resource readings)
+//! ledger-bench fetch <dataset> [--manifests <dir>] [--cache <dir>]   (network: pinned sources)
+//! ledger-bench prepare <dataset> [--manifests <dir>] [--cache <dir>] (offline extraction)
+//! ledger-bench clean <dataset> [--all] [--cache <dir>]
+//! ledger-bench recon --replica <url> --out <dir> [--states 1,1000,10000]
+//!                    [--depths 1,10,100,500,1000,2500,5000] [--reps 20] [--warmup 3]
+//!                    [--preview-reps 10] [--cold-depths 100,1000,5000] [--cold-reps 3]
+//!                    [--restart-cmd <shell>] [--server-cgroup <dir>] [--postgres-cgroup <dir>]
+//!                    [--depth-limit 10000]  (the server's LEDGER_LIMIT_RECONSTRUCTION_DEPTH)
+//!                    [--meta key=value]...   (reconstruction characterization; scripts/benchmark-recon.sh)
 //! ```
 //!
-//! Exit status: 0 pass; 1 correctness failure or aborted run; 2 usage; 3 invalid dataset
-//! (manifest mismatch).
+//! Every command except `fetch` is offline. Exit status: 0 pass; 1 correctness failure or
+//! aborted run; 2 usage; 3 invalid or unprepared dataset (manifest mismatch, missing or
+//! unverified cache, failed preparation); 4 `fetch` could not obtain the pinned source
+//! (network, HTTP, or a download that does not match its pin).
 
 use ledger_bench::{
-    dataset::{self, Dataset, PROFILES, verify_manifest},
+    bear,
+    dataset::{self, Context, Dataset, PROFILES, verify_manifest},
+    manifest::Manifest,
+    recon,
     result::{
         BenchResult, Counts, DatasetInfo, DatasetResult, Environment, OpStats, Performance,
         RESULT_SCHEMA, Resources, RunInfo, markdown, stats,
@@ -35,7 +49,8 @@ use std::{
 const USAGE: &str = "usage: ledger-bench (list | validate --profile <p> | manifest --profile <p> | \
      run --profile <p> --replica <url> --out <dir> [--owner-database-url <url>] [--manifests <dir>] \
      [--meta key=value]... [--issuer <iss>] [--audience <aud>] [--secret-env <VAR>] [--allow-non-loopback] | \
-     report <result.json> | annotate <result.json> key=value...)";
+     report <result.json> | annotate <result.json> key=value... | \
+     fetch <dataset> | prepare <dataset> | clean <dataset> [--all])  [--manifests <dir>] [--cache <dir>]";
 
 fn unix_ms() -> u128 {
     SystemTime::now()
@@ -108,6 +123,7 @@ struct Args {
     out: PathBuf,
     owner_database_url: String,
     manifests: PathBuf,
+    cache: PathBuf,
     meta: BTreeMap<String, String>,
     issuer: String,
     audience: String,
@@ -122,6 +138,7 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
         out: PathBuf::new(),
         owner_database_url: std::env::var("LEDGER_BENCH_OWNER_DATABASE_URL").unwrap_or_default(),
         manifests: PathBuf::from("benchmark/datasets"),
+        cache: PathBuf::from("target/benchmark-cache"),
         meta: BTreeMap::new(),
         issuer: "https://dev-issuer.example/".into(),
         audience: "api://sculpin-ledger-dev".into(),
@@ -136,6 +153,7 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
             "--out" => a.out = value()?.into(),
             "--owner-database-url" => a.owner_database_url = value()?,
             "--manifests" => a.manifests = value()?.into(),
+            "--cache" => a.cache = value()?.into(),
             "--meta" => {
                 let kv = value()?;
                 let (k, v) = kv.split_once('=').ok_or("--meta takes key=value")?;
@@ -158,7 +176,13 @@ fn counts(w: &Workload) -> Counts {
     let mut c = Counts {
         commits: w.commit_count(),
         branches: w.final_heads.len(),
-        genesis_quads: w.expected.get("main@0").map_or(0, |e| e.quads),
+        genesis_quads: w
+            .expected
+            .values()
+            .filter(|e| e.kind == "bulk")
+            .map(|e| e.quads)
+            .max()
+            .unwrap_or(0),
         final_main_quads: w
             .final_heads
             .get("main")
@@ -253,32 +277,28 @@ fn write_result(out: &Path, r: &BenchResult) -> Result<(), String> {
     std::fs::write(out.join("report.md"), markdown(r)).map_err(|e| e.to_string())
 }
 
-/// A dataset prepared for a run, with its manifest check.
+/// A dataset prepared for a run, with its manifest check. `ready` is the workload and its
+/// computed manifest, or why the dataset cannot run (unprepared cache, mismatch).
 struct Prepared {
     dataset: Box<dyn Dataset>,
-    workload: Workload,
-    manifest: dataset::Manifest,
-    valid: Result<(), String>,
+    ready: Result<(Workload, Manifest), String>,
     generate_ms: u128,
 }
 
-fn validate(profile: &str, manifests: &Path) -> Result<Vec<Prepared>, String> {
+fn validate(profile: &str, ctx: &Context) -> Result<Vec<Prepared>, String> {
     let datasets = dataset::profile(profile).ok_or("unknown profile")?;
     let mut out = Vec::new();
     for dataset in datasets {
         let started = Instant::now();
-        let workload = dataset
-            .prepare()
-            .map_err(|e| format!("{}: {e}", dataset.id()))?;
-        let generate_ms = started.elapsed().as_millis();
-        let manifest = dataset.manifest(&workload);
-        let valid = verify_manifest(manifests, &manifest);
+        let ready = dataset.prepare(ctx).and_then(|w| {
+            let m = dataset.manifest(ctx, &w)?;
+            verify_manifest(&ctx.manifests, &m)?;
+            Ok((w, m))
+        });
         out.push(Prepared {
             dataset,
-            workload,
-            manifest,
-            valid,
-            generate_ms,
+            ready,
+            generate_ms: started.elapsed().as_millis(),
         });
     }
     Ok(out)
@@ -309,7 +329,11 @@ async fn run(a: Args) -> ExitCode {
     }
     let started_ms = unix_ms();
     let started = Instant::now();
-    let prepared = match validate(&a.profile, &a.manifests) {
+    let ctx = Context {
+        manifests: a.manifests.clone(),
+        cache: a.cache.clone(),
+    };
+    let prepared = match validate(&a.profile, &ctx) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("{e}");
@@ -340,45 +364,50 @@ async fn run(a: Args) -> ExitCode {
     let mut postgres = "unknown".to_owned();
     for Prepared {
         dataset: d,
-        workload: w,
-        manifest: m,
-        valid,
+        ready,
         generate_ms,
     } in prepared
     {
+        let manifest_path = a
+            .manifests
+            .join(format!("{}.json", d.id()))
+            .display()
+            .to_string();
+        let committed_checksum = dataset::load_manifest(&a.manifests, d.id())
+            .map(|m| m.output.workload_checksum)
+            .unwrap_or_else(|e| format!("unavailable: {e}"));
+        let (w, m) = match ready {
+            Ok(ok) => ok,
+            Err(e) => {
+                eprintln!("INVALID DATASET: {}: {e}", d.id());
+                result.status = "fail".into();
+                exit = 3;
+                result.datasets.push(DatasetResult {
+                    id: d.id().into(),
+                    dataset: DatasetInfo {
+                        manifest_path,
+                        manifest: serde_json::Value::Null,
+                        committed_workload_checksum: committed_checksum,
+                        checksum_ok: false,
+                        problem: Some(e),
+                    },
+                    ..DatasetResult::default()
+                });
+                continue;
+            }
+        };
         let mut dr = DatasetResult {
             id: d.id().into(),
             dataset: DatasetInfo {
-                generator: m.generator.clone(),
-                generator_version: m.generator_version.clone(),
-                seed: m.seed.clone(),
-                params: m.params.clone(),
-                manifest: a
-                    .manifests
-                    .join(format!("{}.json", d.id()))
-                    .display()
-                    .to_string(),
-                manifest_checksum: std::fs::read_to_string(
-                    a.manifests.join(format!("{}.json", d.id())),
-                )
-                .ok()
-                .and_then(|t| serde_json::from_str::<dataset::Manifest>(&t).ok())
-                .map(|m| m.output_checksum)
-                .unwrap_or_else(|| "missing".into()),
-                generated_checksum: m.output_checksum.clone(),
-                checksum_ok: valid.is_ok(),
-                license: m.license.clone(),
+                manifest_path,
+                manifest: serde_json::to_value(&m).expect("serializable manifest"),
+                committed_workload_checksum: committed_checksum,
+                checksum_ok: true,
+                problem: None,
             },
             counts: counts(&w),
             ..DatasetResult::default()
         };
-        if let Err(e) = valid {
-            eprintln!("INVALID DATASET: {e}");
-            result.status = "fail".into();
-            exit = 3;
-            result.datasets.push(dr);
-            continue;
-        }
         eprintln!(
             "{}: {} commits generated in {generate_ms} ms; running against {}",
             d.id(),
@@ -447,6 +476,163 @@ fn annotate(path: &Path, pairs: impl Iterator<Item = String>) -> Result<(), Stri
     write_result(path.parent().unwrap_or(Path::new(".")), &r)
 }
 
+/// A comma-separated list of counts; an empty value is an empty list.
+fn list(v: &str) -> Result<Vec<usize>, String> {
+    if v.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    v.split(',')
+        .map(|x| {
+            x.trim()
+                .parse::<usize>()
+                .map_err(|_| format!("bad list {v:?}"))
+        })
+        .collect()
+}
+
+async fn recon_command(mut argv: impl Iterator<Item = String>) -> ExitCode {
+    let mut cfg = recon::ReconConfig {
+        replica: String::new(),
+        owner_database_url: std::env::var("LEDGER_BENCH_OWNER_DATABASE_URL").unwrap_or_default(),
+        secret: std::env::var("LEDGER_BENCH_HS256_SECRET").unwrap_or_default(),
+        issuer: "https://dev-issuer.example/".into(),
+        audience: "api://sculpin-ledger-dev".into(),
+        states: vec![1, 1_000, 10_000],
+        depths: vec![1, 10, 100, 500, 1_000, 2_500, 5_000],
+        reps: 20,
+        warmup: 3,
+        preview_reps: 10,
+        cold_depths: vec![100, 1_000, 5_000],
+        cold_reps: 3,
+        restart_cmd: None,
+        server_cgroup: None,
+        postgres_cgroup: None,
+        depth_limit: ledger_store::ReconstructionLimits::DEVELOPMENT.max_depth,
+        run_id: format!("{}-{}", unix_ms(), std::process::id()),
+    };
+    let mut out = PathBuf::new();
+    let mut meta = BTreeMap::new();
+    let parsed: Result<(), String> = (|| {
+        while let Some(flag) = argv.next() {
+            let mut value = || argv.next().ok_or_else(|| format!("{flag} needs a value"));
+            match flag.as_str() {
+                "--replica" => cfg.replica = value()?.trim_end_matches('/').to_owned(),
+                "--owner-database-url" => cfg.owner_database_url = value()?,
+                "--out" => out = value()?.into(),
+                "--states" => cfg.states = list(&value()?)?,
+                "--depths" => cfg.depths = list(&value()?)?,
+                "--reps" => cfg.reps = value()?.parse().map_err(|_| "--reps")?,
+                "--warmup" => cfg.warmup = value()?.parse().map_err(|_| "--warmup")?,
+                "--preview-reps" => {
+                    cfg.preview_reps = value()?.parse().map_err(|_| "--preview-reps")?
+                }
+                "--cold-depths" => cfg.cold_depths = list(&value()?)?,
+                "--cold-reps" => cfg.cold_reps = value()?.parse().map_err(|_| "--cold-reps")?,
+                "--restart-cmd" => cfg.restart_cmd = Some(value()?),
+                "--server-cgroup" => cfg.server_cgroup = Some(value()?.into()),
+                "--postgres-cgroup" => cfg.postgres_cgroup = Some(value()?.into()),
+                "--depth-limit" => {
+                    cfg.depth_limit = value()?.parse().map_err(|_| "--depth-limit")?
+                }
+                "--meta" => {
+                    let kv = value()?;
+                    let (k, v) = kv.split_once('=').ok_or("--meta takes key=value")?;
+                    if k == "official" {
+                        return Err(
+                            "official is decided by scripts/benchmark-recon.sh (LEDGER_BENCH_OFFICIAL), not by --meta".into(),
+                        );
+                    }
+                    meta.insert(k.to_owned(), v.to_owned());
+                }
+                _ => return Err(USAGE.into()),
+            }
+        }
+        Ok(())
+    })();
+    if let Err(e) = parsed {
+        eprintln!("{e}");
+        return ExitCode::from(2);
+    }
+    if !is_loopback(&cfg.replica)
+        || !dsn_is_loopback(&cfg.owner_database_url)
+        || cfg.secret.is_empty()
+        || out.as_os_str().is_empty()
+    {
+        eprintln!(
+            "recon needs a loopback --replica and owner database, LEDGER_BENCH_HS256_SECRET and --out"
+        );
+        return ExitCode::from(2);
+    }
+    if let Err(e) = cfg.validate() {
+        eprintln!("invalid recon configuration: {e}");
+        return ExitCode::from(2);
+    }
+    let started = Instant::now();
+    let mut r = recon::run(&cfg).await;
+    r.meta = meta;
+    // Set by benchmark-recon.sh from the checkout state and the absence of custom arguments.
+    r.meta.insert(
+        "official".into(),
+        std::env::var("LEDGER_BENCH_OFFICIAL")
+            .unwrap_or_else(|_| "no (not run by scripts/benchmark-recon.sh)".into()),
+    );
+    r.meta.insert(
+        "wall_s".into(),
+        format!("{:.0}", started.elapsed().as_secs_f64()),
+    );
+    let env = environment(&cfg.replica, "see the meta postgres entry");
+    // Extend, never replace: the run records its own entries (e.g. the settle step).
+    r.environment.extend(BTreeMap::from([
+        ("os".into(), env.os),
+        ("kernel".into(), env.kernel),
+        ("cpu".into(), format!("{} × {}", env.cpus, env.cpu_model)),
+        (
+            "mem_total_mib".into(),
+            (env.mem_total_kib / 1024).to_string(),
+        ),
+        ("states".into(), format!("{:?}", cfg.states)),
+        ("depths".into(), format!("{:?}", cfg.depths)),
+        (
+            "reps".into(),
+            format!(
+                "{} (+{} warm-up); previews {}; cold {} at {:?}",
+                cfg.reps, cfg.warmup, cfg.preview_reps, cfg.cold_reps, cfg.cold_depths
+            ),
+        ),
+        (
+            "cache_conditions".into(),
+            format!(
+                "warm: after warm-up on an active database; {}: PostgreSQL process and shared buffers restarted, then /ready, pool reconnection and statistics queries, then the measured first ledger reconstruction (OS page cache NOT dropped)",
+                recon::FIRST_AFTER_RESTART
+            ),
+        ),
+    ]));
+    let write = || -> Result<(), String> {
+        std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
+        std::fs::write(
+            out.join("recon.json"),
+            serde_json::to_string_pretty(&r).map_err(|e| e.to_string())? + "\n",
+        )
+        .map_err(|e| e.to_string())?;
+        std::fs::write(out.join("recon.md"), recon::markdown(&r)).map_err(|e| e.to_string())
+    };
+    if let Err(e) = write() {
+        eprintln!("writing results: {e}");
+        return ExitCode::from(1);
+    }
+    println!(
+        "RECON {} ({} points, {} failures)",
+        r.status.to_uppercase(),
+        r.points.len(),
+        r.failures.len()
+    );
+    if r.status == "pass" {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let mut argv = std::env::args().skip(1);
@@ -474,43 +660,107 @@ async fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
-            let prepared = match validate(&a.profile, &a.manifests) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("{e}");
+            let ctx = Context {
+                manifests: a.manifests.clone(),
+                cache: a.cache.clone(),
+            };
+            let datasets = match dataset::profile(&a.profile) {
+                Some(d) => d,
+                None => {
+                    eprintln!("unknown profile");
                     return ExitCode::from(2);
                 }
             };
             let mut exit = 0;
-            for Prepared {
-                dataset: d,
-                manifest: m,
-                valid: ok,
-                generate_ms: ms,
-                ..
-            } in prepared
-            {
-                if cmd == "manifest" {
-                    println!(
+            for d in datasets {
+                let started = Instant::now();
+                let computed = d.prepare(&ctx).and_then(|w| d.manifest(&ctx, &w));
+                let ms = started.elapsed().as_millis();
+                match (cmd.as_str(), computed) {
+                    ("manifest", Ok(m)) => println!(
                         "{}",
                         serde_json::to_string_pretty(&m).expect("serializable")
-                    );
-                    continue;
-                }
-                match ok {
-                    Ok(()) => println!(
-                        "{}: valid ({} commits, {}, generated in {ms} ms)",
-                        d.id(),
-                        m.commits,
-                        m.output_checksum
                     ),
-                    Err(e) => {
-                        eprintln!("INVALID DATASET: {e}");
+                    (_, Ok(m)) => match verify_manifest(&ctx.manifests, &m) {
+                        Ok(()) => println!(
+                            "{}: valid ({} commits, {}, prepared in {ms} ms)",
+                            d.id(),
+                            m.output.commits,
+                            m.output.workload_checksum
+                        ),
+                        Err(e) => {
+                            eprintln!("INVALID DATASET: {e}");
+                            exit = 3;
+                        }
+                    },
+                    (_, Err(e)) => {
+                        eprintln!("INVALID DATASET: {}: {e}", d.id());
                         exit = 3;
                     }
                 }
             }
             ExitCode::from(exit)
+        }
+        "recon" => recon_command(argv).await,
+        "fetch" | "prepare" | "clean" => {
+            let Some(id) = argv.next() else {
+                eprintln!("{USAGE}");
+                return ExitCode::from(2);
+            };
+            let mut ctx = Context {
+                manifests: PathBuf::from("benchmark/datasets"),
+                cache: PathBuf::from("target/benchmark-cache"),
+            };
+            let mut all = false;
+            while let Some(flag) = argv.next() {
+                match flag.as_str() {
+                    "--all" if cmd == "clean" => all = true,
+                    "--manifests" | "--cache" => {
+                        let Some(v) = argv.next() else {
+                            eprintln!("{USAGE}");
+                            return ExitCode::from(2);
+                        };
+                        if flag == "--cache" {
+                            ctx.cache = v.into();
+                        } else {
+                            ctx.manifests = v.into();
+                        }
+                    }
+                    _ => {
+                        eprintln!("{USAGE}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            if id != "bear-b-ci" {
+                eprintln!(
+                    "{id}: only extracted datasets (bear-b-ci) have a fetch/prepare lifecycle"
+                );
+                return ExitCode::from(2);
+            }
+            let outcome = match cmd.as_str() {
+                "fetch" => bear::fetch(&ctx, &id).await,
+                "prepare" => bear::prepare(&ctx, &id).map(|(sha, bytes, x)| {
+                    vec![
+                        format!("prepared artifact: {bytes} bytes, sha256 {sha}"),
+                        format!("range: {}", x.range),
+                        format!("counts: {:?}", x.counts),
+                    ]
+                }),
+                _ => bear::clean(&ctx, &id, all),
+            };
+            match outcome {
+                Ok(lines) => {
+                    for l in lines {
+                        println!("{l}");
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("{cmd} {id}: {e}");
+                    ExitCode::from(if cmd == "fetch" { 4 } else { 3 })
+                }
+            }
         }
         "run" => match parse(argv) {
             Ok(a) => run(a).await,
@@ -561,6 +811,13 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_list_value_is_an_empty_list() {
+        assert_eq!(list(""), Ok(vec![]));
+        assert_eq!(list("1, 10,100"), Ok(vec![1, 10, 100]));
+        assert!(list("1,,2").is_err());
+    }
 
     #[test]
     fn only_loopback_replicas_are_accepted_by_default() {

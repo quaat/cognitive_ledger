@@ -56,15 +56,14 @@ pub struct DatasetResult {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DatasetInfo {
-    pub generator: String,
-    pub generator_version: String,
-    pub seed: String,
-    pub params: serde_json::Value,
-    pub manifest: String,
-    pub manifest_checksum: String,
-    pub generated_checksum: String,
+    pub manifest_path: String,
+    /// The computed manifest (`sculpin-ledger-bench-manifest/v2`); equal to the committed one
+    /// when `checksum_ok`. `null` when the dataset could not be prepared.
+    pub manifest: serde_json::Value,
+    pub committed_workload_checksum: String,
     pub checksum_ok: bool,
-    pub license: String,
+    /// Why the dataset could not run (unprepared cache, manifest mismatch).
+    pub problem: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -224,19 +223,44 @@ pub fn markdown(r: &BenchResult) -> String {
     for d in &r.datasets {
         let _ = writeln!(out, "## Dataset `{}`\n", d.id);
         let i = &d.dataset;
+        let m = &i.manifest;
+        let text = |v: &serde_json::Value| v.as_str().unwrap_or("?").to_owned();
+        let origin = if m["kind"] == "extracted" {
+            format!(
+                "Extracted from {} ({}, {}); license: {}; attribution: {}; modified: normalized to canonical N-Quads and windowed by `{}`; redistribution: {}; range: {}; artifact sha256 `{}`",
+                text(&m["source"]["title"]),
+                text(&m["source"]["publisher"]),
+                text(&m["source"]["source_version"]),
+                text(&m["source"]["license"]),
+                text(&m["source"]["attribution"]),
+                text(&m["extraction"]["version"]),
+                text(&m["source"]["redistribution"]),
+                text(&m["extraction"]["range"]),
+                text(&m["output"]["artifact_sha256"])
+            )
+        } else {
+            format!(
+                "Generator `{}` `{}`, seed `{}`; license: {}",
+                text(&m["generator"]["name"]),
+                text(&m["generator"]["version"]),
+                text(&m["generator"]["seed"]),
+                text(&m["generator"]["license"])
+            )
+        };
         let _ = writeln!(
             out,
-            "Generator `{}` `{}`, seed `{}`; checksum `{}` ({}); license: {}.\n",
-            i.generator,
-            i.generator_version,
-            i.seed,
-            i.generated_checksum,
+            "{origin}. Workload checksum `{}` ({}).\n",
+            text(&m["output"]["workload_checksum"]),
             if i.checksum_ok {
-                "matches the manifest"
+                "matches the manifest".to_owned()
             } else {
-                "**does not match the manifest**"
-            },
-            i.license
+                format!(
+                    "**invalid**: {}",
+                    i.problem
+                        .as_deref()
+                        .unwrap_or("does not match the manifest")
+                )
+            }
         );
         let c = &d.counts;
         let _ = writeln!(

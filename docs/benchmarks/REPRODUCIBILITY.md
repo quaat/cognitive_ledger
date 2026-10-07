@@ -20,6 +20,18 @@ A result without these fields, from a dirty tree (`tracked_changes > 0` or
 `untracked_files > 0`), or with `checksum_ok = false` is not an official benchmark
 result.
 
+## Manifests
+Manifests use `sculpin-ledger-bench-manifest/v2`. It has typed `generator` (generated
+datasets), `source` and `extraction` (extracted datasets) and `output` sections. Parsing
+refuses unknown fields and requires complete provenance for the dataset's kind:
+- for an extracted dataset: publisher, version, URLs, license, attribution, redistribution
+  basis, retrieval date, each source file's SHA-256 and size, the extraction algorithm,
+  version, parameters, range and counts, the skolemized blank-node count, and the prepared
+  artifact's SHA-256 and size;
+- for every dataset: the workload checksum.
+
+A v1 manifest has no `manifest_schema`, so it is refused rather than reinterpreted.
+
 ## Datasets
 - **Generated datasets** are regenerated on every run from the manifest's seed and
   parameters. The full workload, including every expectation, is hashed into

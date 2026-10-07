@@ -26,7 +26,9 @@ permissions: {contents: read}
 env:
   FUZZ_TOOLCHAIN: nightly-2026-09-25
 jobs:
-  fuzz:
+  # The matrix reports one check per sanitizer ("fuzz-sanitizer (none)", "… (address)").
+  # Branch protection requires the stable aggregate `fuzz` below instead.
+  fuzz-sanitizer:
     runs-on: ubuntu-latest
     timeout-minutes: 300
     strategy:
@@ -39,19 +41,25 @@ jobs:
       - name: Select run parameters
         id: params
         shell: bash
+        # Dispatch inputs reach the shell only as environment values, never as script text.
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_SECONDS: ${{ inputs.seconds_per_target }}
+          INPUT_SANITIZER: ${{ inputs.sanitizer }}
+          SANITIZER: ${{ matrix.sanitizer }}
         run: |
           set -euo pipefail
-          case "${{ github.event_name }}" in
+          case "$EVENT" in
             pull_request|push) seconds=45 ;;
             schedule) seconds=900 ;;
-            workflow_dispatch) seconds='${{ inputs.seconds_per_target }}' ;;
+            workflow_dispatch) seconds="$INPUT_SECONDS" ;;
           esac
-          [[ "$seconds" =~ ^[0-9]+$ ]] && [ "$seconds" -ge 60 -o "${{ github.event_name }}" != workflow_dispatch ] && [ "$seconds" -le 1800 ] \
-            || { echo "seconds_per_target must be an integer in 60..1800 (got '$seconds')" >&2; exit 1; }
-          wanted='${{ inputs.sanitizer }}'; [ -n "$wanted" ] || wanted=both
+          [[ "$seconds" =~ ^[0-9]+$ ]] && [ "$seconds" -ge 60 -o "$EVENT" != workflow_dispatch ] && [ "$seconds" -le 1800 ] \
+            || { echo "seconds_per_target must be an integer in 60..1800" >&2; exit 1; }
+          wanted="$INPUT_SANITIZER"; [ -n "$wanted" ] || wanted=both
           case "$wanted" in none|address|both) ;; *) echo "sanitizer must be none, address or both" >&2; exit 1 ;; esac
           run=true
-          if [ "$wanted" != both ] && [ "$wanted" != "${{ matrix.sanitizer }}" ]; then run=false; fi
+          if [ "$wanted" != both ] && [ "$wanted" != "$SANITIZER" ]; then run=false; fi
           echo "seconds=$seconds" >> "$GITHUB_OUTPUT"
           echo "run=$run" >> "$GITHUB_OUTPUT"
       - name: Install the pinned nightly toolchain
@@ -80,3 +88,19 @@ jobs:
             target/fuzz/*/*.log
             fuzz/artifacts/**
           if-no-files-found: ignore
+
+  # Stable required check: succeeds only if every matrix job succeeded. `if: always()` makes
+  # it run (and fail) when a matrix job failed or was cancelled, instead of being skipped,
+  # which a required check would treat as passing.
+  fuzz:
+    needs: fuzz-sanitizer
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every sanitizer job succeeded
+        env:
+          RESULT: ${{ needs.fuzz-sanitizer.result }}
+        run: |
+          echo "fuzz-sanitizer matrix result: ${RESULT}"
+          [ "${RESULT}" = success ]

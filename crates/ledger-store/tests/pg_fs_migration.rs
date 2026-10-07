@@ -12,6 +12,7 @@ use ledger_store::{
     CommitRequest, CutoverPhase, FileStore, FsToPgMigration, Ledger, MigrationOutcome, PgRefStore,
     PostgresImmutableStore, V1Binding,
 };
+use sqlx::Connection;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -413,7 +414,17 @@ async fn legacy_shared_ref_topology_upgrades_only_after_content_is_imported() {
     assert_eq!(refs.head().await.unwrap(), Some(c1.clone()));
 
     // Upgrading straight to the workflow schema is refused with an actionable message.
-    let error = ledger_store::schema::migrate_all(&pool).await.unwrap_err();
+    // On a dedicated connection: a failed sqlx run keeps its advisory lock on the connection
+    // it ran on, and closing that connection releases it.
+    let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        ledger_store::schema::migrate_all_on(&mut conn),
+    )
+    .await
+    .expect("a refused migration must fail, not hang")
+    .unwrap_err();
+    let _ = conn.close().await;
     assert!(
         error
             .to_string()
@@ -421,13 +432,6 @@ async fn legacy_shared_ref_topology_upgrades_only_after_content_is_imported() {
         "{error}"
     );
     assert!(error.to_string().contains(&c1.to_string()), "{error}");
-    // A failed sqlx run keeps its advisory lock on that pooled connection: reconnect.
-    pool.close().await;
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&url)
-        .await
-        .unwrap();
 
     // Wrong source directory: an unrelated (empty) store must not "succeed".
     let wrong = tempfile::tempdir().unwrap();

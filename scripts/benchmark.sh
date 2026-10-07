@@ -5,7 +5,7 @@
 # before the stack starts; correctness assertions fail the run, timings are observations.
 # After the run, `ledger-admin verify` must report VERIFY OK.
 #
-# Usage: scripts/benchmark.sh [profile]   (profiles: ci (default), local)
+# Usage: scripts/benchmark.sh [profile]   (profiles: ci (default), local, bear)
 # Output: target/benchmark/<UTC>-<profile>/{result.json,report.md,phases.txt,verify.log,...}
 # Network: image build and crate downloads happen before the run; the run itself talks only
 # to loopback (the ledger and PostgreSQL).
@@ -28,9 +28,19 @@ T0=$(date +%s)
 
 cargo build --locked --release -p ledger-bench
 phase harness-build
-# Fail fast on an invalid dataset (no stack needed). Every profile's manifests are checked,
-# not only the one being run, so a drifting `local` manifest also fails the PR job.
-for p in ci local; do ./target/release/ledger-bench validate --profile "$p"; done
+# Extracted datasets: fetch (the only networked step; pinned size and SHA-256, cached) and
+# prepare (offline extraction with the source cross-checks) before anything else.
+case "${PROFILE}" in
+  ci|bear)
+    ./target/release/ledger-bench fetch bear-b-ci
+    ./target/release/ledger-bench prepare bear-b-ci
+    ;;
+esac
+phase dataset-fetch-and-prepare
+# Fail fast on an invalid dataset (no stack needed): the profile being run, plus the
+# synthetic `local` manifest, so a drifting `local` manifest also fails the PR job.
+./target/release/ledger-bench validate --profile "${PROFILE}"
+[ "${PROFILE}" = local ] || ./target/release/ledger-bench validate --profile local
 phase dataset-validate
 
 "${COMPOSE[@]}" config --quiet
@@ -42,6 +52,8 @@ REV=$(git rev-parse HEAD)
 DIRTY=$(git status --porcelain --untracked-files=no | wc -l | tr -d ' ')
 UNTRACKED=$(git status --porcelain --untracked-files=normal | grep -c '^??' || true)
 INPUTS=$(cat Dockerfile compose.yaml Cargo.lock | sha256sum | cut -d' ' -f1)
+# With tracked changes, which ones: a hash of the diff (the count alone does not identify them).
+DIFF_SHA=$(git diff HEAD | sha256sum | cut -d' ' -f1)
 # compose.yaml runs the server with the development unvalidated-acceptance switch.
 ACCEPTANCE=$(grep -q 'LEDGER_UNVALIDATED_ACCEPTANCE: allow-unvalidated-acceptance-development-only' compose.yaml \
   && echo unvalidated-development || echo validation-required)
@@ -74,7 +86,7 @@ export LEDGER_BENCH_HS256_SECRET=development-only-hs256-secret-not-for-productio
 export LEDGER_BENCH_OWNER_DATABASE_URL='postgres://ledger:ledger-development-only@127.0.0.1:55432/ledger?sslmode=disable'
 set +e
 ./target/release/ledger-bench run --profile "${PROFILE}" --replica http://127.0.0.1:8080 --out "${OUT}" \
-  --meta "build_rev=${REV}" --meta "tracked_changes=${DIRTY}" --meta "untracked_files=${UNTRACKED}" \
+  --meta "build_rev=${REV}" --meta "tracked_changes=${DIRTY}" --meta "untracked_files=${UNTRACKED}" --meta "tracked_diff_sha256=${DIFF_SHA}" \
   --meta "rustc=$(rustc --version)" --meta "server_image=${IMAGE}" \
   --meta "server_toolchain=$(grep -m1 '^FROM' Dockerfile)" --meta "inputs_sha256(Dockerfile,compose.yaml,Cargo.lock)=${INPUTS}" \
   --meta "docker=$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo unknown)" \

@@ -14,11 +14,15 @@
 //!   production diff to ledger-reconstructed states and compares it with the oracle's set
 //!   difference.
 //!
-//! The oracle side uses a ledger crate exactly once, and labels it: preview
-//! `merged_state_digest` values are compared with `ledger_rdf::state_digest` of the
-//! oracle's expected merged state. That is the frozen `sculpin-rdf-state/v1` protocol
-//! function, golden-pinned and independently re-implemented in
-//! `scripts/golden/state_v1_reference.py`.
+//! The oracle side uses ledger code in two labelled places:
+//! - preview `merged_state_digest` values are compared with `ledger_rdf::state_digest` of the
+//!   oracle's expected merged state. That is the frozen `sculpin-rdf-state/v1` protocol
+//!   function, golden-pinned and independently re-implemented in
+//!   `scripts/golden/state_v1_reference.py`;
+//! - the BEAR-B extraction normalizes every source triple through `ledger_rdf::Quad`, the
+//!   frozen canonical N-Quads form (`bear.rs`; the rewrite count is pinned in the manifest).
+//!   A meaning-changing canonicalization that causes no collision would not be detected by
+//!   the oracle: a labelled, accepted dependency.
 //!
 //! The checks themselves are pure functions ([`state_mismatch`], [`preview_checks`]), so
 //! unit tests can feed them wrong ledger replies. Correctness failures accumulate, with
@@ -29,7 +33,7 @@ use crate::{
     result::{Correctness, Failure, SeriesPoint},
     workload::{
         CommitStep, Expected, Label, MergeStep, PreviewExpect, State, Step, Workload,
-        first_parent_chain, oracle_digest,
+        first_parent_chain, oracle_digest, statement_ref,
     },
 };
 use ledger_core::{AnyCommit, CommitId, GraphId, ImmutableStore, TenantId};
@@ -87,19 +91,47 @@ pub struct RunData {
 
 /// `ledger_materialized_state(C) == expected_state(C)` on the raw API list: strings only,
 /// strictly ascending (canonical order, no duplicates), then count and the oracle digest.
+/// A ledger reply as it may appear in a failure: verbatim, or, for third-party data, only
+/// its error code and a hash of the body (server messages can quote statements).
+fn reply(v: &Value, redact: bool) -> String {
+    if redact {
+        format!(
+            "code {} (body {})",
+            v["code"],
+            statement_ref(&v.to_string(), true)
+        )
+    } else {
+        v.to_string()
+    }
+}
+
+fn quoted(statement: &str, redact: bool) -> String {
+    if redact {
+        statement_ref(statement, true)
+    } else {
+        format!("{statement:?}")
+    }
+}
+
 /// `None` when it holds; otherwise a diagnostic.
-pub fn state_mismatch(e: &Expected, raw: &[Value]) -> Option<String> {
+pub fn state_mismatch(e: &Expected, raw: &[Value], redact: bool) -> Option<String> {
     let mut lines = Vec::with_capacity(raw.len());
     for q in raw {
         match q.as_str() {
             Some(s) => lines.push(s),
-            None => return Some(format!("non-string entry in the state: {q}")),
+            None => {
+                return Some(format!(
+                    "non-string entry in the state: {}",
+                    quoted(&q.to_string(), redact)
+                ));
+            }
         }
     }
     if let Some(w) = lines.windows(2).find(|w| w[0] >= w[1]) {
         return Some(format!(
-            "state not strictly ascending (duplicate or out of order): {:?} then {:?}",
-            w[0], w[1]
+            "state not strictly ascending (duplicate or out of order): {} then {}",
+            quoted(w[0], redact),
+            quoted(w[1], redact)
         ));
     }
     let digest = oracle_digest(lines.iter().copied());
@@ -115,15 +147,17 @@ pub fn state_mismatch(e: &Expected, raw: &[Value]) -> Option<String> {
     );
     if let Some(full) = &e.state {
         let actual: BTreeSet<&str> = lines.iter().copied().collect();
-        let missing: Vec<&String> = full
+        let missing: Vec<String> = full
             .iter()
             .filter(|q| !actual.contains(q.as_str()))
             .take(3)
+            .map(|q| statement_ref(q, redact))
             .collect();
-        let extra: Vec<&&str> = actual
+        let extra: Vec<String> = actual
             .iter()
             .filter(|q| !full.contains(**q))
             .take(3)
+            .map(|q| statement_ref(q, redact))
             .collect();
         detail.push_str(&format!("; missing {missing:?}; unexpected {extra:?}"));
     }
@@ -396,11 +430,14 @@ impl Runner<'_> {
         let path = format!("/v1/graphs/{}/commits/{id}/state", self.graph);
         let (status, v, t, bytes) = self.call(reqwest::Method::GET, &path, None, None).await?;
         if status != 200 {
-            return Err(format!("state of {label}: HTTP {status} {v}"));
+            return Err(format!(
+                "state of {label}: HTTP {status} {}",
+                reply(&v, self.w.redact_statements)
+            ));
         }
         self.sample("api", op, Some(label), t, Some(bytes));
         let raw = v["quads"].as_array().cloned().unwrap_or_default();
-        let mismatch = state_mismatch(&self.w.expected[label], &raw);
+        let mismatch = state_mismatch(&self.w.expected[label], &raw, self.w.redact_statements);
         self.check(family, label, mismatch.is_none(), || {
             mismatch.unwrap_or_default()
         });
@@ -429,7 +466,11 @@ impl Runner<'_> {
             .call(reqwest::Method::POST, &path, Some(key), Some(&body))
             .await?;
         if status != 201 {
-            return Err(format!("prepare {}: HTTP {status} {v}", c.label));
+            return Err(format!(
+                "prepare {}: HTTP {status} {}",
+                c.label,
+                reply(&v, self.w.redact_statements)
+            ));
         }
         self.sample("api", "prepare", Some(&c.label), t, Some(bytes));
         let candidate = v["candidate"]
@@ -443,7 +484,11 @@ impl Runner<'_> {
             .call(reqwest::Method::POST, &path, Some(key), Some(&body))
             .await?;
         if status != 200 {
-            return Err(format!("accept {}: HTTP {status} {v}", c.label));
+            return Err(format!(
+                "accept {}: HTTP {status} {}",
+                c.label,
+                reply(&v, self.w.redact_statements)
+            ));
         }
         self.sample("api", "accept", Some(&c.label), t, Some(bytes));
         let id = CommitId::from_str(&candidate).map_err(|e| e.to_string())?;
@@ -463,7 +508,10 @@ impl Runner<'_> {
             .call(reqwest::Method::POST, &path, Some(key), Some(&body))
             .await?;
         if status != 201 {
-            return Err(format!("create branch {name} at {from}: HTTP {status} {v}"));
+            return Err(format!(
+                "create branch {name} at {from}: HTTP {status} {}",
+                reply(&v, self.w.redact_statements)
+            ));
         }
         self.sample("api", "branch_create", Some(from), t, Some(bytes));
         self.heads.insert(name.to_owned(), from.clone());
@@ -492,7 +540,11 @@ impl Runner<'_> {
                 .call(reqwest::Method::POST, &path, None, Some(&body))
                 .await?;
             if status != 200 {
-                return Err(format!("preview {}: HTTP {status} {v}", m.id));
+                return Err(format!(
+                    "preview {}: HTTP {status} {}",
+                    m.id,
+                    reply(&v, self.w.redact_statements)
+                ));
             }
             let target_head = self.heads.get(&m.target).cloned();
             self.sample("api", "merge_preview", target_head.as_ref(), t, Some(bytes));
@@ -524,7 +576,11 @@ impl Runner<'_> {
             .call(reqwest::Method::POST, &path, Some(key), Some(&body))
             .await?;
         if status != 201 {
-            return Err(format!("propose {}: HTTP {status} {v}", m.id));
+            return Err(format!(
+                "propose {}: HTTP {status} {}",
+                m.id,
+                reply(&v, self.w.redact_statements)
+            ));
         }
         self.sample("api", "merge_propose", Some(&apply.label), t, Some(bytes));
         let candidate = v["candidate"]
@@ -541,7 +597,11 @@ impl Runner<'_> {
             .call(reqwest::Method::POST, &path, Some(key), Some(&body))
             .await?;
         if status != 200 {
-            return Err(format!("apply {}: HTTP {status} {v}", m.id));
+            return Err(format!(
+                "apply {}: HTTP {status} {}",
+                m.id,
+                reply(&v, self.w.redact_statements)
+            ));
         }
         self.sample("api", "merge_apply", Some(&apply.label), t, Some(bytes));
         self.check(
@@ -627,6 +687,44 @@ impl Runner<'_> {
         for label in labels {
             self.read_and_check("historical reconstruction", &label, "state_read_historical")
                 .await?;
+        }
+        Ok(())
+    }
+
+    /// Appearing, disappearing and reappearing statements at version boundaries.
+    async fn verify_history_facts(&mut self) -> Result<(), String> {
+        let mut cache: BTreeMap<Label, BTreeSet<String>> = BTreeMap::new();
+        for f in self.w.history_facts.clone() {
+            for (label, want) in f
+                .present
+                .iter()
+                .map(|l| (l, true))
+                .chain(f.absent.iter().map(|l| (l, false)))
+            {
+                if !cache.contains_key(label) {
+                    let raw = self
+                        .read_and_check("historical reconstruction", label, "state_read_historical")
+                        .await?;
+                    let set = raw
+                        .iter()
+                        .filter_map(|q| q.as_str().map(str::to_owned))
+                        .collect();
+                    cache.insert(label.clone(), set);
+                }
+                let has = cache[label].contains(&f.quad);
+                self.check(
+                    "history fact (appear / disappear / reappear)",
+                    label,
+                    has == want,
+                    || {
+                        format!(
+                            "{} expected {} at {label}",
+                            statement_ref(&f.quad, self.w.redact_statements),
+                            if want { "present" } else { "absent" }
+                        )
+                    },
+                );
+            }
         }
         Ok(())
     }
@@ -827,6 +925,7 @@ pub async fn run(w: &Workload, dataset: &str, cfg: &Config) -> RunData {
         let started = Instant::now();
         r.verify_heads_and_logs().await?;
         r.verify_history().await?;
+        r.verify_history_facts().await?;
         phases.insert(
             "historical reconstruction checks".to_owned(),
             started.elapsed().as_millis(),
@@ -914,7 +1013,7 @@ mod tests {
     #[test]
     fn a_wrong_state_reply_is_a_failure() {
         let e = expected(&[A, B]);
-        assert!(state_mismatch(&e, &[json!(A), json!(B)]).is_none());
+        assert!(state_mismatch(&e, &[json!(A), json!(B)], false).is_none());
         for (reply, why) in [
             (vec![json!(A)], "missing"),
             (vec![json!(A), json!(B), json!(C)], "unexpected"),
@@ -923,9 +1022,38 @@ mod tests {
             (vec![json!(A), json!(A), json!(B)], "ascending"),
             (vec![json!(A), json!(1)], "non-string"),
         ] {
-            let m = state_mismatch(&e, &reply).expect("must fail");
+            let m = state_mismatch(&e, &reply, false).expect("must fail");
             assert!(m.contains(why), "{why}: {m}");
         }
+    }
+
+    #[test]
+    fn third_party_replies_and_unordered_states_are_redacted() {
+        let body = json!({"code": "BASE_MISMATCH", "message": "absent from the base state: <urn:b> <urn:p> \"x\" ."});
+        let r = reply(&body, true);
+        assert!(
+            r.contains("BASE_MISMATCH") && r.contains("stmt:") && !r.contains("urn:b"),
+            "{r}"
+        );
+        assert!(reply(&body, false).contains("urn:b"));
+        let e = expected(&[A, B]);
+        let m = state_mismatch(&e, &[json!(B), json!(A)], true).unwrap();
+        assert!(
+            m.contains("not strictly ascending") && !m.contains("urn:"),
+            "{m}"
+        );
+        let m = state_mismatch(&e, &[json!(1)], true).unwrap();
+        assert!(m.contains("non-string") && m.contains("stmt:"), "{m}");
+    }
+
+    #[test]
+    fn third_party_statements_are_redacted_in_failure_details() {
+        let e = expected(&[A, B]);
+        let m = state_mismatch(&e, &[json!(A), json!(C)], true).unwrap();
+        assert!(
+            !m.contains("urn:b") && !m.contains("urn:c") && m.contains("stmt:"),
+            "{m}"
+        );
     }
 
     fn preview(classification: &'static str) -> PreviewExpect {

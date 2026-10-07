@@ -1,29 +1,32 @@
 {
+  "manifest_schema": "sculpin-ledger-bench-manifest/v2",
   "dataset": "synthetic-ledger-ci",
   "kind": "generated",
-  "source": "apps/ledger-bench/src/synthetic.rs (generated; no external data)",
-  "source_version": "synthetic-ledger-gen/3",
-  "license": "Apache-2.0 (project-owned generated data)",
-  "generator": "ledger-bench synthetic",
-  "generator_version": "synthetic-ledger-gen/3",
-  "seed": "0x5eed0001c1ed6e00",
-  "params": {
-    "churn": 35,
-    "conflicts": 10,
-    "contested": 10,
-    "convergent": 2,
-    "entities": 1000,
-    "fast": 6,
-    "feature": 15,
-    "growth": 35,
-    "main_mid": 20,
-    "main_post": 10,
-    "main_pre": 20,
-    "meta_entities": 100,
-    "predicates": 6,
-    "sample_every": 10,
-    "verify_all_history": true
+  "generator": {
+    "name": "ledger-bench synthetic (apps/ledger-bench/src/synthetic.rs)",
+    "version": "synthetic-ledger-gen/3",
+    "seed": "0x5eed0001c1ed6e00",
+    "params": {
+      "churn": 35,
+      "conflicts": 10,
+      "contested": 10,
+      "convergent": 2,
+      "entities": 1000,
+      "fast": 6,
+      "feature": 15,
+      "growth": 35,
+      "main_mid": 20,
+      "main_post": 10,
+      "main_pre": 20,
+      "meta_entities": 100,
+      "predicates": 6,
+      "sample_every": 10,
+      "verify_all_history": true
+    },
+    "license": "Apache-2.0 (project-owned generated data)"
   },
-  "commits": 205,
-  "output_checksum": "sha256:c8ad2fc2c2ada5f2df436898799c58093333e11d285d6536cabbcc79c1faf7ff"
+  "output": {
+    "commits": 205,
+    "workload_checksum": "sha256:c8ad2fc2c2ada5f2df436898799c58093333e11d285d6536cabbcc79c1faf7ff"
+  }
 }

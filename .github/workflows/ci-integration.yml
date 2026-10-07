@@ -6,6 +6,9 @@ permissions: {contents: read}
 jobs:
   docker:
     runs-on: ubuntu-latest
+    # Normal runs take 8–9 minutes (Plans 0009/0010 hosted evidence); a hang must fail
+    # within the hour, not run to GitHub's 6-hour default.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with: {persist-credentials: false}
