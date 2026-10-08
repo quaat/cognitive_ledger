@@ -19,8 +19,8 @@
 //! stored, digests are compared. Acceptance decisions read the hashed canonical bytes, never
 //! the relational projection columns.
 
-use crate::FailPoint;
 #[cfg(feature = "test-hooks")]
+use crate::FailPoint;
 use crate::lifecycle::Statements;
 use crate::{
     db_error,

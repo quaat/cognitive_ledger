@@ -162,6 +162,14 @@ def probe(features, uses, expect_ok):
     if (r.returncode == 0) != expect_ok:
         fail(f"test-hooks probe ({'with' if expect_ok else 'without'} the feature) {'succeeded' if r.returncode == 0 else 'failed'} unexpectedly:\n{r.stderr[-4000:]}")
     if not expect_ok:
+        # The production build must fail *only* because the probed symbols are absent: any
+        # other rustc error means the production feature set itself does not compile (a
+        # `test-hooks`-gated import that production code relies on, say), which this probe
+        # would otherwise accept as "failed as expected" (Plan 0013 M2 review clean-up).
+        others = sorted({line.split(":")[0] for line in r.stderr.splitlines()
+                         if line.startswith("error[E") and not line.startswith("error[E0432]")})
+        if others:
+            fail(f"test-hooks probe: the production feature set does not compile ({', '.join(others)}):\n{r.stderr[-4000:]}")
         for i, u in enumerate(uses):
             # rustc echoes the offending source line under each unresolved import; matching
             # it pins every symbol by its full path, so same-named symbols of different crates
