@@ -3541,10 +3541,10 @@ mod tests {
         );
         assert_eq!(body["correlation_id"], correlation.unwrap());
         // The edge grace is the only budget before database work: request_timeout plus a
-        // tenth of it.
+        // tenth of it — a 50 ms timeout answers in well under a second, not at 1.05 s.
         let elapsed = started.elapsed();
         assert!(
-            elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(3),
+            elapsed >= Duration::from_millis(50) && elapsed < Duration::from_secs(1),
             "{elapsed:?}"
         );
     }
