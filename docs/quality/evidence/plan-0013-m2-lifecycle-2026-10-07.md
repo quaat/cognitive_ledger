@@ -122,10 +122,10 @@ reject the broken build). `check-fast`, `test-integration.sh` (INTEGRATION OK) a
 verifier clean, zero unexpected error classes) passed at `dadb1f2`. Hosted GitHub Actions on
 `dadb1f2`: benchmark-ci, container, dependency-review, docker, fast, fuzz (sanitizer jobs `address` 10m15s and `none` 8m59s), supply-chain all **pass** (Actions runs 37845727788, 37845727836, 37845727871, 37845727876, 37845728101).
 
-## Post-review fixes, round 2 (hosted Codex review of `dadb1f2`; fix revision `FIX3_SHA`)
+## Post-review fixes, round 2 (hosted Codex review of `dadb1f2`; fix revision `9bfc8db`)
 
 | test | class | 17.2 | 15.19 | measured |
 |---|---|---|---|---|
 | `the_readiness_probe_stops_at_its_first_catalog_statement_after_the_request_deadline` | ACCEPTED (new) | pass | pass | `_sqlx_migrations` locked by the owner past a 300 ms request deadline: the probe's first catalog statement waits on the lock, returns after the deadline, and the second (the guard trigger lookup) is refused — `DependencyTimeout` "time budget ended before the guard trigger lookup" — within the 500 ms the test allows of the lock release; the connection returns idle; a fresh probe passes. **Red** against the pre-fix shape (`schema::verify(&pool)`): the probe completed with `Ok(())` after the lock release (every catalog statement ran past the deadline; 17.2) |
 
-Suites re-run at `FIX3_SHA` on both versions: `pg_lifecycle` 22 passed / 22 passed (24.0 s / 21.7 s; the per-statement acceptance 501 ms on both, the 17 backstop 2.29 s); `pg_least_privilege` 19 / 19; `pg_projection` 7 / 7; `pg_workflow` 14 / 14; `pg_api` 20 / 20 (`future_` excluded); `pg_validation_api` 23 / 23; lint clean.
+Suites re-run at `9bfc8db` on both versions: `pg_lifecycle` 22 passed / 22 passed (24.0 s / 21.7 s; the per-statement acceptance 501 ms on both, the 17 backstop 2.29 s); `pg_least_privilege` 19 / 19; `pg_projection` 7 / 7; `pg_workflow` 14 / 14; `pg_api` 20 / 20 (`future_` excluded); `pg_validation_api` 23 / 23; lint clean.
