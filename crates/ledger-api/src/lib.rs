@@ -515,10 +515,15 @@ struct EdgeConfig {
 }
 
 /// How much longer than the request deadline the edge lets a handler run before answering
-/// for it. A handler that has reached its database operation answers `REQUEST_TIMEOUT` itself
-/// exactly at the deadline (`run_db`); the grace only catches work before that point (slow
-/// bodies, authentication), which holds no pooled connection and may be dropped.
-const EDGE_GRACE: Duration = Duration::from_secs(1);
+/// for it: a tenth of the request timeout, at most one second (PR #17 review of `9c699cc`,
+/// P2: a fixed second made a 50 ms timeout take 1.05 s). A handler that has reached its
+/// database operation answers `REQUEST_TIMEOUT` itself exactly at the deadline (`run_db`),
+/// so the grace only decides which of the two answers wins that race; work before that
+/// point (slow bodies, authentication) holds no pooled connection and may be dropped at the
+/// grace. With the default 30 s request timeout the grace is 1 s, as documented.
+fn edge_grace(request_timeout: Duration) -> Duration {
+    (request_timeout / 10).min(Duration::from_secs(1))
+}
 
 async fn correlation_and_timeout(
     State(edge): State<EdgeConfig>,
@@ -557,11 +562,15 @@ async fn correlation_and_timeout(
     } else {
         lifecycle::OperationClass::Read
     };
-    let mut response =
-        match tokio::time::timeout_at((deadline + EDGE_GRACE).into(), next.run(request)).await {
-            Ok(response) => response,
-            Err(_) => ApiError::request_timeout(class, &correlation).into_response(),
-        };
+    let mut response = match tokio::time::timeout_at(
+        (deadline + edge_grace(edge.request_timeout)).into(),
+        next.run(request),
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(_) => ApiError::request_timeout(class, &correlation).into_response(),
+    };
     if let Ok(value) = HeaderValue::from_str(&correlation) {
         response.headers_mut().insert(CORRELATION_HEADER, value);
     }
@@ -3531,7 +3540,8 @@ mod tests {
             "{message}"
         );
         assert_eq!(body["correlation_id"], correlation.unwrap());
-        // The edge grace is the only budget before database work: ≈ request_timeout + 1 s.
+        // The edge grace is the only budget before database work: request_timeout plus a
+        // tenth of it.
         let elapsed = started.elapsed();
         assert!(
             elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(3),

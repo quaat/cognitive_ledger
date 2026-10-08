@@ -102,8 +102,8 @@ pub(crate) async fn acquire(
 }
 
 /// Begin a bounded transaction on a pooled connection obtained within the request budget.
-/// The transaction bound starts now, after the acquisition, and never extends past the
-/// request deadline (ADR-0026 §8: a transaction whose client has given up ends at its next
+/// The transaction bound starts the moment the connection is held — before `BEGIN` is sent,
+/// so a slow `BEGIN` counts against it — and never extends past the request deadline (ADR-0026 §8: a transaction whose client has given up ends at its next
 /// deadline check instead of committing late).
 ///
 /// Cancellation safety (module docs): the acquisition is the only timed step; a budget
@@ -115,6 +115,10 @@ pub(crate) async fn begin(
     hook: BeginHook<'_>,
 ) -> Result<BoundedTx, LedgerError> {
     let conn = acquire(pool, session.acquire_timeout).await?;
+    // The bound starts the moment the connection is held (PR #17 review of `9c699cc`, P2):
+    // a delayed `BEGIN` counts against it, so the hold never exceeds the bound plus one
+    // statement tail even when the server is slow to begin.
+    let started = Instant::now();
     #[cfg(feature = "test-hooks")]
     if let Some(hook) = hook {
         hook.at(crate::test_hooks::HookPoint::BeforeBegin, None)
@@ -136,7 +140,6 @@ pub(crate) async fn begin(
     #[cfg(not(feature = "test-hooks"))]
     let statement = None;
     let tx = begin_on(conn, statement).await?;
-    let started = Instant::now();
     let mut deadline = started + session.transaction_bound;
     if let Some(request) = request_deadline() {
         deadline = deadline.min(request);

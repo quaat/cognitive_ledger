@@ -105,8 +105,9 @@ validator_timeout + statement_timeout  ≤  request_timeout     (when a validato
 | `validator_timeout` | 15 s (20 s) | the validation client |
 
 **The transaction bound, honestly.** Every workflow transaction (`begin_scoped`) carries a
-deadline `T = min(begin + transaction_bound, request deadline)` (`begin` is after the pool
-acquire, so the bound never includes the wait for a connection; the cap means **no `COMMIT` is
+deadline `T = min(begin + transaction_bound, request deadline)` (`begin` is the instant the
+connection is held, after the pool acquire and before `BEGIN` is sent — the bound never
+includes the wait for a connection and always includes a slow `BEGIN`; the cap means **no `COMMIT` is
 ever sent after the request deadline**). Before **every** statement of the transaction and before
 *sending* `COMMIT`, the deadline is checked; at or past `T` the transaction is rolled back and
 the request fails with `DependencyTimeout` (`DEPENDENCY_TIMEOUT`, retry by key). The check is

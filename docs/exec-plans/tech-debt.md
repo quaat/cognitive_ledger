@@ -266,7 +266,8 @@ file:line evidence and the milestone that fixes each):
   (F8 scope; it is bounded and its COMMIT error is `CommitOutcomeUnknown` like the rest).
 - M2 residuals (P3): the projector validates no lifecycle hierarchy for its own pool and its
   `number()` accepts 0 (F9, M3); detached-operation counts are visible only in the drain log
-  (metrics are Phase 7B); the edge grace of 1 s before admission is a constant.
+  (metrics are Phase 7B); the edge grace before admission is a tenth of the request timeout
+  capped at 1 s (not separately configurable).
 - `mark_superseded` has no idempotency key (a retry after a lost response gets
   `LineageMismatch`); the projector's `number()` accepts 0, its DB session limits are not
   configurable and its worker count is not checked against its 8-connection pool;

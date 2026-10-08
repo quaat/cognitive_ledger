@@ -2187,7 +2187,7 @@ async fn edge_timeout_slow_loris_and_body_boundary_are_bounded() {
     .await;
 
     // Slow-loris body: one byte every 100 ms, never finishing. The edge timeout covers body
-    // reading, so the request ends with REQUEST_TIMEOUT after ~2 s (deadline + grace) instead
+    // reading, so the request ends with REQUEST_TIMEOUT after ~1.1 s (deadline + grace) instead
     // of holding a connection open indefinitely.
     let proposals = format!("/v1/graphs/{g}/proposals");
     let drip = futures_util::stream::unfold(0u32, |i| async move {
@@ -2207,7 +2207,7 @@ async fn edge_timeout_slow_loris_and_body_boundary_are_bounded() {
         .unwrap();
     let started = std::time::Instant::now();
     let r = h.raw(request).await;
-    // Before any database work the edge answers at request_timeout + its 1 s grace; the
+    // Before any database work the edge answers at request_timeout + its grace (a tenth); the
     // class comes from the Idempotency-Key header (a write: outcome unknown, same key).
     assert_error(&r, StatusCode::SERVICE_UNAVAILABLE, "REQUEST_TIMEOUT");
     assert!(
@@ -2215,9 +2215,9 @@ async fn edge_timeout_slow_loris_and_body_boundary_are_bounded() {
         "{r:?}"
     );
     assert!(
-        started.elapsed() >= Duration::from_millis(1900)
+        started.elapsed() >= Duration::from_millis(1000)
             && started.elapsed() < Duration::from_secs(5),
-        "slow-loris cut at request_timeout + the 1 s edge grace: {:?}",
+        "slow-loris cut at request_timeout + the edge grace (a tenth of it): {:?}",
         started.elapsed()
     );
 
