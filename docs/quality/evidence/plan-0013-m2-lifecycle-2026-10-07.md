@@ -131,3 +131,12 @@ verifier clean, zero unexpected error classes) passed at `dadb1f2`. Hosted GitHu
 Suites re-run at `9bfc8db` on both versions: `pg_lifecycle` 22 passed / 22 passed (24.0 s / 21.7 s; the per-statement acceptance 501 ms on both, the 17 backstop 2.29 s); `pg_least_privilege` 19 / 19; `pg_projection` 7 / 7; `pg_workflow` 14 / 14; `pg_api` 20 / 20 (`future_` excluded); `pg_validation_api` 23 / 23; lint clean.
 
 Hosted: hosted GitHub Actions on `7958214` (the evidence commit on top of `9bfc8db`): benchmark-ci, container, dependency-review, docker, fast, fuzz (sanitizer jobs `address` 10m38s, `none` 9m36s), supply-chain all **pass** (Actions runs 37849053018, 37849053037, 37849053068, 37849053099, 37849053121); the four review threads of `48e323b` and `dadb1f2` are answered with their fix commits and tests and resolved; a fresh Codex review of the final head was requested.
+
+## Post-review fixes, round 3 (hosted Codex review of `9c699cc`: two P2s; fix revision `4c1ac0b`)
+Edge grace = a tenth of the request timeout, at most 1 s (`edge_timeout_slow_loris_…` now
+asserts ≥ the 1 s request timeout and < 5 s: the cut lands at ≈ 1.1 s); the transaction
+bound's clock starts at acquisition, before `BEGIN`. `pg_lifecycle` 22 / 22 and `pg_api`
+20 / 20 on 17.2 and 15.19; INTEGRATION OK; FAULT GATE OK (4,643 commits, 0 inconsistent,
+verifier clean). The unit envelope test's elapsed-time assertion still encoded the fixed
+1 s grace and failed at `4c1ac0b` (local `check-fast` and the hosted `fast` job); `83b5103`
+corrects it — `ledger-api` unit tests 27 passed, `check-fast` passed.
