@@ -363,10 +363,10 @@ capability check and bounded request parsing (body size, JSON) stay outside the 
 the ordinary handler, and may be dropped freely: they touch no pooled connection. The
 canonical request identity is computed inside the operation, after the graph lookup, so the
 error precedence of every route is unchanged (a missing or foreign graph is `NOT_FOUND` before
-a malformed body is `INVALID_REQUEST`); it is pure CPU work on an already bounded body. The one
-request-path database activity not budgeted per acquisition is the readiness probe's schema
-verification (several catalog statements, each bounded by `statement_timeout`, inside the
-tracked operation). The M3 `db_work` permit attaches to exactly this operation lifetime; the
+a malformed body is `INVALID_REQUEST`); it is pure CPU work on an already bounded body. The readiness
+probe's schema verification (several catalog statements) runs on one request-budgeted
+connection and obtains each statement through the checked accessor, so a `/ready` whose
+client has timed out stops at its next catalog statement (PR #17 review of `dadb1f2`, P1). The M3 `db_work` permit attaches to exactly this operation lifetime; the
 `expensive` and `validations` permits already do in M2 (owned permits moved into the task). A
 request-side connection acquisition inside the operation never waits beyond the request's
 remaining budget (`min(pool_acquire_timeout, remaining)`), and an acquisition attempted after

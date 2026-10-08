@@ -470,7 +470,10 @@ impl PostgresLedgerStore {
     /// Readiness probe: the database answers and the schema is exactly the level this
     /// build requires (ADR-0016). A drifted schema is `SchemaIncompatible`, not ready.
     pub async fn ready(&self) -> Result<(), LedgerError> {
-        let report = crate::schema::verify(&self.pool).await?;
+        // One request-budgeted connection for the whole probe; every catalog statement is
+        // checked against the request deadline before it starts (ADR-0026 §8).
+        let mut conn = crate::lifecycle::acquire(&self.pool, self.session.acquire_timeout).await?;
+        let report = crate::schema::verify_on(&mut conn).await?;
         if let Some(expected) = &self.fingerprints
             && *expected != report.fingerprints
         {

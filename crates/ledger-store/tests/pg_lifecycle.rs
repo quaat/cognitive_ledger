@@ -2361,6 +2361,77 @@ async fn statements_cannot_keep_starting_after_the_transaction_deadline_without_
     verify_clean(&owner).await;
 }
 
+/// ACCEPTED (PR #17 review of `dadb1f2`, P1; ADR-0026 §8). The readiness probe's schema
+/// verification runs several catalog statements; on a request-path connection each is checked
+/// against the request deadline before it starts. The owner holds `_sqlx_migrations` locked
+/// past the request deadline, so the probe's first statement returns after the deadline; its
+/// second statement is then refused — the probe never keeps running catalog queries for
+/// several statement tails after its client has given up. A probe without a deadline (start-up
+/// shape) still passes afterwards.
+#[tokio::test]
+#[ignore = "requires PostgreSQL: run via the PostgreSQL suites with LEDGER_TEST_DATABASE_URL"]
+async fn the_readiness_probe_stops_at_its_first_catalog_statement_after_the_request_deadline() {
+    let owner = store().await;
+    let app = unique("lc-ready");
+    let probe = store_with_limits(
+        &app,
+        DbSessionLimits {
+            max_connections: 1,
+            lock_timeout: Duration::from_secs(5),
+            ..DbSessionLimits::default()
+        },
+    )
+    .await;
+    assert!(
+        probe.ready().await.is_ok(),
+        "the probe passes without a deadline"
+    );
+    let mut holder = owner.pool().begin().await.unwrap();
+    sqlx::query("LOCK TABLE _sqlx_migrations IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_millis(300);
+    let probing = probe.clone();
+    let handle = tokio::spawn(ledger_store::lifecycle::with_request_deadline(
+        deadline,
+        async move { probing.ready().await },
+    ));
+    wait_until(
+        async || {
+            sessions(&owner, &app)
+                .await
+                .iter()
+                .any(|s| s.wait_event_type == "Lock")
+        },
+        "the probe's first statement to wait on the locked table",
+    )
+    .await;
+    // The wait is the scenario: the lock outlives the request deadline.
+    tokio::time::sleep_until(tokio::time::Instant::from_std(
+        deadline + Duration::from_millis(200),
+    ))
+    .await;
+    holder.rollback().await.unwrap();
+    let started = Instant::now();
+    let result = handle.await.unwrap();
+    let after_release = started.elapsed();
+    assert!(
+        matches!(&result, Err(LedgerError::DependencyTimeout(m)) if m.contains("time budget ended before the guard trigger lookup")),
+        "the second catalog statement is refused by the request deadline: {result:?}"
+    );
+    assert!(
+        after_release < Duration::from_millis(500),
+        "nothing ran after the refusal: {after_release:?}"
+    );
+    wait_until(
+        async || transaction_states(&owner, &app).await == vec![("idle".to_owned(), false)],
+        "the probe's connection to be back in the pool",
+    )
+    .await;
+    assert!(probe.ready().await.is_ok(), "a fresh probe passes");
+}
+
 /// ACCEPTED (M2, ADR-0026 §4). An error from `COMMIT` itself whose class is a lost connection
 /// is reported as `CommitOutcomeUnknown` (never as a rollback): the transaction, paused just
 /// before `COMMIT`, has its backend terminated from another session; `COMMIT` then fails on
