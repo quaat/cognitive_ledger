@@ -428,6 +428,14 @@ struct ValidatorSettings {
     token_file: Option<String>,
 }
 
+/// Whether a callable validator is configured for the headroom relation of the lifecycle
+/// hierarchy (ADR-0026 §2): the same normalization as [`validator_settings`] — an empty
+/// `LEDGER_VALIDATOR_URL` is an absent URL (validator outage or not deployed), so it does not
+/// enforce `validator + statement ≤ request` (PR #17 review of `cc693de`, P2).
+fn validator_endpoint_configured(url: Option<&str>) -> bool {
+    url.is_some_and(|u| !u.is_empty())
+}
+
 /// The trust anchor is `LEDGER_VALIDATOR_SERVICE_ID`; `LEDGER_VALIDATOR_URL` only makes it
 /// callable. A URL without a service id, a token file without a URL, and production
 /// authentication without a service id are refused: a missing or partial configuration never
@@ -601,7 +609,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let session = db_session_limits()?;
             // The ADR-0026 §2 hierarchy, validated before any connection is opened: an
             // inconsistent deployment refuses to start with the violated relation named.
-            let validator_configured = env_optional("LEDGER_VALIDATOR_URL")?.is_some();
+            let validator_configured =
+                validator_endpoint_configured(env_optional("LEDGER_VALIDATOR_URL")?.as_deref());
             ledger_api::lifecycle::validate_lifecycle(
                 &session,
                 &limits,
@@ -857,6 +866,20 @@ mod tests {
             let empty_url = validator_settings(production, Some(""), Some(S1), None).unwrap();
             assert_eq!(empty_url, outage, "an empty URL is an absent URL");
         }
+        // The lifecycle headroom relation follows the same normalization: an empty or absent
+        // URL configures no validator, so a 25 s validator timeout under the default 30 s
+        // request / 10 s statement limits is not refused during an outage.
+        assert!(!validator_endpoint_configured(None));
+        assert!(!validator_endpoint_configured(Some("")));
+        assert!(validator_endpoint_configured(Some("https://v/validate")));
+        let api = ledger_api::ApiLimits {
+            validator_timeout: std::time::Duration::from_secs(25),
+            ..ledger_api::ApiLimits::default()
+        };
+        let db = ledger_store::DbSessionLimits::default();
+        let drain = std::time::Duration::from_secs(40);
+        assert!(ledger_api::lifecycle::validate_lifecycle(&db, &api, drain, false).is_ok());
+        assert!(ledger_api::lifecycle::validate_lifecycle(&db, &api, drain, true).is_err());
         // URL without service id: refused in every mode (never "trust whoever answers")
         for production in [true, false] {
             for id in [None, Some("")] {
