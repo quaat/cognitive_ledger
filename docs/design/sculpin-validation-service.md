@@ -134,8 +134,9 @@ candidate, and acceptance names it (ADR-0019): a validation from another environ
    acceptance can require it.
 
 ## Timeouts, retries, idempotency
-- The ledger's call is bounded by `LEDGER_LIMIT_VALIDATOR_SECONDS` (default 20 s, below the
-  request timeout) and `LEDGER_LIMIT_VALIDATOR_RESPONSE_BYTES` (default 1 MiB, streamed and
+- The ledger's call is bounded by `LEDGER_LIMIT_VALIDATOR_SECONDS` (default 15 s; the
+  start-up validation requires `validator + statement_timeout ≤ request_timeout`, and the call
+  is additionally capped by the request's remaining budget — ADR-0026) and `LEDGER_LIMIT_VALIDATOR_RESPONSE_BYTES` (default 1 MiB, streamed and
   cut at the cap). Concurrent calls per replica are capped by
   `LEDGER_LIMIT_CONCURRENT_VALIDATIONS` (default 4; excess → `503 RESOURCE_LIMIT`); the
   reconstruction before the call takes one of the expensive-operation slots.

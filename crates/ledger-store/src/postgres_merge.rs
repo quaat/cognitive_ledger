@@ -16,6 +16,7 @@
 //!   decision, the outbox row and the idempotency result.
 
 use crate::db_error;
+use crate::lifecycle::Statements;
 use crate::postgres_branches::GraphParents;
 #[cfg(feature = "test-hooks")]
 use crate::postgres_workflow::FailPoint;
@@ -30,7 +31,7 @@ use ledger_merge::{
     three_way_reported,
 };
 use ledger_rdf::{Quad, diff};
-use sqlx::{PgConnection, Row};
+use sqlx::Row;
 use std::collections::BTreeSet;
 use tokio::sync::Mutex;
 
@@ -236,7 +237,7 @@ fn dag_error(e: ledger_dag::DagError<LedgerError>) -> LedgerError {
 impl WorkflowRepository {
     /// Read a branch's head and status without locks; `BranchNotFound` if absent.
     async fn branch_head(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         graph: &GraphId,
         branch: &str,
     ) -> Result<(CommitId, String), LedgerError> {
@@ -246,7 +247,7 @@ impl WorkflowRepository {
         )
         .bind(graph.as_str())
         .bind(branch)
-        .fetch_optional(&mut *conn)
+        .fetch_optional(conn.stmt("the refs lookup")?)
         .await
         .map_err(db_error)?;
         let Some(row) = row else {
@@ -289,7 +290,7 @@ impl WorkflowRepository {
             });
         }
         self.readable_graph(tenant, graph).await?;
-        let mut conn = self.pool.acquire().await.map_err(db_error)?;
+        let mut conn = crate::lifecycle::acquire(&self.pool, self.session.acquire_timeout).await?;
         let (target_head, target_status) =
             Self::branch_head(&mut conn, graph, &spec.target).await?;
         let (source_head, source_status) =
@@ -302,7 +303,7 @@ impl WorkflowRepository {
         }
         let analysis = {
             let provider = GraphParents {
-                conn: Mutex::new(&mut *conn),
+                conn: Mutex::new(&mut conn as &mut dyn Statements),
                 graph: graph.clone(),
                 window: self.windows.ancestry,
             };
@@ -448,7 +449,7 @@ impl WorkflowRepository {
     }
 
     async fn replay_merge_proposed(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         stored: StoredResult,
         scope: &RequestScope,
     ) -> Result<MergeProposed, LedgerError> {
@@ -484,7 +485,7 @@ impl WorkflowRepository {
     }
 
     async fn load_merge_row(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         graph: &GraphId,
         proposal_id: i64,
     ) -> Result<Option<MergeRow>, LedgerError> {
@@ -493,7 +494,7 @@ impl WorkflowRepository {
         ))
         .bind(proposal_id)
         .bind(graph.as_str())
-        .fetch_optional(&mut *conn)
+        .fetch_optional(conn.stmt("the merge_proposals lookup")?)
         .await
         .map_err(db_error)?;
         row.as_ref().map(merge_row).transpose()
@@ -507,7 +508,7 @@ impl WorkflowRepository {
         scope: &RequestScope,
     ) -> Result<Option<MergeProposed>, LedgerError> {
         validate_scope_fn(scope)?;
-        let mut conn = self.pool.acquire().await.map_err(db_error)?;
+        let mut conn = crate::lifecycle::acquire(&self.pool, self.session.acquire_timeout).await?;
         match Self::stored_result(&mut conn, scope, Operation::MergePropose).await? {
             Some(stored) => Ok(Some(
                 Self::replay_merge_proposed(&mut conn, stored, scope).await?,
@@ -527,7 +528,8 @@ impl WorkflowRepository {
         validate_reason(Some(&request.message))?;
         // A completed request replays before anything is recomputed (Phase-4 lesson).
         {
-            let mut conn = self.pool.acquire().await.map_err(db_error)?;
+            let mut conn =
+                crate::lifecycle::acquire(&self.pool, self.session.acquire_timeout).await?;
             if let Some(stored) =
                 Self::stored_result(&mut conn, scope, Operation::MergePropose).await?
             {
@@ -604,6 +606,10 @@ impl WorkflowRepository {
         if let Some(stored) = Self::stored_result(&mut tx, scope, Operation::MergePropose).await? {
             return Self::replay_merge_proposed(&mut tx, stored, scope).await;
         }
+        #[cfg(feature = "test-hooks")]
+        self.hook_at(crate::test_hooks::HookPoint::AfterReplayCheck, &mut tx)
+            .await?;
+        tx.check_deadline("the graph and branch locks")?;
         Self::graph_must_be_active(&mut tx, scope).await?;
         match Self::lock_branch(&mut tx, &scope.graph, &request.spec.target, false).await? {
             None => return Err(LedgerError::BranchNotFound(request.spec.target.clone())),
@@ -636,6 +642,7 @@ impl WorkflowRepository {
 
         // The integration commit (ADR-0023 envelope): parents [target, source], the exact
         // patch from the target state to the merged state (computed by the preview).
+        tx.check_deadline("the candidate publication")?;
         let patch_id = patch.id();
         crate::postgres_immutable::publish_object(&mut tx, &patch_id.0, &patch.canonical_bytes())
             .await?;
@@ -651,11 +658,13 @@ impl WorkflowRepository {
             source_system: None,
             message: request.message.clone(),
         });
+        tx.check_deadline("the candidate commit publication")?;
         let candidate_id = self
             .immutable
             .publish_commit_in(&mut tx, &candidate)
             .await?;
         let actor = scope.principal.actor();
+        tx.check_deadline("the proposal row")?;
         let proposal_id: i64 = sqlx::query_scalar(
             "INSERT INTO proposals (graph_id, branch, tenant_id, principal_id, principal_type, \
              on_behalf_of, expected_head, requested_patch_id, effective_patch_id, candidate_commit, \
@@ -672,7 +681,7 @@ impl WorkflowRepository {
         .bind(patch_id.to_string())
         .bind(candidate_id.to_string())
         .bind(scope.correlation_id.as_deref())
-        .fetch_one(&mut *tx)
+        .fetch_one(tx.stmt("the proposals insert")?)
         .await
         .map_err(|e| match &e {
             sqlx::Error::Database(d) if d.is_unique_violation() => LedgerError::MergeStale(
@@ -687,6 +696,7 @@ impl WorkflowRepository {
             .merged_state_digest
             .clone()
             .expect("a candidate class has a digest");
+        tx.check_deadline("the merge proposal row")?;
         sqlx::query(
             "INSERT INTO merge_proposals (proposal_id, graph_id, target_branch, candidate_commit, \
              target_head, source_branch, source_head, merge_base, base_explicit, classification, \
@@ -710,7 +720,7 @@ impl WorkflowRepository {
         .bind(digest.to_string())
         .bind(&request.preview_token)
         .bind(&source_parties)
-        .execute(&mut *tx)
+        .execute(tx.stmt("the merge_proposals insert")?)
         .await
         .map_err(|e| match &e {
             sqlx::Error::Database(d) if d.is_unique_violation() => LedgerError::MergeStale(
@@ -719,6 +729,7 @@ impl WorkflowRepository {
             ),
             _ => db_error(e),
         })?;
+        tx.check_deadline("the idempotency result")?;
         Self::record_result(
             &mut tx,
             scope,
@@ -742,7 +753,7 @@ impl WorkflowRepository {
         #[cfg(feature = "test-hooks")]
         self.hook_at(crate::test_hooks::HookPoint::BeforeCommit, &mut tx)
             .await?;
-        tx.commit().await.map_err(db_error)?;
+        tx.commit().await?;
         #[cfg(feature = "test-hooks")]
         self.pause_at(crate::test_hooks::HookPoint::AfterCommit)
             .await;
@@ -753,12 +764,19 @@ impl WorkflowRepository {
         &self,
         scope: &RequestScope,
         operation: Operation,
-    ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, LedgerError> {
-        Self::begin_scoped(&self.pool, scope, operation).await
+    ) -> Result<crate::lifecycle::BoundedTx, LedgerError> {
+        Self::begin_scoped(
+            &self.pool,
+            &self.session,
+            scope,
+            operation,
+            self.begin_hook(),
+        )
+        .await
     }
 
     async fn replay_merge_applied(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         stored: StoredResult,
         scope: &RequestScope,
     ) -> Result<MergeApplied, LedgerError> {
@@ -776,7 +794,7 @@ impl WorkflowRepository {
              JOIN projection_outbox o ON o.ref_event_id = d.ref_event_id WHERE d.decision_id = $1",
         )
         .bind(decision_id)
-        .fetch_one(&mut *conn)
+        .fetch_one(conn.stmt("the decisions lookup")?)
         .await
         .map_err(db_error)?;
         Ok(MergeApplied {
@@ -797,7 +815,7 @@ impl WorkflowRepository {
 
     /// Lock a ref row `FOR UPDATE` (target) or `FOR SHARE` (source); head and version.
     async fn lock_ref(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         graph: &GraphId,
         branch: &str,
         exclusive: bool,
@@ -810,7 +828,7 @@ impl WorkflowRepository {
         let row = sqlx::query(sql)
             .bind(graph.as_str())
             .bind(branch)
-            .fetch_optional(&mut *conn)
+            .fetch_optional(conn.stmt("the ref lock")?)
             .await
             .map_err(db_error)?;
         row.map(|r| {
@@ -835,6 +853,10 @@ impl WorkflowRepository {
         if request.validation == ValidationPolicy::Required {
             return Err(LedgerError::ValidationRequired);
         }
+        #[cfg(feature = "test-hooks")]
+        self.hook_at(crate::test_hooks::HookPoint::AfterReplayCheck, &mut tx)
+            .await?;
+        tx.check_deadline("the graph, ref and branch locks")?;
         Self::graph_must_be_active(&mut tx, scope).await?;
         let Some(row) = Self::load_merge_row(&mut tx, &scope.graph, request.proposal_id).await?
         else {
@@ -890,7 +912,7 @@ impl WorkflowRepository {
             "SELECT decision_id, decision FROM decisions WHERE candidate_commit = $1",
         )
         .bind(row.candidate.to_string())
-        .fetch_optional(&mut *tx)
+        .fetch_optional(tx.stmt("the decisions lookup")?)
         .await
         .map_err(db_error)?;
         if let Some((decision_id, decision)) = decided {
@@ -956,6 +978,7 @@ impl WorkflowRepository {
         let validation_ids: Vec<String> =
             cited.iter().map(|c| c.validation_id.to_string()).collect();
 
+        tx.check_deadline("the ref movement")?;
         let new_version = target_version + 1;
         let updated = sqlx::query(
             "UPDATE refs SET head = $3, version = version + 1, updated_at = now() \
@@ -965,7 +988,7 @@ impl WorkflowRepository {
         .bind(&row.target_branch)
         .bind(row.candidate.to_string())
         .bind(target_head.to_string())
-        .execute(&mut *tx)
+        .execute(tx.stmt("the refs update")?)
         .await
         .map_err(db_error)?;
         if updated.rows_affected() != 1 {
@@ -976,6 +999,7 @@ impl WorkflowRepository {
         #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterRefUpdate)?;
         let actor = scope.principal.actor();
+        tx.check_deadline("the ref event")?;
         let ref_event_id: i64 = sqlx::query_scalar(
             "INSERT INTO ref_events (graph_id, branch, old_head, new_head, old_version, new_version, \
              operation, tenant_id, principal_id, principal_type, on_behalf_of, reason, correlation_id) \
@@ -993,11 +1017,12 @@ impl WorkflowRepository {
         .bind(actor.on_behalf_of.as_ref().map(|p| p.as_str().to_owned()))
         .bind(request.reason.as_deref())
         .bind(scope.correlation_id.as_deref())
-        .fetch_one(&mut *tx)
+        .fetch_one(tx.stmt("the ref_events insert")?)
         .await
         .map_err(db_error)?;
         #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterRefEvent)?;
+        tx.check_deadline("the decision")?;
         let decision_id: i64 = sqlx::query_scalar(
             "INSERT INTO decisions (proposal_id, graph_id, branch, candidate_commit, decision, \
              tenant_id, principal_id, principal_type, on_behalf_of, reason, validation_ids, ref_event_id, \
@@ -1016,7 +1041,7 @@ impl WorkflowRepository {
         .bind(&validation_ids)
         .bind(ref_event_id)
         .bind(scope.correlation_id.as_deref())
-        .fetch_one(&mut *tx)
+        .fetch_one(tx.stmt("the decisions insert")?)
         .await
         .map_err(db_error)?;
         if let Some(cited) = &cited {
@@ -1031,6 +1056,7 @@ impl WorkflowRepository {
         }
         #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterDecision)?;
+        tx.check_deadline("the outbox row")?;
         let outbox_id: i64 = sqlx::query_scalar(
             "INSERT INTO projection_outbox (graph_id, branch, commit_id, ref_version, event_kind, ref_event_id) \
              VALUES ($1, $2, $3, $4, 'ref_advanced', $5) RETURNING outbox_id",
@@ -1040,11 +1066,12 @@ impl WorkflowRepository {
         .bind(row.candidate.to_string())
         .bind(new_version)
         .bind(ref_event_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(tx.stmt("the projection_outbox insert")?)
         .await
         .map_err(db_error)?;
         #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterOutbox)?;
+        tx.check_deadline("the idempotency result")?;
         Self::record_result(
             &mut tx,
             scope,
@@ -1062,7 +1089,7 @@ impl WorkflowRepository {
         #[cfg(feature = "test-hooks")]
         self.hook_at(crate::test_hooks::HookPoint::BeforeCommit, &mut tx)
             .await?;
-        tx.commit().await.map_err(db_error)?;
+        tx.commit().await?;
         #[cfg(feature = "test-hooks")]
         self.pause_at(crate::test_hooks::HookPoint::AfterCommit)
             .await;
@@ -1080,7 +1107,7 @@ impl WorkflowRepository {
 /// The proposers (and principals acted for) of the given commits, sorted and distinct: the
 /// `source_parties` of a merge row. `verify` recomputes it with the same query.
 pub(crate) async fn source_parties_on(
-    conn: &mut sqlx::PgConnection,
+    conn: &mut dyn Statements,
     graph: &GraphId,
     commits: &[String],
 ) -> Result<Vec<String>, LedgerError> {
@@ -1093,7 +1120,7 @@ pub(crate) async fn source_parties_on(
     )
     .bind(graph.as_str())
     .bind(commits)
-    .fetch_all(conn)
+    .fetch_all(conn.stmt("the proposals lookup")?)
     .await
     .map_err(db_error)
 }

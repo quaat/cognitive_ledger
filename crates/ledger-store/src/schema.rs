@@ -6,6 +6,7 @@
 //! level this build was written for and refuses behind, ahead, absent or corrupt metadata.
 
 use crate::db_error;
+use crate::lifecycle::Statements;
 use ledger_core::LedgerError;
 use sqlx::{PgConnection, PgPool, Row};
 use std::borrow::Cow;
@@ -107,11 +108,23 @@ pub struct SchemaReport {
 
 /// Verify that the database is at exactly `REQUIRED_SCHEMA_VERSION` with intact migration
 /// metadata. Runs on the runtime or projector identity (SELECT on `_sqlx_migrations`).
+/// Start-up and tooling entry point: one pooled connection outside any request budget. The
+/// readiness probe uses [`verify_on`] with a request-budgeted connection instead.
 pub async fn verify(pool: &PgPool) -> Result<SchemaReport, LedgerError> {
+    let mut conn = pool.acquire().await.map_err(db_error)?;
+    verify_on(&mut *conn).await
+}
+
+/// [`verify`] on the caller's connection: every catalog statement is obtained through
+/// [`Statements::stmt`] immediately before it runs, so on a request-path connection the
+/// probe never starts a statement after the request deadline (PR #17 review: a `/ready`
+/// whose client timed out must not keep running catalog queries for several statement
+/// tails and exceed the drain bound).
+pub(crate) async fn verify_on(conn: &mut dyn Statements) -> Result<SchemaReport, LedgerError> {
     let rows = match sqlx::query(
         "SELECT version, checksum, success FROM _sqlx_migrations ORDER BY version",
     )
-    .fetch_all(pool)
+    .fetch_all(conn.stmt("the migration metadata lookup")?)
     .await
     {
         Ok(rows) => rows,
@@ -194,10 +207,10 @@ pub async fn verify(pool: &PgPool) -> Result<SchemaReport, LedgerError> {
     // Every database integrity primitive the runtime privilege model depends on must be
     // present, enabled, attached to the intended object and semantically what this build
     // expects; a same-named replacement elsewhere or with weaker semantics is not compatible.
-    verify_guard_triggers(pool).await?;
-    verify_guard_functions(pool).await?;
-    let fingerprints = verify_constraints_and_indexes(pool).await?;
-    verify_not_null(pool).await?;
+    verify_guard_triggers(conn).await?;
+    verify_guard_functions(conn).await?;
+    let fingerprints = verify_constraints_and_indexes(conn).await?;
+    verify_not_null(conn).await?;
     Ok(SchemaReport {
         version: highest,
         fingerprints,
@@ -693,7 +706,7 @@ pub fn expected_guard_functions() -> Vec<ExpectedFunction> {
 /// Every guard function in the database has exactly the body, language, return type and
 /// `search_path` setting the migrations gave it and is not `SECURITY DEFINER`: a same-named
 /// no-op replacement would otherwise keep every trigger "present and enabled".
-async fn verify_guard_functions(pool: &PgPool) -> Result<(), LedgerError> {
+async fn verify_guard_functions(conn: &mut dyn Statements) -> Result<(), LedgerError> {
     let expected = expected_guard_functions();
     for name in GUARD_FUNCTIONS {
         if !expected.iter().any(|f| f.name == *name) {
@@ -713,7 +726,7 @@ async fn verify_guard_functions(pool: &PgPool) -> Result<(), LedgerError> {
              WHERE n.nspname = 'public' AND p.proname = $1",
         )
         .bind(&f.name)
-        .fetch_all(pool)
+        .fetch_all(conn.stmt("the guard function lookup")?)
         .await
         .map_err(db_error)?;
         let row = match rows.as_slice() {
@@ -780,7 +793,7 @@ async fn verify_guard_functions(pool: &PgPool) -> Result<(), LedgerError> {
 
 /// Every guard trigger exists on its table, is enabled, calls its function and has exactly
 /// the timing, events, column list and constraint properties the migration gave it.
-async fn verify_guard_triggers(pool: &PgPool) -> Result<(), LedgerError> {
+async fn verify_guard_triggers(conn: &mut dyn Statements) -> Result<(), LedgerError> {
     for t in GUARD_TRIGGERS {
         let rows = sqlx::query(
             "SELECT pn.nspname AS fn_schema, p.proname AS fn_name, tg.tgenabled::text AS enabled, \
@@ -799,7 +812,7 @@ async fn verify_guard_triggers(pool: &PgPool) -> Result<(), LedgerError> {
         )
         .bind(t.table)
         .bind(t.name)
-        .fetch_all(pool)
+        .fetch_all(conn.stmt("the guard trigger lookup")?)
         .await
         .map_err(db_error)?;
         let row = match rows.as_slice() {
@@ -2162,7 +2175,7 @@ fn index_key(name: &str) -> String {
 /// Refuse a database in which any column the migrations declare `NOT NULL` accepts NULL
 /// (catalog read only; runs at start-up and on readiness). A `NOT VALID` not-null constraint
 /// (PostgreSQL 18+, `contype = 'n'`) does not count: existing rows may still be NULL.
-async fn verify_not_null(pool: &PgPool) -> Result<(), LedgerError> {
+async fn verify_not_null(conn: &mut dyn Statements) -> Result<(), LedgerError> {
     let rows = sqlx::query(
         "SELECT c.relname::text AS table_name, a.attname::text AS column_name \
          FROM pg_attribute a \
@@ -2173,7 +2186,7 @@ async fn verify_not_null(pool: &PgPool) -> Result<(), LedgerError> {
            AND NOT EXISTS (SELECT 1 FROM pg_constraint k WHERE k.conrelid = a.attrelid \
                            AND k.contype = 'n' AND NOT k.convalidated AND a.attnum = ANY (k.conkey))",
     )
-    .fetch_all(pool)
+    .fetch_all(conn.stmt("the not-null column lookup")?)
     .await
     .map_err(db_error)?;
     let mut not_null = std::collections::BTreeSet::new();
@@ -2201,7 +2214,7 @@ async fn verify_not_null(pool: &PgPool) -> Result<(), LedgerError> {
 /// no deparse), so it is lock-free and runs on readiness. Returns the expression fingerprints
 /// of the CHECKs and partial-index predicates for readiness comparison.
 async fn verify_constraints_and_indexes(
-    pool: &PgPool,
+    conn: &mut dyn Statements,
 ) -> Result<BTreeMap<String, String>, LedgerError> {
     let rows = sqlx::query(
         "SELECT c.relname::text AS table_name, con.conname::text AS name, con.contype::text AS kind, \
@@ -2224,7 +2237,7 @@ async fn verify_constraints_and_indexes(
          LEFT JOIN pg_index i ON i.indexrelid = con.conindid AND con.contype IN ('u', 'p') \
          WHERE n.nspname = 'public'",
     )
-    .fetch_all(pool)
+    .fetch_all(conn.stmt("the constraint and index lookup")?)
     .await
     .map_err(db_error)?;
     struct Found {
@@ -2357,7 +2370,7 @@ async fn verify_constraints_and_indexes(
          JOIN pg_namespace n ON n.oid = t.relnamespace \
          WHERE n.nspname = 'public' AND i.indisunique AND i.indisvalid",
     )
-    .fetch_all(pool)
+    .fetch_all(conn.stmt("the constraint and index lookup")?)
     .await
     .map_err(db_error)?;
     for (name, table, columns, predicate) in EXPECTED_UNIQUE_INDEXES {

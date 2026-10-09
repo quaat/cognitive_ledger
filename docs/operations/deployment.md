@@ -105,12 +105,44 @@ amendment).
   followed the bytes (ADR-0025, which also lists how the error surfaces and how to
   investigate the blamed commit). No shipped command performs this verification over a
   whole database yet (tech-debt).
-- Database session (every runtime connection): `LEDGER_DB_STATEMENT_TIMEOUT_MS` (30000),
-  `LEDGER_DB_LOCK_TIMEOUT_MS` (10000), `LEDGER_DB_IDLE_IN_TRANSACTION_TIMEOUT_MS`
-  (60000), `LEDGER_DB_MAX_CONNECTIONS` (16); values are milliseconds up to 2³¹−1. A
-  cancelled statement, lock wait, deadlock or serialization failure is rolled back and
-  reported as a retryable 503 `DEPENDENCY_TIMEOUT`; a terminated idle transaction as 503
-  `DEPENDENCY_UNAVAILABLE`. Clients retry with the same `Idempotency-Key`.
+- Request and transaction lifecycle (ADR-0026, Plan 0013 M2). Database session, set on
+  every runtime connection at connect: `LEDGER_DB_LOCK_TIMEOUT_MS` (5000),
+  `LEDGER_DB_STATEMENT_TIMEOUT_MS` (10000), `LEDGER_DB_IDLE_IN_TRANSACTION_TIMEOUT_MS`
+  (30000), `LEDGER_DB_MAX_CONNECTIONS` (16); the ledger's own bounds:
+  `LEDGER_DB_TRANSACTION_TIMEOUT_MS` (20000, the application deadline of every workflow
+  transaction, checked before its statement phases and before `COMMIT`),
+  `LEDGER_DB_ACQUIRE_TIMEOUT_MS` (5000, the wait for a pooled connection; a request never
+  waits past its own remaining budget), `LEDGER_LIMIT_REQUEST_SECONDS` (30),
+  `LEDGER_LIMIT_VALIDATOR_SECONDS` (15), `LEDGER_DRAIN_TIMEOUT_MS` (40000, the graceful
+  shutdown window for open connections *and* detached database operations). Milliseconds
+  up to 2³¹−1. Start-up validates the hierarchy and refuses to serve otherwise, naming the
+  violated relation:
+  `lock < statement < transaction < request ≤ drain`, `transaction + statement ≤ request`,
+  `acquire ≤ request`, `statement ≤ idle_in_transaction ≤ request`, `validator + statement ≤
+  request` (with a validator), `request + statement ≤ drain` (the longest detached operation:
+  a transaction's deadline is capped by its request's, so no `COMMIT` is sent after the
+  request deadline). On PostgreSQL 17 the
+  session also gets `transaction_timeout = transaction + statement` as a server-side
+  backstop (it terminates the session, SQLSTATE 25P04, reported as 503 `DEPENDENCY_TIMEOUT`;
+  the pool reconnects); PostgreSQL 15 has no such setting and is fully supported without
+  it. The deadline is checked before every statement of a workflow transaction and before
+  `COMMIT`; the declared bound on any transaction's connection and locks is that deadline
+  plus one statement tail (≤ the statement timeout), never beyond the request timeout.
+  Client guidance (`docs/api/openapi.json`): a statement, lock wait, deadlock,
+  serialization failure or transaction bound exceeded before `COMMIT` is rolled back and
+  reported as 503 `DEPENDENCY_TIMEOUT` (retry with the same `Idempotency-Key`); a database
+  that is not usable, a connection not obtained within the budget, or a draining server is
+  503 `DEPENDENCY_UNAVAILABLE`; a request that exceeds `LEDGER_LIMIT_REQUEST_SECONDS` is
+  503 `REQUEST_TIMEOUT` — for a read nothing was written, for an idempotent write the
+  outcome is unknown and the same key replays a committed result or executes afresh,
+  because the server never drops database work on a timeout: it stops waiting and the
+  operation runs to its own bound (M1 showed a dropped statement pins its connection
+  anyway). An error raised by `COMMIT` itself is reported with the outcome-unknown guidance,
+  never as a rollback. Shutdown (SIGTERM/SIGINT): the server stops accepting, refuses new
+  database operations, and waits up to `LEDGER_DRAIN_TIMEOUT_MS` for open connections and
+  detached operations together; if the deadline is reached it exits and logs only counts —
+  an in-flight `COMMIT` then has an unknown outcome until its key is retried (the ledger
+  never claims it rolled back).
 
 ## Health and readiness
 `/health` is process liveness. `/ready` answers 200 only when the database answers under

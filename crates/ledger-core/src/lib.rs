@@ -92,6 +92,13 @@ pub enum LedgerError {
     /// (ADR-0016). The transaction was rolled back; retry with the same idempotency key.
     #[error("DEPENDENCY_TIMEOUT: {0}")]
     DependencyTimeout(String),
+    /// `COMMIT` was sent and its outcome is unknown (ADR-0026 §4): the connection was lost, the
+    /// session was terminated or the commit statement failed while completing. The
+    /// transaction may be durable, so this is never reported as a rollback; retry with the
+    /// same idempotency key — a committed result replays, a rolled-back one executes afresh.
+    /// The inner error is the driver failure as the store classified it.
+    #[error("COMMIT_OUTCOME_UNKNOWN: {0}")]
+    CommitOutcomeUnknown(Box<LedgerError>),
     /// The database schema is not the exact level this build requires (behind, ahead,
     /// absent or corrupt migration metadata). Startup and readiness refuse (ADR-0016).
     #[error("SCHEMA_INCOMPATIBLE: {0}")]

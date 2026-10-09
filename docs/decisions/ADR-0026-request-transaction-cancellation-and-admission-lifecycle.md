@@ -1,10 +1,15 @@
 # ADR-0026: Request, transaction, cancellation and admission lifecycle
 
 ## Status
-**Proposed — draft for owner/architecture review (2026-10-07, Plan 0013 / Phase 7A).** Written
-after the M1 characterization evidence existed ([Plan 0013](../exec-plans/active/0013-phase7a-resource-governance.md),
-Evidence; measurements in [`plan-0013-m1-lifecycle-2026-10-07.md`](../quality/evidence/plan-0013-m1-lifecycle-2026-10-07.md)).
-Accepted only after that review; M2/M3 code does not start before. It builds on ADR-0013
+**Accepted (2026-10-07, Plan 0013 / Phase 7A; M2 implements §2–§4 and §8, M3 implements §5).**
+Drafted after the M1 characterization evidence existed ([Plan 0013](../exec-plans/active/0013-phase7a-resource-governance.md),
+Evidence; measurements in [`plan-0013-m1-lifecycle-2026-10-07.md`](../quality/evidence/plan-0013-m1-lifecycle-2026-10-07.md)),
+reviewed by five bounded independent reviews, and accepted at the start of M2 with two
+clarifications from the architecture review recorded in §8 (the ownership boundary of a
+detached operation starts at the route's first pooled query, not at the "store call", and
+detached operations are tracked by the server through shutdown). Both are judged
+clarifications of §3/§5, which already required detaching rather than dropping and a drain
+that covers detached work; neither changes a decision, so M2 proceeds under this text. It builds on ADR-0013
 (atomic acceptance transaction; idempotency results, not reservations) and ADR-0016 (session
 limits set at connect by the runtime identity). No protocol identity, commit format, RDF
 semantics, merge semantics or durable schema changes; see Compatibility.
@@ -80,11 +85,12 @@ projector for its own pool:
 ```text
 lock_timeout        <  statement_timeout  <  transaction_bound  <  request_timeout  ≤  drain_deadline
 transaction_bound + statement_timeout  ≤  request_timeout
-pool_acquire_timeout + transaction_bound + statement_timeout  ≤  drain_deadline
-idle_in_transaction_session_timeout    ≤  request_timeout
+request_timeout + statement_timeout    ≤  drain_deadline      (the longest detached operation, §3)
+statement_timeout ≤ idle_in_transaction_session_timeout ≤ request_timeout
 pool_acquire_timeout                   ≤  request_timeout     (every single acquire is additionally
                                                               wrapped in min(acquire, remaining budget))
-validator_timeout + statement_timeout  ≤  request_timeout     (when a validator is configured)
+validator_timeout + statement_timeout  ≤  request_timeout     (when a validator is configured; the
+                                                              call is also capped by the remaining budget)
 ```
 
 | setting | default (was) | enforced by |
@@ -99,18 +105,30 @@ validator_timeout + statement_timeout  ≤  request_timeout     (when a validato
 | `validator_timeout` | 15 s (20 s) | the validation client |
 
 **The transaction bound, honestly.** Every workflow transaction (`begin_scoped`) carries a
-deadline `T = begin + transaction_bound` (`begin` is after the pool acquire, so the deadline
-never includes the wait for a connection). Before each repository statement and before
-*sending* `COMMIT` the remaining budget is checked; at or past `T` the transaction is rolled
-back and the request fails with `DependencyTimeout` (`DEPENDENCY_TIMEOUT`, retry by key). That
-check alone is not a hard bound — a statement started at `T − ε` runs on. The declared bound,
-the same on both supported servers, is:
+deadline `T = min(begin + transaction_bound, request deadline)` (`begin` is the instant the
+connection is held, after the pool acquire and before `BEGIN` is sent — the bound never
+includes the wait for a connection and always includes a slow `BEGIN`; the cap means **no `COMMIT` is
+ever sent after the request deadline**). Before **every** statement of the transaction and before
+*sending* `COMMIT`, the deadline is checked; at or past `T` the transaction is rolled back and
+the request fails with `DependencyTimeout` (`DEPENDENCY_TIMEOUT`, retry by key). The check is
+structural, not a convention: a bounded transaction does not dereference to a connection, and
+the only way to run SQL on it is the checked accessor `Statements::stmt(phase)`, which every
+helper the transaction calls — lookups, locks, publications, index writes, reconstruction
+windows, idempotency rows — obtains immediately before each statement (PR #17 review P1: a
+helper that ran several statements behind one outer check could keep starting statements past
+the deadline on PostgreSQL 15, which has no backstop). The same accessor on a pooled
+request-path connection refuses to start a statement after the request deadline. Only
+`test-hooks` builds have an unchecked accessor, for the injected statements that simulate a
+check-skipping bug in the PostgreSQL 17 backstop test. That check alone is not a hard bound — a statement started at `T − ε` runs on.
+The declared bound, the same on both supported servers, is:
 
 ```text
 a transaction holds its connection and locks for at most
-    transaction_bound + one in-flight statement tail, the tail ≤ statement_timeout
-    (+ the cancel and pool-return latency, client-observed ≈ 0.1 s), i.e. ≤ 30 s with the defaults — never beyond
-    request_timeout (relation: transaction_bound + statement_timeout ≤ request_timeout)
+    T + one in-flight statement tail, the tail ≤ statement_timeout
+    (+ the cancel and pool-return latency, client-observed ≈ 0.1 s), i.e. ≤ 30 s with the
+    defaults — never beyond request_timeout (transaction_bound + statement_timeout ≤
+    request_timeout) and, because T ≤ the request deadline, never a COMMIT after the client's
+    budget ended
 ```
 PostgreSQL 17's `transaction_timeout` **terminates the session** (FATAL, SQLSTATE 25P04) — it
 does not cancel the statement and leave the connection reusable — so it is set as a
@@ -143,10 +161,13 @@ statement_timeout < request_timeout   is the cancellation floor:
   statement was sent (client-observed).
 No active cancellation is issued: the ledger never calls pg_cancel_backend,
 pg_terminate_backend or sends a protocol CancelRequest.
-The edge never drops an admitted store operation: it DETACHES it. The handler runs the
-store call in a task that owns the admission permits; at the request deadline the handler
-stops waiting and answers REQUEST_TIMEOUT, while the task runs to its own bounded end
-(transaction_bound + statement tail, or completion) and only then releases the permits.
+The edge never drops an admitted database-bearing operation: it DETACHES it. The handler
+runs the WHOLE database-bearing part of the route — from the authorized_graph lookup (the
+first pooled query) through replay lookups, repository operations and the last pooled
+query — as one tracked task that owns the admission permits (§8); at the request deadline
+the handler stops waiting and answers REQUEST_TIMEOUT, while the task runs to its own
+bounded end (transaction_bound + statement tail, or completion) and only then releases
+the permits.
 ```
 Detaching, not dropping, is what makes the admission bound real (§5): a dropped future would
 free its permit while its connection stays busy for up to `statement_timeout`, so repeated
@@ -154,9 +175,11 @@ edge timeouts could push heavy connection usage past the budget into the reserve
 (scenario (d) of Plan 0013). It also removes the only place where sqlx's drop-mid-statement
 semantics mattered: no store future is ever dropped by the edge, so a detached write either
 commits (durable, replayable: the client was told the outcome is unknown) or rolls back at a
-bound. A detached operation ends at most `pool_acquire_timeout + transaction_bound +
-statement_timeout` after admission (35 s by default); the drain deadline covers it. Spawning
-needs `'static` futures (owned request values and `Arc`s), which the handlers can provide.
+bound. Because every acquisition is bounded by the request budget, every transaction deadline is
+capped by the request deadline and the validator call is capped by the remaining budget, a
+detached operation ends at most `request_timeout + one statement tail` after it began (40 s
+by default); the drain deadline is validated to cover exactly that. Spawning needs `'static`
+futures (owned request values and `Arc`s), which the handlers provide.
 **Why not the M0 `pg_cancel_backend(pid)` drop guard.** `pg_cancel_backend(pid)` addresses a
 backend session. The pool lends that session to the next request as soon as the abandoned
 statement ends, so a cancel that arrives after that (the common case for a detached task
@@ -203,7 +226,8 @@ from a dropped future is forbidden. Client guidance is therefore decided from wh
 | read request timed out at the edge | 503 `REQUEST_TIMEOUT` | nothing was written; retry |
 | idempotent write timed out at the edge (whether or not execution began; the detached operation may still commit) | 503 `REQUEST_TIMEOUT` | the outcome is unknown; retry with the same idempotency key (it replays a committed result or executes afresh) |
 | failure raised by a statement before `COMMIT` was sent (statement/lock timeout, deadlock, serialization, the ledger's deadline) | 503 `DEPENDENCY_TIMEOUT` | rolled back; retry with the same key (unchanged) |
-| any error returned by `COMMIT` itself (connection lost, FATAL 25P04/57P01, I/O) | 503 `DEPENDENCY_UNAVAILABLE` or `DEPENDENCY_TIMEOUT` by class | **the outcome is unknown**; retry with the same key — never "rolled back": under synchronous replication or a lost reply the transaction may be durable, and the retry replays it (ADR-0013: the stored result is read under the idempotency lock in a fresh snapshot) |
+| an availability or timeout error returned by `COMMIT` itself (connection lost, I/O, protocol, FATAL 25P04/57P01, 57014 while committing) | 503 `DEPENDENCY_UNAVAILABLE` or `DEPENDENCY_TIMEOUT` by class | **the outcome is unknown**; retry with the same key — never "rolled back": under synchronous replication or a lost reply the transaction may be durable, and the retry replays it (ADR-0013: the stored result is read under the idempotency lock in a fresh snapshot) |
+| an ordinary ERROR raised by `COMMIT` (a deferred integrity trigger of migrations 0009/0012 firing at commit) | 500 `INTERNAL` (unchanged) | the server reported the failure, so the transaction is definitely rolled back; this is a defect to investigate, not a retry |
 | database unavailable / pool acquire timeout | 503 `DEPENDENCY_UNAVAILABLE` | reads: not available, retry; writes: retry with the same key |
 | committed result whose response was lost | (the retry) 200 `replayed: true` | — |
 
@@ -211,7 +235,12 @@ The class is decided from the route and the presence of an `Idempotency-Key` hea
 never from how far the handler got. `COMMIT` is never wrapped in a client-side timeout.
 
 `REQUEST_TIMEOUT` is one new stable code (additive; the status class stays 5xx; the OpenAPI
-document lists it). Key-less reads are never told to retry with an idempotency key. The
+document lists it). It replaces `RESOURCE_LIMIT` for the HTTP time limit — a client that keyed
+on `RESOURCE_LIMIT` for timeouts must accept `REQUEST_TIMEOUT` (the only client-visible code
+change of Phase 7A; `RESOURCE_LIMIT` keeps meaning admission or size). The class is decided from
+the method and the `Idempotency-Key` header (a mutating method with a key is an idempotent
+write; everything else, merge preview included, is a read). Key-less reads are never told to
+retry with an idempotency key. The
 envelope reveals only the caller's own route class and aggregate load (already observable
 through latency); no graph, tenant or other caller's identity enters it. Design B
 (a monotonic request lifecycle state `NotStarted → RunningPreCommit → CommitStarted →
@@ -316,7 +345,7 @@ semantics, lock order, outbox or projection protocol, or the database schema. Ad
 error code (`REQUEST_TIMEOUT`), more precise messages, new configuration
 (`LEDGER_DB_TRANSACTION_TIMEOUT_MS`, `LEDGER_DB_ACQUIRE_TIMEOUT_MS`,
 `LEDGER_RESERVED_CHEAP_CONNECTIONS`, `LEDGER_DRAIN_TIMEOUT_MS`; changed defaults for the
-existing `LEDGER_DB_*_TIMEOUT_MS` and `LEDGER_VALIDATOR_TIMEOUT_MS`), start-up validation that
+existing `LEDGER_DB_*_TIMEOUT_MS`, `LEDGER_LIMIT_REQUEST_SECONDS` and `LEDGER_LIMIT_VALIDATOR_SECONDS`), start-up validation that
 refuses inconsistent settings (a deployment with `statement_timeout` ≥ `request_timeout` no
 longer starts); `25P04` joins the retryable SQLSTATEs (M1 already made the driver's
 `Protocol` failures retryable after the fault gate exposed 500s during PostgreSQL crash
@@ -324,6 +353,58 @@ recovery, Plan 0013 F11); `ledger-projector` and `ledger-admin` gained the serve
 start-up refusal of a `test-hooks` build in M1. If M2 or M3 turns out to need a table (an admission registry, a cancellation
 registry, key reservations) or a different idempotency persistence model, Phase 7A stops and
 that becomes a separate architectural decision — never smuggled into M2.
+
+### 8. Ownership boundary and detached-operation tracking (clarifications, M2)
+**Ownership boundary.** `authorized_graph` is itself a pooled query, so the boundary cannot
+be "the store call": once a route is admitted to database work, the entire database-bearing
+route operation — from the first `authorized_graph` query through replay lookups, repository
+operations and the last pooled query — is owned by one bounded, tracked, detached operation.
+An HTTP timeout may stop waiting for that operation; it never drops it. Authentication, the
+capability check and bounded request parsing (body size, JSON) stay outside the operation, in
+the ordinary handler, and may be dropped freely: they touch no pooled connection. The
+canonical request identity is computed inside the operation, after the graph lookup, so the
+error precedence of every route is unchanged (a missing or foreign graph is `NOT_FOUND` before
+a malformed body is `INVALID_REQUEST`); it is pure CPU work on an already bounded body. The readiness
+probe's schema verification (several catalog statements) runs on one request-budgeted
+connection and obtains each statement through the checked accessor, so a `/ready` whose
+client has timed out stops at its next catalog statement (PR #17 review of `dadb1f2`, P1). The M3 `db_work` permit attaches to exactly this operation lifetime; the
+`expensive` and `validations` permits already do in M2 (owned permits moved into the task). A
+request-side connection acquisition inside the operation never waits beyond the request's
+remaining budget (`min(pool_acquire_timeout, remaining)`), and an acquisition attempted after
+the budget is spent fails at once (`DependencyUnavailable`, nothing done). **Transaction
+start-up is cancellation-safe** (PR #17 review P1): the acquisition is the only database step
+raced against a client-side timer; a budget that ends between the acquisition and `BEGIN`
+returns the clean connection without beginning anything; `BEGIN` itself is awaited in a task
+of its own that is never dropped — in sqlx 0.8.6 the client-side transaction depth is
+incremented only after `BEGIN`'s `ReadyForQuery`, so a begin future dropped in that window
+would return to the pool a connection PostgreSQL still considers inside a transaction, which
+the next borrower would unknowingly reuse. If the awaiting future is ever dropped, the begin
+task still completes and drops its transaction there (queueing `ROLLBACK`), so the pool never
+receives a connection with an open transaction the client does not know about; a `BEGIN` that
+cannot complete is an error and its connection is not reused. Regression tests:
+`pg_lifecycle::a_request_budget_that_ends_before_begin_…` and
+`a_caller_dropped_during_begin_never_returns_an_open_transaction_to_the_pool`. Concretely: an operation whose
+client has already received `REQUEST_TIMEOUT` therefore stops at its next connection
+acquisition — typically before its transaction began — and the retry by key executes afresh;
+an operation already inside a transaction runs to its bound and commits or rolls back on its
+own terms (the retry then replays or executes afresh). Both outcomes are covered by the
+"outcome unknown; retry with the same key" guidance the client was given.
+
+**Tracking through shutdown.** Axum's graceful shutdown waits for HTTP connections, not for
+tasks that outlive a timeout response. The server therefore owns a tracker of detached
+operations with these lifecycle semantics: (1) the server owns the tracker; (2) every detached
+database-bearing operation is registered in it before it runs; (3) on the shutdown signal the
+server stops accepting new HTTP work and (4) closes the tracker to new detached operations (a
+route reaching it answers 503 `DEPENDENCY_UNAVAILABLE` "shutting down", nothing done) — both
+wake from the same signal, in no guaranteed order, which is harmless: a request admitted in the
+window is tracked and drained, one refused in the window did nothing; (5) ordinary HTTP
+requests and tracked detached work are given the configured `drain_deadline`, which is
+validated to cover the longest detached operation (`request_timeout + statement_timeout ≤
+drain_deadline`, §3); (6) the process exits when both have completed or the
+drain deadline is reached, logging only counts (never request contents, tenant data,
+idempotency keys, SQL or credentials); (7) a forced exit at the deadline is never described as
+proving the rollback of an ambiguous `COMMIT` — PostgreSQL ends the abandoned session's
+transaction by its own rules, and the retry-by-key contract (§6) resolves the outcome.
 
 ## Alternatives considered
 - **`pg_cancel_backend` on drop (M0 proposal).** Rejected for Phase 7A: cancels the next
@@ -345,13 +426,14 @@ that becomes a separate architectural decision — never smuggled into M2.
 - **Budget-aware per-statement timeouts on PostgreSQL 15.** Not adopted; see §2.
 
 ## Consequences
-- M2 implements §2–§4 (hierarchy validation, transaction bound, PostgreSQL 17
+- M2 implements §2–§4 and §8 (hierarchy validation, transaction bound, PostgreSQL 17
   `transaction_timeout` backstop and its measurement, `25P04` classification, configurable
-  acquire timeout bounded per acquire by the request budget, drain covering detached work,
-  validator headroom check, `REQUEST_TIMEOUT` envelope and per-class messages, COMMIT errors as
-  "outcome unknown", the detached store operation); M3 implements §5 (db_work with the
+  acquire timeout bounded per acquire by the request budget, the tracked detached operation
+  and the drain covering it, validator headroom check, `REQUEST_TIMEOUT` envelope and
+  per-class messages, COMMIT errors as "outcome unknown"); M3 implements §5 (db_work with the
   detached lifetime, acquisition order incl. replay lookups, `/ready` single-flight + cache,
-  start-up validation, projector and admin configuration and `test-hooks` refusal). Each lands only against the M1 tests that are red today
+  start-up validation of the admission budget, projector configuration validation incl. its
+  own pool's hierarchy). Each lands only against the M1 tests that are red today
   (`future_*`) plus the preservation tests that must stay green.
 - Operators get shorter defaults: statements over 10 s, lock waits over 5 s and transactions
   over 20 s fail with `DEPENDENCY_TIMEOUT`. Plan 0011/0012 measurements put a 256-window

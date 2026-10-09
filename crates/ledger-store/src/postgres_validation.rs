@@ -21,6 +21,7 @@
 
 #[cfg(feature = "test-hooks")]
 use crate::FailPoint;
+use crate::lifecycle::Statements;
 use crate::{
     db_error,
     postgres_workflow::{Operation, RequestScope, StoredResult, WorkflowRepository},
@@ -31,7 +32,7 @@ use ledger_validation_protocol::{
     RequestedContext, SemanticContextId, SemanticEnvironmentId, SemanticExecutionContext,
     ValidationId, ValidationOutcome, ValidationRecord, ValidatorIdentity,
 };
-use sqlx::{PgConnection, PgPool, Row};
+use sqlx::{PgPool, Row};
 use std::collections::BTreeSet;
 use time::OffsetDateTime;
 
@@ -108,8 +109,12 @@ pub struct ValidatorOutcome {
 pub struct ValidationRepository {
     pool: PgPool,
     limits: crate::ReconstructionLimits,
+    /// Lifecycle limits (ADR-0026): transaction bound and acquire timeout.
+    session: crate::DbSessionLimits,
     #[cfg(feature = "test-hooks")]
     failpoint: Option<FailPoint>,
+    #[cfg(feature = "test-hooks")]
+    pause: Option<crate::test_hooks::PauseHook>,
 }
 
 fn now() -> Result<LedgerTimestamp, LedgerError> {
@@ -121,14 +126,62 @@ impl ValidationRepository {
         Self {
             pool,
             limits: crate::ReconstructionLimits::DEVELOPMENT,
+            session: crate::DbSessionLimits::default(),
             #[cfg(feature = "test-hooks")]
             failpoint: None,
+            #[cfg(feature = "test-hooks")]
+            pause: None,
         }
     }
 
     pub fn with_limits(mut self, limits: crate::ReconstructionLimits) -> Self {
         self.limits = limits;
         self
+    }
+
+    /// Lifecycle limits for this repository's acquisitions and transactions (ADR-0026).
+    pub fn with_session_limits(mut self, session: crate::DbSessionLimits) -> Self {
+        self.session = session;
+        self
+    }
+
+    /// Pause (or inject a slow statement into) the record transaction at the hook's point
+    /// (feature `test-hooks` only).
+    #[cfg(feature = "test-hooks")]
+    pub fn with_pause_hook(mut self, hook: crate::test_hooks::PauseHook) -> Self {
+        self.pause = Some(hook);
+        self
+    }
+
+    /// This repository's pause hook as the transaction start-up hook (test-hooks builds).
+    fn begin_hook(&self) -> crate::lifecycle::BeginHook<'_> {
+        #[cfg(feature = "test-hooks")]
+        {
+            self.pause.as_ref()
+        }
+        #[cfg(not(feature = "test-hooks"))]
+        {
+            None
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    async fn pause_at(&self, point: crate::test_hooks::HookPoint) {
+        if let Some(hook) = &self.pause {
+            let _ = hook.at(point, None).await;
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    async fn hook_at(
+        &self,
+        point: crate::test_hooks::HookPoint,
+        tx: &mut crate::lifecycle::BoundedTx,
+    ) -> Result<(), LedgerError> {
+        match &self.pause {
+            Some(hook) => hook.at(point, Some(tx)).await,
+            None => Ok(()),
+        }
     }
 
     /// Abort `record`'s transaction at `point` (tests only): `AfterLineageValidation` after
@@ -167,7 +220,7 @@ impl ValidationRepository {
     ) -> Result<Option<RecordedValidation>, LedgerError> {
         let scope = &request.scope;
         WorkflowRepository::validate_scope(scope)?;
-        let mut conn = self.pool.acquire().await.map_err(db_error)?;
+        let mut conn = crate::lifecycle::acquire(&self.pool, self.session.acquire_timeout).await?;
         match WorkflowRepository::stored_result(&mut conn, scope, Operation::Validate).await? {
             Some(stored) => Ok(Some(Self::replay(&mut conn, stored, scope).await?)),
             None => Ok(None),
@@ -184,29 +237,36 @@ impl ValidationRepository {
         let scope = &request.scope;
         WorkflowRepository::validate_scope(scope)?;
         request.requested.validate()?;
-        let mut tx = self.pool.begin().await.map_err(db_error)?;
+        let mut tx = crate::lifecycle::begin(&self.pool, &self.session, self.begin_hook()).await?;
         sqlx::query("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
-            .execute(&mut *tx)
+            .execute(tx.stmt("the isolation level")?)
             .await
             .map_err(db_error)?;
         if let Some(stored) =
             WorkflowRepository::stored_result(&mut tx, scope, Operation::Validate).await?
         {
             let replayed = Self::replay(&mut tx, stored, scope).await?;
-            tx.rollback().await.map_err(db_error)?;
+            tx.rollback().await?;
             return Ok(ValidationBegin::Replayed(Box::new(replayed)));
         }
+        tx.check_deadline("the graph lock")?;
         WorkflowRepository::graph_must_be_active(&mut tx, scope).await?;
         Self::candidate_is_prepared_here(&mut tx, &scope.graph, &request.candidate).await?;
         let knowledge_base_id: Option<String> =
             sqlx::query_scalar("SELECT knowledge_base_id FROM graphs WHERE graph_id = $1")
                 .bind(scope.graph.as_str())
-                .fetch_one(&mut *tx)
+                .fetch_one(tx.stmt("the graphs lookup")?)
                 .await
                 .map_err(db_error)?;
-        let reconstructed =
-            WorkflowRepository::state_at_on(&mut tx, &request.candidate, limits).await?;
-        tx.rollback().await.map_err(db_error)?;
+        tx.check_deadline("the candidate-state reconstruction")?;
+        let reconstructed = WorkflowRepository::state_at_on_windowed(
+            &mut tx,
+            &request.candidate,
+            limits,
+            crate::RetrievalWindows::DEFAULT,
+        )
+        .await?;
+        tx.rollback().await?;
         let digest = state_digest(&reconstructed.state);
         Ok(ValidationBegin::Fresh(ValidationTicket {
             graph: scope.graph.clone(),
@@ -261,23 +321,35 @@ impl ValidationRepository {
         let record_bytes = record.canonical_bytes()?;
         let validation_id = record.id()?;
 
-        let mut tx =
-            WorkflowRepository::begin_scoped(&self.pool, scope, Operation::Validate).await?;
+        let mut tx = WorkflowRepository::begin_scoped(
+            &self.pool,
+            &self.session,
+            scope,
+            Operation::Validate,
+            self.begin_hook(),
+        )
+        .await?;
         if let Some(stored) =
             WorkflowRepository::stored_result(&mut tx, scope, Operation::Validate).await?
         {
             let replayed = Self::replay(&mut tx, stored, scope).await?;
-            tx.rollback().await.map_err(db_error)?;
+            tx.rollback().await?;
             return Ok(replayed);
         }
+        #[cfg(feature = "test-hooks")]
+        self.hook_at(crate::test_hooks::HookPoint::AfterReplayCheck, &mut tx)
+            .await?;
+        tx.check_deadline("the graph lock and the context insert")?;
         WorkflowRepository::graph_must_be_active(&mut tx, scope).await?;
         Self::candidate_is_prepared_here(&mut tx, &scope.graph, &ticket.candidate).await?;
         Self::insert_context(&mut tx, scope, &context_bytes, &context_id).await?;
         #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterLineageValidation)?;
+        tx.check_deadline("the validation record")?;
         Self::insert_record(&mut tx, scope, &record_bytes, &validation_id).await?;
         #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::AfterDecision)?;
+        tx.check_deadline("the idempotency result")?;
         WorkflowRepository::record_result(
             &mut tx,
             scope,
@@ -292,7 +364,13 @@ impl ValidationRepository {
         .await?;
         #[cfg(feature = "test-hooks")]
         self.fail_at(FailPoint::BeforeCommit)?;
-        tx.commit().await.map_err(db_error)?;
+        #[cfg(feature = "test-hooks")]
+        self.hook_at(crate::test_hooks::HookPoint::BeforeCommit, &mut tx)
+            .await?;
+        tx.commit().await?;
+        #[cfg(feature = "test-hooks")]
+        self.pause_at(crate::test_hooks::HookPoint::AfterCommit)
+            .await;
         Ok(RecordedValidation {
             validation_id,
             context_id,
@@ -310,7 +388,7 @@ impl ValidationRepository {
         graph: &GraphId,
         validation_id: &ValidationId,
     ) -> Result<Option<(ValidationRecord, SemanticExecutionContext)>, LedgerError> {
-        let mut conn = self.pool.acquire().await.map_err(db_error)?;
+        let mut conn = crate::lifecycle::acquire(&self.pool, self.session.acquire_timeout).await?;
         Self::load_on(&mut conn, tenant, graph, validation_id).await
     }
 
@@ -329,7 +407,11 @@ impl ValidationRepository {
         .bind(graph.as_str())
         .bind(tenant.as_str())
         .bind(candidate.to_string())
-        .fetch_all(&self.pool)
+        .fetch_all(
+            crate::lifecycle::acquire(&self.pool, self.session.acquire_timeout)
+                .await?
+                .stmt("the validation_records lookup")?,
+        )
         .await
         .map_err(db_error)?;
         rows.iter()
@@ -344,7 +426,7 @@ impl ValidationRepository {
     /// from the relational projection). `None` when no record with that id exists for the
     /// tenant/graph pair.
     pub(crate) async fn load_on(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         tenant: &TenantId,
         graph: &GraphId,
         validation_id: &ValidationId,
@@ -357,7 +439,7 @@ impl ValidationRepository {
         .bind(validation_id.to_string())
         .bind(graph.as_str())
         .bind(tenant.as_str())
-        .fetch_optional(&mut *conn)
+        .fetch_optional(conn.stmt("the validation_records lookup")?)
         .await
         .map_err(db_error)?;
         let Some(row) = row else {
@@ -376,7 +458,7 @@ impl ValidationRepository {
     }
 
     async fn replay(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         stored: StoredResult,
         scope: &RequestScope,
     ) -> Result<RecordedValidation, LedgerError> {
@@ -412,14 +494,14 @@ impl ValidationRepository {
     /// (commits without a proposal are not workflow candidates). Reported as
     /// `LINEAGE_MISMATCH`, which discloses nothing about other graphs' commits.
     async fn candidate_is_prepared_here(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         graph: &GraphId,
         candidate: &CommitId,
     ) -> Result<(), LedgerError> {
         let indexed: Option<String> =
             sqlx::query_scalar("SELECT graph_id FROM commit_index WHERE id = $1")
                 .bind(candidate.to_string())
-                .fetch_optional(&mut *conn)
+                .fetch_optional(conn.stmt("the commit_index lookup")?)
                 .await
                 .map_err(db_error)?;
         if indexed.as_deref() != Some(graph.as_str()) {
@@ -432,7 +514,7 @@ impl ValidationRepository {
         )
         .bind(candidate.to_string())
         .bind(graph.as_str())
-        .fetch_optional(&mut *conn)
+        .fetch_optional(conn.stmt("the proposals lookup")?)
         .await
         .map_err(db_error)?;
         if proposed.is_none() {
@@ -448,7 +530,7 @@ impl ValidationRepository {
     /// projection columns come from the decoded canonical bytes; the virtual-context
     /// projection is written only by the transaction that inserted the row.
     async fn insert_context(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         scope: &RequestScope,
         bytes: &[u8],
         id: &SemanticContextId,
@@ -484,7 +566,7 @@ impl ValidationRepository {
         .bind(i32::try_from(canonical.virtual_contexts.len()).expect("bounded by protocol"))
         .bind(bytes)
         .bind(canonical.sources_revision.as_deref())
-        .execute(&mut *conn)
+        .execute(conn.stmt("the semantic_execution_contexts insert")?)
         .await
         .map_err(db_error)?;
         if inserted.rows_affected() == 1 {
@@ -500,7 +582,7 @@ impl ValidationRepository {
                 .bind(&vc.object_refs)
                 .bind(vc.query_spec_digest.to_string())
                 .bind(vc.hydration_plan_digest.to_string())
-                .execute(&mut *conn)
+                .execute(conn.stmt("the semantic_virtual_contexts insert")?)
                 .await
                 .map_err(db_error)?;
             }
@@ -509,7 +591,7 @@ impl ValidationRepository {
             "SELECT canonical_bytes, graph_id, tenant_id FROM semantic_execution_contexts WHERE context_id = $1",
         )
         .bind(id.to_string())
-        .fetch_one(&mut *conn)
+        .fetch_one(conn.stmt("the semantic_execution_contexts lookup")?)
         .await
         .map_err(db_error)?;
         let stored: Vec<u8> = row.try_get("canonical_bytes").map_err(db_error)?;
@@ -528,7 +610,7 @@ impl ValidationRepository {
     /// keys that produce byte-identical records (same microsecond, same verdict) share one
     /// row; the requester columns keep the first writer (audit), the identity is unaffected.
     async fn insert_record(
-        conn: &mut PgConnection,
+        conn: &mut dyn Statements,
         scope: &RequestScope,
         bytes: &[u8],
         id: &ValidationId,
@@ -564,7 +646,7 @@ impl ValidationRepository {
         .bind(actor.on_behalf_of.as_ref().map(|p| p.as_str().to_owned()))
         .bind(scope.correlation_id.as_deref())
         .bind(bytes)
-        .execute(&mut *conn)
+        .execute(conn.stmt("the validation_records insert")?)
         .await
         .map_err(db_error)?;
         if inserted.rows_affected() == 1 {
@@ -578,7 +660,7 @@ impl ValidationRepository {
                 .bind(&violation.severity)
                 .bind(&violation.code)
                 .bind(&violation.message)
-                .execute(&mut *conn)
+                .execute(conn.stmt("the validation_violations insert")?)
                 .await
                 .map_err(db_error)?;
             }
@@ -591,7 +673,7 @@ impl ValidationRepository {
             "SELECT canonical_bytes, graph_id, tenant_id FROM validation_records WHERE validation_id = $1",
         )
         .bind(id.to_string())
-        .fetch_one(&mut *conn)
+        .fetch_one(conn.stmt("the validation_records lookup")?)
         .await
         .map_err(db_error)?;
         let stored: Vec<u8> = row.try_get("canonical_bytes").map_err(db_error)?;
@@ -667,7 +749,7 @@ pub(crate) struct CitedValidation {
 /// `LINEAGE_MISMATCH`) and agrees with its context (else corruption). The verdict and the
 /// environment come from the verified canonical bytes.
 pub(crate) async fn cited_validation(
-    conn: &mut PgConnection,
+    conn: &mut dyn Statements,
     scope: &RequestScope,
     candidate: &CommitId,
     validation_id: &ValidationId,

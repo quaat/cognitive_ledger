@@ -463,7 +463,7 @@ async fn verify_merge_rows(pool: &PgPool) -> Result<CheckResult, LedgerError> {
             let conflict_count: i32 = row.try_get("conflict_count").map_err(db_error)?;
             let (analysis, target_ancestry, source_ancestry) = {
                 let provider = crate::postgres_branches::GraphParents {
-                    conn: tokio::sync::Mutex::new(&mut *conn),
+                    conn: tokio::sync::Mutex::new(&mut *conn as &mut dyn crate::lifecycle::Statements),
                     graph: graph.clone(),
                     window: crate::RetrievalWindows::DEFAULT.ancestry,
                 };

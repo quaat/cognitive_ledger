@@ -58,4 +58,4 @@ See [Plan 0012](../exec-plans/completed/0012-phase6c-batched-retrieval.md).
 ## Phase 7A runtime resource governance (P7)
 See [Plan 0013](../exec-plans/active/0013-phase7a-resource-governance.md).
 
-- [ADR-0026: Request, transaction, cancellation and admission lifecycle](ADR-0026-request-transaction-cancellation-and-admission-lifecycle.md) — *proposed; owner review pending*
+- [ADR-0026: Request, transaction, cancellation and admission lifecycle](ADR-0026-request-transaction-cancellation-and-admission-lifecycle.md) — *accepted 2026-10-07 (Plan 0013 M2 implements §2–§4 and §8; §5 admission is M3)*

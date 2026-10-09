@@ -192,16 +192,42 @@ async fn runtime_identity_serves_the_workflow_but_cannot_touch_schema_or_history
         .ready()
         .await
         .expect("ready under the runtime identity");
+    // ADR-0026 §2 defaults (Plan 0013 M2): statement 10 s, lock 5 s, idle 30 s; on PostgreSQL
+    // 17 the `transaction_timeout` backstop at bound + statement = 30 s, absent on 15.
     let (timeout,): (String,) = sqlx::query_as("SHOW statement_timeout")
         .fetch_one(store.pool())
         .await
         .unwrap();
-    assert_eq!(timeout, "30s", "session limit applied on connect");
+    assert_eq!(timeout, "10s", "session limit applied on connect");
+    let (lock,): (String,) = sqlx::query_as("SHOW lock_timeout")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(lock, "5s");
     let (idle,): (String,) = sqlx::query_as("SHOW idle_in_transaction_session_timeout")
         .fetch_one(store.pool())
         .await
         .unwrap();
-    assert_eq!(idle, "1min");
+    assert_eq!(idle, "30s");
+    let (version,): (String,) = sqlx::query_as("SHOW server_version_num")
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    let backstop: Result<(String,), _> = sqlx::query_as("SHOW transaction_timeout")
+        .fetch_one(store.pool())
+        .await;
+    if version.parse::<i64>().unwrap() >= 170000 {
+        assert_eq!(
+            backstop.unwrap().0,
+            "30s",
+            "PostgreSQL 17 backstop = bound + statement"
+        );
+    } else {
+        assert!(
+            backstop.is_err(),
+            "PostgreSQL 15 has no transaction_timeout"
+        );
+    }
 
     // Every public operation: prepare, replay, accept, replay, second prepare, reject.
     let wf = store.workflows();

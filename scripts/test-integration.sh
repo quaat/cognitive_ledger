@@ -70,7 +70,7 @@ cargo test -p ledger-store --features postgres --test pg_workflow -- --ignored -
 cargo test -p ledger-store --features postgres --test pg_lifecycle -- --ignored --nocapture --skip future_
 
 # --- 1f. Authenticated HTTP API over real PostgreSQL (P1.4); Plan 0013 M1 `p7a_*` lifecycle
-#         tests included, `future_*` (red until M2/M3) excluded by design ----------------------
+#         tests included, `future_*` (red until M3) excluded by design ----------------------
 cargo test -p ledger-api --test pg_api -- --ignored --nocapture --skip future_
 
 # --- 1g. Least privilege (ADR-0016, P1.5): owner migrates, runtime serves, runtime cannot

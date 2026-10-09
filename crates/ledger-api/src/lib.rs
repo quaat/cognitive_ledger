@@ -5,6 +5,7 @@
 //! bounded. Errors are a stable, redacted envelope carrying the request's correlation id.
 
 pub mod auth;
+pub mod lifecycle;
 pub mod request_identity;
 pub mod validator;
 
@@ -21,10 +22,10 @@ use axum::{
 use ledger_core::{CommitId, ContentId, GraphId, LedgerError, LedgerTimestamp};
 use ledger_rdf::{Operation, OperationKind, Patch, Quad};
 use ledger_store::{
-    AcceptRequest, Ledger, MAX_BRANCH_BYTES, MAX_CORRELATION_BYTES, MAX_IDEMPOTENCY_KEY_BYTES,
-    MAX_REASON_BYTES, PostgresLedgerStore, PrepareRequest, ReconstructionLimits, RejectRequest,
-    RequestScope, ValidateRequest, ValidationBegin, ValidationPolicy, ValidationTrustPolicy,
-    ValidatorOutcome,
+    AcceptRequest, DbSessionLimits, Ledger, MAX_BRANCH_BYTES, MAX_CORRELATION_BYTES,
+    MAX_IDEMPOTENCY_KEY_BYTES, MAX_REASON_BYTES, PostgresLedgerStore, PrepareRequest,
+    ReconstructionLimits, RejectRequest, RequestScope, ValidateRequest, ValidationBegin,
+    ValidationPolicy, ValidationTrustPolicy, ValidatorOutcome,
 };
 use ledger_validation_protocol::{
     CandidateDescriptor, RequestedContext, SemanticContextId, SemanticEnvironmentId,
@@ -35,12 +36,13 @@ use request_identity::CanonicalRequest;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    future::Future,
     str::FromStr,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tracing::{info, warn};
 
@@ -102,7 +104,8 @@ impl Default for ApiLimits {
             // readiness) always find a connection while expensive work is saturated.
             max_concurrent_expensive: 12,
             max_concurrent_validations: 4,
-            validator_timeout: Duration::from_secs(20),
+            // ADR-0026 §2: validator_timeout + statement_timeout ≤ request_timeout (15 + 10 ≤ 30).
+            validator_timeout: Duration::from_secs(15),
             validator_response_bytes: 1024 * 1024,
             max_validation_state_bytes: 8 * 1024 * 1024,
             max_validation_metadata_bytes: 16 * 1024,
@@ -135,8 +138,12 @@ struct Shared {
     authenticator: SharedAuthenticator,
     limits: ApiLimits,
     acceptance: AcceptancePolicy,
-    expensive: tokio::sync::Semaphore,
-    validations: tokio::sync::Semaphore,
+    /// Owned permits (`Arc`): a permit moves into the detached operation and is released when
+    /// the operation ends, never when the edge stops waiting (ADR-0026 §3, §8).
+    expensive: Arc<tokio::sync::Semaphore>,
+    validations: Arc<tokio::sync::Semaphore>,
+    /// Every database-bearing route operation runs through this tracker (ADR-0026 §8).
+    detached: lifecycle::DetachedOperations,
     validation: Option<ValidationService>,
     /// The trusted validation service (ADR-0019); independent of `validation`, which is
     /// only the ability to call it.
@@ -172,8 +179,11 @@ impl AppState {
         // never silently replaced.
         let trust = store.validation_trust().cloned();
         Self(Arc::new(Shared {
-            expensive: tokio::sync::Semaphore::new(limits.max_concurrent_expensive),
-            validations: tokio::sync::Semaphore::new(limits.max_concurrent_validations),
+            expensive: Arc::new(tokio::sync::Semaphore::new(limits.max_concurrent_expensive)),
+            validations: Arc::new(tokio::sync::Semaphore::new(
+                limits.max_concurrent_validations,
+            )),
+            detached: lifecycle::DetachedOperations::new(),
             validation: None,
             trust,
             store,
@@ -225,6 +235,74 @@ impl AppState {
         EdgeConfig {
             request_timeout: self.0.limits.request_timeout,
             correlation_counter: self.0.correlation_counter.clone(),
+        }
+    }
+
+    /// The tracker of detached database-bearing operations (ADR-0026 §8): the server closes
+    /// it at shutdown and waits for it; tests observe it.
+    pub fn detached(&self) -> &lifecycle::DetachedOperations {
+        &self.0.detached
+    }
+
+    /// Shutdown step 4 (ADR-0026 §8): refuse new database-bearing operations. Running ones
+    /// continue to their bounded end; `detached().wait_idle()` resolves when they are done.
+    pub fn begin_shutdown(&self) {
+        self.0.detached.close();
+    }
+
+    /// The lifecycle limits of the served store (for start-up validation).
+    pub fn session_limits(&self) -> DbSessionLimits {
+        self.0.store.session_limits()
+    }
+
+    /// Run the database-bearing part of a route as one tracked, detached operation (ADR-0026
+    /// §3, §8): everything from the graph lookup to the last pooled query happens inside
+    /// `operation`, under the request's deadline for every connection acquisition. The edge
+    /// waits until `deadline`; past it the client gets `REQUEST_TIMEOUT` for its class and
+    /// the operation continues to its own bounded end (transaction bound + statement tail).
+    /// Nothing inside is ever dropped by a timeout.
+    async fn run_db<T, F>(
+        &self,
+        deadline: Instant,
+        class: lifecycle::OperationClass,
+        correlation: &str,
+        operation: F,
+    ) -> Result<T, ApiError>
+    where
+        T: Send + 'static,
+        F: Future<Output = Result<T, ApiError>> + Send + 'static,
+    {
+        if Instant::now() >= deadline {
+            // The budget was spent before any database work (slow authentication or body):
+            // nothing to start, nothing done.
+            return Err(ApiError::request_timeout(class, correlation));
+        }
+        let handle = self
+            .0
+            .detached
+            .spawn(ledger_store::lifecycle::with_request_deadline(
+                deadline, operation,
+            ))
+            .map_err(|_| ApiError::shutting_down(class, correlation))?;
+        match tokio::time::timeout_at(deadline.into(), handle).await {
+            Ok(Ok(result)) => result.map_err(|e| e.for_class(class)),
+            Ok(Err(join)) => {
+                // A panic inside the operation: the registration is released by its guard. Only
+                // the failure kind is logged (a panic payload could carry request data).
+                warn!(
+                    correlation,
+                    panicked = join.is_panic(),
+                    cancelled = join.is_cancelled(),
+                    "database operation task failed"
+                );
+                Err(ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "INTERNAL",
+                    "internal ledger error",
+                    correlation,
+                ))
+            }
+            Err(_) => Err(ApiError::request_timeout(class, correlation)),
         }
     }
 }
@@ -436,6 +514,17 @@ struct EdgeConfig {
     correlation_counter: Arc<AtomicU64>,
 }
 
+/// How much longer than the request deadline the edge lets a handler run before answering
+/// for it: a tenth of the request timeout, at most one second (PR #17 review of `9c699cc`,
+/// P2: a fixed second made a 50 ms timeout take 1.05 s). A handler that has reached its
+/// database operation answers `REQUEST_TIMEOUT` itself exactly at the deadline (`run_db`),
+/// so the grace only decides which of the two answers wins that race; work before that
+/// point (slow bodies, authentication) holds no pooled connection and may be dropped at the
+/// grace. With the default 30 s request timeout the grace is 1 s, as documented.
+fn edge_grace(request_timeout: Duration) -> Duration {
+    (request_timeout / 10).min(Duration::from_secs(1))
+}
+
 async fn correlation_and_timeout(
     State(edge): State<EdgeConfig>,
     mut request: Request<Body>,
@@ -459,16 +548,28 @@ async fn correlation_and_timeout(
     request
         .extensions_mut()
         .insert(Correlation(correlation.clone()));
-    let timeout = edge.request_timeout;
-    let mut response = match tokio::time::timeout(timeout, next.run(request)).await {
+    let deadline = Instant::now() + edge.request_timeout;
+    request
+        .extensions_mut()
+        .insert(lifecycle::RequestDeadline(deadline));
+    // The class is decided from the request alone (ADR-0026 §4): an idempotent write is a
+    // mutating method carrying an Idempotency-Key; everything else is a read (merge preview
+    // is a POST without a key and so a read).
+    let class = if request.method() != axum::http::Method::GET
+        && request.headers().contains_key("idempotency-key")
+    {
+        lifecycle::OperationClass::IdempotentWrite
+    } else {
+        lifecycle::OperationClass::Read
+    };
+    let mut response = match tokio::time::timeout_at(
+        (deadline + edge_grace(edge.request_timeout)).into(),
+        next.run(request),
+    )
+    .await
+    {
         Ok(response) => response,
-        Err(_) => ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "RESOURCE_LIMIT",
-            "request exceeded the configured time limit",
-            &correlation,
-        )
-        .into_response(),
+        Err(_) => ApiError::request_timeout(class, &correlation).into_response(),
     };
     if let Ok(value) = HeaderValue::from_str(&correlation) {
         response.headers_mut().insert(CORRELATION_HEADER, value);
@@ -532,6 +633,68 @@ impl ApiError {
             correlation,
         )
     }
+    /// The request exceeded its time budget at the edge (ADR-0026 §4). For an idempotent write
+    /// the detached operation may still commit, so the outcome is unknown and the same key
+    /// resolves it; a read wrote nothing and has no key.
+    fn request_timeout(class: lifecycle::OperationClass, correlation: &str) -> Self {
+        let message = match class {
+            lifecycle::OperationClass::Read => {
+                "the request exceeded its time limit; nothing was written; retry"
+            }
+            lifecycle::OperationClass::IdempotentWrite => {
+                "the request exceeded its time limit; the outcome is unknown: retry with the \
+                 same idempotency key to replay a committed result or execute it afresh"
+            }
+        };
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "REQUEST_TIMEOUT",
+            message,
+            correlation,
+        )
+    }
+
+    /// The server is draining (ADR-0026 §8): no new database-bearing operation starts, so
+    /// nothing was done.
+    fn shutting_down(class: lifecycle::OperationClass, correlation: &str) -> Self {
+        let message = match class {
+            lifecycle::OperationClass::Read => {
+                "the ledger is shutting down; nothing was done; retry against another replica"
+            }
+            lifecycle::OperationClass::IdempotentWrite => {
+                "the ledger is shutting down; nothing was done; retry with the same idempotency \
+                 key against another replica"
+            }
+        };
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "DEPENDENCY_UNAVAILABLE",
+            message,
+            correlation,
+        )
+    }
+
+    /// Dependency guidance by class (ADR-0026 §4): the store's messages are written for
+    /// idempotent writes ("retry with the same idempotency key"); a key-less read gets read
+    /// guidance instead. Everything else passes through unchanged.
+    fn for_class(mut self, class: lifecycle::OperationClass) -> Self {
+        if class == lifecycle::OperationClass::Read {
+            match self.code {
+                "DEPENDENCY_UNAVAILABLE" => {
+                    self.message =
+                        "the ledger database is not available; nothing was written; retry".into();
+                }
+                "DEPENDENCY_TIMEOUT" => {
+                    self.message = "the database operation exceeded its time limit or lost a lock \
+                                    race; nothing was written; retry"
+                        .into();
+                }
+                _ => {}
+            }
+        }
+        self
+    }
+
     fn resource_limit(message: impl Into<String>, correlation: &str) -> Self {
         Self::new(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -712,6 +875,20 @@ impl ApiError {
                  rolled back; retry with the same idempotency key"
                     .into(),
             ),
+            // COMMIT itself failed (ADR-0026 §4): the transaction may be durable, so never
+            // "rolled back"; the code follows the driver failure's class, the guidance is
+            // identical.
+            E::CommitOutcomeUnknown(inner) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                match **inner {
+                    E::DependencyTimeout(_) => "DEPENDENCY_TIMEOUT",
+                    _ => "DEPENDENCY_UNAVAILABLE",
+                },
+                "the database did not confirm the commit; the outcome is unknown: retry with \
+                 the same idempotency key (a committed result replays, a rolled-back one \
+                 executes afresh)"
+                    .into(),
+            ),
             E::SchemaIncompatible(_) | E::RuntimeIdentity(_) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "DEPENDENCY_UNAVAILABLE",
@@ -774,6 +951,8 @@ impl IntoResponse for ApiError {
 pub struct RequestContext {
     pub identity: VerifiedIdentity,
     pub correlation_id: String,
+    /// When the request's time budget ends (set by the edge middleware).
+    pub deadline: Instant,
 }
 
 impl RequestContext {
@@ -822,9 +1001,15 @@ impl FromRequestParts<AppState> for RequestContext {
             .authenticate(bearer)
             .await
             .map_err(|e| ApiError::from_auth(e, &correlation))?;
+        let deadline = parts
+            .extensions
+            .get::<lifecycle::RequestDeadline>()
+            .map(|d| d.0)
+            .unwrap_or_else(|| Instant::now() + state.0.limits.request_timeout);
         Ok(Self {
             identity,
             correlation_id: correlation,
+            deadline,
         })
     }
 }
@@ -944,18 +1129,34 @@ async fn ready(State(state): State<AppState>, request: Request<Body>) -> Respons
         .get::<Correlation>()
         .map(|c| c.0.clone())
         .unwrap_or_default();
-    match state.0.store.ready().await {
+    let deadline = request
+        .extensions()
+        .get::<lifecycle::RequestDeadline>()
+        .map(|d| d.0)
+        .unwrap_or_else(|| Instant::now() + state.0.limits.request_timeout);
+    let detached = state.clone();
+    let inner_correlation = correlation.clone();
+    let outcome = state
+        .run_db(
+            deadline,
+            lifecycle::OperationClass::Read,
+            &correlation,
+            async move {
+                detached.0.store.ready().await.map_err(|e| {
+                    warn!(correlation = %inner_correlation, error = %e, "readiness check failed");
+                    ApiError::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "DEPENDENCY_UNAVAILABLE",
+                        "the ledger database is not available",
+                        &inner_correlation,
+                    )
+                })
+            },
+        )
+        .await;
+    match outcome {
         Ok(()) => Json(Health { status: "ready" }).into_response(),
-        Err(e) => {
-            warn!(correlation, error = %e, "readiness check failed");
-            ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "DEPENDENCY_UNAVAILABLE",
-                "the ledger database is not available",
-                &correlation,
-            )
-            .into_response()
-        }
+        Err(e) => e.into_response(),
     }
 }
 
@@ -1173,49 +1374,65 @@ async fn prepare(
     ctx.require(Capability::Propose)?;
     let correlation = ctx.correlation_id.clone();
     let key = idempotency_key(&headers, &correlation)?;
-    let graph = authorized_graph(&state, &ctx, &graph).await?;
-    let parsed = canonical_prepare(&graph, body, &state.0.limits, &correlation)?;
-    let request = PrepareRequest {
-        scope: scope(&ctx, &graph, key, parsed.canonical.digest()),
-        branch: parsed.branch,
-        expected_head: parsed.expected_head,
-        requested: parsed.requested,
-        activity: parsed.activity,
-        event_time: parsed.event_time,
-        evidence_refs: parsed.evidence_refs,
-        source_system: parsed.source_system,
-        message: parsed.message,
-    };
-    let _permit = state.0.expensive.try_acquire().map_err(|_| {
-        ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "RESOURCE_LIMIT",
-            "too many concurrent expensive operations; retry later",
-            &correlation,
+    // From the graph lookup on, every statement belongs to one tracked, detached
+    // operation the edge may stop waiting for but never drops (ADR-0026 §8).
+    let detached = state.clone();
+    let corr = correlation.clone();
+    state
+        .run_db(
+            ctx.deadline,
+            lifecycle::OperationClass::IdempotentWrite,
+            &corr,
+            async move {
+                let state = detached;
+                let graph = authorized_graph(&state, &ctx, &graph).await?;
+                let parsed = canonical_prepare(&graph, body, &state.0.limits, &correlation)?;
+                let request = PrepareRequest {
+                    scope: scope(&ctx, &graph, key, parsed.canonical.digest()),
+                    branch: parsed.branch,
+                    expected_head: parsed.expected_head,
+                    requested: parsed.requested,
+                    activity: parsed.activity,
+                    event_time: parsed.event_time,
+                    evidence_refs: parsed.evidence_refs,
+                    source_system: parsed.source_system,
+                    message: parsed.message,
+                };
+                let _permit = Arc::clone(&state.0.expensive)
+                    .try_acquire_owned()
+                    .map_err(|_| {
+                        ApiError::new(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "RESOURCE_LIMIT",
+                            "too many concurrent expensive operations; retry later",
+                            &correlation,
+                        )
+                    })?;
+                let prepared = state
+                    .0
+                    .store
+                    .workflows()
+                    .prepare(&request)
+                    .await
+                    .map_err(|e| ApiError::from_ledger(e, &correlation))?;
+                Ok((
+                    if prepared.replayed {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::CREATED
+                    },
+                    Json(PrepareResponse {
+                        proposal_id: prepared.proposal_id,
+                        candidate: prepared.candidate,
+                        requested_patch: prepared.requested_patch,
+                        effective_patch: prepared.effective_patch,
+                        replayed: prepared.replayed,
+                        correlation_id: correlation,
+                    }),
+                ))
+            },
         )
-    })?;
-    let prepared = state
-        .0
-        .store
-        .workflows()
-        .prepare(&request)
         .await
-        .map_err(|e| ApiError::from_ledger(e, &correlation))?;
-    Ok((
-        if prepared.replayed {
-            StatusCode::OK
-        } else {
-            StatusCode::CREATED
-        },
-        Json(PrepareResponse {
-            proposal_id: prepared.proposal_id,
-            candidate: prepared.candidate,
-            requested_patch: prepared.requested_patch,
-            effective_patch: prepared.effective_patch,
-            replayed: prepared.replayed,
-            correlation_id: correlation,
-        }),
-    ))
 }
 
 #[derive(Deserialize)]
@@ -1360,48 +1577,66 @@ async fn accept(
     ctx.require(Capability::Review)?;
     let correlation = ctx.correlation_id.clone();
     let key = idempotency_key(&headers, &correlation)?;
-    let graph = authorized_graph(&state, &ctx, &graph).await?;
-    let candidate = CommitId::from_str(&candidate)
-        .map_err(|_| ApiError::invalid("invalid candidate commit id", &correlation))?;
-    let canonical = canonical_accept(&graph, &candidate, &body, &correlation)?;
-    // A named validation binds acceptance to that record and context (ADR-0019) under
-    // every deployment policy. Without one, the deployment's policy travels with the
-    // request; the store enforces it after the idempotent-replay lookup, so a durable
-    // earlier acceptance still replays.
-    let validation = match (&body.validation_id, &body.semantic_environment_id) {
-        (Some(validation_id), Some(semantic_environment_id)) => ValidationPolicy::Validated {
-            validation_id: validation_id.clone(),
-            semantic_environment_id: semantic_environment_id.clone(),
-        },
-        _ => match state.0.acceptance {
-            AcceptancePolicy::RequireValidation => ValidationPolicy::Required,
-            AcceptancePolicy::AllowUnvalidatedDevelopmentOnly => ValidationPolicy::NoValidation,
-        },
-    };
-    let request = AcceptRequest {
-        scope: scope(&ctx, &graph, key, canonical.digest()),
-        branch: body.ref_name,
-        expected_head: body.expected_head,
-        candidate,
-        reason: body.reason,
-        validation,
-    };
-    let accepted = state
-        .0
-        .store
-        .workflows()
-        .accept(&request)
+    // From the graph lookup on, every statement belongs to one tracked, detached
+    // operation the edge may stop waiting for but never drops (ADR-0026 §8).
+    let detached = state.clone();
+    let corr = correlation.clone();
+    state
+        .run_db(
+            ctx.deadline,
+            lifecycle::OperationClass::IdempotentWrite,
+            &corr,
+            async move {
+                let state = detached;
+                let graph = authorized_graph(&state, &ctx, &graph).await?;
+                let candidate = CommitId::from_str(&candidate)
+                    .map_err(|_| ApiError::invalid("invalid candidate commit id", &correlation))?;
+                let canonical = canonical_accept(&graph, &candidate, &body, &correlation)?;
+                // A named validation binds acceptance to that record and context (ADR-0019) under
+                // every deployment policy. Without one, the deployment's policy travels with the
+                // request; the store enforces it after the idempotent-replay lookup, so a durable
+                // earlier acceptance still replays.
+                let validation = match (&body.validation_id, &body.semantic_environment_id) {
+                    (Some(validation_id), Some(semantic_environment_id)) => {
+                        ValidationPolicy::Validated {
+                            validation_id: validation_id.clone(),
+                            semantic_environment_id: semantic_environment_id.clone(),
+                        }
+                    }
+                    _ => match state.0.acceptance {
+                        AcceptancePolicy::RequireValidation => ValidationPolicy::Required,
+                        AcceptancePolicy::AllowUnvalidatedDevelopmentOnly => {
+                            ValidationPolicy::NoValidation
+                        }
+                    },
+                };
+                let request = AcceptRequest {
+                    scope: scope(&ctx, &graph, key, canonical.digest()),
+                    branch: body.ref_name,
+                    expected_head: body.expected_head,
+                    candidate,
+                    reason: body.reason,
+                    validation,
+                };
+                let accepted = state
+                    .0
+                    .store
+                    .workflows()
+                    .accept(&request)
+                    .await
+                    .map_err(|e| ApiError::from_ledger(e, &correlation))?;
+                Ok(Json(AcceptResponse {
+                    decision_id: accepted.decision_id,
+                    ref_event_id: accepted.ref_event_id,
+                    outbox_id: accepted.outbox_id,
+                    ref_version: accepted.ref_version,
+                    head: accepted.head,
+                    replayed: accepted.replayed,
+                    correlation_id: correlation,
+                }))
+            },
+        )
         .await
-        .map_err(|e| ApiError::from_ledger(e, &correlation))?;
-    Ok(Json(AcceptResponse {
-        decision_id: accepted.decision_id,
-        ref_event_id: accepted.ref_event_id,
-        outbox_id: accepted.outbox_id,
-        ref_version: accepted.ref_version,
-        head: accepted.head,
-        replayed: accepted.replayed,
-        correlation_id: correlation,
-    }))
 }
 
 #[derive(Deserialize)]
@@ -1432,29 +1667,43 @@ async fn reject(
     ctx.require(Capability::Review)?;
     let correlation = ctx.correlation_id.clone();
     let key = idempotency_key(&headers, &correlation)?;
-    let graph = authorized_graph(&state, &ctx, &graph).await?;
-    let candidate = CommitId::from_str(&candidate)
-        .map_err(|_| ApiError::invalid("invalid candidate commit id", &correlation))?;
-    let canonical = canonical_reject(&graph, &candidate, &body, &correlation)?;
-    let request = RejectRequest {
-        scope: scope(&ctx, &graph, key, canonical.digest()),
-        branch: body.ref_name,
-        candidate,
-        reason: body.reason,
-        validation_id: body.validation_id,
-    };
-    let rejected = state
-        .0
-        .store
-        .workflows()
-        .reject(&request)
+    // From the graph lookup on, every statement belongs to one tracked, detached
+    // operation the edge may stop waiting for but never drops (ADR-0026 §8).
+    let detached = state.clone();
+    let corr = correlation.clone();
+    state
+        .run_db(
+            ctx.deadline,
+            lifecycle::OperationClass::IdempotentWrite,
+            &corr,
+            async move {
+                let state = detached;
+                let graph = authorized_graph(&state, &ctx, &graph).await?;
+                let candidate = CommitId::from_str(&candidate)
+                    .map_err(|_| ApiError::invalid("invalid candidate commit id", &correlation))?;
+                let canonical = canonical_reject(&graph, &candidate, &body, &correlation)?;
+                let request = RejectRequest {
+                    scope: scope(&ctx, &graph, key, canonical.digest()),
+                    branch: body.ref_name,
+                    candidate,
+                    reason: body.reason,
+                    validation_id: body.validation_id,
+                };
+                let rejected = state
+                    .0
+                    .store
+                    .workflows()
+                    .reject(&request)
+                    .await
+                    .map_err(|e| ApiError::from_ledger(e, &correlation))?;
+                Ok(Json(RejectResponse {
+                    decision_id: rejected.decision_id,
+                    replayed: rejected.replayed,
+                    correlation_id: correlation,
+                }))
+            },
+        )
         .await
-        .map_err(|e| ApiError::from_ledger(e, &correlation))?;
-    Ok(Json(RejectResponse {
-        decision_id: rejected.decision_id,
-        replayed: rejected.replayed,
-        correlation_id: correlation,
-    }))
 }
 
 #[derive(Deserialize)]
@@ -1503,181 +1752,212 @@ async fn validate(
     ctx.require(Capability::Validate)?;
     let correlation = ctx.correlation_id.clone();
     let key = idempotency_key(&headers, &correlation)?;
-    let graph = authorized_graph(&state, &ctx, &graph).await?;
-    let candidate = CommitId::from_str(&candidate)
-        .map_err(|_| ApiError::invalid("invalid candidate commit id", &correlation))?;
-    let limits = &state.0.limits;
-    let canonical = canonical_validate(&graph, &candidate, &body, limits, &correlation)?;
-    let request = ValidateRequest {
-        scope: scope(&ctx, &graph, key, canonical.digest()),
-        candidate: candidate.clone(),
-        requested: body.requested,
-    };
-    // One logical invocation per (authenticated scope, key, canonical request): concurrent
-    // duplicates and retries after a lost response or crash carry the same id, so the
-    // validator resolves them to one validation in one environment (ADR-0019 amendment).
-    let invocation_id = ValidationInvocation::for_request(
-        &request.scope.principal,
-        &request.scope.graph,
-        &request.scope.idempotency_key,
-        &request.scope.request_digest,
-    )
-    .id()
-    .map_err(|e| ApiError::from_ledger(e.into(), &correlation))?;
-    let store = state.0.store.validations();
-    // A completed identical request replays before any admission slot or validator check.
-    let replayed = store
-        .replayed(&request)
-        .await
-        .map_err(|e| ApiError::from_ledger(e, &correlation))?;
-    let begun = match replayed {
-        Some(recorded) => ValidationBegin::Replayed(Box::new(recorded)),
-        None => {
-            if state.0.validation.is_none() {
-                return Err(ApiError::from_ledger(
-                    LedgerError::ValidatorUnavailable("no validation service is configured".into()),
-                    &correlation,
-                ));
-            }
-            let _expensive = state
-                .0
-                .expensive
-                .try_acquire()
-                .map_err(|_| busy(&correlation, "expensive operations"))?;
-            // Never reconstruct more than may be shipped to the validator.
-            let mut bounds = limits.reconstruction;
-            bounds.max_bytes = bounds.max_bytes.min(limits.max_validation_state_bytes);
-            store
-                .begin_with_limits(&request, &bounds)
+    // From the graph lookup on, every statement belongs to one tracked, detached
+    // operation the edge may stop waiting for but never drops (ADR-0026 §8).
+    let detached = state.clone();
+    let corr = correlation.clone();
+    state
+        .run_db(
+            ctx.deadline,
+            lifecycle::OperationClass::IdempotentWrite,
+            &corr,
+            async move {
+                let state = detached;
+                let graph = authorized_graph(&state, &ctx, &graph).await?;
+                let candidate = CommitId::from_str(&candidate)
+                    .map_err(|_| ApiError::invalid("invalid candidate commit id", &correlation))?;
+                let limits = &state.0.limits;
+                let canonical =
+                    canonical_validate(&graph, &candidate, &body, limits, &correlation)?;
+                let request = ValidateRequest {
+                    scope: scope(&ctx, &graph, key, canonical.digest()),
+                    candidate: candidate.clone(),
+                    requested: body.requested,
+                };
+                // One logical invocation per (authenticated scope, key, canonical request): concurrent
+                // duplicates and retries after a lost response or crash carry the same id, so the
+                // validator resolves them to one validation in one environment (ADR-0019 amendment).
+                let invocation_id = ValidationInvocation::for_request(
+                    &request.scope.principal,
+                    &request.scope.graph,
+                    &request.scope.idempotency_key,
+                    &request.scope.request_digest,
+                )
+                .id()
+                .map_err(|e| ApiError::from_ledger(e.into(), &correlation))?;
+                let store = state.0.store.validations();
+                // A completed identical request replays before any admission slot or validator check.
+                let replayed = store
+                    .replayed(&request)
+                    .await
+                    .map_err(|e| ApiError::from_ledger(e, &correlation))?;
+                let begun = match replayed {
+                    Some(recorded) => ValidationBegin::Replayed(Box::new(recorded)),
+                    None => {
+                        if state.0.validation.is_none() {
+                            return Err(ApiError::from_ledger(
+                                LedgerError::ValidatorUnavailable(
+                                    "no validation service is configured".into(),
+                                ),
+                                &correlation,
+                            ));
+                        }
+                        let _expensive = Arc::clone(&state.0.expensive)
+                            .try_acquire_owned()
+                            .map_err(|_| busy(&correlation, "expensive operations"))?;
+                        // Never reconstruct more than may be shipped to the validator.
+                        let mut bounds = limits.reconstruction;
+                        bounds.max_bytes = bounds.max_bytes.min(limits.max_validation_state_bytes);
+                        store
+                            .begin_with_limits(&request, &bounds)
+                            .await
+                            .map_err(|e| ApiError::from_ledger(e, &correlation))?
+                    }
+                };
+                let _validation_slot = match &begun {
+                    ValidationBegin::Replayed(_) => None,
+                    ValidationBegin::Fresh(_) => Some(
+                        Arc::clone(&state.0.validations)
+                            .try_acquire_owned()
+                            .map_err(|_| busy(&correlation, "validations"))?,
+                    ),
+                };
+                let ticket = match begun {
+                    ValidationBegin::Replayed(recorded) => {
+                        let recorded = *recorded;
+                        let context = load_context(
+                            &state,
+                            &ctx,
+                            &graph,
+                            &recorded.validation_id,
+                            &correlation,
+                        )
+                        .await?;
+                        return Ok((
+                            StatusCode::OK,
+                            Json(ValidationResponse {
+                                validation_id: recorded.validation_id,
+                                semantic_context_id: recorded.context_id,
+                                semantic_environment_id: recorded.environment_id,
+                                candidate,
+                                conforms: recorded.record.outcome.is_conforming(),
+                                record: recorded.record,
+                                context,
+                                replayed: Some(true),
+                                correlation_id: correlation,
+                            }),
+                        ));
+                    }
+                    ValidationBegin::Fresh(ticket) => ticket,
+                };
+                let Some(service) = state.0.validation.clone() else {
+                    return Err(ApiError::from_ledger(
+                        LedgerError::ValidatorUnavailable(
+                            "no validation service is configured".into(),
+                        ),
+                        &correlation,
+                    ));
+                };
+                let mut total = 0usize;
+                let mut quads = Vec::with_capacity(ticket.state().len());
+                for quad in ticket.state() {
+                    let line = quad.to_string();
+                    total += line.len() + 1;
+                    if total > limits.max_validation_state_bytes {
+                        return Err(ApiError::resource_limit(
+                            format!(
+                                "the candidate state exceeds the {} bytes shipped to the validator",
+                                limits.max_validation_state_bytes
+                            ),
+                            &correlation,
+                        ));
+                    }
+                    quads.push(line);
+                }
+                let mut outbound = ValidationRequest::new(
+                    invocation_id,
+                    CandidateDescriptor {
+                        graph_id: graph.clone(),
+                        knowledge_base_id: ticket.knowledge_base_id().map(str::to_owned),
+                        commit: candidate.clone(),
+                        state_digest: ticket.state_digest().clone(),
+                        state_href: Some(format!("/v1/graphs/{graph}/commits/{candidate}/state")),
+                        quads,
+                    },
+                    request.requested.clone(),
+                );
+                outbound.correlation_id = Some(correlation.clone());
+                // The validator gets its own timeout, never more than the request's remaining budget
+                // (ADR-0026 §8: the detached operation ends by request + one statement tail).
+                let validator_deadline =
+                    (Instant::now() + limits.validator_timeout).min(ctx.deadline);
+                let answer = match tokio::time::timeout_at(
+                    validator_deadline.into(),
+                    service.client.validate(&outbound),
+                )
                 .await
+                {
+                    Ok(result) => result.map_err(LedgerError::from),
+                    Err(_) => Err(LedgerError::ValidatorUnavailable(
+                        "validator call exceeded the configured timeout".into(),
+                    )),
+                }
                 .map_err(|e| ApiError::from_ledger(e, &correlation))?
-        }
-    };
-    let _validation_slot = match &begun {
-        ValidationBegin::Replayed(_) => None,
-        ValidationBegin::Fresh(_) => Some(
-            state
-                .0
-                .validations
-                .try_acquire()
-                .map_err(|_| busy(&correlation, "validations"))?,
-        ),
-    };
-    let ticket = match begun {
-        ValidationBegin::Replayed(recorded) => {
-            let recorded = *recorded;
-            let context =
-                load_context(&state, &ctx, &graph, &recorded.validation_id, &correlation).await?;
-            return Ok((
-                StatusCode::OK,
-                Json(ValidationResponse {
-                    validation_id: recorded.validation_id,
-                    semantic_context_id: recorded.context_id,
-                    semantic_environment_id: recorded.environment_id,
-                    candidate,
-                    conforms: recorded.record.outcome.is_conforming(),
-                    record: recorded.record,
-                    context,
-                    replayed: Some(true),
-                    correlation_id: correlation,
-                }),
-            ));
-        }
-        ValidationBegin::Fresh(ticket) => ticket,
-    };
-    let Some(service) = state.0.validation.clone() else {
-        return Err(ApiError::from_ledger(
-            LedgerError::ValidatorUnavailable("no validation service is configured".into()),
-            &correlation,
-        ));
-    };
-    let mut total = 0usize;
-    let mut quads = Vec::with_capacity(ticket.state().len());
-    for quad in ticket.state() {
-        let line = quad.to_string();
-        total += line.len() + 1;
-        if total > limits.max_validation_state_bytes {
-            return Err(ApiError::resource_limit(
-                format!(
-                    "the candidate state exceeds the {} bytes shipped to the validator",
-                    limits.max_validation_state_bytes
-                ),
-                &correlation,
-            ));
-        }
-        quads.push(line);
-    }
-    let mut outbound = ValidationRequest::new(
-        invocation_id,
-        CandidateDescriptor {
-            graph_id: graph.clone(),
-            knowledge_base_id: ticket.knowledge_base_id().map(str::to_owned),
-            commit: candidate.clone(),
-            state_digest: ticket.state_digest().clone(),
-            state_href: Some(format!("/v1/graphs/{graph}/commits/{candidate}/state")),
-            quads,
-        },
-        request.requested.clone(),
-    );
-    outbound.correlation_id = Some(correlation.clone());
-    let answer =
-        match tokio::time::timeout(limits.validator_timeout, service.client.validate(&outbound))
-            .await
-        {
-            Ok(result) => result.map_err(LedgerError::from),
-            Err(_) => Err(LedgerError::ValidatorUnavailable(
-                "validator call exceeded the configured timeout".into(),
-            )),
-        }
-        .map_err(|e| ApiError::from_ledger(e, &correlation))?
-        .with_bounded_summary();
-    let context = answer
-        .into_context(
-            &graph,
-            &candidate,
-            ticket.state_digest(),
-            &service.service_id,
-            &request.requested,
-        )
-        .map_err(|e| {
-            ApiError::from_ledger(LedgerError::ValidatorError(e.to_string()), &correlation)
-        })?;
-    let recorded = store
-        .record(
-            &request,
-            &ticket,
-            ValidatorOutcome {
-                context: context.clone(),
-                outcome: answer.outcome,
-                report_digest: answer.report.digest,
-                report_reference: answer.report.reference,
+                .with_bounded_summary();
+                let context = answer
+                    .into_context(
+                        &graph,
+                        &candidate,
+                        ticket.state_digest(),
+                        &service.service_id,
+                        &request.requested,
+                    )
+                    .map_err(|e| {
+                        ApiError::from_ledger(
+                            LedgerError::ValidatorError(e.to_string()),
+                            &correlation,
+                        )
+                    })?;
+                let recorded = store
+                    .record(
+                        &request,
+                        &ticket,
+                        ValidatorOutcome {
+                            context: context.clone(),
+                            outcome: answer.outcome,
+                            report_digest: answer.report.digest,
+                            report_reference: answer.report.reference,
+                        },
+                    )
+                    .await
+                    .map_err(|e| ApiError::from_ledger(e, &correlation))?;
+                let context = if recorded.replayed {
+                    load_context(&state, &ctx, &graph, &recorded.validation_id, &correlation)
+                        .await?
+                } else {
+                    context
+                };
+                Ok((
+                    if recorded.replayed {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::CREATED
+                    },
+                    Json(ValidationResponse {
+                        validation_id: recorded.validation_id,
+                        semantic_context_id: recorded.context_id,
+                        semantic_environment_id: recorded.environment_id,
+                        candidate,
+                        conforms: recorded.record.outcome.is_conforming(),
+                        record: recorded.record,
+                        context,
+                        replayed: Some(recorded.replayed),
+                        correlation_id: correlation,
+                    }),
+                ))
             },
         )
         .await
-        .map_err(|e| ApiError::from_ledger(e, &correlation))?;
-    let context = if recorded.replayed {
-        load_context(&state, &ctx, &graph, &recorded.validation_id, &correlation).await?
-    } else {
-        context
-    };
-    Ok((
-        if recorded.replayed {
-            StatusCode::OK
-        } else {
-            StatusCode::CREATED
-        },
-        Json(ValidationResponse {
-            validation_id: recorded.validation_id,
-            semantic_context_id: recorded.context_id,
-            semantic_environment_id: recorded.environment_id,
-            candidate,
-            conforms: recorded.record.outcome.is_conforming(),
-            record: recorded.record,
-            context,
-            replayed: Some(recorded.replayed),
-            correlation_id: correlation,
-        }),
-    ))
 }
 
 async fn load_context(
@@ -1707,35 +1987,50 @@ async fn read_validation(
 ) -> Result<Json<ValidationResponse>, ApiError> {
     ctx.require(Capability::Read)?;
     let correlation = ctx.correlation_id.clone();
-    let graph = authorized_graph(&state, &ctx, &graph).await?;
-    let not_found = || ApiError::from_ledger(LedgerError::ValidationNotFound, &correlation);
-    let candidate = CommitId::from_str(&candidate).map_err(|_| not_found())?;
-    let validation_id = ValidationId::from_str(&validation).map_err(|_| not_found())?;
-    let (record, context) = state
-        .0
-        .store
-        .validations()
-        .load(&ctx.identity.principal.tenant_id, &graph, &validation_id)
+    // From the graph lookup on, every statement belongs to one tracked, detached
+    // operation the edge may stop waiting for but never drops (ADR-0026 §8).
+    let detached = state.clone();
+    let corr = correlation.clone();
+    state
+        .run_db(
+            ctx.deadline,
+            lifecycle::OperationClass::Read,
+            &corr,
+            async move {
+                let state = detached;
+                let graph = authorized_graph(&state, &ctx, &graph).await?;
+                let not_found =
+                    || ApiError::from_ledger(LedgerError::ValidationNotFound, &correlation);
+                let candidate = CommitId::from_str(&candidate).map_err(|_| not_found())?;
+                let validation_id = ValidationId::from_str(&validation).map_err(|_| not_found())?;
+                let (record, context) = state
+                    .0
+                    .store
+                    .validations()
+                    .load(&ctx.identity.principal.tenant_id, &graph, &validation_id)
+                    .await
+                    .map_err(|e| ApiError::from_ledger(e, &correlation))?
+                    .ok_or_else(not_found)?;
+                if record.candidate_commit != candidate {
+                    return Err(not_found());
+                }
+                let semantic_environment_id = context
+                    .environment_id()
+                    .map_err(|e| ApiError::from_ledger(e.into(), &correlation))?;
+                Ok(Json(ValidationResponse {
+                    semantic_context_id: record.semantic_execution_context_id.clone(),
+                    semantic_environment_id,
+                    validation_id,
+                    candidate,
+                    conforms: record.outcome.is_conforming(),
+                    record,
+                    context,
+                    replayed: None,
+                    correlation_id: correlation,
+                }))
+            },
+        )
         .await
-        .map_err(|e| ApiError::from_ledger(e, &correlation))?
-        .ok_or_else(not_found)?;
-    if record.candidate_commit != candidate {
-        return Err(not_found());
-    }
-    let semantic_environment_id = context
-        .environment_id()
-        .map_err(|e| ApiError::from_ledger(e.into(), &correlation))?;
-    Ok(Json(ValidationResponse {
-        semantic_context_id: record.semantic_execution_context_id.clone(),
-        semantic_environment_id,
-        validation_id,
-        candidate,
-        conforms: record.outcome.is_conforming(),
-        record,
-        context,
-        replayed: None,
-        correlation_id: correlation,
-    }))
 }
 
 #[derive(Serialize)]
@@ -1753,28 +2048,42 @@ async fn read_ref(
 ) -> Result<Json<RefResponse>, ApiError> {
     ctx.require(Capability::Read)?;
     let correlation = ctx.correlation_id.clone();
-    let graph = authorized_graph(&state, &ctx, &graph).await?;
-    let name = query.get("name").cloned().ok_or_else(|| {
-        ApiError::invalid(
-            "query parameter `name` (ref name) is required",
-            &correlation,
+    // From the graph lookup on, every statement belongs to one tracked, detached
+    // operation the edge may stop waiting for but never drops (ADR-0026 §8).
+    let detached = state.clone();
+    let corr = correlation.clone();
+    state
+        .run_db(
+            ctx.deadline,
+            lifecycle::OperationClass::Read,
+            &corr,
+            async move {
+                let state = detached;
+                let graph = authorized_graph(&state, &ctx, &graph).await?;
+                let name = query.get("name").cloned().ok_or_else(|| {
+                    ApiError::invalid(
+                        "query parameter `name` (ref name) is required",
+                        &correlation,
+                    )
+                })?;
+                check_branch(&name, &correlation)?;
+                let head = state
+                    .0
+                    .store
+                    .ref_head(&graph, &name)
+                    .await
+                    .map_err(|e| ApiError::from_ledger(e, &correlation))?;
+                match head {
+                    Some((head, version)) => Ok(Json(RefResponse {
+                        name,
+                        head: Some(head),
+                        version: Some(version),
+                    })),
+                    None => Err(ApiError::not_found(&correlation)),
+                }
+            },
         )
-    })?;
-    check_branch(&name, &correlation)?;
-    let head = state
-        .0
-        .store
-        .ref_head(&graph, &name)
         .await
-        .map_err(|e| ApiError::from_ledger(e, &correlation))?;
-    match head {
-        Some((head, version)) => Ok(Json(RefResponse {
-            name,
-            head: Some(head),
-            version: Some(version),
-        })),
-        None => Err(ApiError::not_found(&correlation)),
-    }
 }
 
 // ---- branches (ADR-0022) ------------------------------------------------------------------
@@ -2272,92 +2581,107 @@ async fn merge_preview(
 ) -> Result<Json<MergePreviewResponse>, ApiError> {
     ctx.require(Capability::Read)?;
     let correlation = ctx.correlation_id.clone();
-    let graph = authorized_graph(&state, &ctx, &graph).await?;
-    let spec = merge_spec(
-        &body.source,
-        &body.target,
-        body.strategy.as_deref(),
-        body.base.as_ref(),
-        &correlation,
-    )?;
-    // A merge preview reconstructs three states (and a propose four): it takes
-    // `MERGE_PERMITS` expensive slots, so merges cannot crowd out single-state reads.
-    let _permit = state
-        .0
-        .expensive
-        .try_acquire_many(merge_permits(&state))
-        .map_err(|_| {
-            ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "RESOURCE_LIMIT",
-                "too many concurrent expensive operations; retry later",
-                &correlation,
-            )
-        })?;
-    let limits = ledger_store::TraversalLimits {
-        max_visited: MERGE_MAX_VISITED,
-        deadline: Some(std::time::Instant::now() + MERGE_DEADLINE),
-    };
-    let report = state
-        .0
-        .limits
-        .merge_report_limits()
-        .expect("validated in AppState::new");
-    let p = state
-        .0
-        .store
-        .workflows()
-        .merge_preview_reported(
-            &ctx.identity.principal.tenant_id,
-            &graph,
-            &spec,
-            limits,
-            report,
+    // From the graph lookup on, every statement belongs to one tracked, detached
+    // operation the edge may stop waiting for but never drops (ADR-0026 §8).
+    let detached = state.clone();
+    let corr = correlation.clone();
+    state
+        .run_db(
+            ctx.deadline,
+            lifecycle::OperationClass::Read,
+            &corr,
+            async move {
+                let state = detached;
+                let graph = authorized_graph(&state, &ctx, &graph).await?;
+                let spec = merge_spec(
+                    &body.source,
+                    &body.target,
+                    body.strategy.as_deref(),
+                    body.base.as_ref(),
+                    &correlation,
+                )?;
+                // A merge preview reconstructs three states (and a propose four): it takes
+                // `MERGE_PERMITS` expensive slots, so merges cannot crowd out single-state reads.
+                let _permit = state
+                    .0
+                    .expensive
+                    .clone()
+                    .try_acquire_many_owned(merge_permits(&state))
+                    .map_err(|_| {
+                        ApiError::new(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "RESOURCE_LIMIT",
+                            "too many concurrent expensive operations; retry later",
+                            &correlation,
+                        )
+                    })?;
+                let limits = ledger_store::TraversalLimits {
+                    max_visited: MERGE_MAX_VISITED,
+                    deadline: Some(std::time::Instant::now() + MERGE_DEADLINE),
+                };
+                let report = state
+                    .0
+                    .limits
+                    .merge_report_limits()
+                    .expect("validated in AppState::new");
+                let p = state
+                    .0
+                    .store
+                    .workflows()
+                    .merge_preview_reported(
+                        &ctx.identity.principal.tenant_id,
+                        &graph,
+                        &spec,
+                        limits,
+                        report,
+                    )
+                    .await
+                    .map_err(|e| ApiError::from_ledger(e, &correlation))?;
+                // A deliberately built criss-cross can have many best common ancestors: list a bounded
+                // prefix (the order is ascending, so any listed one can be named as `base`) and the count.
+                let (candidates, candidate_count) = match &p.class {
+                    ledger_store::MergeClass::AmbiguousMergeBase(c) => (
+                        c.iter()
+                            .take(MAX_LISTED_MERGE_BASE_CANDIDATES)
+                            .cloned()
+                            .collect(),
+                        Some(c.len()),
+                    ),
+                    _ => (Vec::new(), None),
+                };
+                Ok(Json(MergePreviewResponse {
+                    classification: p.class.as_str(),
+                    source_head: p.source_head,
+                    target_head: p.target_head,
+                    merge_base: p.merge_base,
+                    merge_base_candidates: candidates,
+                    merge_base_candidate_count: candidate_count,
+                    ahead: p.ahead,
+                    behind: p.behind,
+                    target_delta: p.target_delta.into(),
+                    source_delta: p.source_delta.into(),
+                    strategy: p.strategy.as_str(),
+                    conflict_count: p.conflict_count,
+                    conflicts: p
+                        .conflicts
+                        .iter()
+                        .map(|c| ConflictResponse {
+                            graph: c.key.graph.clone(),
+                            subject: c.key.subject.clone(),
+                            predicate: c.key.predicate.clone(),
+                            base: side(&c.base),
+                            target: side(&c.target),
+                            source: side(&c.source),
+                        })
+                        .collect(),
+                    conflicts_truncated: p.conflicts_truncated,
+                    merged_state_digest: p.merged_state_digest,
+                    preview_token: p.preview_token,
+                    correlation_id: correlation,
+                }))
+            },
         )
         .await
-        .map_err(|e| ApiError::from_ledger(e, &correlation))?;
-    // A deliberately built criss-cross can have many best common ancestors: list a bounded
-    // prefix (the order is ascending, so any listed one can be named as `base`) and the count.
-    let (candidates, candidate_count) = match &p.class {
-        ledger_store::MergeClass::AmbiguousMergeBase(c) => (
-            c.iter()
-                .take(MAX_LISTED_MERGE_BASE_CANDIDATES)
-                .cloned()
-                .collect(),
-            Some(c.len()),
-        ),
-        _ => (Vec::new(), None),
-    };
-    Ok(Json(MergePreviewResponse {
-        classification: p.class.as_str(),
-        source_head: p.source_head,
-        target_head: p.target_head,
-        merge_base: p.merge_base,
-        merge_base_candidates: candidates,
-        merge_base_candidate_count: candidate_count,
-        ahead: p.ahead,
-        behind: p.behind,
-        target_delta: p.target_delta.into(),
-        source_delta: p.source_delta.into(),
-        strategy: p.strategy.as_str(),
-        conflict_count: p.conflict_count,
-        conflicts: p
-            .conflicts
-            .iter()
-            .map(|c| ConflictResponse {
-                graph: c.key.graph.clone(),
-                subject: c.key.subject.clone(),
-                predicate: c.key.predicate.clone(),
-                base: side(&c.base),
-                target: side(&c.target),
-                source: side(&c.source),
-            })
-            .collect(),
-        conflicts_truncated: p.conflicts_truncated,
-        merged_state_digest: p.merged_state_digest,
-        preview_token: p.preview_token,
-        correlation_id: correlation,
-    }))
 }
 
 #[derive(Serialize)]
@@ -2386,62 +2710,77 @@ async fn merge_propose(
     ctx.require(Capability::Propose)?;
     let correlation = ctx.correlation_id.clone();
     let key = idempotency_key(&headers, &correlation)?;
-    let graph = authorized_graph(&state, &ctx, &graph).await?;
-    let canonical = canonical_merge_propose(&graph, &body, &correlation)?;
-    let spec = merge_spec(
-        &body.source,
-        &body.target,
-        body.strategy.as_deref(),
-        body.base.as_ref(),
-        &correlation,
-    )?;
-    let request = ledger_store::ProposeMergeRequest {
-        scope: scope(&ctx, &graph, key, canonical.digest()),
-        spec,
-        preview_token: body.preview_token,
-        message: body.message.unwrap_or_default(),
-        evidence_refs: body.evidence_refs,
-    };
-    // A completed propose replays before any admission permit is taken.
-    if let Some(p) = state
-        .0
-        .store
-        .workflows()
-        .stored_merge_proposal(&request.scope)
+    // From the graph lookup on, every statement belongs to one tracked, detached
+    // operation the edge may stop waiting for but never drops (ADR-0026 §8).
+    let detached = state.clone();
+    let corr = correlation.clone();
+    state
+        .run_db(
+            ctx.deadline,
+            lifecycle::OperationClass::IdempotentWrite,
+            &corr,
+            async move {
+                let state = detached;
+                let graph = authorized_graph(&state, &ctx, &graph).await?;
+                let canonical = canonical_merge_propose(&graph, &body, &correlation)?;
+                let spec = merge_spec(
+                    &body.source,
+                    &body.target,
+                    body.strategy.as_deref(),
+                    body.base.as_ref(),
+                    &correlation,
+                )?;
+                let request = ledger_store::ProposeMergeRequest {
+                    scope: scope(&ctx, &graph, key, canonical.digest()),
+                    spec,
+                    preview_token: body.preview_token,
+                    message: body.message.unwrap_or_default(),
+                    evidence_refs: body.evidence_refs,
+                };
+                // A completed propose replays before any admission permit is taken.
+                if let Some(p) = state
+                    .0
+                    .store
+                    .workflows()
+                    .stored_merge_proposal(&request.scope)
+                    .await
+                    .map_err(|e| ApiError::from_ledger(e, &correlation))?
+                {
+                    return Ok((StatusCode::OK, Json(propose_response(p, correlation))));
+                }
+                let _permit = state
+                    .0
+                    .expensive
+                    .clone()
+                    .try_acquire_many_owned(merge_permits(&state))
+                    .map_err(|_| {
+                        ApiError::new(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "RESOURCE_LIMIT",
+                            "too many concurrent expensive operations; retry later",
+                            &correlation,
+                        )
+                    })?;
+                let limits = ledger_store::TraversalLimits {
+                    max_visited: MERGE_MAX_VISITED,
+                    deadline: Some(std::time::Instant::now() + MERGE_DEADLINE),
+                };
+                let p = state
+                    .0
+                    .store
+                    .workflows()
+                    .merge_propose(&request, limits)
+                    .await
+                    .map_err(|e| ApiError::from_ledger(e, &correlation))?;
+                let status = if p.replayed {
+                    StatusCode::OK
+                } else {
+                    StatusCode::CREATED
+                };
+                Ok((status, Json(propose_response(p, correlation))))
+            },
+        )
         .await
-        .map_err(|e| ApiError::from_ledger(e, &correlation))?
-    {
-        return Ok((StatusCode::OK, Json(propose_response(p, correlation))));
-    }
-    let _permit = state
-        .0
-        .expensive
-        .try_acquire_many(merge_permits(&state))
-        .map_err(|_| {
-            ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "RESOURCE_LIMIT",
-                "too many concurrent expensive operations; retry later",
-                &correlation,
-            )
-        })?;
-    let limits = ledger_store::TraversalLimits {
-        max_visited: MERGE_MAX_VISITED,
-        deadline: Some(std::time::Instant::now() + MERGE_DEADLINE),
-    };
-    let p = state
-        .0
-        .store
-        .workflows()
-        .merge_propose(&request, limits)
-        .await
-        .map_err(|e| ApiError::from_ledger(e, &correlation))?;
-    let status = if p.replayed {
-        StatusCode::OK
-    } else {
-        StatusCode::CREATED
-    };
-    Ok((status, Json(propose_response(p, correlation))))
 }
 
 fn propose_response(p: ledger_store::MergeProposed, correlation: String) -> MergeProposeResponse {
@@ -2471,44 +2810,62 @@ async fn merge_apply(
     ctx.require(Capability::Review)?;
     let correlation = ctx.correlation_id.clone();
     let key = idempotency_key(&headers, &correlation)?;
-    let graph = authorized_graph(&state, &ctx, &graph).await?;
-    let canonical = canonical_merge_apply(&graph, &body, &correlation)?;
-    // As for accept: a named validation binds the merge to that record (ADR-0019);
-    // otherwise the deployment policy travels with the request and the store enforces it
-    // after the replay lookup.
-    let validation = match (&body.validation_id, &body.semantic_environment_id) {
-        (Some(validation_id), Some(semantic_environment_id)) => ValidationPolicy::Validated {
-            validation_id: validation_id.clone(),
-            semantic_environment_id: semantic_environment_id.clone(),
-        },
-        _ => match state.0.acceptance {
-            AcceptancePolicy::RequireValidation => ValidationPolicy::Required,
-            AcceptancePolicy::AllowUnvalidatedDevelopmentOnly => ValidationPolicy::NoValidation,
-        },
-    };
-    let request = ledger_store::ApplyMergeRequest {
-        scope: scope(&ctx, &graph, key, canonical.digest()),
-        proposal_id: body.proposal_id,
-        preview_token: body.preview_token,
-        reason: body.reason.filter(|r| !r.is_empty()),
-        validation,
-    };
-    let applied = state
-        .0
-        .store
-        .workflows()
-        .merge_apply(&request)
+    // From the graph lookup on, every statement belongs to one tracked, detached
+    // operation the edge may stop waiting for but never drops (ADR-0026 §8).
+    let detached = state.clone();
+    let corr = correlation.clone();
+    state
+        .run_db(
+            ctx.deadline,
+            lifecycle::OperationClass::IdempotentWrite,
+            &corr,
+            async move {
+                let state = detached;
+                let graph = authorized_graph(&state, &ctx, &graph).await?;
+                let canonical = canonical_merge_apply(&graph, &body, &correlation)?;
+                // As for accept: a named validation binds the merge to that record (ADR-0019);
+                // otherwise the deployment policy travels with the request and the store enforces it
+                // after the replay lookup.
+                let validation = match (&body.validation_id, &body.semantic_environment_id) {
+                    (Some(validation_id), Some(semantic_environment_id)) => {
+                        ValidationPolicy::Validated {
+                            validation_id: validation_id.clone(),
+                            semantic_environment_id: semantic_environment_id.clone(),
+                        }
+                    }
+                    _ => match state.0.acceptance {
+                        AcceptancePolicy::RequireValidation => ValidationPolicy::Required,
+                        AcceptancePolicy::AllowUnvalidatedDevelopmentOnly => {
+                            ValidationPolicy::NoValidation
+                        }
+                    },
+                };
+                let request = ledger_store::ApplyMergeRequest {
+                    scope: scope(&ctx, &graph, key, canonical.digest()),
+                    proposal_id: body.proposal_id,
+                    preview_token: body.preview_token,
+                    reason: body.reason.filter(|r| !r.is_empty()),
+                    validation,
+                };
+                let applied = state
+                    .0
+                    .store
+                    .workflows()
+                    .merge_apply(&request)
+                    .await
+                    .map_err(|e| ApiError::from_ledger(e, &correlation))?;
+                Ok(Json(AcceptResponse {
+                    decision_id: applied.decision_id,
+                    ref_event_id: applied.ref_event_id,
+                    outbox_id: applied.outbox_id,
+                    ref_version: applied.ref_version,
+                    head: applied.head,
+                    replayed: applied.replayed,
+                    correlation_id: correlation,
+                }))
+            },
+        )
         .await
-        .map_err(|e| ApiError::from_ledger(e, &correlation))?;
-    Ok(Json(AcceptResponse {
-        decision_id: applied.decision_id,
-        ref_event_id: applied.ref_event_id,
-        outbox_id: applied.outbox_id,
-        ref_version: applied.ref_version,
-        head: applied.head,
-        replayed: applied.replayed,
-        correlation_id: correlation,
-    }))
 }
 
 fn query_name(query: &BTreeMap<String, String>, correlation: &str) -> Result<String, ApiError> {
@@ -2552,43 +2909,57 @@ async fn create_branch(
     }
     let correlation = ctx.correlation_id.clone();
     let key = idempotency_key(&headers, &correlation)?;
-    let graph = authorized_graph(&state, &ctx, &graph).await?;
-    let canonical = canonical_branch_create(&graph, &body, &correlation)?;
-    let request = ledger_store::CreateBranchRequest {
-        scope: scope(&ctx, &graph, key, canonical.digest()),
-        name: body.name,
-        source: body.source,
-        from_commit: body.from_commit,
-        policy: ledger_store::BranchPolicy {
-            protected: body.policy.protected,
-            require_validation: body.policy.require_validation,
-            require_distinct_reviewer: body.policy.require_distinct_reviewer,
-        },
-    };
-    let limits = ledger_store::TraversalLimits {
-        max_visited: BRANCH_POINT_MAX_VISITED,
-        deadline: Some(std::time::Instant::now() + BRANCH_POINT_DEADLINE),
-    };
-    let outcome = state
-        .0
-        .store
-        .workflows()
-        .create_branch(&request, limits)
+    // From the graph lookup on, every statement belongs to one tracked, detached
+    // operation the edge may stop waiting for but never drops (ADR-0026 §8).
+    let detached = state.clone();
+    let corr = correlation.clone();
+    state
+        .run_db(
+            ctx.deadline,
+            lifecycle::OperationClass::IdempotentWrite,
+            &corr,
+            async move {
+                let state = detached;
+                let graph = authorized_graph(&state, &ctx, &graph).await?;
+                let canonical = canonical_branch_create(&graph, &body, &correlation)?;
+                let request = ledger_store::CreateBranchRequest {
+                    scope: scope(&ctx, &graph, key, canonical.digest()),
+                    name: body.name,
+                    source: body.source,
+                    from_commit: body.from_commit,
+                    policy: ledger_store::BranchPolicy {
+                        protected: body.policy.protected,
+                        require_validation: body.policy.require_validation,
+                        require_distinct_reviewer: body.policy.require_distinct_reviewer,
+                    },
+                };
+                let limits = ledger_store::TraversalLimits {
+                    max_visited: BRANCH_POINT_MAX_VISITED,
+                    deadline: Some(std::time::Instant::now() + BRANCH_POINT_DEADLINE),
+                };
+                let outcome = state
+                    .0
+                    .store
+                    .workflows()
+                    .create_branch(&request, limits)
+                    .await
+                    .map_err(|e| ApiError::from_ledger(e, &correlation))?;
+                let status = if outcome.replayed {
+                    StatusCode::OK
+                } else {
+                    StatusCode::CREATED
+                };
+                Ok((
+                    status,
+                    Json(BranchLifecycleResponse {
+                        event: outcome.event.into(),
+                        replayed: outcome.replayed,
+                        correlation_id: correlation,
+                    }),
+                ))
+            },
+        )
         .await
-        .map_err(|e| ApiError::from_ledger(e, &correlation))?;
-    let status = if outcome.replayed {
-        StatusCode::OK
-    } else {
-        StatusCode::CREATED
-    };
-    Ok((
-        status,
-        Json(BranchLifecycleResponse {
-            event: outcome.event.into(),
-            replayed: outcome.replayed,
-            correlation_id: correlation,
-        }),
-    ))
 }
 
 async fn change_branch(
@@ -2603,25 +2974,39 @@ async fn change_branch(
     ctx.require(Capability::Admin)?;
     let correlation = ctx.correlation_id.clone();
     let key = idempotency_key(&headers, &correlation)?;
-    let graph = authorized_graph(&state, &ctx, &graph).await?;
-    let canonical = canonical_branch_lifecycle(&graph, delete, &body, &correlation)?;
-    let request = ledger_store::BranchLifecycleRequest {
-        scope: scope(&ctx, &graph, key, canonical.digest()),
-        name: body.name,
-        reason: body.reason.filter(|r| !r.is_empty()),
-    };
-    let repo = state.0.store.workflows();
-    let outcome = if delete {
-        repo.delete_branch(&request).await
-    } else {
-        repo.restore_branch(&request).await
-    }
-    .map_err(|e| ApiError::from_ledger(e, &correlation))?;
-    Ok(Json(BranchLifecycleResponse {
-        event: outcome.event.into(),
-        replayed: outcome.replayed,
-        correlation_id: correlation,
-    }))
+    // From the graph lookup on, every statement belongs to one tracked, detached
+    // operation the edge may stop waiting for but never drops (ADR-0026 §8).
+    let detached = state.clone();
+    let corr = correlation.clone();
+    state
+        .run_db(
+            ctx.deadline,
+            lifecycle::OperationClass::IdempotentWrite,
+            &corr,
+            async move {
+                let state = detached;
+                let graph = authorized_graph(&state, &ctx, &graph).await?;
+                let canonical = canonical_branch_lifecycle(&graph, delete, &body, &correlation)?;
+                let request = ledger_store::BranchLifecycleRequest {
+                    scope: scope(&ctx, &graph, key, canonical.digest()),
+                    name: body.name,
+                    reason: body.reason.filter(|r| !r.is_empty()),
+                };
+                let repo = state.0.store.workflows();
+                let outcome = if delete {
+                    repo.delete_branch(&request).await
+                } else {
+                    repo.restore_branch(&request).await
+                }
+                .map_err(|e| ApiError::from_ledger(e, &correlation))?;
+                Ok(Json(BranchLifecycleResponse {
+                    event: outcome.event.into(),
+                    replayed: outcome.replayed,
+                    correlation_id: correlation,
+                }))
+            },
+        )
+        .await
 }
 
 async fn delete_branch(
@@ -2652,18 +3037,32 @@ async fn list_branches(
 ) -> Result<Json<BranchListResponse>, ApiError> {
     ctx.require(Capability::Read)?;
     let correlation = ctx.correlation_id.clone();
-    let graph = authorized_graph(&state, &ctx, &graph).await?;
-    let limit = query_limit(&query, &correlation)?;
-    let branches = state
-        .0
-        .store
-        .workflows()
-        .branches(&ctx.identity.principal.tenant_id, &graph, limit)
+    // From the graph lookup on, every statement belongs to one tracked, detached
+    // operation the edge may stop waiting for but never drops (ADR-0026 §8).
+    let detached = state.clone();
+    let corr = correlation.clone();
+    state
+        .run_db(
+            ctx.deadline,
+            lifecycle::OperationClass::Read,
+            &corr,
+            async move {
+                let state = detached;
+                let graph = authorized_graph(&state, &ctx, &graph).await?;
+                let limit = query_limit(&query, &correlation)?;
+                let branches = state
+                    .0
+                    .store
+                    .workflows()
+                    .branches(&ctx.identity.principal.tenant_id, &graph, limit)
+                    .await
+                    .map_err(|e| ApiError::from_ledger(e, &correlation))?;
+                Ok(Json(BranchListResponse {
+                    branches: branches.into_iter().map(Into::into).collect(),
+                }))
+            },
+        )
         .await
-        .map_err(|e| ApiError::from_ledger(e, &correlation))?;
-    Ok(Json(BranchListResponse {
-        branches: branches.into_iter().map(Into::into).collect(),
-    }))
 }
 
 async fn branch_status(
@@ -2674,17 +3073,33 @@ async fn branch_status(
 ) -> Result<Json<BranchResponse>, ApiError> {
     ctx.require(Capability::Read)?;
     let correlation = ctx.correlation_id.clone();
-    let graph = authorized_graph(&state, &ctx, &graph).await?;
-    let name = query_name(&query, &correlation)?;
+    // From the graph lookup on, every statement belongs to one tracked, detached
+    // operation the edge may stop waiting for but never drops (ADR-0026 §8).
+    let detached = state.clone();
+    let corr = correlation.clone();
     state
-        .0
-        .store
-        .workflows()
-        .branch(&ctx.identity.principal.tenant_id, &graph, &name)
+        .run_db(
+            ctx.deadline,
+            lifecycle::OperationClass::Read,
+            &corr,
+            async move {
+                let state = detached;
+                let graph = authorized_graph(&state, &ctx, &graph).await?;
+                let name = query_name(&query, &correlation)?;
+                state
+                    .0
+                    .store
+                    .workflows()
+                    .branch(&ctx.identity.principal.tenant_id, &graph, &name)
+                    .await
+                    .map_err(|e| ApiError::from_ledger(e, &correlation))?
+                    .map(|b| Json(b.into()))
+                    .ok_or_else(|| {
+                        ApiError::from_ledger(LedgerError::BranchNotFound(name), &correlation)
+                    })
+            },
+        )
         .await
-        .map_err(|e| ApiError::from_ledger(e, &correlation))?
-        .map(|b| Json(b.into()))
-        .ok_or_else(|| ApiError::from_ledger(LedgerError::BranchNotFound(name), &correlation))
 }
 
 async fn branch_history(
@@ -2695,39 +3110,56 @@ async fn branch_history(
 ) -> Result<Json<BranchHistoryResponse>, ApiError> {
     ctx.require(Capability::Read)?;
     let correlation = ctx.correlation_id.clone();
-    let graph = authorized_graph(&state, &ctx, &graph).await?;
-    let name = query_name(&query, &correlation)?;
-    let limit = query_limit(&query, &correlation)?;
-    let (lifecycle, movements) = state
-        .0
-        .store
-        .workflows()
-        .branch_history(&ctx.identity.principal.tenant_id, &graph, &name, limit)
+    // From the graph lookup on, every statement belongs to one tracked, detached
+    // operation the edge may stop waiting for but never drops (ADR-0026 §8).
+    let detached = state.clone();
+    let corr = correlation.clone();
+    state
+        .run_db(
+            ctx.deadline,
+            lifecycle::OperationClass::Read,
+            &corr,
+            async move {
+                let state = detached;
+                let graph = authorized_graph(&state, &ctx, &graph).await?;
+                let name = query_name(&query, &correlation)?;
+                let limit = query_limit(&query, &correlation)?;
+                let (lifecycle, movements) = state
+                    .0
+                    .store
+                    .workflows()
+                    .branch_history(&ctx.identity.principal.tenant_id, &graph, &name, limit)
+                    .await
+                    .map_err(|e| ApiError::from_ledger(e, &correlation))?
+                    .ok_or_else(|| {
+                        ApiError::from_ledger(
+                            LedgerError::BranchNotFound(name.clone()),
+                            &correlation,
+                        )
+                    })?;
+                Ok(Json(BranchHistoryResponse {
+                    name,
+                    lifecycle: lifecycle.into_iter().map(Into::into).collect(),
+                    movements: movements
+                        .into_iter()
+                        .map(|m| RefMovementResponse {
+                            event_id: m.event_id,
+                            operation: m.operation,
+                            old_head: m.old_head,
+                            new_head: m.new_head,
+                            old_version: m.old_version,
+                            new_version: m.new_version,
+                            principal_id: m.principal_id,
+                            principal_type: m.principal_type,
+                            on_behalf_of: m.on_behalf_of,
+                            reason: m.reason,
+                            recorded_at: m.recorded_at,
+                        })
+                        .collect(),
+                }))
+            },
+        )
         .await
-        .map_err(|e| ApiError::from_ledger(e, &correlation))?
-        .ok_or_else(|| {
-            ApiError::from_ledger(LedgerError::BranchNotFound(name.clone()), &correlation)
-        })?;
-    Ok(Json(BranchHistoryResponse {
-        name,
-        lifecycle: lifecycle.into_iter().map(Into::into).collect(),
-        movements: movements
-            .into_iter()
-            .map(|m| RefMovementResponse {
-                event_id: m.event_id,
-                operation: m.operation,
-                old_head: m.old_head,
-                new_head: m.new_head,
-                old_version: m.old_version,
-                new_version: m.new_version,
-                principal_id: m.principal_id,
-                principal_type: m.principal_type,
-                on_behalf_of: m.on_behalf_of,
-                reason: m.reason,
-                recorded_at: m.recorded_at,
-            })
-            .collect(),
-    }))
 }
 
 async fn branch_log(
@@ -2738,36 +3170,53 @@ async fn branch_log(
 ) -> Result<Json<BranchLogResponse>, ApiError> {
     ctx.require(Capability::Read)?;
     let correlation = ctx.correlation_id.clone();
-    let graph = authorized_graph(&state, &ctx, &graph).await?;
-    let name = query_name(&query, &correlation)?;
-    let limit = query_limit(&query, &correlation)?;
-    let tenant = &ctx.identity.principal.tenant_id;
-    let repo = state.0.store.workflows();
-    let branch = repo
-        .branch(tenant, &graph, &name)
-        .await
-        .map_err(|e| ApiError::from_ledger(e, &correlation))?
-        .ok_or_else(|| {
-            ApiError::from_ledger(LedgerError::BranchNotFound(name.clone()), &correlation)
-        })?;
-    let commits = repo
-        .first_parent_history(
-            tenant,
-            &graph,
-            &branch.head,
-            limit as usize,
-            ledger_store::TraversalLimits {
-                max_visited: MAX_HISTORY_PAGE as usize,
-                deadline: Some(std::time::Instant::now() + BRANCH_POINT_DEADLINE),
+    // From the graph lookup on, every statement belongs to one tracked, detached
+    // operation the edge may stop waiting for but never drops (ADR-0026 §8).
+    let detached = state.clone();
+    let corr = correlation.clone();
+    state
+        .run_db(
+            ctx.deadline,
+            lifecycle::OperationClass::Read,
+            &corr,
+            async move {
+                let state = detached;
+                let graph = authorized_graph(&state, &ctx, &graph).await?;
+                let name = query_name(&query, &correlation)?;
+                let limit = query_limit(&query, &correlation)?;
+                let tenant = &ctx.identity.principal.tenant_id;
+                let repo = state.0.store.workflows();
+                let branch = repo
+                    .branch(tenant, &graph, &name)
+                    .await
+                    .map_err(|e| ApiError::from_ledger(e, &correlation))?
+                    .ok_or_else(|| {
+                        ApiError::from_ledger(
+                            LedgerError::BranchNotFound(name.clone()),
+                            &correlation,
+                        )
+                    })?;
+                let commits = repo
+                    .first_parent_history(
+                        tenant,
+                        &graph,
+                        &branch.head,
+                        limit as usize,
+                        ledger_store::TraversalLimits {
+                            max_visited: MAX_HISTORY_PAGE as usize,
+                            deadline: Some(std::time::Instant::now() + BRANCH_POINT_DEADLINE),
+                        },
+                    )
+                    .await
+                    .map_err(|e| ApiError::from_ledger(e, &correlation))?;
+                Ok(Json(BranchLogResponse {
+                    name,
+                    head: branch.head,
+                    commits,
+                }))
             },
         )
         .await
-        .map_err(|e| ApiError::from_ledger(e, &correlation))?;
-    Ok(Json(BranchLogResponse {
-        name,
-        head: branch.head,
-        commits,
-    }))
 }
 
 #[derive(Serialize)]
@@ -2783,38 +3232,56 @@ async fn read_state(
 ) -> Result<Json<StateResponse>, ApiError> {
     ctx.require(Capability::Read)?;
     let correlation = ctx.correlation_id.clone();
-    let graph = authorized_graph(&state, &ctx, &graph).await?;
-    // Malformed ids, unknown commits and commits of other graphs are all NOT_FOUND.
-    let commit = CommitId::from_str(&commit).map_err(|_| ApiError::not_found(&correlation))?;
-    let member = state
-        .0
-        .store
-        .commit_graph(&commit)
-        .await
-        .map_err(|e| ApiError::from_ledger(e, &correlation))?;
-    if member.as_ref() != Some(&graph) {
-        return Err(ApiError::not_found(&correlation));
-    }
-    let _permit = state.0.expensive.try_acquire().map_err(|_| {
-        ApiError::new(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "RESOURCE_LIMIT",
-            "too many concurrent expensive operations; retry later",
-            &correlation,
+    // From the graph lookup on, every statement belongs to one tracked, detached
+    // operation the edge may stop waiting for but never drops (ADR-0026 §8).
+    let detached = state.clone();
+    let corr = correlation.clone();
+    state
+        .run_db(
+            ctx.deadline,
+            lifecycle::OperationClass::Read,
+            &corr,
+            async move {
+                let state = detached;
+                let graph = authorized_graph(&state, &ctx, &graph).await?;
+                // Malformed ids, unknown commits and commits of other graphs are all NOT_FOUND.
+                let commit =
+                    CommitId::from_str(&commit).map_err(|_| ApiError::not_found(&correlation))?;
+                let member = state
+                    .0
+                    .store
+                    .commit_graph(&commit)
+                    .await
+                    .map_err(|e| ApiError::from_ledger(e, &correlation))?;
+                if member.as_ref() != Some(&graph) {
+                    return Err(ApiError::not_found(&correlation));
+                }
+                let _permit = Arc::clone(&state.0.expensive)
+                    .try_acquire_owned()
+                    .map_err(|_| {
+                        ApiError::new(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "RESOURCE_LIMIT",
+                            "too many concurrent expensive operations; retry later",
+                            &correlation,
+                        )
+                    })?;
+                // A read never reconstructs more than it may export.
+                let mut bounds = state.0.limits.reconstruction;
+                bounds.max_bytes = bounds.max_bytes.min(state.0.limits.max_state_export_bytes);
+                let quads = state
+                    .0
+                    .store
+                    .workflows()
+                    .reconstruct(&commit, &bounds)
+                    .await
+                    .map_err(|e| ApiError::from_ledger(e, &correlation))?;
+                let quads =
+                    export_quads(quads, state.0.limits.max_state_export_bytes, &correlation)?;
+                Ok(Json(StateResponse { commit, quads }))
+            },
         )
-    })?;
-    // A read never reconstructs more than it may export.
-    let mut bounds = state.0.limits.reconstruction;
-    bounds.max_bytes = bounds.max_bytes.min(state.0.limits.max_state_export_bytes);
-    let quads = state
-        .0
-        .store
-        .workflows()
-        .reconstruct(&commit, &bounds)
         .await
-        .map_err(|e| ApiError::from_ledger(e, &correlation))?;
-    let quads = export_quads(quads, state.0.limits.max_state_export_bytes, &correlation)?;
-    Ok(Json(StateResponse { commit, quads }))
 }
 
 #[cfg(test)]
@@ -2889,6 +3356,7 @@ mod tests {
             "RESOURCE_LIMIT",
             "DEPENDENCY_UNAVAILABLE",
             "DEPENDENCY_TIMEOUT",
+            "REQUEST_TIMEOUT",
             "INTERNAL",
             "BRANCH_NOT_FOUND",
             "BRANCH_EXISTS",
@@ -3051,18 +3519,76 @@ mod tests {
         }
     }
 
+    /// A request stuck before any database work (here: in authentication) is answered by
+    /// the edge with `REQUEST_TIMEOUT` (ADR-0026 §4), classified by the request alone: a
+    /// key-less read is told nothing was written and never to retry with a key.
     #[tokio::test]
-    async fn requests_exceeding_the_time_limit_get_a_resource_limit_envelope() {
+    async fn requests_exceeding_the_time_limit_get_a_request_timeout_envelope_by_class() {
         let limits = ApiLimits {
             request_timeout: Duration::from_millis(50),
             ..ApiLimits::default()
         };
         let app = router(lazy_state(Arc::new(NeverAnswers), limits));
+        let started = Instant::now();
         let (status, body, correlation) =
             send(&app, "GET", "/v1/graphs/g1/refs?name=main", Some("t")).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-        assert_eq!(body["code"], "RESOURCE_LIMIT");
+        assert_eq!(body["code"], "REQUEST_TIMEOUT");
+        let message = body["message"].as_str().unwrap();
+        assert!(
+            message.contains("nothing was written") && !message.contains("idempotency"),
+            "{message}"
+        );
         assert_eq!(body["correlation_id"], correlation.unwrap());
+        // The edge grace is the only budget before database work: request_timeout plus a
+        // tenth of it — a 50 ms timeout answers in well under a second, not at 1.05 s.
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(50) && elapsed < Duration::from_secs(1),
+            "{elapsed:?}"
+        );
+    }
+
+    /// An error from COMMIT itself (ADR-0026 §4) carries the outcome-unknown guidance under
+    /// the inner class's code; a key-less read's dependency guidance never names a key.
+    #[test]
+    fn commit_outcome_unknown_and_read_guidance_map_as_the_adr_says() {
+        let timeout = ApiError::from_ledger(
+            LedgerError::CommitOutcomeUnknown(Box::new(LedgerError::DependencyTimeout("x".into()))),
+            "c",
+        );
+        assert_eq!(
+            (timeout.status, timeout.code),
+            (StatusCode::SERVICE_UNAVAILABLE, "DEPENDENCY_TIMEOUT")
+        );
+        assert!(
+            timeout.message.contains("outcome is unknown")
+                && timeout.message.contains("same idempotency key"),
+            "{}",
+            timeout.message
+        );
+        let lost = ApiError::from_ledger(
+            LedgerError::CommitOutcomeUnknown(Box::new(LedgerError::DependencyUnavailable(
+                "x".into(),
+            ))),
+            "c",
+        );
+        assert_eq!(lost.code, "DEPENDENCY_UNAVAILABLE");
+        assert!(lost.message.contains("outcome is unknown"));
+        let read = ApiError::from_ledger(LedgerError::DependencyUnavailable("x".into()), "c")
+            .for_class(lifecycle::OperationClass::Read);
+        assert!(
+            !read.message.contains("idempotency") && read.message.contains("nothing was written"),
+            "{}",
+            read.message
+        );
+        let write = ApiError::from_ledger(LedgerError::DependencyUnavailable("x".into()), "c")
+            .for_class(lifecycle::OperationClass::IdempotentWrite);
+        assert!(
+            write.message.contains("same idempotency key"),
+            "{}",
+            write.message
+        );
     }
 
     #[tokio::test]
