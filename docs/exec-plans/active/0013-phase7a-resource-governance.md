@@ -300,6 +300,8 @@ The Codex review of `9c699cc` (the head after the readiness fix) raised no P1 an
 
 The Codex review of `cc693de` raised one P2: the start-up hierarchy check treated `LEDGER_VALIDATOR_URL=''` as a configured validator (enforcing `validator + statement ≤ request` and refusing an outage configuration that `validator_settings` itself normalizes to "no endpoint"). **Confirmed; fixed in `482c673`** (`validator_endpoint_configured` applies the same normalization; unit-tested next to the empty-URL equivalence; `ledger-server` 15 unit tests, `check-fast` passed). Rounds of the hosted review: `48e323b` 2 P1 + 1 P2, `dadb1f2` 1 P1, `9c699cc` 2 P2, `cc693de` 1 P2 — every finding confirmed and fixed; no P0/P1 open.
 
+A second review of `cc693de` raised one more P2: `state_at_on_windowed` checked the deadline only before each window fetch, so the CPU work of the final window (hashing, decoding, applying) could carry a transaction past its deadline unnoticed until its rollback. **Confirmed; fixed in `18a6839`** (`lifecycle::check`, a deadline check without a statement, after every chain window and every patch window, the last included). No dedicated deterministic test: CPU time between statements cannot be injected without a production switch; the check is structural and the reconstruction suites (`pg_workflow`, `pg_validation`, `pg_merge`, `pg_retrieval`, `pg_lifecycle`) pass on both versions.
+
 ## Independent reviews (M1, 2026-10-07)
 Five bounded read-only reviews (cancellation/session reuse, admission/starvation, idempotency/transaction semantics, test determinism/fault evidence, security/tenant leakage). Dispositions:
 

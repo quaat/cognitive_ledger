@@ -146,3 +146,10 @@ An empty `LEDGER_VALIDATOR_URL` no longer counts as a configured validator for t
 relation (the same normalization as `validator_settings`); unit test in `ledger-server`
 (15 passed); `check-fast` passed. Hosted Actions on `cc693de`: all green (runs
 37857286399, 37857286426, 37857286485, 37857286520, 37857286558).
+
+## Post-review fixes, round 5 (second review of `cc693de`: one P2; fix revision `18a6839`)
+Deadline checks after each reconstruction window's CPU work (`lifecycle::check`); suites at
+`18a6839` on 17.2 and 15.19: `pg_lifecycle` 22, `pg_workflow` 14, `pg_validation` 9, `pg_merge` 27,
+`pg_retrieval` 12, `pg_branches` 18, `pg_api` 20 — all passed; `check-fast` passed. Hosted
+Actions on `b70620d` (round 4 head): all green (runs 37862632512, 37862632515, 37862632536,
+37862632537, 37862632570).
