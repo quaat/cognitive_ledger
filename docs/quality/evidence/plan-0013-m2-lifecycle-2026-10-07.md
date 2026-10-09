@@ -140,3 +140,9 @@ bound's clock starts at acquisition, before `BEGIN`. `pg_lifecycle` 22 / 22 and 
 verifier clean). The unit envelope test's elapsed-time assertion still encoded the fixed
 1 s grace and failed at `4c1ac0b` (local `check-fast` and the hosted `fast` job); `83b5103`
 corrects it — `ledger-api` unit tests 27 passed, `check-fast` passed.
+
+## Post-review fixes, round 4 (hosted Codex review of `cc693de`: one P2; fix revision `482c673`)
+An empty `LEDGER_VALIDATOR_URL` no longer counts as a configured validator for the headroom
+relation (the same normalization as `validator_settings`); unit test in `ledger-server`
+(15 passed); `check-fast` passed. Hosted Actions on `cc693de`: all green (runs
+37857286399, 37857286426, 37857286485, 37857286520, 37857286558).
