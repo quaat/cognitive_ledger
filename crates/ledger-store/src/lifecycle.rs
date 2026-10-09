@@ -266,6 +266,13 @@ impl BoundedTx {
     }
 }
 
+/// A deadline check with no statement: for CPU work between statements (hashing, decoding
+/// and applying a reconstruction window) that must not carry a bounded transaction, or a
+/// request-path connection, past its deadline unnoticed.
+pub(crate) fn check(conn: &mut dyn Statements, before: &'static str) -> Result<(), LedgerError> {
+    conn.stmt(before).map(|_| ())
+}
+
 /// The deadline check itself.
 pub(crate) fn check_deadline_at(
     deadline: Instant,

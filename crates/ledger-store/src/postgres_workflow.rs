@@ -1232,6 +1232,11 @@ impl WorkflowRepository {
                     expected = parent;
                 }
             }
+            // The CPU work of a window (hashing, decoding) also counts against the deadline:
+            // checked after each window as well as before the next fetch, so the final
+            // window's processing cannot carry the transaction past the bound unnoticed
+            // (PR #17 review of `cc693de`, P2).
+            crate::lifecycle::check(conn, "the next chain window's processing")?;
         }
         let mut state = BTreeSet::new();
         let mut total_bytes = 0usize;
@@ -1249,6 +1254,7 @@ impl WorkflowRepository {
                 crate::apply_bounded(&mut state, &mut total_bytes, &patch, limits)?;
                 next += 1;
             }
+            crate::lifecycle::check(conn, "the reconstruction result")?;
         }
         Ok(Reconstructed {
             state,
