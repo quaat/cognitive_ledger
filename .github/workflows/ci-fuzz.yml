@@ -70,7 +70,7 @@ jobs:
           rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal --component rust-src --no-self-update
           rustc "+$FUZZ_TOOLCHAIN" -Vv
           cargo "+$FUZZ_TOOLCHAIN" -V
-      - uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
+      - uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         if: steps.params.outputs.run == 'true'
         with:
           tool: cargo-fuzz@0.13.2
